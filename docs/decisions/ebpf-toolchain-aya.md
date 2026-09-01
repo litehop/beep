@@ -6,7 +6,7 @@
 ## Context
 
 The ServiceLB dataplane (`servicelb-ebpf-geneve-dataplane.md`) needs a
-Rust-callable toolchain to write, load, and manage tc-bpf/XDP programs and
+Rust-callable toolchain to write, load, and manage tc-bpf programs and
 their maps. Candidates: `aya` (pure Rust), `libbpf-rs` (a Rust wrapper
 around the C libbpf library), and C + libbpf directly.
 
