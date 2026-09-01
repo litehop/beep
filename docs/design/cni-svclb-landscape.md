@@ -113,7 +113,9 @@ whole per-node budget), ZeroTier (not WireGuard-based).
 
 ## References
 
-`ai/findings/legacy/cni-svclb-landscape-2026-08-25.md` history (git) has
-the full citation-by-citation research this digest summarizes — CVE/issue
+The full citation-by-citation research this digest summarizes — CVE/issue
 links, exact benchmark sources, and the complete disqualification
-evidence, recoverable by commit if ever needed verbatim.
+evidence — lived at `docs/design/cni-svclb-landscape-2026-08-25.md` before
+this restructure deleted it; recoverable via `git log --all
+--diff-filter=D -- docs/design/cni-svclb-landscape-2026-08-25.md` if ever
+needed verbatim.
