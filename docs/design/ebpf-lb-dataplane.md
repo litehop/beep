@@ -136,25 +136,26 @@ idle. Pinned under `/sys/fs/bpf` so a restart keeps flow state.
    continuously monitorable** (`ebpf-toolchain-aya.md`), not assumed
    stable.
 
+## Settled wire-format decisions (mayor-gjbov, 2026-09-03)
+
+- **Geneve option encoding**: raw pod IP for the pod identifier; raw
+  `VIP_IP:VIP_PORT` for the VIP echo. Compact alternatives save
+  noise-level bytes at the cost of a map-ordering or id-collision surface.
+  The echo is load-bearing (see Conntrack), not cosmetic.
+- **VIP↔PodIP NAT placement**: DNAT on the backend (step 4), un-DNAT on
+  the ingress (step 7), reusing the step-2 write. Gates Phase 2
+  (mayor-g7jh2).
+- **Backend reverse-flow key uniqueness**: keep the full 5-tuple key; on a
+  cross-Service collision (shared backend Pod:targetPort, reused client
+  source port) remap the backend's own source port for that flow only,
+  un-remapping on return — protocol-agnostic, closing UDP where TCP's
+  kernel-enforced uniqueness gives partial cover. QUIC is exempt: it
+  already keys on a minted DCID (see Conntrack).
+
 ## Open questions before the Phase-3 prototype
 
-- **Traefik fixed-length QUIC CID support**: hard precondition for the CID
-  design, not yet verified.
-- **Geneve option wire encoding**: pod identifier — raw pod IP (simplest)
-  vs. compact backend-index (smaller, couples nodes' map-ordering). VIP
-  echo — raw `VIP_IP:VIP_PORT` vs. a compact flow-id the ingress mints and
-  backend echoes (smaller, format-agnostic). Pick one of each before
-  implementation.
-- **VIP↔PodIP NAT placement**: proposed — DNAT on the backend (step 4),
-  un-DNAT on the ingress (step 7), reusing the ingress's step-2 write.
-  Alternative: both on the backend, needing it to learn the ingress's VIP.
-  Not yet settled.
-- **Backend reverse-flow key uniqueness**: rewrite-stable (see Conntrack)
-  but not proven unique across flows — two Services (different VIPs)
-  sharing a backend Pod at the same targetPort, hit by a client reusing
-  one ephemeral src port across both, would collide. Possible fix: fold
-  the captured VIP into the backend key too, mirroring the ingress fix.
-  Left open.
+- **Traefik fixed-length QUIC CID support**: hard precondition for the
+  CID design above, not yet verified (`bd show mayor-g3lag`).
 
 ## References
 
