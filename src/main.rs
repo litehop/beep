@@ -15,7 +15,7 @@ use aya::{
     include_bytes_aligned,
     programs::{
         links::{FdLink, LinkError, PinnedLink},
-        tc::{self, SchedClassifierLink, TcAttachOptions, TcError},
+        tc::{SchedClassifierLink, TcAttachOptions},
         LinkOrder, SchedClassifier, TcAttachType,
     },
     sys::SyscallError,
@@ -127,15 +127,10 @@ fn attach_and_pin(
     attach_type: TcAttachType,
     pin_dir: &Path,
 ) -> anyhow::Result<()> {
-    match tc::qdisc_add_clsact(iface) {
-        Ok(()) => {}
-        // aya's dedicated `TcError::AlreadyAttached` variant is never
-        // actually constructed by `qdisc_add_clsact` (as of aya 0.14): an
-        // existing clsact qdisc surfaces as a generic netlink EEXIST.
-        Err(TcError::NetlinkError(e)) if e.raw_os_error() == Some(libc::EEXIST) => {}
-        Err(e) => return Err(e.into()),
-    }
-
+    // No `tc::qdisc_add_clsact` call: `attach_with_options` below always
+    // requests `TcxOrder`, and aya's TCX branch of `do_attach` calls
+    // `bpf_link_create` directly -- it never touches (or needs) a clsact
+    // qdisc, that's only for the legacy netlink attach path.
     let program: &mut SchedClassifier = ebpf
         .program_mut(name)
         .ok_or_else(|| anyhow!("no program named `{name}` in the eBPF object"))?

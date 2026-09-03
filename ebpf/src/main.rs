@@ -17,6 +17,12 @@ pub fn uplink_ingress(_ctx: TcContext) -> i32 {
 }
 
 /// Hook 2: ingress classifier on `geneve0`, backend node (forward leg, decap).
+///
+/// Shares a TCX ingress chain on `geneve0` with `geneve_ingress_return`
+/// (hook 4): TCX only treats `TC_ACT_UNSPEC` as "defer to the next program"
+/// -- `TC_ACT_OK` is terminal, so once these gain real logic, whichever one
+/// attaches first will permanently shadow the other unless one of them
+/// returns `TC_ACT_UNSPEC` to hand off. Design left to Phase 2.
 #[classifier]
 pub fn geneve_ingress_decap(_ctx: TcContext) -> i32 {
     TC_ACT_OK
@@ -29,6 +35,11 @@ pub fn uplink_egress_return(_ctx: TcContext) -> i32 {
 }
 
 /// Hook 4: ingress classifier on `geneve0`, ingress node (return leg, decap).
+///
+/// Shares a TCX ingress chain on `geneve0` with `geneve_ingress_decap`
+/// (hook 2) -- see that hook's doc comment for the terminal-verdict
+/// shadowing constraint (`TC_ACT_OK` vs `TC_ACT_UNSPEC`) Phase 2 must
+/// resolve.
 #[classifier]
 pub fn geneve_ingress_return(_ctx: TcContext) -> i32 {
     TC_ACT_OK
