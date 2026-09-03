@@ -1,5 +1,5 @@
 ---
-as_of: 2026-09-01
+as_of: 2026-09-03
 kind: initiative-state
 ---
 
@@ -39,8 +39,15 @@ tc-bpf. tc-bpf's clsact qdisc attaches identically on any device.
 
 ## Packet flow
 
-**Forward:** (1) Client → `VIP:PORT`; routing lands it on the node holding
-the VIP (the "ingress node"). (2) Ingress hashes to a ready backend,
+**Forward:** (1) Client → `NODE_IP:SVC_PORT` — an address the receiving
+node owns (its primary IP, or a prefix statically routed to it), dialed
+directly. There is no floating VIP and no ARP/BGP announcement (servicelb
+ADR): DNS publishes the nodes' own addresses and every node accepts the
+service port, so the packet lands on whichever node the client dialed, and
+that node is the "ingress node" — not a fixed VIP owner. The dialed
+`NODE_IP:SVC_PORT` is the flow's "front address," and plays the role
+written `VIP:PORT` in the rest of this doc (kept for continuity, though in
+this model it is a node-owned address, not a virtual IP). (2) Ingress hashes to a ready backend,
 writes a flow-affinity entry keyed on the forward tuple `(CLIENT_IP,
 SRC_PORT, VIP_IP, VIP_PORT, proto)`, and (3) stamps Geneve metadata
 (remote = backend node, fixed VNI, a pod-identifier option), redirects to
