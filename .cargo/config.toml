@@ -1,0 +1,8 @@
+# Scoped to this nested workspace only (crates/servicelb and below) --
+# cargo config files apply to the directory subtree they live in, so this
+# does not affect the outer u7s workspace's own builds.
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+
+[target.bpfeb-unknown-none]
+linker = "bpf-linker"

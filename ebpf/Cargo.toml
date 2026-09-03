@@ -1,0 +1,12 @@
+[package]
+name = "u7s-servicelb-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+
+[[bin]]
+name = "servicelb-ebpf"
+path = "src/main.rs"
