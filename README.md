@@ -74,6 +74,6 @@ $ sudo bpftool map dump id <id>             # actual live entries, not the ceili
 ```
 
 This is the command path Phase 3's conntrack maps will be read through too
-once flow-affinity sizing/eviction lands (mayor-pa0ze); Phase 2's `VIP_MAP`,
+once flow-affinity sizing/eviction lands; Phase 2's `VIP_MAP`,
 `POD_TARGETS`, `FWD_FLOW`, and `REV_FLOW` are naive single-entry-scale maps,
 not yet sized for churn.

@@ -131,6 +131,7 @@ unsafe impl Pod for VipBackend {}
 #[derive(Clone, Copy)]
 struct Config {
     geneve_ifindex: u32,
+    uplink_ifindex: u32,
 }
 unsafe impl Pod for Config {}
 
@@ -158,7 +159,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&pin_dir)
         .with_context(|| format!("creating pin dir {}", pin_dir.display()))?;
 
-    populate_config(&mut ebpf, &geneve_iface).context("populating CONFIG map")?;
+    populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixture(
         &mut ebpf,
         vip_ip,
@@ -209,14 +210,23 @@ fn main() -> anyhow::Result<()> {
 /// state is inspected, so it can't be a compile-time constant in the eBPF
 /// program) and writes it to the single-entry `CONFIG` map both redirecting
 /// classifiers read at runtime.
-fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str) -> anyhow::Result<()> {
-    let ifindex = iface_index(geneve_iface)
+fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str, uplink_iface: &str) -> anyhow::Result<()> {
+    let geneve_ifindex = iface_index(geneve_iface)
         .with_context(|| format!("resolving ifindex for {geneve_iface}"))?;
+    let uplink_ifindex = iface_index(uplink_iface)
+        .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
     let mut config: AyaArray<_, Config> = AyaArray::try_from(
         ebpf.map_mut("CONFIG")
             .ok_or_else(|| anyhow!("no map named `CONFIG` in the eBPF object"))?,
     )?;
-    config.set(0, Config { geneve_ifindex: ifindex }, 0)?;
+    config.set(
+        0,
+        Config {
+            geneve_ifindex,
+            uplink_ifindex,
+        },
+        0,
+    )?;
     Ok(())
 }
 
@@ -224,7 +234,10 @@ fn iface_index(name: &str) -> anyhow::Result<u32> {
     let c_name = std::ffi::CString::new(name).context("interface name contains a NUL byte")?;
     let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
     if ifindex == 0 {
-        return Err(anyhow!("if_nametoindex({name}) failed: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "if_nametoindex({name}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(ifindex)
 }

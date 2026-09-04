@@ -8,7 +8,7 @@
 //! static VIP:PORT -> backend-node/PodIP:TargetPort mapping populated by the
 //! userspace loader at startup -- real Service/EndpointSlice watching is
 //! Phase 5. Naive single-entry flow-affinity maps; collision-proofing and
-//! LRU sizing are Phase 3 (mayor-pa0ze).
+//! LRU sizing are Phase 3.
 //!
 //! # Wire-value convention (load-bearing, read before editing)
 //!
@@ -38,8 +38,8 @@
 use aya_ebpf::{
     bindings::{bpf_tunnel_key, BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT},
     helpers::{
-        bpf_redirect, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_set_tunnel_key,
-        bpf_skb_set_tunnel_opt,
+        bpf_redirect, bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt,
+        bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
     maps::{Array, HashMap},
@@ -61,8 +61,8 @@ const VNI_RET: u32 = 200;
 /// private, single-implementation encoding. Wire order (see module doc).
 const GENEVE_OPT_CLASS: u16 = 0xffffu16.to_be();
 /// Forward-leg option: raw pod IP (4 bytes), the pod-identifier the backend
-/// needs to pick a target port (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`,
-/// mayor-gjbov wire-format settlement: "raw pod IP for the pod identifier").
+/// needs to pick a target port (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`
+/// wire-format settlement: "raw pod IP for the pod identifier").
 const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
 /// Return-leg option: raw `VIP_IP:VIP_PORT` echo (6 bytes + 2 padding),
 /// captured by the backend before it DNATs and echoed back so the ingress
@@ -73,6 +73,10 @@ const ETH_HLEN: usize = 14;
 const ETH_P_IPV4: u16 = 0x0800u16.to_be();
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+/// `enum pkt_type` value from `uapi/linux/if_packet.h` -- not exposed as a
+/// binding constant by this aya-ebpf version, but a stable kernel uABI value.
+/// See `bpf_skb_change_type`'s call sites below for why this is needed.
+const PACKET_HOST: u32 = 0;
 
 // IPv4-header-relative offsets (no options: IHL must be 5, checked before use).
 const IP_VER_IHL: usize = ETH_HLEN;
@@ -122,16 +126,28 @@ static POD_TARGETS: HashMap<u32, u16> = HashMap::with_max_entries(32, 0);
 /// rebuilt and checked at return-decap time (step 7) from the Geneve VIP
 /// echo plus the inner dst -- confirms the return is answering a flow this
 /// node actually forwarded, not stale/spoofed. Naive single-entry map:
-/// collision-proofing is Phase 3 (mayor-pa0ze), not here.
+/// collision-proofing is Phase 3, not here.
+///
+/// Field order is load-bearing: `BPF_MAP_TYPE_HASH` compares/hashes the raw
+/// bytes of the key struct, including any compiler-inserted alignment
+/// padding -- Rust's struct-literal syntax only initializes named fields, so
+/// a padding gap is left as whatever garbage was already on that call site's
+/// stack, and differs between the insert (decap) and lookup (egress) call
+/// sites despite every named field matching (confirmed on a live kernel: a
+/// byte-identical insert+lookup, microseconds apart, still missed). A `u16`
+/// between two `u32`s forces a hidden 2-byte gap; keeping all `u32`s first
+/// and covering the true trailing gap with an explicit, always-zeroed
+/// `_pad: [u8; 3]` (14 named bytes -> 16 total, matching `size_of`) leaves no
+/// byte uncovered.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FlowKey {
     pub client_ip: u32,
-    pub client_port: u16,
     pub other_ip: u32,
+    pub client_port: u16,
     pub other_port: u16,
     pub proto: u8,
-    pub _pad: u8,
+    pub _pad: [u8; 3],
 }
 
 #[map]
@@ -160,6 +176,7 @@ static REV_FLOW: HashMap<FlowKey, RevFlowValue> = HashMap::with_max_entries(64, 
 #[derive(Clone, Copy)]
 pub struct Config {
     pub geneve_ifindex: u32,
+    pub uplink_ifindex: u32,
 }
 
 #[map]
@@ -200,11 +217,11 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     let src_port: u16 = ctx.load(L4_SPORT).ok()?;
     let flow_key = FlowKey {
         client_ip: src_ip,
-        client_port: src_port,
         other_ip: dst_ip,
+        client_port: src_port,
         other_port: dst_port,
         proto,
-        _pad: 0,
+        _pad: [0; 3],
     };
     FWD_FLOW.insert(flow_key, backend.backend_node_ip, 0).ok()?;
 
@@ -251,6 +268,17 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
 /// real logic. Merging into one program keyed on the flow (here, the VNI)
 /// removes the ambiguity outright instead of ordering it away with
 /// `TC_ACT_UNSPEC` hand-off, which would still depend on attach order.
+///
+/// `try_geneve_decap_forward`/`_return` are `#[inline(always)]`, not
+/// `#[inline(never)]`: the bpf-linker/LLVM combination in this toolchain
+/// miscompiles a real (non-inlined) BPF-to-BPF call whose callee returns
+/// `Option<i32>` -- the caller reads the discriminant back out of a
+/// scratch argument register (R2) instead of the return register (R0),
+/// which the verifier correctly rejects as a read of an uninitialized,
+/// call-clobbered register (confirmed on a live kernel: `bpf_link_create`
+/// EPERM, verifier trace pinpoints `R2 !read_ok` immediately after the
+/// call instruction). Since each of these helpers has exactly one call
+/// site, forcing inlining has no downside and sidesteps the bug entirely.
 #[classifier]
 pub fn geneve_ingress(ctx: TcContext) -> i32 {
     let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
@@ -279,7 +307,7 @@ pub fn geneve_ingress(ctx: TcContext) -> i32 {
 /// client IP at L3), then hand the packet to the normal receive path:
 /// `TC_ACT_OK` on an inbound decap leaves the now-foreign-dst'd packet to
 /// the kernel's own routing, which is flannel's job from here, not ours.
-#[inline(never)]
+#[inline(always)]
 fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32> {
     if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
@@ -293,8 +321,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     }
 
     let mut opt = [0u8; 8];
-    if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        < 0
+    if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) } < 0
     {
         return Some(TC_ACT_SHOT);
     }
@@ -312,11 +339,11 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 
     let rev_key = FlowKey {
         client_ip,
-        client_port,
         other_ip: pod_ip,
+        client_port,
         other_port: target_port,
         proto,
-        _pad: 0,
+        _pad: [0; 3],
     };
     let rev_value = RevFlowValue {
         ingress_node_ip: unsafe { tkey.__bindgen_anon_1.remote_ipv4 },
@@ -326,7 +353,31 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     };
     REV_FLOW.insert(rev_key, rev_value, 0).ok()?;
 
-    rewrite_ip_port(ctx, IP_DST, vip_ip, pod_ip, L4_DPORT, vip_port, target_port, proto)?;
+    rewrite_ip_port(
+        ctx,
+        IP_DST,
+        vip_ip,
+        pod_ip,
+        L4_DPORT,
+        vip_port,
+        target_port,
+        proto,
+    )?;
+
+    // A decap'd skb inherits the tunneled inner Ethernet header UNCHANGED
+    // from the encapsulating end (`bpf_skb_set_tunnel_key`/`_opt` stamp
+    // metadata alongside the packet, they never touch its data), so its dst
+    // MAC is still whatever real NIC address received it there -- never
+    // this node's `geneve0`. `ip_rcv_core()` silently drops any inbound skb
+    // classified `PACKET_OTHERHOST` before routing/delivery ever runs
+    // (confirmed on a live kernel via the `kfree_skb` tracepoint:
+    // `location=ip_rcv_core+.. reason: OTHERHOST`); `bpf_skb_change_type`
+    // is the kernel's own escape hatch for exactly this class of
+    // encap/decap mismatch, forcing local-delivery eligibility so routing
+    // keys off the (correct, just-rewritten) IP destination instead.
+    if unsafe { bpf_skb_change_type(ctx.skb.skb, PACKET_HOST) } != 0 {
+        return Some(TC_ACT_SHOT);
+    }
 
     Some(TC_ACT_OK)
 }
@@ -336,7 +387,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 /// this node actually forwarded (drop otherwise -- an echo with no matching
 /// forward entry is stale or spoofed), then un-DNAT src back to the VIP and
 /// let normal routing carry it out to the client.
-#[inline(never)]
+#[inline(always)]
 fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i32> {
     if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
@@ -350,8 +401,7 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
     }
 
     let mut opt = [0u8; 12];
-    if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        < 0
+    if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) } < 0
     {
         return Some(TC_ACT_SHOT);
     }
@@ -368,17 +418,42 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
 
     let key = FlowKey {
         client_ip,
-        client_port,
         other_ip: vip_ip,
+        client_port,
         other_port: vip_port,
         proto,
-        _pad: 0,
+        _pad: [0; 3],
     };
     unsafe { FWD_FLOW.get(key) }?;
 
-    rewrite_ip_port(ctx, IP_SRC, pod_ip, vip_ip, L4_SPORT, target_port, vip_port, proto)?;
+    rewrite_ip_port(
+        ctx,
+        IP_SRC,
+        pod_ip,
+        vip_ip,
+        L4_SPORT,
+        target_port,
+        vip_port,
+        proto,
+    )?;
 
-    Some(TC_ACT_OK)
+    // Unlike the forward decap, this can't hand off with TC_ACT_OK: `src` is
+    // now the VIP -- an address THIS node genuinely owns -- and the kernel's
+    // normal receive-side routing decision (`ip_rcv_finish_core`) unconditionally
+    // martian-drops any packet whose source is one of the node's own local
+    // addresses arriving for forwarding rather than local origination
+    // (confirmed on a live kernel via the `kfree_skb` tracepoint:
+    // `reason: IP_LOCAL_SOURCE`, independent of rp_filter, which does NOT
+    // gate this check). `bpf_redirect` straight to the uplink transmits the
+    // skb directly, bypassing that receive-side routing decision entirely --
+    // the same "receive on one device, redirect for transmit on another"
+    // pattern `uplink_ingress` already uses for the forward leg's geneve0
+    // redirect, just in the opposite direction.
+    let uplink_ifindex = CONFIG.get(0)?.uplink_ifindex;
+    if unsafe { bpf_redirect(uplink_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
+        return Some(TC_ACT_SHOT);
+    }
+    Some(TC_ACT_REDIRECT)
 }
 
 /// Hook 3: egress classifier on the physical uplink, backend node (return
@@ -410,11 +485,11 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
 
     let key = FlowKey {
         client_ip,
-        client_port,
         other_ip: pod_ip,
+        client_port,
         other_port: target_port,
         proto,
-        _pad: 0,
+        _pad: [0; 3],
     };
     let rev = *unsafe { REV_FLOW.get(key) }?;
 
@@ -460,7 +535,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
 /// require (module doc). UDP's checksum is optional in IPv4 (0 means
 /// disabled) -- a 0 is left alone rather than "fixed up" into a real one.
 #[allow(clippy::too_many_arguments)]
-#[inline(never)]
+#[inline(always)]
 fn rewrite_ip_port(
     ctx: &TcContext,
     ip_off: usize,
@@ -471,11 +546,16 @@ fn rewrite_ip_port(
     new_port: u16,
     proto: u8,
 ) -> Option<()> {
-    let l4_csum_off = if proto == IPPROTO_TCP { TCP_CSUM } else { UDP_CSUM };
+    let l4_csum_off = if proto == IPPROTO_TCP {
+        TCP_CSUM
+    } else {
+        UDP_CSUM
+    };
     let is_udp = proto == IPPROTO_UDP;
     let udp_csum_disabled = is_udp && ctx.load::<u16>(UDP_CSUM).ok()? == 0;
 
-    ctx.l3_csum_replace(IP_CSUM, old_ip as u64, new_ip as u64, 4).ok()?;
+    ctx.l3_csum_replace(IP_CSUM, old_ip as u64, new_ip as u64, 4)
+        .ok()?;
     if !udp_csum_disabled {
         ctx.l4_csum_replace(
             l4_csum_off,
