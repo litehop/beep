@@ -20,7 +20,11 @@
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
 # is > 0 and under a gross-regression ceiling (not a tight bound, just a
-# tripwire for an accidental max_entries blow-up).
+# tripwire for an accidental max_entries blow-up). The ceiling is 4 MiB:
+# LRU_HASH conntrack maps (FWD_FLOW/REV_FLOW/etc) preallocate for their full
+# max_entries capacity regardless of active-flow count, and pa0ze's Phase-3
+# 8192-entry sizing (#1567) measures ~1.82 MiB (1,909,072 bytes) preallocated
+# per node -- 4 MiB leaves ~2.1x headroom over that real, constant footprint.
 set -euo pipefail
 
 csv="${1:?usage: $0 <ebpf-map-memory.csv>}"
@@ -46,7 +50,7 @@ expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
   exit 1
 }
 [ "$total" -gt 0 ] || { echo "FAIL: total bytes_memlock is 0 despite ${#expected[@]} maps discovered -- bpftool map show broken?" >&2; exit 1; }
-limit=$((1024 * 1024))
-[ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 1 MiB gross-regression ceiling" >&2; exit 1; }
+limit=$((4 * 1024 * 1024))
+[ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 4 MiB gross-regression ceiling" >&2; exit 1; }
 
 echo "PASS: exactly ${#expected[@]} known servicelb maps discovered, total bytes_memlock=$total is within the gross-regression ceiling"
