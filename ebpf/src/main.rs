@@ -357,29 +357,43 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // Decision 3 (`ebpf-lb-dataplane.md`): two Services with different front
     // addresses sharing this backend Pod:targetPort, hit by a client
     // reusing one source port across both, would otherwise write this same
-    // reverse key twice. Check whether a DIFFERENT front already holds it
-    // before trusting the natural key -- a matching front (or no entry at
-    // all) means this is the same flow refreshing, or the first writer.
-    let existing_front =
-        unsafe { REV_FLOW.get(natural_rev_key) }.map(|v| (ipv4_mapped_v6(v.vip_ip), v.vip_port));
+    // reverse key twice. Check whether a DIFFERENT (front, original client
+    // port) identity already holds it before trusting the natural key -- a
+    // matching identity (or no entry at all) means this is the same flow
+    // refreshing, or the first writer. Front alone isn't enough: a distinct
+    // flow through this same front whose real source port happens to equal
+    // another flow's already-committed synthetic port would otherwise be
+    // misread as that flow's own state and clobber its REV_FLOW entry.
+    let existing_occupant = unsafe { REV_FLOW.get(natural_rev_key) }.map(|v| {
+        (
+            (ipv4_mapped_v6(v.vip_ip), v.vip_port),
+            v.original_client_port,
+        )
+    });
     let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
     // The probe's occupancy check: REV_FLOW itself is the source of truth
     // for which candidate ports are actually free, not a derived guess --
     // a single low-entropy hash of the front address only guaranteed
-    // uniqueness for exactly 2 conflicting fronts (review 5114293379). An
-    // occupant holding OUR OWN front is a prior packet of this exact flow's
-    // already-committed remap, not a conflict -- without this comparison
-    // the flow reads its own state back as "taken" and churns to a new
-    // port every packet until PROBE_LIMIT is exhausted (review 5114699386).
+    // uniqueness for exactly 2 conflicting fronts. An occupant matching both
+    // our own front and our own original client port is a prior packet of
+    // this exact flow's already-committed remap, not a conflict -- without
+    // that full comparison the flow (or an unrelated flow reusing its
+    // synthetic port as a real source port) reads state back as "taken"/
+    // "mine" incorrectly and either churns ports until PROBE_LIMIT is
+    // exhausted, or silently clobbers another flow's entry.
     let is_reverse_key_taken = |candidate_port: u16| {
         let candidate_key =
             encode_tcp_flow_key(client_ip_v6, candidate_port, pod_ip_v6, target_port, proto);
-        let occupant_front =
-            unsafe { REV_FLOW.get(candidate_key) }.map(|v| (ipv4_mapped_v6(v.vip_ip), v.vip_port));
-        occupant_conflicts(occupant_front, new_front)
+        let occupant = unsafe { REV_FLOW.get(candidate_key) }.map(|v| {
+            (
+                (ipv4_mapped_v6(v.vip_ip), v.vip_port),
+                v.original_client_port,
+            )
+        });
+        occupant_conflicts(occupant, new_front, client_port)
     };
     let (rev_key, backend_src_port) = match resolve_backend_src_port(
-        existing_front,
+        existing_occupant,
         new_front,
         client_port,
         is_reverse_key_taken,
