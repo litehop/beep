@@ -9,9 +9,9 @@ Phase-1 datapath mechanism for the ServiceLB dataplane (`bd show
 mayor-2et9d`, supersedes `mayor-fhfro`/`mayor-mma08`); implements
 `docs/decisions/servicelb-ebpf-geneve-dataplane.md` (this dataplane IS the
 ServiceLB), `servicelb-symmetric-geneve-return.md` (symmetric, not DSR),
-and `ebpf-toolchain-aya.md` (`aya`), not re-argued here. Service-level
-semantics from `bd show mayor-0gpqp` (VIP model, `externalTrafficPolicy`,
-IPv6/dual-stack, node-selector scoping) carry over unchanged.
+and `ebpf-toolchain-aya.md` (`aya`). Service-level semantics from `bd show
+mayor-0gpqp` (VIP model, `externalTrafficPolicy`, IPv6/dual-stack,
+node-selector scoping) carry over unchanged.
 
 Must work across four underlay scenarios, none assumed: WireGuard/
 Tailscale mesh; disjoint subnets; a node behind NAT; all colocated, no
@@ -74,25 +74,23 @@ to the recovered VIP, routes.
 
 **The key must include the VIP, not just the client.** A client-only
 `(CLIENT_IP, SRC_PORT, proto)` key collides: a client can hold two
-concurrent connections from the same local port to two different VIPs
-(demux uses the full remote address, not just the port), and if both
-resolve to the same ingress node, their entries collide. The key must be
-the forward tuple `(CLIENT_IP, SRC_PORT, VIP_IP, VIP_PORT, proto)` —
-trivial at step 2, but step 7 can't read it back the same way: the
-returning packet only carries `PodIP:TargetPort`, the backend's DNAT
-having overwritten the VIP. Fix: the backend captures `VIP_IP:VIP_PORT`
-before DNATing, echoes it on return, and the ingress rebuilds the key.
-**Still one map, just a wider key.**
+concurrent connections from the same local port to different VIPs, and if
+both resolve to the same ingress node, their entries collide. The forward
+tuple `(CLIENT_IP, SRC_PORT, VIP_IP, VIP_PORT, proto)` fixes this —
+trivial at step 2, but step 7 only sees `PodIP:TargetPort` (the backend's
+DNAT overwrote the VIP). Fix: the backend captures `VIP_IP:VIP_PORT`
+before DNATing and echoes it on return, so the ingress rebuilds the same
+key. **Still one map, just a wider key.**
 
 The backend's reverse-flow key, `(CLIENT_IP, SRC_PORT, PodIP, TargetPort,
-proto)`, is rewrite-stable — nothing rewrites either side between write
-(step 4) and read (step 6) — but that says nothing about cross-flow
-uniqueness (see Open questions). Both keys share one shape, fitting
-**one map per protocol** for both roles: VIP-space and flannel's pod-CIDR
-are disjoint by construction, so the two entry kinds never collide.
+proto)`, is rewrite-stable — neither side changes between write (step 4)
+and read (step 6) — but says nothing about cross-flow uniqueness (see
+Open questions). Both keys share one shape, so **one map per protocol**
+covers both roles: VIP-space and flannel's pod-CIDR are disjoint by
+construction, so the two kinds never collide.
 
 `BPF_MAP_TYPE_LRU_PERCPU_HASH`, custom (`nf_conntrack` is heavier). Per-CPU
-cost is bounded by vCPU count — target hardware is 1 vCPU/1GB, nearly free.
+cost is bounded by vCPU count, nearly free at 1 vCPU/1GB.
 
 - **TCP**: key = `(CLIENT_IP, SRC_PORT, OTHER_IP, OTHER_PORT, proto)`
   (`OTHER`=VIP or PodIP, by role). IPv6-primary: **37 bytes** (16+16+2+2+1)
@@ -101,42 +99,47 @@ cost is bounded by vCPU count — target hardware is 1 vCPU/1GB, nearly free.
 - **QUIC**: key = a fixed-length Destination Connection ID prefix, minted
   by the LB (RFC 9000 §17.2's self-describing Initial-packet DCID) — no
   TCP-style collision risk, since it's not derived from the client's
-  address. CID-based vs. 4-tuple/pass-through is a design decision
+  address. Fixed-length, not variable: the 1-RTT short header (§17.3.1)
+  has no length field, so matching needs one externally-agreed CID
+  length. CID-based vs. 4-tuple/pass-through is a design decision
   informed by how L7 proxies (Traefik, nginx, Envoy, HAProxy) handle QUIC
   CIDs — learn-from candidates, not gates (`bd show mayor-g3lag`);
   4-tuple/pass-through is an acceptable fallback (degraded migration
-  affinity) if none cooperates. 4096-entry ceiling.
+  affinity) if none cooperates. `draft-ietf-quic-load-balancers-21`'s
+  richer per-hop scheme is worth adopting only past a single ingress
+  point (chained LBs); this fixed-length prefix suffices for one hop.
+  4096-entry ceiling.
 
-| Component | Estimate | Basis |
+| Component | Estimate (1 vCPU) | Basis |
 |---|---|---|
 | Userspace control-plane process | 3–5 MiB RSS | Rust async binary; idle after reconcile. |
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
 | VIP map (<100 Services × ≤2 protocols) | ~25 KiB | <200 entries. |
-| Endpoint map (<1000 endpoints) | ~128 KiB | Every node carries the full map. |
-| TCP flow-affinity, per-CPU | ~0.5–1 MiB at 1 vCPU | 8192 × ~90 B (37 B key + ~34 B value + ~20 B overhead). |
-| QUIC CID map, per-CPU | ~0.25–0.5 MiB at 1 vCPU | 4096 entries, same model. |
+| Endpoint map (<1000 endpoints) | ~128 KiB | Full map on every node. |
+| TCP flow-affinity, per-CPU | ~0.5–1 MiB | 8192 × ~90 B (37 B key, ~34 B value, ~20 B overhead). |
+| QUIC CID map, per-CPU | ~0.25–0.5 MiB | 4096 entries, same model. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
-| **Total** | **~4–7 MiB at 1 vCPU** | Scales linearly with vCPU count. |
+| **Total** | **~4–7 MiB** | Scales linearly with vCPU count. |
 
-All maps pre-allocate their full ceiling at creation — loxilb's "cannot
-start on 1GB node" failure mode (gate 2). Ceilings are sized small for
-u7s's envelope (<10 nodes/<100 Services/<1000 endpoints).
+All maps pre-allocate their full ceiling — loxilb's "cannot start on 1GB
+node" failure mode (gate 2) — sized small for u7s's envelope (<10
+nodes/<100 Services/<1000 endpoints).
 
 ## Userspace control plane
 
-Runs per node, not centrally (eBPF maps are local kernel memory, no
-remote-write API). One DaemonSet per node, `hostNetwork` +
-`CAP_BPF`/`CAP_NET_ADMIN`, no CRI socket: load tc-bpf programs once, watch
-`Service`/`EndpointSlice`, write maps on change, idle. Pinned under
-`/sys/fs/bpf` so a restart keeps flow state.
+Runs per node, not centrally (eBPF maps are local kernel memory). One
+DaemonSet per node, `hostNetwork`/`CAP_BPF`/`CAP_NET_ADMIN`, no CRI
+socket: load tc-bpf programs once, watch `Service`/`EndpointSlice`, write
+maps on change, idle. Pinned under `/sys/fs/bpf` so restarts keep flow
+state.
 
 ## Prototype gates — go/no-go before Phase 3
 
-1. **Return path works cross-node on real disjoint subnets** — a pure
-   Geneve round trip; Lima alone can't validate it, needs a real
-   multi-provider topology.
-2. **Measured RSS footprint on a real 1GB/1vCPU node**, not the ~4–7 MiB
-   estimate (pre-allocation can hide a floor until run, per loxilb).
+1. **Return path works cross-node on real disjoint subnets** — Lima alone
+   can't validate a Geneve round trip; needs a real multi-provider
+   topology.
+2. **Measured RSS on a real 1GB/1vCPU node**, not the ~4–7 MiB estimate
+   (pre-allocation can hide a floor until run, per loxilb).
 3. **Userspace RSS and kernel eBPF-map memory independently and
    continuously monitorable** (`ebpf-toolchain-aya.md`), not assumed
    stable.
