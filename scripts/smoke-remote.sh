@@ -19,6 +19,9 @@ POD_IP="198.51.100.53"
 TARGET_PORT="18080"
 PIN_DIR="/sys/fs/bpf/servicelb-smoke"
 BIN="/tmp/u7s-servicelb-smoke"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEMORY_SCRIPT="$SCRIPT_DIR/sample-ebpf-memory.sh"
+MEMORY_OUT_DIR="/tmp/servicelb-ebpf-memory"
 LOADER_LOG="/tmp/servicelb-smoke-loader.log"
 BACKEND_LOG="/tmp/servicelb-smoke-backend.log"
 RESPONSE_FILE="/tmp/servicelb-smoke-response.http"
@@ -122,6 +125,12 @@ grep -q "all 3 hooks attached" "$LOADER_LOG" || {
 echo "VERIFIER-ACCEPT: PASS"
 cat "$LOADER_LOG"
 
+echo "==> sampling eBPF map memory + loader RSS (before round trip)"
+# A monitoring gap (e.g. jq missing on this node) must never fail the
+# VERIFIER-ACCEPT/ROUND-TRIP fixture it's observing -- same contract
+# sample-ebpf-memory.sh's own header documents for its per-tick sampling.
+bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
+
 # Independent, kernel-truth confirmation (not just the loader's own log):
 # a verifier rejection never reaches this state at all, since program.load()
 # above would have returned Err and aborted the loader before this point.
@@ -144,3 +153,11 @@ body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT}/")
   exit 1
 }
 echo "ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
+
+echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
+bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
+
+echo "==> ebpf-map-memory.csv:"
+cat "$MEMORY_OUT_DIR/ebpf-map-memory.csv" 2>/dev/null || echo "  (not captured -- see WARN above)"
+echo "==> loader-rss.csv:"
+cat "$MEMORY_OUT_DIR/loader-rss.csv" 2>/dev/null || echo "  (not captured -- see WARN above)"

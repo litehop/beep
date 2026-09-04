@@ -49,6 +49,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SERVICELB_DIR="$REPO_ROOT/crates/servicelb"
 REMOTE_SCRIPT="$SCRIPT_DIR/smoke-remote.sh"
+MEMORY_SCRIPT="$SCRIPT_DIR/sample-ebpf-memory.sh"
 
 for tool in cargo-zigbuild limactl; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
@@ -70,7 +71,8 @@ BIN="$SERVICELB_DIR/target/aarch64-unknown-linux-gnu/release/u7s-servicelb"
 
 limactl copy "$BIN" "$VM":/tmp/u7s-servicelb-smoke
 limactl copy "$REMOTE_SCRIPT" "$VM":/tmp/smoke-remote.sh
-limactl shell "$VM" -- bash -c 'chmod +x /tmp/u7s-servicelb-smoke /tmp/smoke-remote.sh'
+limactl copy "$MEMORY_SCRIPT" "$VM":/tmp/sample-ebpf-memory.sh
+limactl shell "$VM" -- bash -c 'chmod +x /tmp/u7s-servicelb-smoke /tmp/smoke-remote.sh /tmp/sample-ebpf-memory.sh'
 
 cleanup() {
   limactl shell "$VM" -- sudo bash /tmp/smoke-remote.sh cleanup || true

@@ -81,7 +81,7 @@ $ cat /proc/"$(pgrep u7s-servicelb)"/status | grep VmRSS
 against the maps this loader's programs reference:
 
 ```console
-$ sudo bpftool prog show pinned /sys/fs/bpf/servicelb/uplink_ingress.prog
+$ sudo bpftool prog show pinned /sys/fs/bpf/servicelb/uplink_ingress-prog
 $ sudo bpftool map show                     # lists every loaded map with id, type, key/value size, max_entries
 $ sudo bpftool map dump id <id>             # actual live entries, not the ceiling
 ```
