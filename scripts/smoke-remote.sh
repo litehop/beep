@@ -126,7 +126,10 @@ echo "VERIFIER-ACCEPT: PASS"
 cat "$LOADER_LOG"
 
 echo "==> sampling eBPF map memory + loader RSS (before round trip)"
-bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR"
+# A monitoring gap (e.g. jq missing on this node) must never fail the
+# VERIFIER-ACCEPT/ROUND-TRIP fixture it's observing -- same contract
+# sample-ebpf-memory.sh's own header documents for its per-tick sampling.
+bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
 
 # Independent, kernel-truth confirmation (not just the loader's own log):
 # a verifier rejection never reaches this state at all, since program.load()
@@ -152,9 +155,9 @@ body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT}/")
 echo "ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
 
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
-bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR"
+bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
 
 echo "==> ebpf-map-memory.csv:"
-cat "$MEMORY_OUT_DIR/ebpf-map-memory.csv"
+cat "$MEMORY_OUT_DIR/ebpf-map-memory.csv" 2>/dev/null || echo "  (not captured -- see WARN above)"
 echo "==> loader-rss.csv:"
-cat "$MEMORY_OUT_DIR/loader-rss.csv"
+cat "$MEMORY_OUT_DIR/loader-rss.csv" 2>/dev/null || echo "  (not captured -- see WARN above)"
