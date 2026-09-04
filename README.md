@@ -52,6 +52,19 @@ kernel objects, not the process. Re-running the binary re-adopts existing
 pins in place rather than double-attaching, and overwrites the fixture
 map entries with whatever `--vip-ip`/etc. are passed that run.
 
+## Local eBPF verifier gate
+
+`ebpf-build` CI only proves the `bpfel-unknown-none` object *compiles* --
+not that the kernel verifier *accepts* it at load, or that a packet
+actually completes the encap/decap round trip. Run
+`scripts/servicelb/smoke.sh [--vm <lima-vm-name>]` (default
+`lima-node-5`) locally before merging any servicelb-ebpf PR: it
+cross-builds this crate, loads the 3 tc-bpf classifiers into a real
+kernel on an already-provisioned Lima VM, asserts the verifier accepted
+them, and drives one client -> VIP -> backend TCP round trip through a
+self-contained veth/netns fixture. See the script's own header comment
+for prerequisites and what each step does.
+
 ## Memory observability
 
 Per `docs/decisions/ebpf-toolchain-aya.md`, both sides of memory use must
