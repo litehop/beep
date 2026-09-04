@@ -120,27 +120,60 @@ pub enum BackendPortDecision {
     /// this synthetic port instead, only on the backend-facing segment
     /// (un-remapped back to the real port on return).
     Remap(u16),
+    /// Every candidate in the bounded probe window (`PROBE_LIMIT` tries)
+    /// was already occupied in REV_FLOW -- e.g. an (N+1)th Service piling
+    /// onto the same backend Pod:targetPort/client-port collision. The
+    /// caller MUST drop the packet rather than fall back to an unprobed
+    /// port: reusing an occupied reverse key silently reproduces the exact
+    /// clobbering bug Decision 3 exists to close.
+    Exhausted,
 }
+
+/// Upper bound on probe attempts in `resolve_backend_src_port`. Bounded so
+/// the eBPF verifier can prove the loop terminates; small enough to keep
+/// the per-packet map-lookup cost low. A single low-entropy hash derived
+/// from the front address only guaranteed uniqueness for exactly 2
+/// conflicting fronts (~14 bits of entropy -- 75008/91392 realistic front
+/// pairs collided in review 5114293379's simulation), so this many fronts
+/// piling onto one backend Pod:targetPort/client-port combination is the
+/// realistic ceiling this dataplane needs to survive without silently
+/// clobbering a live flow.
+pub const PROBE_LIMIT: u16 = 16;
 
 /// `existing_front`: the front (VIP_IP, VIP_PORT) already stored under the
 /// naive reverse key, if any (`None` = first writer, no conflict possible).
 /// `new_front`: the front address the current packet arrived through.
 /// `original_port`: the client's real source port -- excluded as a
-/// candidate remap value so the two resulting reverse keys are guaranteed
-/// distinct, not just probably distinct.
+/// candidate remap value so the remapped reverse key can never collide
+/// with the natural (unremapped) one.
+/// `is_reverse_key_taken`: probes REV_FLOW -- the actual source of
+/// occupancy truth -- for whether a candidate synthetic port's resulting
+/// reverse key is already held by some OTHER flow. Injectable so this
+/// stays pure and unit-testable outside a kernel: `servicelb-ebpf` passes
+/// a closure that performs the real map lookup; tests pass a closure over
+/// a plain `HashSet`.
 pub fn resolve_backend_src_port(
     existing_front: Option<([u8; 16], u16)>,
     new_front: ([u8; 16], u16),
     original_port: u16,
+    is_reverse_key_taken: impl Fn(u16) -> bool,
 ) -> BackendPortDecision {
     match existing_front {
         None => BackendPortDecision::NoRemap,
         Some(front) if front == new_front => BackendPortDecision::NoRemap,
-        Some(_) => BackendPortDecision::Remap(synthetic_backend_port(
-            new_front.0,
-            new_front.1,
-            original_port,
-        )),
+        Some(_) => {
+            let seed = synthetic_port_seed(new_front.0, new_front.1);
+            let mut i: u16 = 0;
+            while i < PROBE_LIMIT {
+                let offset = seed.wrapping_add(i) % REMAP_PORT_RANGE;
+                let candidate = REMAP_PORT_BASE.wrapping_add(offset);
+                if candidate != original_port && !is_reverse_key_taken(candidate) {
+                    return BackendPortDecision::Remap(candidate);
+                }
+                i += 1;
+            }
+            BackendPortDecision::Exhausted
+        }
     }
 }
 
@@ -151,22 +184,20 @@ pub fn resolve_backend_src_port(
 pub const REMAP_PORT_BASE: u16 = 49152;
 pub const REMAP_PORT_RANGE: u16 = u16::MAX - REMAP_PORT_BASE + 1; // 16384
 
-/// Deterministic (not counter-based, no allocator map needed): the same
-/// conflicting front always remaps the same way, so re-deriving it
-/// packet-by-packet is idempotent -- the reverse-flow map itself is the
-/// only state this needs.
-pub fn synthetic_backend_port(front_ip: [u8; 16], front_port: u16, avoid: u16) -> u16 {
+/// Deterministic starting point for `resolve_backend_src_port`'s probe:
+/// the same conflicting front always starts probing from the same offset,
+/// so distinct fronts spread out across the port range instead of all
+/// colliding on the same first guess. Deliberately NOT the final decision
+/// on its own anymore (that was this fix's bug: two independently-computed
+/// seeds can coincide, and did for the majority of realistic front pairs)
+/// -- `resolve_backend_src_port`'s occupancy probe is what actually
+/// guarantees uniqueness.
+fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
     let ip_word = u32::from_ne_bytes(front_ip[12..16].try_into().unwrap())
         ^ u32::from_ne_bytes(front_ip[0..4].try_into().unwrap());
     let mixed =
         ip_word ^ ip_word.rotate_right(16) ^ (front_port as u32) ^ ((front_port as u32) << 3);
-    let offset = (mixed as u16) % REMAP_PORT_RANGE;
-    let mut candidate = REMAP_PORT_BASE.wrapping_add(offset);
-    if candidate == avoid {
-        let bumped = (offset + 1) % REMAP_PORT_RANGE;
-        candidate = REMAP_PORT_BASE.wrapping_add(bumped);
-    }
-    candidate
+    (mixed as u16) % REMAP_PORT_RANGE
 }
 
 #[cfg(test)]
@@ -238,11 +269,11 @@ mod tests {
         // client's real connection identity for the common case.
         let vip_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
         assert_eq!(
-            resolve_backend_src_port(None, vip_a, 0x9999),
+            resolve_backend_src_port(None, vip_a, 0x9999, |_| false),
             BackendPortDecision::NoRemap
         );
         assert_eq!(
-            resolve_backend_src_port(Some(vip_a), vip_a, 0x9999),
+            resolve_backend_src_port(Some(vip_a), vip_a, 0x9999, |_| false),
             BackendPortDecision::NoRemap
         );
     }
@@ -263,13 +294,16 @@ mod tests {
         let front_b = (ipv4_mapped_v6(0x0200_000a), 0x5001u16);
 
         // Service A's flow writes first: no existing entry, no conflict.
-        let decision_a = resolve_backend_src_port(None, front_a, client_src_port);
+        let decision_a = resolve_backend_src_port(None, front_a, client_src_port, |_| false);
         assert_eq!(decision_a, BackendPortDecision::NoRemap);
         let port_a = client_src_port;
 
         // Service B's flow arrives with the same natural reverse key
-        // already held by Service A's (different) front -- conflict.
-        let decision_b = resolve_backend_src_port(Some(front_a), front_b, client_src_port);
+        // already held by Service A's (different) front -- conflict. The
+        // only occupied reverse port so far is Service A's (port_a).
+        let decision_b = resolve_backend_src_port(Some(front_a), front_b, client_src_port, |p| {
+            p == port_a
+        });
         let BackendPortDecision::Remap(port_b) = decision_b else {
             panic!("expected a remap on front-address conflict, got {decision_b:?}");
         };
@@ -287,17 +321,148 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_port_never_collides_with_the_port_it_must_avoid() {
-        // The internal bump-on-self-collision branch only fires on a rare
-        // arithmetic coincidence -- not reachable by inspection, so sweep
-        // a spread of fronts against one fixed avoid value.
-        let avoid = 0x9999u16;
-        for ip_octet in 0u8..=255 {
-            for port in [1u16, 100, 5000, 49152, 60000] {
-                let front_ip = ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, ip_octet]));
-                let candidate = synthetic_backend_port(front_ip, port, avoid);
-                assert_ne!(candidate, avoid);
+    fn three_plus_services_sharing_a_backend_pod_and_client_port_get_distinct_reverse_ports() {
+        // Review 5114293379's finding: deriving the synthetic port from a
+        // single low-entropy hash of the front address (~14 bits) only
+        // guaranteed uniqueness for exactly 2 conflicting fronts -- a THIRD
+        // Service sharing this backend Pod:targetPort with a reused client
+        // source port could derive the SAME synthetic port as the second
+        // and silently clobber it. Concretely, these four front VIPs (IP
+        // octets 30/94/158/222, all on VIP port 31000 -- a stride of 64
+        // that resonates with the old formula's `rotate_right(16)` mixing)
+        // all hash to the identical seed:
+        let colliding_fronts: [([u8; 16], u16); 4] = [
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000),
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 94])), 31000),
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 158])), 31000),
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 222])), 31000),
+        ];
+        let shared_seed = synthetic_port_seed(colliding_fronts[0].0, colliding_fronts[0].1);
+        for front in &colliding_fronts[1..] {
+            assert_eq!(
+                synthetic_port_seed(front.0, front.1),
+                shared_seed,
+                "fixture invariant broken: this test only proves the fix if these fronts \
+                 actually share a derive-only seed"
+            );
+        }
+
+        let client_ip = ipv4_mapped_v6(0x0100_000a);
+        let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
+        let target_port = 0x1f90u16;
+        let client_src_port = 0x9999u16;
+        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
+
+        // First writer: no existing entry, natural reverse key holds the
+        // client's real port unremapped.
+        let mut taken = vec![client_src_port];
+        assert_eq!(
+            resolve_backend_src_port(None, first_writer, client_src_port, |p| taken.contains(&p)),
+            BackendPortDecision::NoRemap
+        );
+
+        // Each of the four colliding fronts conflicts against the first
+        // writer's occupied natural key. Pre-fix, all four would derive
+        // `shared_seed` and collide with each other, not just avoid
+        // `client_src_port`. Post-fix, each must probe REV_FLOW occupancy
+        // (the `taken` closure below) and land on a fresh port.
+        let mut resolved_ports = vec![client_src_port];
+        for front in colliding_fronts {
+            let decision =
+                resolve_backend_src_port(Some(first_writer), front, client_src_port, |p| {
+                    taken.contains(&p)
+                });
+            let BackendPortDecision::Remap(port) = decision else {
+                panic!("expected a remap for conflicting front {front:?}, got {decision:?}");
+            };
+            assert!(
+                !taken.contains(&port),
+                "port {port} for front {front:?} was already occupied by an earlier flow -- \
+                 the occupancy probe failed to avoid a live REV_FLOW entry"
+            );
+            taken.push(port);
+            resolved_ports.push(port);
+        }
+
+        let mut dedup = resolved_ports.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            resolved_ports.len(),
+            "N-front collision in {resolved_ports:?}: a later Service on this backend \
+             Pod:targetPort would silently clobber an earlier one's REV_FLOW entry, exactly \
+             the bug Decision 3 exists to close"
+        );
+
+        // The actual invariant REV_FLOW depends on: the encoded reverse
+        // keys, not just the raw port numbers, must be pairwise distinct.
+        let keys: Vec<TcpFlowKey> = resolved_ports
+            .iter()
+            .map(|&port| encode_tcp_flow_key(client_ip, port, pod_ip, target_port, 6))
+            .collect();
+        for i in 0..keys.len() {
+            for key in &keys[i + 1..] {
+                assert_ne!(&keys[i], key, "reverse keys for two of these services collide");
             }
         }
+    }
+
+    #[test]
+    fn many_fronts_sharing_a_backend_pod_never_produce_a_duplicate_reverse_key() {
+        // Ports review 5114293379's simulation shape at unit-test scale:
+        // sweep many front VIP:port pairs that all resolve to the same
+        // backend Pod:targetPort with one reused client source port (the
+        // reviewer's run found 75008/91392 realistic front pairs collided
+        // under the pre-fix derive-only formula). Every resulting reverse
+        // key this dataplane hands out for the backend must be distinct.
+        let client_ip = ipv4_mapped_v6(0x0100_000a);
+        let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
+        let target_port = 0x1f90u16;
+        let client_src_port = 0x9999u16;
+
+        let mut fronts = Vec::new();
+        for ip_octet in 0u8..=250 {
+            for port in [5000u16, 5001, 5002, 8080, 8443, 30000, 31000, 32000] {
+                fronts.push((
+                    ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, ip_octet])),
+                    port,
+                ));
+            }
+        }
+        let first_writer = fronts[0];
+
+        let mut taken = vec![client_src_port];
+        let mut keys = vec![encode_tcp_flow_key(
+            client_ip,
+            client_src_port,
+            pod_ip,
+            target_port,
+            6,
+        )];
+        for &front in &fronts[1..] {
+            let decision =
+                resolve_backend_src_port(Some(first_writer), front, client_src_port, |p| {
+                    taken.contains(&p)
+                });
+            let BackendPortDecision::Remap(port) = decision else {
+                panic!("expected a remap for conflicting front {front:?}, got {decision:?}");
+            };
+            taken.push(port);
+            keys.push(encode_tcp_flow_key(client_ip, port, pod_ip, target_port, 6));
+        }
+
+        let mut dedup = keys.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            keys.len(),
+            "{} of {} reverse keys collided across {} fronts sharing one backend -- an (N+1)th \
+             Service would silently clobber a live flow",
+            keys.len() - dedup.len(),
+            keys.len(),
+            fronts.len()
+        );
     }
 }

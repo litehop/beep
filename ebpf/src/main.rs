@@ -362,14 +362,31 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     let existing_front =
         unsafe { REV_FLOW.get(natural_rev_key) }.map(|v| (ipv4_mapped_v6(v.vip_ip), v.vip_port));
     let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
-    let (rev_key, backend_src_port) =
-        match resolve_backend_src_port(existing_front, new_front, client_port) {
-            BackendPortDecision::NoRemap => (natural_rev_key, client_port),
-            BackendPortDecision::Remap(synthetic_port) => (
-                encode_tcp_flow_key(client_ip_v6, synthetic_port, pod_ip_v6, target_port, proto),
-                synthetic_port,
-            ),
-        };
+    // The probe's occupancy check: REV_FLOW itself is the source of truth
+    // for which candidate ports are actually free, not a derived guess --
+    // a single low-entropy hash of the front address only guaranteed
+    // uniqueness for exactly 2 conflicting fronts (review 5114293379).
+    let is_reverse_key_taken = |candidate_port: u16| {
+        let candidate_key =
+            encode_tcp_flow_key(client_ip_v6, candidate_port, pod_ip_v6, target_port, proto);
+        unsafe { REV_FLOW.get(candidate_key) }.is_some()
+    };
+    let (rev_key, backend_src_port) = match resolve_backend_src_port(
+        existing_front,
+        new_front,
+        client_port,
+        is_reverse_key_taken,
+    ) {
+        BackendPortDecision::NoRemap => (natural_rev_key, client_port),
+        BackendPortDecision::Remap(synthetic_port) => (
+            encode_tcp_flow_key(client_ip_v6, synthetic_port, pod_ip_v6, target_port, proto),
+            synthetic_port,
+        ),
+        // Every candidate in the bounded probe window was already taken --
+        // drop rather than reuse an occupied reverse key, which would
+        // silently reproduce the exact clobbering bug Decision 3 closes.
+        BackendPortDecision::Exhausted => return Some(TC_ACT_SHOT),
+    };
 
     let rev_value = RevFlowValue {
         ingress_node_ip: unsafe { tkey.__bindgen_anon_1.remote_ipv4 },
