@@ -1,0 +1,10 @@
+[package]
+name = "u7s-servicelb-common"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# no_std except under `cargo test`, which needs std's test harness -- this
+# lets `cargo test` run natively on any host while `servicelb-ebpf` still
+# pulls it in as a no_std, core-only dependency for bpfel-unknown-none.
+[dependencies]
