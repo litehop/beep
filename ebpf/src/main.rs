@@ -49,7 +49,8 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use u7s_servicelb_common::{
-    encode_tcp_flow_key, ipv4_mapped_v6, resolve_backend_src_port, BackendPortDecision, TcpFlowKey,
+    encode_tcp_flow_key, ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port,
+    BackendPortDecision, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -365,11 +366,17 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // The probe's occupancy check: REV_FLOW itself is the source of truth
     // for which candidate ports are actually free, not a derived guess --
     // a single low-entropy hash of the front address only guaranteed
-    // uniqueness for exactly 2 conflicting fronts (review 5114293379).
+    // uniqueness for exactly 2 conflicting fronts (review 5114293379). An
+    // occupant holding OUR OWN front is a prior packet of this exact flow's
+    // already-committed remap, not a conflict -- without this comparison
+    // the flow reads its own state back as "taken" and churns to a new
+    // port every packet until PROBE_LIMIT is exhausted (review 5114699386).
     let is_reverse_key_taken = |candidate_port: u16| {
         let candidate_key =
             encode_tcp_flow_key(client_ip_v6, candidate_port, pod_ip_v6, target_port, proto);
-        unsafe { REV_FLOW.get(candidate_key) }.is_some()
+        let occupant_front =
+            unsafe { REV_FLOW.get(candidate_key) }.map(|v| (ipv4_mapped_v6(v.vip_ip), v.vip_port));
+        occupant_conflicts(occupant_front, new_front)
     };
     let (rev_key, backend_src_port) = match resolve_backend_src_port(
         existing_front,

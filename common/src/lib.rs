@@ -177,6 +177,21 @@ pub fn resolve_backend_src_port(
     }
 }
 
+/// Whether an occupant already sitting on a candidate reverse key should
+/// count as taken for `resolve_backend_src_port`'s probe. An occupant
+/// holding the SAME front we're resolving for is our own earlier packet's
+/// committed remap, not a genuine conflict -- treating it as taken makes
+/// every packet of an already-remapped flow re-probe and land on a fresh
+/// port, churning through `PROBE_LIMIT` candidates until the flow is
+/// dropped as `Exhausted` purely from reading back its own state (review
+/// 5114699386).
+pub fn occupant_conflicts(
+    occupant_front: Option<([u8; 16], u16)>,
+    resolving_for: ([u8; 16], u16),
+) -> bool {
+    matches!(occupant_front, Some(front) if front != resolving_for)
+}
+
 /// IANA dynamic/private port range (RFC 6335 SS6) -- this dataplane
 /// controls both ends of the backend<->Pod segment the remapped port is
 /// visible on, so it doesn't need to avoid the client's own ephemeral
@@ -301,9 +316,8 @@ mod tests {
         // Service B's flow arrives with the same natural reverse key
         // already held by Service A's (different) front -- conflict. The
         // only occupied reverse port so far is Service A's (port_a).
-        let decision_b = resolve_backend_src_port(Some(front_a), front_b, client_src_port, |p| {
-            p == port_a
-        });
+        let decision_b =
+            resolve_backend_src_port(Some(front_a), front_b, client_src_port, |p| p == port_a);
         let BackendPortDecision::Remap(port_b) = decision_b else {
             panic!("expected a remap on front-address conflict, got {decision_b:?}");
         };
@@ -403,7 +417,10 @@ mod tests {
             .collect();
         for i in 0..keys.len() {
             for key in &keys[i + 1..] {
-                assert_ne!(&keys[i], key, "reverse keys for two of these services collide");
+                assert_ne!(
+                    &keys[i], key,
+                    "reverse keys for two of these services collide"
+                );
             }
         }
     }
@@ -463,6 +480,80 @@ mod tests {
             keys.len() - dedup.len(),
             keys.len(),
             fronts.len()
+        );
+    }
+
+    #[test]
+    fn remapped_flows_resolve_to_the_same_port_on_every_packet() {
+        // Round-3 review 5114699386: the probe's occupancy closure checked
+        // only `REV_FLOW.get(candidate).is_some()`, with no comparison to
+        // the flow's own front. A remapped flow's natural reverse key is
+        // (and stays) held by the OTHER, first-writer front -- this flow
+        // never overwrites it, it writes its own remapped key instead -- so
+        // every packet re-enters the conflict branch and re-probes from the
+        // same deterministic seed. Without front-aware occupancy, the
+        // flow's own prior candidate reads back as "taken", so it picks a
+        // NEW port each packet: the port churns and the flow is eventually
+        // dropped as Exhausted. This test simulates REV_FLOW across two
+        // packets of the same flow and requires the SAME synthetic port
+        // both times.
+        use std::collections::HashMap;
+
+        let client_src_port = 0x9999u16;
+        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
+        let front_a = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000u16);
+
+        // Sim of REV_FLOW keyed by candidate port -> the front that
+        // committed a reverse-flow entry there (main.rs's occupant lookup
+        // maps a full 37-byte key to a `RevFlowValue`; the port is enough
+        // here since every candidate in this test shares client/pod/target).
+        let mut rev_flow: HashMap<u16, ([u8; 16], u16)> = HashMap::new();
+        rev_flow.insert(client_src_port, first_writer);
+
+        let resolve = |rev_flow: &HashMap<u16, ([u8; 16], u16)>| {
+            resolve_backend_src_port(Some(first_writer), front_a, client_src_port, |candidate| {
+                occupant_conflicts(rev_flow.get(&candidate).copied(), front_a)
+            })
+        };
+
+        // Packet 1: no candidate committed yet for front_a.
+        let decision_1 = resolve(&rev_flow);
+        let BackendPortDecision::Remap(port_1) = decision_1 else {
+            panic!("expected a remap on front-address conflict, got {decision_1:?}");
+        };
+        rev_flow.insert(port_1, front_a);
+
+        // Packet 2 of the SAME flow: the natural reverse key still shows
+        // first_writer's front (this flow never writes there), so
+        // resolution runs the conflict branch again -- it must land back
+        // on port_1, not churn to a new candidate.
+        let decision_2 = resolve(&rev_flow);
+        let BackendPortDecision::Remap(port_2) = decision_2 else {
+            panic!("expected a remap on repeat resolution, got {decision_2:?}");
+        };
+        assert_eq!(
+            port_1, port_2,
+            "the same flow's repeated resolution returned different ports ({port_1} then \
+             {port_2}) -- readback of our own committed remap is being treated as a conflict, \
+             which churns the port every packet until PROBE_LIMIT is exhausted and the flow is \
+             dropped"
+        );
+
+        // A genuinely different conflicting front must still land on its
+        // own, distinct port -- idempotency for one flow must not collapse
+        // distinctness across flows.
+        let front_b = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 94])), 31000u16);
+        let decision_b = resolve_backend_src_port(Some(first_writer), front_b, client_src_port, {
+            let rev_flow = &rev_flow;
+            move |candidate| occupant_conflicts(rev_flow.get(&candidate).copied(), front_b)
+        });
+        let BackendPortDecision::Remap(port_b) = decision_b else {
+            panic!("expected a remap for a distinct conflicting front, got {decision_b:?}");
+        };
+        assert_ne!(
+            port_1, port_b,
+            "a distinct conflicting front must not be handed the same synthetic port as an \
+             unrelated flow's own committed remap"
         );
     }
 }
