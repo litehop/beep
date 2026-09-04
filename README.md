@@ -1,4 +1,4 @@
-# u7s-servicelb (Phase 2: Geneve encap/decap, single-flow happy path)
+# u7s-servicelb (Phase 2+3: Geneve encap/decap, conntrack full-tuple keying)
 
 Loader for the ServiceLB eBPF dataplane
 (`ai/extended-context/ebpf-lb-dataplane.md`,
@@ -86,7 +86,8 @@ $ sudo bpftool map show                     # lists every loaded map with id, ty
 $ sudo bpftool map dump id <id>             # actual live entries, not the ceiling
 ```
 
-This is the command path Phase 3's conntrack maps will be read through too
-once flow-affinity sizing/eviction lands; Phase 2's `VIP_MAP`,
-`POD_TARGETS`, `FWD_FLOW`, and `REV_FLOW` are naive single-entry-scale maps,
-not yet sized for churn.
+This is the command path to inspect Phase 3's conntrack maps through:
+`FWD_FLOW`/`REV_FLOW` are `LRU_HASH`, 8192-entry ceiling, full-tuple
+(`u7s_servicelb_common::TcpFlowKey`) keyed. `VIP_MAP`/`POD_TARGETS` remain
+Phase 2's naive single-entry-scale fixture maps -- real Service/EndpointSlice
+sizing is Phase 5.

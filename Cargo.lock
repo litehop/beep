@@ -512,10 +512,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "u7s-servicelb-common"
+version = "0.1.0"
+
+[[package]]
 name = "u7s-servicelb-ebpf"
 version = "0.1.0"
 dependencies = [
  "aya-ebpf",
+ "u7s-servicelb-common",
 ]
 
 [[package]]

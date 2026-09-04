@@ -10,7 +10,7 @@ license = "Apache-2.0"
 # living alongside this crate; build.rs invokes aya-build to cross-build it
 # and embed the resulting object.
 [workspace]
-members = ["servicelb-ebpf"]
+members = ["servicelb-ebpf", "servicelb-common"]
 resolver = "2"
 
 [profile.release.package.u7s-servicelb-ebpf]

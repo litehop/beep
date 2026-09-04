@@ -1,14 +1,17 @@
 #![no_std]
 #![no_main]
 
-//! Phase 2 of the ServiceLB eBPF dataplane: Geneve encap/decap on the
-//! symmetric-return path, single-flow happy path
-//! (`ai/extended-context/ebpf-lb-dataplane.md`'s "Packet flow" section,
-//! `docs/decisions/servicelb-symmetric-geneve-return.md`). IPv4 only, one
-//! static VIP:PORT -> backend-node/PodIP:TargetPort mapping populated by the
-//! userspace loader at startup -- real Service/EndpointSlice watching is
-//! Phase 5. Naive single-entry flow-affinity maps; collision-proofing and
-//! LRU sizing are Phase 3.
+//! Phase 2 (Geneve encap/decap on the symmetric-return path) plus Phase 3
+//! (conntrack full-tuple keying + backend source-port remap on conflict) of
+//! the ServiceLB eBPF dataplane
+//! (`ai/extended-context/ebpf-lb-dataplane.md`'s "Packet flow" and
+//! "Conntrack & affinity" sections, `docs/decisions/servicelb-symmetric-geneve-return.md`).
+//! IPv4 only, one static VIP:PORT -> backend-node/PodIP:TargetPort mapping
+//! populated by the userspace loader at startup -- real Service/EndpointSlice
+//! watching is Phase 5. Flow-affinity keys are IPv6-primary (`u7s_servicelb_common`)
+//! so the same map shape covers real IPv6 flows once packet parsing grows
+//! that far; today's IPv4-only parsing embeds each address as IPv4-mapped
+//! IPv6 before keying.
 //!
 //! # Wire-value convention (load-bearing, read before editing)
 //!
@@ -42,8 +45,11 @@ use aya_ebpf::{
         bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
-    maps::{Array, HashMap},
+    maps::{Array, HashMap, LruHashMap},
     programs::TcContext,
+};
+use u7s_servicelb_common::{
+    encode_tcp_flow_key, ipv4_mapped_v6, resolve_backend_src_port, BackendPortDecision, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -125,50 +131,56 @@ static POD_TARGETS: HashMap<u32, u16> = HashMap::with_max_entries(32, 0);
 /// Ingress-side forward-flow affinity, written at stamp time (step 2),
 /// rebuilt and checked at return-decap time (step 7) from the Geneve VIP
 /// echo plus the inner dst -- confirms the return is answering a flow this
-/// node actually forwarded, not stale/spoofed. Naive single-entry map:
-/// collision-proofing is Phase 3, not here.
+/// node actually forwarded, not stale/spoofed.
 ///
-/// Field order is load-bearing: `BPF_MAP_TYPE_HASH` compares/hashes the raw
-/// bytes of the key struct, including any compiler-inserted alignment
-/// padding -- Rust's struct-literal syntax only initializes named fields, so
-/// a padding gap is left as whatever garbage was already on that call site's
-/// stack, and differs between the insert (decap) and lookup (egress) call
-/// sites despite every named field matching (confirmed on a live kernel: a
-/// byte-identical insert+lookup, microseconds apart, still missed). A `u16`
-/// between two `u32`s forces a hidden 2-byte gap; keeping all `u32`s first
-/// and covering the true trailing gap with an explicit, always-zeroed
-/// `_pad: [u8; 3]` (14 named bytes -> 16 total, matching `size_of`) leaves no
-/// byte uncovered.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FlowKey {
-    pub client_ip: u32,
-    pub other_ip: u32,
-    pub client_port: u16,
-    pub other_port: u16,
-    pub proto: u8,
-    pub _pad: [u8; 3],
-}
-
+/// Key type: `u7s_servicelb_common::TcpFlowKey`, a flat 37-byte array, not a
+/// `#[repr(C)]` struct -- `BPF_MAP_TYPE_*_HASH` compares/hashes a key's raw
+/// bytes including any compiler-inserted alignment padding, and a struct's
+/// padding gap is left as whatever garbage was already on the call site's
+/// stack, differing between independent call sites despite every named
+/// field matching (Phase 2 hit exactly this on a live kernel: a byte-
+/// identical insert+lookup, microseconds apart, still missed). A byte array
+/// has no such gap. 8192-entry ceiling per `ebpf-lb-dataplane.md`'s TCP
+/// sizing row.
+///
+/// `LRU_HASH`, not the doc's `LRU_PERCPU_HASH`: a per-CPU map keeps a
+/// SEPARATE value per key per CPU, so a write on one CPU is invisible to a
+/// read on another -- fatal for a rendezvous table where the write (step 2)
+/// and the read (step 7) are different packets of the same flow with no
+/// guaranteed same-CPU affinity. Confirmed empirically on this dataplane's
+/// own single-VM smoke fixture (8 vCPUs): a plain retransmitted SYN,
+/// processed on a different CPU than the original, saw a per-CPU miss and
+/// broke the round trip intermittently -- not a churn/eviction edge case,
+/// reproducible on the very first connection. `LRU_HASH` is still bounded
+/// and evicting (the doc's core requirement over a naive `HashMap`), just
+/// with one shared table instead of per-CPU shards.
 #[map]
-static FWD_FLOW: HashMap<FlowKey, u32> = HashMap::with_max_entries(64, 0);
+static FWD_FLOW: LruHashMap<TcpFlowKey, u32> = LruHashMap::with_max_entries(8192, 0);
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
 /// ingress node and the original VIP to echo, since by the time it runs the
 /// packet's own header no longer carries the VIP -- DNAT already overwrote
 /// it (`ebpf-lb-dataplane.md`, Conntrack & affinity).
+///
+/// `original_client_port` backs Decision 3's un-remap: when the forward
+/// decap below remapped the backend-facing source port to keep this key
+/// unique (two Services sharing a backend Pod:targetPort, client reusing
+/// one source port across both), the egress classifier restores the
+/// client's real port here before the packet leaves this node -- the
+/// ingress node's own return-decap step has no knowledge of any backend-
+/// local remap and must see the true client port in the inner dst.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RevFlowValue {
     pub ingress_node_ip: u32,
     pub vip_ip: u32,
     pub vip_port: u16,
-    pub _pad: u16,
+    pub original_client_port: u16,
 }
 
 #[map]
-static REV_FLOW: HashMap<FlowKey, RevFlowValue> = HashMap::with_max_entries(64, 0);
+static REV_FLOW: LruHashMap<TcpFlowKey, RevFlowValue> = LruHashMap::with_max_entries(8192, 0);
 
 /// Host-specific runtime config the loader fills in after attach (an
 /// ifindex isn't known until then). Single entry.
@@ -215,14 +227,13 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
 
     let src_ip: u32 = ctx.load(IP_SRC).ok()?;
     let src_port: u16 = ctx.load(L4_SPORT).ok()?;
-    let flow_key = FlowKey {
-        client_ip: src_ip,
-        other_ip: dst_ip,
-        client_port: src_port,
-        other_port: dst_port,
+    let flow_key = encode_tcp_flow_key(
+        ipv4_mapped_v6(src_ip),
+        src_port,
+        ipv4_mapped_v6(dst_ip),
+        dst_port,
         proto,
-        _pad: [0; 3],
-    };
+    );
     FWD_FLOW.insert(flow_key, backend.backend_node_ip, 0).ok()?;
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
@@ -337,21 +348,42 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     let vip_ip: u32 = ctx.load(IP_DST).ok()?; // captured before rewrite
     let vip_port: u16 = ctx.load(L4_DPORT).ok()?; // captured before rewrite
 
-    let rev_key = FlowKey {
-        client_ip,
-        other_ip: pod_ip,
-        client_port,
-        other_port: target_port,
-        proto,
-        _pad: [0; 3],
-    };
+    let client_ip_v6 = ipv4_mapped_v6(client_ip);
+    let pod_ip_v6 = ipv4_mapped_v6(pod_ip);
+    let natural_rev_key =
+        encode_tcp_flow_key(client_ip_v6, client_port, pod_ip_v6, target_port, proto);
+
+    // Decision 3 (`ebpf-lb-dataplane.md`): two Services with different front
+    // addresses sharing this backend Pod:targetPort, hit by a client
+    // reusing one source port across both, would otherwise write this same
+    // reverse key twice. Check whether a DIFFERENT front already holds it
+    // before trusting the natural key -- a matching front (or no entry at
+    // all) means this is the same flow refreshing, or the first writer.
+    let existing_front =
+        unsafe { REV_FLOW.get(natural_rev_key) }.map(|v| (ipv4_mapped_v6(v.vip_ip), v.vip_port));
+    let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
+    let (rev_key, backend_src_port) =
+        match resolve_backend_src_port(existing_front, new_front, client_port) {
+            BackendPortDecision::NoRemap => (natural_rev_key, client_port),
+            BackendPortDecision::Remap(synthetic_port) => (
+                encode_tcp_flow_key(client_ip_v6, synthetic_port, pod_ip_v6, target_port, proto),
+                synthetic_port,
+            ),
+        };
+
     let rev_value = RevFlowValue {
         ingress_node_ip: unsafe { tkey.__bindgen_anon_1.remote_ipv4 },
         vip_ip,
         vip_port,
-        _pad: 0,
+        original_client_port: client_port,
     };
     REV_FLOW.insert(rev_key, rev_value, 0).ok()?;
+
+    // Remap only touches the backend<->Pod segment: the client's real src
+    // port is restored by the egress classifier before the packet re-enters
+    // the Geneve tunnel (see RevFlowValue's doc comment). A no-op when this
+    // flow wasn't remapped.
+    rewrite_l4_port(ctx, L4_SPORT, client_port, backend_src_port, proto)?;
 
     rewrite_ip_port(
         ctx,
@@ -416,14 +448,13 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
     let client_ip: u32 = ctx.load(IP_DST).ok()?;
     let client_port: u16 = ctx.load(L4_DPORT).ok()?;
 
-    let key = FlowKey {
-        client_ip,
-        other_ip: vip_ip,
+    let key = encode_tcp_flow_key(
+        ipv4_mapped_v6(client_ip),
         client_port,
-        other_port: vip_port,
+        ipv4_mapped_v6(vip_ip),
+        vip_port,
         proto,
-        _pad: [0; 3],
-    };
+    );
     unsafe { FWD_FLOW.get(key) }?;
 
     rewrite_ip_port(
@@ -477,21 +508,33 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         return Some(TC_ACT_OK);
     }
 
-    // This is the Pod's own raw reply: src=PodIP:TargetPort, dst=CLIENT_IP:SRC_PORT.
+    // This is the Pod's own raw reply: src=PodIP:TargetPort, dst=CLIENT_IP:SRC_PORT
+    // (or Decision 3's remapped synthetic port -- see RevFlowValue's doc comment).
     let pod_ip: u32 = ctx.load(IP_SRC).ok()?;
     let target_port: u16 = ctx.load(L4_SPORT).ok()?;
     let client_ip: u32 = ctx.load(IP_DST).ok()?;
-    let client_port: u16 = ctx.load(L4_DPORT).ok()?;
+    let backend_dst_port: u16 = ctx.load(L4_DPORT).ok()?;
 
-    let key = FlowKey {
-        client_ip,
-        other_ip: pod_ip,
-        client_port,
-        other_port: target_port,
+    let key = encode_tcp_flow_key(
+        ipv4_mapped_v6(client_ip),
+        backend_dst_port,
+        ipv4_mapped_v6(pod_ip),
+        target_port,
         proto,
-        _pad: [0; 3],
-    };
+    );
     let rev = *unsafe { REV_FLOW.get(key) }?;
+
+    // Un-remap: restore the client's real port before this packet re-enters
+    // the Geneve tunnel -- the ingress node's return-decap step rebuilds its
+    // own lookup key from this inner dst and has no knowledge of any
+    // backend-local remap. A no-op when this flow was never remapped.
+    rewrite_l4_port(
+        ctx,
+        L4_DPORT,
+        backend_dst_port,
+        rev.original_client_port,
+        proto,
+    )?;
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
@@ -569,6 +612,36 @@ fn rewrite_ip_port(
     }
 
     ctx.store(ip_off, &new_ip, 0).ok()?;
+    ctx.store(port_off, &new_port, 0).ok()?;
+    Some(())
+}
+
+/// Rewrites a TCP/UDP port in place with no IP change -- no L3 checksum
+/// involved, only the L4 one. Backs Decision 3's backend source-port remap
+/// (forward leg) and its un-remap (return leg); a no-op when
+/// `old_port == new_port`, so callers can invoke it unconditionally.
+#[inline(always)]
+fn rewrite_l4_port(
+    ctx: &TcContext,
+    port_off: usize,
+    old_port: u16,
+    new_port: u16,
+    proto: u8,
+) -> Option<()> {
+    if old_port == new_port {
+        return Some(());
+    }
+    let l4_csum_off = if proto == IPPROTO_TCP {
+        TCP_CSUM
+    } else {
+        UDP_CSUM
+    };
+    if proto == IPPROTO_UDP && ctx.load::<u16>(UDP_CSUM).ok()? == 0 {
+        ctx.store(port_off, &new_port, 0).ok()?;
+        return Some(());
+    }
+    ctx.l4_csum_replace(l4_csum_off, old_port as u64, new_port as u64, 2)
+        .ok()?;
     ctx.store(port_off, &new_port, 0).ok()?;
     Some(())
 }
