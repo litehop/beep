@@ -1,10 +1,13 @@
-# u7s-servicelb (Phase 1: aya eBPF skeleton)
+# u7s-servicelb (Phase 2: Geneve encap/decap, single-flow happy path)
 
 Loader for the ServiceLB eBPF dataplane
 (`ai/extended-context/ebpf-lb-dataplane.md`,
-`docs/decisions/ebpf-toolchain-aya.md`). Phase 1 attaches four no-op tc-bpf
-classifiers and pins them under a bpffs directory; no packet mutation yet
-(Phase 2).
+`docs/decisions/ebpf-toolchain-aya.md`). Attaches three tc-bpf classifiers
+(Phase 1's separate `geneve_ingress_decap`/`geneve_ingress_return` merged
+into one `geneve_ingress`, dispatched by VNI -- see that program's doc
+comment for why), pins them under a bpffs directory, and populates the one
+static VIP:PORT -> backend-node/PodIP:TargetPort mapping this phase proves
+the mechanism against. Real Service/EndpointSlice watching is Phase 5.
 
 This crate is a nested workspace (`servicelb-ebpf` is its no_std program
 sibling) and is excluded from the outer u7s workspace: it links Linux-only
@@ -32,15 +35,22 @@ the resulting object into the loader binary.
 
 ```console
 $ sudo ./target/release/u7s-servicelb \
-    --uplink-iface eth0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/servicelb
+    --uplink-iface eth0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/servicelb \
+    --vip-ip 10.0.0.5 --vip-port 8080 --proto tcp \
+    --backend-node-ip 10.0.0.6 --pod-ip 10.244.1.7 --target-port 80
 ```
 
+`geneve0` must already exist as a "collect metadata" external Geneve device
+(`ip link add geneve0 type geneve external && ip link set geneve0 up`) --
+this loader only attaches classifiers to it, it does not create it.
+
 Requires `CAP_BPF`/`CAP_NET_ADMIN` (root, or the DaemonSet's intended
-capability set in later phases). Attaches all four hooks and pins each
-link under `--pin-dir`; killing the process leaves the attachment (and
-pins) in place, since state lives in the pinned kernel objects, not the
-process. Re-running the binary re-adopts existing pins in place rather
-than double-attaching.
+capability set in later phases). Attaches all three hooks, populates the
+fixture maps, and pins each link under `--pin-dir`; killing the process
+leaves the attachment (and pins) in place, since state lives in the pinned
+kernel objects, not the process. Re-running the binary re-adopts existing
+pins in place rather than double-attaching, and overwrites the fixture
+map entries with whatever `--vip-ip`/etc. are passed that run.
 
 ## Memory observability
 
@@ -63,5 +73,7 @@ $ sudo bpftool map show                     # lists every loaded map with id, ty
 $ sudo bpftool map dump id <id>             # actual live entries, not the ceiling
 ```
 
-Phase 1 has no maps yet (no-op programs); this is the command path Phase 2's
-conntrack/VIP maps will be read through, not new tooling to build later.
+This is the command path Phase 3's conntrack maps will be read through too
+once flow-affinity sizing/eviction lands (mayor-pa0ze); Phase 2's `VIP_MAP`,
+`POD_TARGETS`, `FWD_FLOW`, and `REV_FLOW` are naive single-entry-scale maps,
+not yet sized for churn.
