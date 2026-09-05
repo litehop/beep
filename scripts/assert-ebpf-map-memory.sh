@@ -35,7 +35,7 @@ total=$(awk -F, 'NR>1 { sum += $6 } END { print sum+0 }' "$csv")
 echo "discovered maps (${#names[@]}): ${names[*]:-none}"
 echo "total bytes_memlock: $total"
 
-expected=(CONFIG FWD_FLOW POD_TARGETS REV_FLOW VIP_MAP)
+expected=(CONFIG FWD_FLOW TARGET_PORTS REV_FLOW VIP_MAP)
 actual_sorted="$(printf '%s\n' "${names[@]}" | sort -u)"
 expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
 

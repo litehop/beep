@@ -5,9 +5,10 @@ Loader for the ServiceLB eBPF dataplane
 `docs/decisions/ebpf-toolchain-aya.md`). Attaches three tc-bpf classifiers
 (Phase 1's separate `geneve_ingress_decap`/`geneve_ingress_return` merged
 into one `geneve_ingress`, dispatched by VNI -- see that program's doc
-comment for why), pins them under a bpffs directory, and populates the one
-static VIP:PORT -> backend-node/PodIP:TargetPort mapping this phase proves
-the mechanism against. Real Service/EndpointSlice watching is Phase 5.
+comment for why), pins them under a bpffs directory, and populates one or
+more static VIP:PORT -> backend-node/PodIP:TargetPort mappings this phase
+proves the mechanism against (repeat `--fixture` for one Pod behind more
+than one Service port). Real Service/EndpointSlice watching is Phase 5.
 
 This crate is a nested workspace (`servicelb-ebpf` is its no_std program
 sibling) and is excluded from the outer u7s workspace: it links Linux-only
@@ -36,8 +37,18 @@ the resulting object into the loader binary.
 ```console
 $ sudo ./target/release/u7s-servicelb \
     --uplink-iface eth0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/servicelb \
-    --vip-ip 10.0.0.5 --vip-port 8080 --proto tcp \
-    --backend-node-ip 10.0.0.6 --pod-ip 10.244.1.7 --target-port 80
+    --fixture 10.0.0.5:8080:tcp:10.0.0.6:10.244.1.7:80
+```
+
+`--fixture` is `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`,
+repeatable -- one Pod behind two Service ports (e.g. 80->8080 alongside
+443->8443) needs two `--fixture` entries sharing the same `pod_ip`:
+
+```console
+$ sudo ./target/release/u7s-servicelb \
+    --uplink-iface eth0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/servicelb \
+    --fixture 10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080 \
+    --fixture 10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443
 ```
 
 `geneve0` must already exist as a "collect metadata" external Geneve device
@@ -50,7 +61,7 @@ fixture maps, and pins each link under `--pin-dir`; killing the process
 leaves the attachment (and pins) in place, since state lives in the pinned
 kernel objects, not the process. Re-running the binary re-adopts existing
 pins in place rather than double-attaching, and overwrites the fixture
-map entries with whatever `--vip-ip`/etc. are passed that run.
+map entries with whatever `--fixture` values are passed that run.
 
 ## Local eBPF verifier gate
 
@@ -61,9 +72,10 @@ actually completes the encap/decap round trip. Run
 `lima-node-5`) locally before merging any servicelb-ebpf PR: it
 cross-builds this crate, loads the 3 tc-bpf classifiers into a real
 kernel on an already-provisioned Lima VM, asserts the verifier accepted
-them, and drives one client -> VIP -> backend TCP round trip through a
-self-contained veth/netns fixture. See the script's own header comment
-for prerequisites and what each step does.
+them, and drives two client -> VIP -> backend TCP round trips (two
+Service ports on one backend Pod) through a self-contained veth/netns
+fixture. See the script's own header comment for prerequisites and what
+each step does.
 
 ## Memory observability
 
@@ -88,6 +100,6 @@ $ sudo bpftool map dump id <id>             # actual live entries, not the ceili
 
 This is the command path to inspect Phase 3's conntrack maps through:
 `FWD_FLOW`/`REV_FLOW` are `LRU_HASH`, 8192-entry ceiling, full-tuple
-(`u7s_servicelb_common::TcpFlowKey`) keyed. `VIP_MAP`/`POD_TARGETS` remain
-Phase 2's naive single-entry-scale fixture maps -- real Service/EndpointSlice
-sizing is Phase 5.
+(`u7s_servicelb_common::TcpFlowKey`) keyed. `VIP_MAP`/`TARGET_PORTS` remain
+Phase 2's naive small-scale fixture maps, both keyed on the same VIP:PORT:proto
+front tuple -- real Service/EndpointSlice sizing is Phase 5.

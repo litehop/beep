@@ -94,7 +94,7 @@ case "$1 $2 $3" in
     case "$4" in
       10) echo '{"name":"VIP_MAP","type":"hash","max_entries":16,"bytes_memlock":4096}' ;;
       11) echo '{"name":"CONFIG","type":"array","max_entries":1,"bytes_memlock":512}' ;;
-      12) echo '{"name":"POD_TARGETS","type":"hash","max_entries":32,"bytes_memlock":8192}' ;;
+      12) echo '{"name":"TARGET_PORTS","type":"hash","max_entries":32,"bytes_memlock":8192}' ;;
       *) exit 1 ;;
     esac
     ;;
@@ -212,7 +212,7 @@ GOOD_CSV="$TMPDIR_TEST/good.csv"
   echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,REV_FLOW,hash,64,8192"
-  echo "2026-09-05T00:00:00Z,192,POD_TARGETS,hash,32,4096"
+  echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,193,FWD_FLOW,hash,64,4096"
 } > "$GOOD_CSV"
 set +e
@@ -221,7 +221,7 @@ GOOD_EXIT=$?
 set -e
 assert_true "a correct single-tick CSV with all 5 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
 
-# A single tick that dropped POD_TARGETS — the actual shape a "4 of 5 maps
+# A single tick that dropped TARGET_PORTS — the actual shape a "4 of 5 maps
 # found" discovery regression produces against the fixed CI invocation.
 DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
 {
@@ -256,12 +256,12 @@ LEGACY_5_THEN_4_CSV="$TMPDIR_TEST/legacy-5-then-4.csv"
   echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,REV_FLOW,hash,64,8192"
-  echo "2026-09-05T00:00:00Z,192,POD_TARGETS,hash,32,4096"
+  echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,193,FWD_FLOW,hash,64,4096"
   echo "2026-09-05T00:00:01Z,189,VIP_MAP,hash,16,4096"
   echo "2026-09-05T00:00:01Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:01Z,191,REV_FLOW,hash,64,8192"
-  echo "2026-09-05T00:00:01Z,192,POD_TARGETS,hash,32,4096"
+  echo "2026-09-05T00:00:01Z,192,TARGET_PORTS,hash,32,4096"
 } > "$LEGACY_5_THEN_4_CSV"
 set +e
 LEGACY_OUT="$(bash "$ASSERT_SCRIPT" "$LEGACY_5_THEN_4_CSV" 2>&1)"
