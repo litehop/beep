@@ -8,9 +8,13 @@
 //! against (repeatable so one Pod behind more than one Service port is
 //! expressible -- `servicelb-ebpf`'s `TARGET_PORTS` keys on the front tuple,
 //! not pod IP alone, precisely so this doesn't collide), and pins the
-//! resulting links under a bpffs directory so a loader restart re-adopts the
-//! existing attachment instead of leaving the interface unprotected or
-//! double-attaching. Real Service/EndpointSlice watching is Phase 5.
+//! resulting links AND maps under a bpffs directory so a loader restart
+//! re-adopts the existing attachment instead of leaving the interface
+//! unprotected or double-attaching, and REUSES the existing `FWD_FLOW`/
+//! `REV_FLOW` conntrack tables instead of swapping in an empty pair --
+//! `Ebpf::load` alone creates a fresh map set on every call, which would
+//! silently drop every established flow on each DaemonSet rollout, eviction,
+//! or OOM kill. Real Service/EndpointSlice watching is Phase 5.
 
 use std::{
     net::Ipv4Addr,
@@ -28,12 +32,18 @@ use aya::{
         LinkOrder, SchedClassifier, TcAttachType,
     },
     sys::SyscallError,
-    Ebpf, Pod,
+    Ebpf, EbpfLoader, Pod,
 };
 use clap::{Parser, ValueEnum};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+
+// Every map `servicelb-ebpf` declares (`servicelb-ebpf/src/main.rs`'s
+// `#[map]` statics). Pinned by name below so a loader restart reuses them
+// instead of `Ebpf::load` creating an empty set -- an omission here silently
+// drops that map's state on every restart with no build-time signal.
+const MAP_NAMES: [&str; 5] = ["CONFIG", "VIP_MAP", "TARGET_PORTS", "FWD_FLOW", "REV_FLOW"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -173,14 +183,22 @@ fn main() -> anyhow::Result<()> {
 
     bump_memlock_rlimit();
 
-    let mut ebpf = Ebpf::load(include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/servicelb-ebpf"
-    )))
-    .context("loading the servicelb-ebpf object")?;
-
+    // Pin dir must exist before `loader.load()`: `map_pin_path`'s
+    // `create_pinned_by_name` calls `bpf_obj_pin` on a miss, which fails if
+    // its parent directory isn't there yet.
     std::fs::create_dir_all(&pin_dir)
         .with_context(|| format!("creating pin dir {}", pin_dir.display()))?;
+
+    let mut loader = EbpfLoader::new();
+    for name in MAP_NAMES {
+        loader.map_pin_path(name, pin_dir.join(name));
+    }
+    let mut ebpf = loader
+        .load(include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/servicelb-ebpf"
+        )))
+        .context("loading the servicelb-ebpf object")?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures).context("populating VIP_MAP/TARGET_PORTS fixture")?;
