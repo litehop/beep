@@ -158,6 +158,17 @@ start_loader() {
     --fixture "${VIP_IP}:${VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT}" \
     --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
     >"$log" 2>&1 &
+  # Not `local`: wait_for_attach (called right after, every time) reads
+  # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
+  # cmdline, which only becomes "$BIN" once execve() replaces the forked
+  # shell's image -- on a contended runner that hasn't happened yet by
+  # wait_for_attach's first, zero-delay iteration, so pgrep sees no match
+  # and misreports a live loader as "exited" (root cause of nondeterministic
+  # CI failures: two real GH Actions runs failed here ~15-26ms after launch
+  # with an empty loader log, i.e. before the loader had even started, not
+  # a verifier reject). kill -0 checks the PID directly, valid from fork()
+  # onward regardless of exec() progress.
+  loader_pid=$!
   disown
 }
 
@@ -165,7 +176,7 @@ wait_for_attach() {
   local log="$1"
   for _ in $(seq 1 20); do
     grep -q "all 3 hooks attached" "$log" 2>/dev/null && return 0
-    if ! pgrep -f "$BIN" >/dev/null; then
+    if ! kill -0 "$loader_pid" 2>/dev/null; then
       echo "FAIL: loader exited before attaching (verifier rejection or load error):" >&2
       cat "$log" >&2
       exit 1
