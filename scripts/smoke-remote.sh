@@ -106,11 +106,21 @@ nohup "$BIN" \
   --vip-ip "$VIP_IP" --vip-port "$VIP_PORT" --proto tcp \
   --backend-node-ip "$VIP_IP" --pod-ip "$POD_IP" --target-port "$TARGET_PORT" \
   >"$LOADER_LOG" 2>&1 &
+loader_pid=$!
 disown
 
+# `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on cmdline,
+# which only becomes "$BIN" once execve() replaces the forked shell's image --
+# on a contended runner that hasn't happened yet by this loop's first,
+# zero-delay iteration, so pgrep sees no match and misreports a live loader
+# as "exited" (root cause of the nondeterministic CI failures this guards
+# against: two real GH Actions runs failed here ~15-26ms after launch with
+# an empty loader log, i.e. before the loader had even started, not a
+# verifier reject). kill -0 checks the PID directly, valid from fork()
+# onward regardless of exec() progress.
 for _ in $(seq 1 20); do
   grep -q "all 3 hooks attached" "$LOADER_LOG" 2>/dev/null && break
-  if ! pgrep -f "$BIN" >/dev/null; then
+  if ! kill -0 "$loader_pid" 2>/dev/null; then
     echo "FAIL: loader exited before attaching (verifier rejection or load error):" >&2
     cat "$LOADER_LOG" >&2
     exit 1
