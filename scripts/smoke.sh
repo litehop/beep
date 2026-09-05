@@ -19,8 +19,9 @@
 #      loads the 3 tc-bpf classifiers, and asserts the verifier ACCEPTED
 #      them (a rejection surfaces as a loader load error, checked
 #      explicitly, plus an independent `bpftool prog list` confirmation);
-#   4. drives one client -> VIP -> backend TCP round trip through the real
-#      Geneve encap/decap dataplane and asserts it completes.
+#   4. drives two client -> VIP -> backend TCP round trips through the real
+#      Geneve encap/decap dataplane -- two Service ports on the SAME backend
+#      Pod -- and asserts each lands on its own distinct target port.
 #
 # Exits non-zero on any failure. Always tears down its own fixture
 # (`smoke-remote.sh cleanup`) on exit, success or failure.

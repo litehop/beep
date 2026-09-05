@@ -17,6 +17,13 @@ CLIENT_IP="203.0.113.2"
 VIP_PORT="19100"
 POD_IP="198.51.100.53"
 TARGET_PORT="18080"
+# A second Service port on the SAME Pod (multi-port Service, e.g. 80->8080
+# alongside 443->8443) -- proves the backend's TARGET_PORTS lookup resolves
+# each front independently instead of collapsing both onto whichever
+# target port was written last (the bug this fixture guards against: a
+# pod-IP-only key can't tell these two fronts apart at all).
+VIP_PORT2="19101"
+TARGET_PORT2="18081"
 PIN_DIR="/sys/fs/bpf/servicelb-smoke"
 BIN="/tmp/u7s-servicelb-smoke"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +31,9 @@ MEMORY_SCRIPT="$SCRIPT_DIR/sample-ebpf-memory.sh"
 MEMORY_OUT_DIR="/tmp/servicelb-ebpf-memory"
 LOADER_LOG="/tmp/servicelb-smoke-loader.log"
 BACKEND_LOG="/tmp/servicelb-smoke-backend.log"
+BACKEND_LOG2="/tmp/servicelb-smoke-backend2.log"
 RESPONSE_FILE="/tmp/servicelb-smoke-response.http"
+RESPONSE_FILE2="/tmp/servicelb-smoke-response2.http"
 RPFILTER_SAVE_FILE="/tmp/servicelb-smoke-rpfilter-all.saved"
 
 cmd="${1:-}"
@@ -32,6 +41,7 @@ cmd="${1:-}"
 cleanup() {
   pkill -f "$BIN" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT2}" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
   # netns: deleting the netns first can orphan smoke-veth1's namespace --
@@ -101,10 +111,13 @@ sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
 sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
 
 echo "==> loading servicelb-ebpf -- this is the verifier-accept gate"
+# Two --fixture entries sharing one Pod IP but different VIP/target ports:
+# the multi-port-Service scenario TARGET_PORTS' front-tuple keying exists
+# to disambiguate.
 nohup "$BIN" \
   --uplink-iface smoke-veth0 --geneve-iface geneve0 --pin-dir "$PIN_DIR" \
-  --vip-ip "$VIP_IP" --vip-port "$VIP_PORT" --proto tcp \
-  --backend-node-ip "$VIP_IP" --pod-ip "$POD_IP" --target-port "$TARGET_PORT" \
+  --fixture "${VIP_IP}:${VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT}" \
+  --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
   >"$LOADER_LOG" 2>&1 &
 loader_pid=$!
 disown
@@ -150,9 +163,16 @@ loaded=$(bpftool prog list | grep -cE 'name (uplink_ingress|geneve_ingress|uplin
   exit 1
 }
 
-echo "==> starting backend responder on ${POD_IP}:${TARGET_PORT}"
+echo "==> starting backend responders on ${POD_IP}:${TARGET_PORT} and ${POD_IP}:${TARGET_PORT2}"
+# Distinct bodies, not just "both connections succeed": the bug this
+# fixture guards against is the backend DNAT-ing BOTH VIP ports to
+# whichever target port a pod-IP-only key last happened to remember, which
+# a same-body response would not catch.
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' > "$RESPONSE_FILE"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK2' > "$RESPONSE_FILE2"
 nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESPONSE_FILE" >"$BACKEND_LOG" 2>&1 &
+disown
+nohup nc -l -N "$POD_IP" "$TARGET_PORT2" < "$RESPONSE_FILE2" >"$BACKEND_LOG2" 2>&1 &
 disown
 sleep 0.5
 
@@ -163,6 +183,14 @@ body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT}/")
   exit 1
 }
 echo "ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
+
+echo "==> driving a second round trip through the SAME Pod's other Service port"
+body2=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT2}/")
+[ "$body2" = "OK2" ] || {
+  echo "FAIL: expected response body 'OK2' from the second Service port, got: $body2 -- a pod-IP-only backend key would DNAT this to the FIRST port's target instead" >&2
+  exit 1
+}
+echo "MULTI-PORT ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT2} -> backend ${POD_IP}:${TARGET_PORT2} -> response 'OK2', distinct from the first Service port's target)"
 
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2

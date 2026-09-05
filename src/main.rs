@@ -3,12 +3,14 @@
 //! `uplink_egress_return` -- Phase 1's separate `geneve_ingress_decap`/
 //! `geneve_ingress_return` merged into one, see that program's doc comment),
 //! attaches each at its hook point
-//! (`ai/extended-context/ebpf-lb-dataplane.md`), populates the one static
-//! VIP:PORT -> backend fixture this phase proves the mechanism against, and
-//! pins the resulting links under a bpffs directory so a loader restart
-//! re-adopts the existing attachment instead of leaving the interface
-//! unprotected or double-attaching. Real Service/EndpointSlice watching is
-//! Phase 5.
+//! (`ai/extended-context/ebpf-lb-dataplane.md`), populates one or more static
+//! VIP:PORT -> backend fixture entries this phase proves the mechanism
+//! against (repeatable so one Pod behind more than one Service port is
+//! expressible -- `servicelb-ebpf`'s `TARGET_PORTS` keys on the front tuple,
+//! not pod IP alone, precisely so this doesn't collide), and pins the
+//! resulting links under a bpffs directory so a loader restart re-adopts the
+//! existing attachment instead of leaving the interface unprotected or
+//! double-attaching. Real Service/EndpointSlice watching is Phase 5.
 
 use std::{
     net::Ipv4Addr,
@@ -51,30 +53,15 @@ struct Args {
     #[arg(long, default_value = "/sys/fs/bpf/servicelb")]
     pin_dir: PathBuf,
 
-    /// VIP address this node accepts Service traffic on (its own node IP
-    /// in the node-owned-address model, `ebpf-lb-dataplane.md`).
-    #[arg(long)]
-    vip_ip: Ipv4Addr,
-
-    /// VIP port.
-    #[arg(long)]
-    vip_port: u16,
-
-    /// Protocol for the fixture VIP:PORT mapping.
-    #[arg(long, value_enum, default_value_t = Proto::Tcp)]
-    proto: Proto,
-
-    /// Node hosting the chosen backend Pod (Geneve remote for the forward leg).
-    #[arg(long)]
-    backend_node_ip: Ipv4Addr,
-
-    /// Backend Pod IP (stamped as the forward-leg Geneve pod-identifier option).
-    #[arg(long)]
-    pod_ip: Ipv4Addr,
-
-    /// Pod's container port the Service targets.
-    #[arg(long)]
-    target_port: u16,
+    /// One VIP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
+    /// to cover one Pod behind more than one Service port (a plain multi-port
+    /// Service, or one Pod backing two distinct Services) -- each repetition
+    /// becomes its own `VIP_MAP`/`TARGET_PORTS` entry. VIP address is this
+    /// node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
+    /// Format: `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`
+    /// (`proto` is `tcp` or `udp`).
+    #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
+    fixtures: Vec<Fixture>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -90,6 +77,47 @@ impl Proto {
             Proto::Udp => IPPROTO_UDP,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Fixture {
+    vip_ip: Ipv4Addr,
+    vip_port: u16,
+    proto: Proto,
+    backend_node_ip: Ipv4Addr,
+    pod_ip: Ipv4Addr,
+    target_port: u16,
+}
+
+fn parse_fixture(s: &str) -> Result<Fixture, String> {
+    let parts: Vec<&str> = s.split(':').collect();
+    let [vip_ip, vip_port, proto, backend_node_ip, pod_ip, target_port] = parts.as_slice() else {
+        return Err(format!(
+            "expected vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port, got `{s}`"
+        ));
+    };
+    Ok(Fixture {
+        vip_ip: vip_ip
+            .parse()
+            .map_err(|e| format!("vip_ip `{vip_ip}`: {e}"))?,
+        vip_port: vip_port
+            .parse()
+            .map_err(|e| format!("vip_port `{vip_port}`: {e}"))?,
+        proto: match *proto {
+            "tcp" => Proto::Tcp,
+            "udp" => Proto::Udp,
+            other => return Err(format!("proto: expected `tcp` or `udp`, got `{other}`")),
+        },
+        backend_node_ip: backend_node_ip
+            .parse()
+            .map_err(|e| format!("backend_node_ip `{backend_node_ip}`: {e}"))?,
+        pod_ip: pod_ip
+            .parse()
+            .map_err(|e| format!("pod_ip `{pod_ip}`: {e}"))?,
+        target_port: target_port
+            .parse()
+            .map_err(|e| format!("target_port `{target_port}`: {e}"))?,
+    })
 }
 
 /// Converts a host-order value into the "raw wire token" representation the
@@ -110,7 +138,7 @@ fn wire_port(port: u16) -> u16 {
 // lookups silently; the wire-value convention doc comment there is the
 // source of truth for what each field must contain.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct VipKey {
     vip_ip: u32,
     vip_port: u16,
@@ -140,12 +168,7 @@ fn main() -> anyhow::Result<()> {
         uplink_iface,
         geneve_iface,
         pin_dir,
-        vip_ip,
-        vip_port,
-        proto,
-        backend_node_ip,
-        pod_ip,
-        target_port,
+        fixtures,
     } = Args::parse();
 
     bump_memlock_rlimit();
@@ -160,16 +183,7 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("creating pin dir {}", pin_dir.display()))?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
-    populate_fixture(
-        &mut ebpf,
-        vip_ip,
-        vip_port,
-        proto,
-        backend_node_ip,
-        pod_ip,
-        target_port,
-    )
-    .context("populating VIP_MAP/POD_TARGETS fixture")?;
+    populate_fixtures(&mut ebpf, &fixtures).context("populating VIP_MAP/TARGET_PORTS fixture")?;
 
     let hooks: [(&str, &str, TcAttachType); 3] = [
         (
@@ -242,51 +256,61 @@ fn iface_index(name: &str) -> anyhow::Result<u32> {
     Ok(ifindex)
 }
 
-/// Writes the one static VIP:PORT -> backend-node/PodIP:TargetPort mapping
-/// this phase proves the mechanism against (`ebpf-lb-dataplane.md`; real
-/// Service/EndpointSlice watching is Phase 5). Every node runs this same
-/// loader with the same fixture: which node ends up playing "ingress" vs
+/// Writes one or more static VIP:PORT -> backend-node/PodIP:TargetPort
+/// mappings this phase proves the mechanism against (`ebpf-lb-dataplane.md`;
+/// real Service/EndpointSlice watching is Phase 5). Every node runs this same
+/// loader with the same fixture set: which node ends up playing "ingress" vs
 /// "backend" for a given packet is decided by which node the client dialed
 /// and where the Pod landed, not by asymmetric per-node config
 /// (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`'s node-owned-address
 /// model).
-fn populate_fixture(
-    ebpf: &mut Ebpf,
-    vip_ip: Ipv4Addr,
-    vip_port: u16,
-    proto: Proto,
-    backend_node_ip: Ipv4Addr,
-    pod_ip: Ipv4Addr,
-    target_port: u16,
-) -> anyhow::Result<()> {
-    let mut vip_map: AyaHashMap<_, VipKey, VipBackend> = AyaHashMap::try_from(
-        ebpf.map_mut("VIP_MAP")
-            .ok_or_else(|| anyhow!("no map named `VIP_MAP` in the eBPF object"))?,
-    )?;
-    vip_map.insert(
-        VipKey {
-            vip_ip: wire_ip(vip_ip),
-            vip_port: wire_port(vip_port),
-            proto: proto.as_ip_proto(),
-            _pad: 0,
-        },
-        VipBackend {
-            // bpf_tunnel_key.remote_ipv4 is the one field the kernel itself
-            // converts host<->network internally on set/get -- confirmed
-            // empirically (a wire-token value here came out byte-reversed
-            // on the wire, e.g. 192.168.109.3 -> 3.109.168.192): host-native
-            // order, unlike every other address/port field in this crate.
-            backend_node_ip: u32::from(backend_node_ip),
-            pod_ip: wire_ip(pod_ip),
-        },
-        0,
-    )?;
+///
+/// `TARGET_PORTS` is keyed on the same (VIP:PORT:proto) front as `VIP_MAP`,
+/// not on pod IP alone: one `--fixture` per Service port, even when several
+/// share a backend Pod IP, so a multi-port Service resolves each port to its
+/// own target port instead of the last-written one silently winning.
+fn fixture_key(fixture: &Fixture) -> VipKey {
+    VipKey {
+        vip_ip: wire_ip(fixture.vip_ip),
+        vip_port: wire_port(fixture.vip_port),
+        proto: fixture.proto.as_ip_proto(),
+        _pad: 0,
+    }
+}
 
-    let mut pod_targets: AyaHashMap<_, u32, u16> = AyaHashMap::try_from(
-        ebpf.map_mut("POD_TARGETS")
-            .ok_or_else(|| anyhow!("no map named `POD_TARGETS` in the eBPF object"))?,
-    )?;
-    pod_targets.insert(wire_ip(pod_ip), wire_port(target_port), 0)?;
+fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()> {
+    {
+        let mut vip_map: AyaHashMap<_, VipKey, VipBackend> = AyaHashMap::try_from(
+            ebpf.map_mut("VIP_MAP")
+                .ok_or_else(|| anyhow!("no map named `VIP_MAP` in the eBPF object"))?,
+        )?;
+        for fixture in fixtures {
+            vip_map.insert(
+                fixture_key(fixture),
+                VipBackend {
+                    // bpf_tunnel_key.remote_ipv4 is the one field the kernel
+                    // itself converts host<->network internally on set/get --
+                    // confirmed empirically (a wire-token value here came out
+                    // byte-reversed on the wire, e.g. 192.168.109.3 ->
+                    // 3.109.168.192): host-native order, unlike every other
+                    // address/port field in this crate.
+                    backend_node_ip: u32::from(fixture.backend_node_ip),
+                    pod_ip: wire_ip(fixture.pod_ip),
+                },
+                0,
+            )?;
+        }
+    }
+
+    {
+        let mut target_ports: AyaHashMap<_, VipKey, u16> = AyaHashMap::try_from(
+            ebpf.map_mut("TARGET_PORTS")
+                .ok_or_else(|| anyhow!("no map named `TARGET_PORTS` in the eBPF object"))?,
+        )?;
+        for fixture in fixtures {
+            target_ports.insert(fixture_key(fixture), wire_port(fixture.target_port), 0)?;
+        }
+    }
 
     Ok(())
 }
@@ -385,5 +409,64 @@ mod tests {
     fn wire_port_matches_network_byte_order() {
         // 8080 = 0x1F90; on the wire the high byte (0x1F) comes first.
         assert_eq!(wire_port(8080).to_le_bytes(), [0x1F, 0x90]);
+    }
+
+    #[test]
+    fn two_service_ports_on_one_pod_route_to_distinct_target_ports() {
+        // A plain multi-port Service (e.g. 80->8080 alongside 443->8443 on
+        // the SAME Pod) needs each Service port to resolve its own target
+        // port independently. The pre-fix `POD_TARGETS: HashMap<u32, u16>`
+        // keyed only on pod IP, so both fixtures collapsed into ONE entry --
+        // whichever `--fixture` was populated last silently won, and the
+        // other Service port's traffic got mis-DNATed to the wrong
+        // container port.
+        use std::collections::HashMap;
+
+        let pod_ip = Ipv4Addr::new(10, 244, 1, 7);
+        let fixtures = [
+            parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap(),
+            parse_fixture("10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443").unwrap(),
+        ];
+        assert_eq!(
+            (fixtures[0].pod_ip, fixtures[1].pod_ip),
+            (pod_ip, pod_ip),
+            "fixture invariant: both entries must share one Pod IP to exercise the bug"
+        );
+
+        // Simulates `TARGET_PORTS`: keyed on the front tuple, exactly like
+        // `populate_fixtures`/`try_geneve_decap_forward`.
+        let mut target_ports: HashMap<VipKey, u16> = HashMap::new();
+        for f in &fixtures {
+            target_ports.insert(fixture_key(f), wire_port(f.target_port));
+        }
+        assert_eq!(
+            target_ports.len(),
+            2,
+            "two distinct Service ports on one Pod must produce two distinct \
+             TARGET_PORTS entries, not collapse into one"
+        );
+        for f in &fixtures {
+            assert_eq!(
+                target_ports.get(&fixture_key(f)).copied(),
+                Some(wire_port(f.target_port)),
+                "VIP port {} must resolve to its own target port {}, not the \
+                 other Service port's",
+                f.vip_port,
+                f.target_port
+            );
+        }
+
+        // The bug this closes, made concrete: keying on pod IP alone cannot
+        // represent this at all -- both fixtures collapse to the same entry.
+        let mut old_pod_targets: HashMap<u32, u16> = HashMap::new();
+        for f in &fixtures {
+            old_pod_targets.insert(wire_ip(f.pod_ip), wire_port(f.target_port));
+        }
+        assert_eq!(
+            old_pod_targets.len(),
+            1,
+            "this demonstrates why pod-IP-only keying was insufficient -- \
+             both Service ports collapse to the same map key"
+        );
     }
 }

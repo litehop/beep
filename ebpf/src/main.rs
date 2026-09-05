@@ -100,9 +100,10 @@ const TCP_CSUM: usize = L4_OFF + 16;
 const UDP_CSUM: usize = L4_OFF + 6;
 
 /// One static VIP:PORT -> backend mapping (fixture, populated once by the
-/// userspace loader). VIP-space and flannel's pod-CIDR are disjoint by
-/// construction (`ebpf-lb-dataplane.md`), so this and `POD_TARGETS` below
-/// never collide despite sharing no key structure.
+/// userspace loader). Same `VipKey` shape as `TARGET_PORTS` below, but a
+/// separate map -- the two never interact, just key on the same front tuple
+/// for the two different roles that need it (ingress backend selection here,
+/// backend target-port selection there).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VipKey {
@@ -124,10 +125,17 @@ pub struct VipBackend {
 #[map]
 static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
 
-/// Backend-local: which port a decap'd, DNAT'd packet should land on for a
-/// given pod IP. <20 entries per `ebpf-lb-dataplane.md`'s sizing table.
+/// Backend-local: which target port a decap'd, DNAT'd packet should land on
+/// for a given front (VIP:PORT:proto) -- keyed the same way as `VIP_MAP`
+/// above, deliberately NOT on pod IP alone. A pod IP alone cannot
+/// disambiguate a multi-port Service, a pod backing two Services, or TCP/UDP
+/// on different ports; the forward Geneve option only ever carries the raw
+/// pod IP (`ebpf-lb-dataplane.md`'s settled wire-format decision), so the
+/// front tuple this map keys on -- still present on the packet's own
+/// untouched inner dst at decap time -- is what disambiguates instead.
+/// <20 entries per `ebpf-lb-dataplane.md`'s sizing table.
 #[map]
-static POD_TARGETS: HashMap<u32, u16> = HashMap::with_max_entries(32, 0);
+static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 
 /// Ingress-side forward-flow affinity, written at stamp time (step 2),
 /// rebuilt and checked at return-decap time (step 7) from the Geneve VIP
@@ -342,12 +350,22 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     }
     let pod_ip = u32::from_ne_bytes(opt[4..8].try_into().ok()?);
 
-    let target_port = *unsafe { POD_TARGETS.get(pod_ip) }?;
-
     let client_ip: u32 = ctx.load(IP_SRC).ok()?;
     let client_port: u16 = ctx.load(L4_SPORT).ok()?;
     let vip_ip: u32 = ctx.load(IP_DST).ok()?; // captured before rewrite
     let vip_port: u16 = ctx.load(L4_DPORT).ok()?; // captured before rewrite
+
+    // Re-keyed off the front the packet still carries at decap time, not the
+    // Geneve option's pod IP: the pod IP alone can't tell 80->8080 apart from
+    // 443->8443 on the same pod (`TARGET_PORTS`' doc comment).
+    let target_port = *unsafe {
+        TARGET_PORTS.get(VipKey {
+            vip_ip,
+            vip_port,
+            proto,
+            _pad: 0,
+        })
+    }?;
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     let pod_ip_v6 = ipv4_mapped_v6(pod_ip);
