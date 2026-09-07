@@ -19,9 +19,10 @@ against this constraint.
 ## Decision
 
 A per-node eBPF pipeline IS u7s's ServiceLB dataplane, not a separate
-component. tc-bpf programs on each node match `LoadBalancer` VIP traffic,
-consistent-hash to a ready backend, and Geneve-encapsulate the packet to
-whichever node holds it, over whatever underlay connects the two nodes.
+component. tc-bpf programs on each node match `LoadBalancer` front-IP
+traffic, consistent-hash to a ready backend, and Geneve-encapsulate the
+packet to whichever node holds it, over whatever underlay connects the
+two nodes.
 This replaces the klipper-lb-alike design (`bd show mayor-0gpqp`, closed as
 superseded); mechanism detail lives in
 `ai/extended-context/ebpf-lb-dataplane.md`.
@@ -36,7 +37,7 @@ client address across nodes. loxilb, a real eBPF
 LB, is disqualified outright: on a real 1 CPU/1GiB Lima VM it crash-loops on
 `ENOMEM` from `bpf_create_map_xattr`, never reaching a running state — it
 needs 2GiB to start. MetalLB, kube-vip, and purelb all require either shared
-L2 (ARP) or a BGP peer for VIP announcement — neither exists in a
+L2 (ARP) or a BGP peer for front-IP announcement — neither exists in a
 disjoint-subnet topology with a NAT'd node in the path. OpenELB is
 CNCF-archived and dead.
 
@@ -46,7 +47,7 @@ CNCF-archived and dead.
   (`ClusterIP`/`NodePort`); this dataplane owns only north-south
   `LoadBalancer` external IP:port traffic, so there is no double-processing
   between the two.
-- No flannel address-space collision: the VIP sits outside flannel's
+- No flannel address-space collision: the front IP sits outside flannel's
   pod-CIDR and Service-CIDR, and the Geneve tunnel never touches flannel's
   vxlan device. The one contact point: backend-node decap hands its DNAT'd
   packet to flannel's pod-CIDR routing for the last hop.
