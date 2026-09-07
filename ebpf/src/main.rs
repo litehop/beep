@@ -49,8 +49,9 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use u7s_servicelb_common::{
-    encode_tcp_flow_key, ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port,
-    BackendPortDecision, TcpFlowKey,
+    encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
+    resolve_backend_src_port, return_authorization, BackendPortDecision, ForwardAdmission,
+    ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -142,6 +143,34 @@ static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 /// echo plus the inner dst -- confirms the return is answering a flow this
 /// node actually forwarded, not stale/spoofed.
 ///
+/// Split into two LRU tiers (promote-on-bidirectionality,
+/// `docs/decisions/servicelb-flow-admission-affinity.md`):
+/// a single floodable table let ~8192 packets from varying source ports
+/// evict every established flow's forward entry in milliseconds, since BPF
+/// LRU evicts strictly by recency with no notion of "established". Modelled
+/// on nf_conntrack's unreplied/assured split: `FWD_PENDING` is the ONLY
+/// place a new flow is minted (`try_uplink_ingress`, on a `FWD_MAIN` miss)
+/// and is therefore the only flood-exposed tier; a flow reaches `FWD_MAIN`
+/// exclusively via `try_geneve_decap_return`'s promotion once the return leg
+/// proves the flow is genuinely bidirectional -- a round trip an off-path
+/// spoofer cannot produce. A flood can churn `FWD_PENDING` but can never
+/// evict an entry out of `FWD_MAIN`. Two PHYSICAL maps, not one map with an
+/// "assured" flag, because BPF LRU eviction isn't predicate-aware -- it
+/// cannot be told to skip assured entries. Both stay LRU (not plain HASH)
+/// so genuine over-capacity degrades gracefully instead of returning E2BIG.
+///
+/// `max_entries` below are load-time DEFAULTS, not the enforced ceiling: the
+/// userspace loader overrides both via `EbpfLoader::map_max_entries`
+/// (`crates/servicelb/src/main.rs`'s `--fwd-pending-max-entries`/
+/// `--fwd-main-max-entries`), so sizing is a DaemonSet config knob, not a
+/// value baked into this object.
+///
+/// Value type is `VipBackend`, the full backend identity
+/// (`backend_node_ip` + `pod_ip`), not just the node IP: aie31.21 pins this
+/// as the per-flow affinity target, so this bead's admission logic already
+/// carries the shape aie31.21 needs -- no map-shape change once
+/// affinity-follow lands. This bead only existence-checks it.
+///
 /// Key type: `u7s_servicelb_common::TcpFlowKey`, a flat 37-byte array, not a
 /// `#[repr(C)]` struct -- `BPF_MAP_TYPE_*_HASH` compares/hashes a key's raw
 /// bytes including any compiler-inserted alignment padding, and a struct's
@@ -149,8 +178,7 @@ static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 /// stack, differing between independent call sites despite every named
 /// field matching (Phase 2 hit exactly this on a live kernel: a byte-
 /// identical insert+lookup, microseconds apart, still missed). A byte array
-/// has no such gap. 8192-entry ceiling per `ebpf-lb-dataplane.md`'s TCP
-/// sizing row.
+/// has no such gap.
 ///
 /// `LRU_HASH`, not the doc's `LRU_PERCPU_HASH`: a per-CPU map keeps a
 /// SEPARATE value per key per CPU, so a write on one CPU is invisible to a
@@ -164,7 +192,10 @@ static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 /// and evicting (the doc's core requirement over a naive `HashMap`), just
 /// with one shared table instead of per-CPU shards.
 #[map]
-static FWD_FLOW: LruHashMap<TcpFlowKey, u32> = LruHashMap::with_max_entries(8192, 0);
+static FWD_PENDING: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_entries(2048, 0);
+
+#[map]
+static FWD_MAIN: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_entries(8192, 0);
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
@@ -243,7 +274,16 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
         dst_port,
         proto,
     );
-    FWD_FLOW.insert(flow_key, backend.backend_node_ip, 0).ok()?;
+    // Admission control: an established flow (FWD_MAIN hit)
+    // needs no write at all -- the lookup itself refreshed its LRU recency.
+    // A new flow mints ONLY into FWD_PENDING, never FWD_MAIN directly, so an
+    // off-path flood of forward-only packets can churn FWD_PENDING but can
+    // never touch an established flow's FWD_MAIN entry.
+    if let ForwardAdmission::MintPending =
+        forward_admission(unsafe { FWD_MAIN.get(flow_key) }.is_some())
+    {
+        FWD_PENDING.insert(flow_key, backend, 0).ok()?;
+    }
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
@@ -511,7 +551,25 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
         vip_port,
         proto,
     );
-    unsafe { FWD_FLOW.get(key) }?;
+    // Admission control: a MAIN hit is already established
+    // and authorized -- skip the PENDING lookup entirely (the doc's stated
+    // steady-state cost is one lookup, matching the pre-split FWD_FLOW.get).
+    // A PENDING hit is this flow's FIRST observed return leg -- proof of
+    // bidirectionality an off-path spoofer cannot produce -- so promote it
+    // into MAIN and drop the PENDING copy. A miss in both is stale or
+    // spoofed, same drop the pre-split FWD_FLOW.get()? performed.
+    let in_main = unsafe { FWD_MAIN.get(key) }.is_some();
+    if !in_main {
+        let pending_value = unsafe { FWD_PENDING.get(key) }.copied();
+        match return_authorization(false, pending_value.is_some()) {
+            ReturnAuthorization::Promote => {
+                FWD_MAIN.insert(key, pending_value?, 0).ok()?;
+                let _ = FWD_PENDING.remove(key);
+            }
+            ReturnAuthorization::Drop => return None,
+            ReturnAuthorization::Established => {}
+        }
+    }
 
     rewrite_ip_port(
         ctx,

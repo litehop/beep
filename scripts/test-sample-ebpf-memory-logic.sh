@@ -24,12 +24,13 @@
 #      data row each, never a second header line (a repeated snapshot must
 #      stay parseable by a single-header CSV reader).
 #   5. assert-ebpf-map-memory.sh — the CI gate this whole family of scripts
-#      feeds: a single-tick CSV with the exact 5 known maps passes; one that
-#      silently dropped a map (a "4 of 5 found" discovery regression) is
+#      feeds: a single-tick CSV with the exact 6 known maps passes; one that
+#      silently dropped a map (a "5 of 6 found" discovery regression) is
 #      caught, not averaged into a smaller-but-still-passing byte sum. This
 #      directly replicates PR #1568's critical-review repro (a constructed
-#      5-then-4-map CSV that the OLD tick-count-inference logic silently
-#      summed instead of rejecting).
+#      multi-tick CSV that the OLD tick-count-inference logic silently
+#      summed instead of rejecting), updated for the FWD_PENDING/FWD_MAIN
+#      split's 6-map set.
 #
 # A stub `bpftool` on PATH stands in for the real kernel tool (unavailable
 # outside Linux + a loaded eBPF program) — real `jq` is used unmodified,
@@ -194,13 +195,13 @@ RSS_HEADER_COUNT4="$(grep -c '^ts,pid,rss_kb$' "$OUT4/loader-rss.csv")"
 assert_eq "loader-rss.csv also writes its header exactly once across two once calls" "1" "$RSS_HEADER_COUNT4"
 
 # ===========================================================================
-# 5. assert-ebpf-map-memory.sh: the CI gate. A correct single-tick 5-map CSV
+# 5. assert-ebpf-map-memory.sh: the CI gate. A correct single-tick 6-map CSV
 #    passes; a single-tick CSV missing one map (the real-world shape of "map
-#    discovery silently breaks and finds 4 of 5 maps") is caught. This is
+#    discovery silently breaks and finds 5 of 6 maps") is caught. This is
 #    fix (2)'s actual mechanism: the CI job now feeds this script a FRESH,
 #    single-`once`-call CSV instead of extracting "the latest tick" out of a
 #    multi-tick file, so the ambiguity PR #1568's review found (a
-#    constructed 5-then-4-map CSV silently summing to a plausible non-zero
+#    constructed multi-tick CSV silently summing to a plausible non-zero
 #    total instead of surfacing the drop) cannot arise for the real CI input
 #    shape. This block proves both that (a) it accepts what the real
 #    sampler produces and (b) even the OLD ambiguous multi-tick shape, fed
@@ -213,15 +214,16 @@ GOOD_CSV="$TMPDIR_TEST/good.csv"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,REV_FLOW,hash,64,8192"
   echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,193,FWD_FLOW,hash,64,4096"
+  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
+  echo "2026-09-05T00:00:00Z,194,FWD_MAIN,hash,64,8192"
 } > "$GOOD_CSV"
 set +e
 bash "$ASSERT_SCRIPT" "$GOOD_CSV" >/dev/null 2>&1
 GOOD_EXIT=$?
 set -e
-assert_true "a correct single-tick CSV with all 5 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
+assert_true "a correct single-tick CSV with all 6 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
 
-# A single tick that dropped TARGET_PORTS — the actual shape a "4 of 5 maps
+# A single tick that dropped TARGET_PORTS — the actual shape a "5 of 6 maps
 # found" discovery regression produces against the fixed CI invocation.
 DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
 {
@@ -229,49 +231,52 @@ DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
   echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,REV_FLOW,hash,64,8192"
-  echo "2026-09-05T00:00:00Z,193,FWD_FLOW,hash,64,4096"
+  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
+  echo "2026-09-05T00:00:00Z,194,FWD_MAIN,hash,64,8192"
 } > "$DROPPED_CSV"
 set +e
 DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" 2>&1)"
 DROPPED_EXIT=$?
 set -e
 if [ "$DROPPED_EXIT" -ne 0 ]; then
-  echo "PASS: a single-tick CSV missing one map (4 of 5) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
+  echo "PASS: a single-tick CSV missing one map (5 of 6) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
   PASS=$(( PASS + 1 ))
 else
-  echo "FAIL: a 4-of-5-map CSV must not pass — got exit 0: $DROPPED_OUT"
+  echo "FAIL: a 5-of-6-map CSV must not pass — got exit 0: $DROPPED_OUT"
   FAIL=$(( FAIL + 1 ))
 fi
 
-# The reviewer's exact repro shape: one CSV holding a 5-map tick followed by
-# a 4-map tick (what smoke-remote.sh's OLD two-call, single-CSV design
-# produced). assert-ebpf-map-memory.sh takes no tick-index argument and
-# applies no tick-selection heuristic at all — it treats every NR>1 row as
-# one tick's data, so this misuse shape (9 rows, name counts that can't
-# match the 5-map expected set) must still fail loudly rather than
+# The reviewer's exact repro shape: one CSV holding a full-map tick followed
+# by a tick missing one map (what smoke-remote.sh's OLD two-call, single-CSV
+# design produced). assert-ebpf-map-memory.sh takes no tick-index argument
+# and applies no tick-selection heuristic at all — it treats every NR>1 row
+# as one tick's data, so this misuse shape (11 rows, name counts that can't
+# match the 6-map expected set) must still fail loudly rather than
 # reproduce the old silent-blend bug.
-LEGACY_5_THEN_4_CSV="$TMPDIR_TEST/legacy-5-then-4.csv"
+LEGACY_6_THEN_5_CSV="$TMPDIR_TEST/legacy-6-then-5.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
   echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,REV_FLOW,hash,64,8192"
   echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,193,FWD_FLOW,hash,64,4096"
+  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
+  echo "2026-09-05T00:00:00Z,194,FWD_MAIN,hash,64,8192"
   echo "2026-09-05T00:00:01Z,189,VIP_MAP,hash,16,4096"
   echo "2026-09-05T00:00:01Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:01Z,191,REV_FLOW,hash,64,8192"
   echo "2026-09-05T00:00:01Z,192,TARGET_PORTS,hash,32,4096"
-} > "$LEGACY_5_THEN_4_CSV"
+  echo "2026-09-05T00:00:01Z,193,FWD_PENDING,hash,64,4096"
+} > "$LEGACY_6_THEN_5_CSV"
 set +e
-LEGACY_OUT="$(bash "$ASSERT_SCRIPT" "$LEGACY_5_THEN_4_CSV" 2>&1)"
+LEGACY_OUT="$(bash "$ASSERT_SCRIPT" "$LEGACY_6_THEN_5_CSV" 2>&1)"
 LEGACY_EXIT=$?
 set -e
 if [ "$LEGACY_EXIT" -ne 0 ]; then
-  echo "PASS: the reviewer's constructed 5-then-4-map two-tick CSV is rejected outright (no tick-selection heuristic to fool) — matches: $LEGACY_OUT"
+  echo "PASS: the reviewer's constructed multi-tick CSV is rejected outright (no tick-selection heuristic to fool) — matches: $LEGACY_OUT"
   PASS=$(( PASS + 1 ))
 else
-  echo "FAIL: the legacy 5-then-4-map two-tick CSV must not silently pass — got exit 0: $LEGACY_OUT"
+  echo "FAIL: the legacy multi-tick CSV must not silently pass — got exit 0: $LEGACY_OUT"
   FAIL=$(( FAIL + 1 ))
 fi
 

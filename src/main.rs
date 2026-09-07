@@ -10,11 +10,16 @@
 //! not pod IP alone, precisely so this doesn't collide), and pins the
 //! resulting links AND maps under a bpffs directory so a loader restart
 //! re-adopts the existing attachment instead of leaving the interface
-//! unprotected or double-attaching, and REUSES the existing `FWD_FLOW`/
-//! `REV_FLOW` conntrack tables instead of swapping in an empty pair --
-//! `Ebpf::load` alone creates a fresh map set on every call, which would
-//! silently drop every established flow on each DaemonSet rollout, eviction,
-//! or OOM kill. Real Service/EndpointSlice watching is Phase 5.
+//! unprotected or double-attaching, and REUSES the existing `FWD_PENDING`/
+//! `FWD_MAIN`/`REV_FLOW` conntrack tables instead of swapping in an empty
+//! set -- `Ebpf::load` alone creates a fresh map set on every call, which
+//! would silently drop every established flow on each DaemonSet rollout,
+//! eviction, or OOM kill. Real Service/EndpointSlice watching is Phase 5.
+//!
+//! `FWD_PENDING`/`FWD_MAIN` sizes are a load-time DaemonSet config knob, not
+//! a value baked into the eBPF object (`servicelb-ebpf`'s admission-control
+//! doc comment) -- overridden here via `EbpfLoader::map_max_entries` before
+//! `load()`.
 
 use std::{
     net::Ipv4Addr,
@@ -43,7 +48,23 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-const MAP_NAMES: [&str; 5] = ["CONFIG", "VIP_MAP", "TARGET_PORTS", "FWD_FLOW", "REV_FLOW"];
+const MAP_NAMES: [&str; 6] = [
+    "CONFIG",
+    "VIP_MAP",
+    "TARGET_PORTS",
+    "FWD_PENDING",
+    "FWD_MAIN",
+    "REV_FLOW",
+];
+
+/// Defaults from the admission-control sizing derivation
+/// (`servicelb-ebpf`'s `FWD_PENDING`/`FWD_MAIN` doc comment): PENDING is the
+/// only flood-exposed tier, sized to peak concurrent half-open connections
+/// with headroom; MAIN is sized to peak legitimate established concurrency,
+/// a valid basis only because admission control keeps it unreachable by a
+/// flood.
+const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
+const DEFAULT_FWD_MAIN_MAX_ENTRIES: u32 = 8192;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,6 +93,19 @@ struct Args {
     /// (`proto` is `tcp` or `udp`).
     #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
     fixtures: Vec<Fixture>,
+
+    /// `FWD_PENDING` max_entries -- the only flood-exposed conntrack tier
+    /// (admission control mints every new flow here; see `servicelb-ebpf`'s
+    /// `FWD_PENDING` doc comment). A load-time DaemonSet config knob, not a
+    /// value baked into the eBPF object.
+    #[arg(long, default_value_t = DEFAULT_FWD_PENDING_MAX_ENTRIES)]
+    fwd_pending_max_entries: u32,
+
+    /// `FWD_MAIN` max_entries -- reachable only via a flow's promoted (i.e.
+    /// bidirectionally-confirmed) conntrack entry, sized to legitimate peak
+    /// established concurrency.
+    #[arg(long, default_value_t = DEFAULT_FWD_MAIN_MAX_ENTRIES)]
+    fwd_main_max_entries: u32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -179,6 +213,8 @@ fn main() -> anyhow::Result<()> {
         geneve_iface,
         pin_dir,
         fixtures,
+        fwd_pending_max_entries,
+        fwd_main_max_entries,
     } = Args::parse();
 
     bump_memlock_rlimit();
@@ -193,6 +229,13 @@ fn main() -> anyhow::Result<()> {
     for name in MAP_NAMES {
         loader.map_pin_path(name, pin_dir.join(name));
     }
+    // Only takes effect the FIRST time a pin path is created: a reused pin
+    // (loader restart against the same --pin-dir) opens the existing map via
+    // its live fd and this override is silently a no-op, which is the
+    // intended behavior -- sizing is decided once at initial provisioning,
+    // not resized on every restart (the declined-runtime-resize decision).
+    loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
+    loader.map_max_entries("FWD_MAIN", fwd_main_max_entries);
     let mut ebpf = loader
         .load(include_bytes_aligned!(concat!(
             env!("OUT_DIR"),

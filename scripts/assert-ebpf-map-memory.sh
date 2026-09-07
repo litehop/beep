@@ -15,16 +15,19 @@
 # ambiguity a fresh single-tick file avoids by construction rather than by
 # parsing around it.
 #
-# Asserts the discovered map set is EXACTLY the 5 known servicelb maps, not
-# just a byte-count ceiling: a partial-discovery regression (e.g. only 4 of 5
+# Asserts the discovered map set is EXACTLY the 6 known servicelb maps, not
+# just a byte-count ceiling: a partial-discovery regression (e.g. only 5 of 6
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
 # is > 0 and under a gross-regression ceiling (not a tight bound, just a
 # tripwire for an accidental max_entries blow-up). The ceiling is 4 MiB:
-# LRU_HASH conntrack maps (FWD_FLOW/REV_FLOW/etc) preallocate for their full
-# max_entries capacity regardless of active-flow count, and pa0ze's Phase-3
-# 8192-entry sizing (#1567) measures ~1.82 MiB (1,909,072 bytes) preallocated
-# per node -- 4 MiB leaves ~2.1x headroom over that real, constant footprint.
+# LRU_HASH conntrack maps (FWD_PENDING/FWD_MAIN/REV_FLOW/etc) preallocate for
+# their full max_entries capacity regardless of active-flow count, and
+# pa0ze's Phase-3 8192-entry sizing (#1567) measured ~1.82 MiB (1,909,072
+# bytes) preallocated per node for the old single-tier FWD_FLOW+REV_FLOW
+# pair (16384 entries total); the FWD_PENDING/FWD_MAIN split adds a smaller
+# PENDING tier on top (2048 entries by default, ~+240 KiB) -- 4 MiB still
+# leaves comfortable headroom over that real, near-constant footprint.
 set -euo pipefail
 
 csv="${1:?usage: $0 <ebpf-map-memory.csv>}"
@@ -35,7 +38,7 @@ total=$(awk -F, 'NR>1 { sum += $6 } END { print sum+0 }' "$csv")
 echo "discovered maps (${#names[@]}): ${names[*]:-none}"
 echo "total bytes_memlock: $total"
 
-expected=(CONFIG FWD_FLOW TARGET_PORTS REV_FLOW VIP_MAP)
+expected=(CONFIG FWD_PENDING FWD_MAIN TARGET_PORTS REV_FLOW VIP_MAP)
 actual_sorted="$(printf '%s\n' "${names[@]}" | sort -u)"
 expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
 

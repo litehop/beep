@@ -99,7 +99,14 @@ $ sudo bpftool map dump id <id>             # actual live entries, not the ceili
 ```
 
 This is the command path to inspect Phase 3's conntrack maps through:
-`FWD_FLOW`/`REV_FLOW` are `LRU_HASH`, 8192-entry ceiling, full-tuple
-(`u7s_servicelb_common::TcpFlowKey`) keyed. `VIP_MAP`/`TARGET_PORTS` remain
-Phase 2's naive small-scale fixture maps, both keyed on the same VIP:PORT:proto
-front tuple -- real Service/EndpointSlice sizing is Phase 5.
+`FWD_PENDING` (2048-entry default), `FWD_MAIN` (8192-entry default), and
+`REV_FLOW` (8192-entry) are `LRU_HASH`, full-tuple
+(`u7s_servicelb_common::TcpFlowKey`) keyed. `FWD_PENDING`/`FWD_MAIN` split the
+old single `FWD_FLOW` table into a promote-on-bidirectionality admission
+scheme: new flows mint into `FWD_PENDING` only, promoting to
+`FWD_MAIN` once the return leg is observed, so a flood of new flows can never
+evict an established one. Both ceilings are configurable at load time via
+`--fwd-pending-max-entries`/`--fwd-main-max-entries`, not baked into the
+object. `VIP_MAP`/`TARGET_PORTS` remain Phase 2's naive small-scale fixture
+maps, both keyed on the same VIP:PORT:proto front tuple -- real
+Service/EndpointSlice sizing is Phase 5.

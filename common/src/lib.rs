@@ -100,6 +100,59 @@ pub fn decode_quic_dcid_key(key: &QuicDcidKey) -> [u8; QUIC_DCID_KEY_LEN] {
     *key
 }
 
+/// Flow-table admission: forward-path decision (`servicelb-ebpf`'s
+/// `try_uplink_ingress`, `docs/decisions/servicelb-flow-admission-affinity.md`).
+/// A new flow is minted ONLY into the small, flood-exposed PENDING tier --
+/// this enum has no variant that writes MAIN, so an off-path flood of
+/// forward-only packets (never observed on the return leg) structurally
+/// cannot populate MAIN no matter how many distinct tuples it tries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardAdmission {
+    /// Already established in MAIN -- the lookup that found it already
+    /// refreshed its LRU recency; nothing else to write.
+    Established,
+    /// No MAIN entry -- (re)mint the PENDING entry, the only place a new
+    /// flow is ever created.
+    MintPending,
+}
+
+/// `in_main`: result of an `FWD_MAIN.get(key)` lookup.
+pub fn forward_admission(in_main: bool) -> ForwardAdmission {
+    if in_main {
+        ForwardAdmission::Established
+    } else {
+        ForwardAdmission::MintPending
+    }
+}
+
+/// Flow-table admission: return-path decision (`servicelb-ebpf`'s
+/// `try_geneve_decap_return`, step 7). A MAIN hit is already-established and
+/// authorized outright. A PENDING hit is this flow's FIRST observed return
+/// leg -- proof of bidirectionality that an off-path spoofer cannot produce
+/// without actually receiving traffic -- so it is authorized AND promoted
+/// into MAIN. A miss in both tiers is stale or spoofed and must drop, same
+/// as the pre-split single-table behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnAuthorization {
+    Established,
+    Promote,
+    Drop,
+}
+
+/// `in_main`/`in_pending`: results of `FWD_MAIN.get(key)`/`FWD_PENDING.get(key)`
+/// lookups. Callers should short-circuit the PENDING lookup when `in_main`
+/// is already true (the established/happy-path case costs one lookup, not
+/// two).
+pub fn return_authorization(in_main: bool, in_pending: bool) -> ReturnAuthorization {
+    if in_main {
+        ReturnAuthorization::Established
+    } else if in_pending {
+        ReturnAuthorization::Promote
+    } else {
+        ReturnAuthorization::Drop
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -648,6 +701,135 @@ mod tests {
             rev_flow.get(&client_port_a).copied(),
             Some((first_writer, client_port_a)),
             "first_writer's original entry must also survive untouched"
+        );
+    }
+
+    // Flow-table admission (promote-on-bidirectionality):
+    // an evicted-forward-entry-turns-into-a-dropped-return-packet bug would
+    // pass every test above (they never touch MAIN/PENDING at all) but break
+    // every live connection under a flood, so these get their own group.
+
+    #[test]
+    fn forward_admission_established_flow_needs_no_pending_write() {
+        // A live flow's forward packets must skip the PENDING insert
+        // entirely -- writing PENDING on every packet of an already-
+        // established flow would waste PENDING capacity on flows that don't
+        // need protecting, shrinking the headroom actually-new connections
+        // get during a flood.
+        assert_eq!(forward_admission(true), ForwardAdmission::Established);
+    }
+
+    #[test]
+    fn forward_admission_new_flow_mints_into_pending_only() {
+        // The only mint site: a flow with no MAIN entry gets a PENDING
+        // write. Critically, `ForwardAdmission` has no variant that asks the
+        // caller to write MAIN -- an off-path flood of forward-only packets
+        // (arbitrarily many distinct tuples, never producing a return leg)
+        // can therefore never populate MAIN by construction, not just by
+        // convention.
+        assert_eq!(forward_admission(false), ForwardAdmission::MintPending);
+    }
+
+    #[test]
+    fn return_authorization_established_flow_is_not_re_promoted() {
+        // A MAIN hit must short-circuit before PENDING is even consulted --
+        // re-running the promote (insert+remove) on every packet of an
+        // already-established flow would be wasted work on the hot path and
+        // would repeatedly touch PENDING for a flow that no longer needs it.
+        assert_eq!(
+            return_authorization(true, false),
+            ReturnAuthorization::Established
+        );
+        assert_eq!(
+            return_authorization(true, true),
+            ReturnAuthorization::Established,
+            "a MAIN hit must win even if a stale PENDING entry for the same key also exists"
+        );
+    }
+
+    #[test]
+    fn return_authorization_first_return_leg_promotes_from_pending() {
+        // The core anti-flush mechanism: the first packet on the return
+        // direction is proof of bidirectionality an off-path spoofer cannot
+        // manufacture (it would need to actually receive the reply), so it
+        // is both authorized and promoted into MAIN.
+        assert_eq!(
+            return_authorization(false, true),
+            ReturnAuthorization::Promote
+        );
+    }
+
+    #[test]
+    fn return_authorization_drops_stale_or_spoofed_return() {
+        // Absent from both tiers means this return answers no flow this
+        // node ever forwarded -- the same drop the single-table version
+        // performed via FWD_FLOW.get returning None.
+        assert_eq!(
+            return_authorization(false, false),
+            ReturnAuthorization::Drop
+        );
+    }
+
+    #[test]
+    fn established_flow_in_main_survives_a_flood_of_forward_only_flows() {
+        // The property the whole split exists for: a spoofed/off-path flood
+        // that only ever sends forward-direction packets from varying
+        // source ports must not be able to touch -- let alone evict -- an
+        // already-established flow sitting in MAIN. Simulates both tiers as
+        // plain sets and drives the two pure decision functions exactly as
+        // `servicelb-ebpf` would, without a kernel.
+        use std::collections::HashSet;
+
+        let mut main: HashSet<u32> = HashSet::new();
+        let mut pending: HashSet<u32> = HashSet::new();
+        let established_flow: u32 = 1;
+
+        // Establish one flow the ordinary way: forward mints it into
+        // PENDING, then its first return leg promotes it into MAIN.
+        assert_eq!(
+            forward_admission(main.contains(&established_flow)),
+            ForwardAdmission::MintPending
+        );
+        pending.insert(established_flow);
+        match return_authorization(
+            main.contains(&established_flow),
+            pending.contains(&established_flow),
+        ) {
+            ReturnAuthorization::Promote => {
+                main.insert(established_flow);
+                pending.remove(&established_flow);
+            }
+            other => panic!("expected the first return leg to promote, got {other:?}"),
+        }
+        assert!(main.contains(&established_flow));
+
+        // Flood: 10,000 distinct never-returning flows hammer the forward
+        // path. Each is a genuinely new tuple (never in MAIN), so each must
+        // mint into PENDING -- never MAIN -- and the established flow's own
+        // forward traffic during the flood must keep finding it already in
+        // MAIN and skip PENDING entirely.
+        for flood_flow in 100..10_100u32 {
+            assert_eq!(
+                forward_admission(main.contains(&flood_flow)),
+                ForwardAdmission::MintPending,
+                "flood tuple {flood_flow} was never established, so it must only ever mint \
+                 into PENDING"
+            );
+            pending.insert(flood_flow); // simulates the LRU churning PENDING
+            assert_eq!(
+                forward_admission(main.contains(&established_flow)),
+                ForwardAdmission::Established,
+                "an unpromoted flood must not evict established flows out of MAIN -- the \
+                 established flow's own forward packets must keep resolving as already-\
+                 established throughout the flood, never fall back to re-minting"
+            );
+        }
+
+        assert!(
+            main.contains(&established_flow) && main.len() == 1,
+            "MAIN must contain exactly the one flow that was actually promoted via a real \
+             return leg -- a flood of {} forward-only tuples must never have written MAIN",
+            pending.len()
         );
     }
 }
