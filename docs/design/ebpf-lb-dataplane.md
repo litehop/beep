@@ -86,7 +86,8 @@ The backend's reverse-flow key, `(CLIENT_IP, SRC_PORT, PodIP, TargetPort,
 proto)`, is rewrite-stable but says nothing about cross-flow uniqueness
 (see Settled wire-format decisions). Both keys share one shape, so **one
 map per protocol** covers both roles: front-IP space and pod-CIDR are
-disjoint by construction, so the two kinds never collide.
+disjoint **only by configuration, not by construction** — a `hostNetwork`
+Pod's IP equals its node's IP; they can collide.
 
 `BPF_MAP_TYPE_LRU_HASH`, custom (`nf_conntrack` is heavier), shared not
 per-CPU — `LRU_PERCPU_HASH` broke conntrack (cross-CPU misses between
