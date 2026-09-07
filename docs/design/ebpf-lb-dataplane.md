@@ -88,8 +88,9 @@ proto)`, is rewrite-stable but says nothing about cross-flow uniqueness
 map per protocol** covers both roles: front-IP space and pod-CIDR are
 disjoint by construction, so the two kinds never collide.
 
-`BPF_MAP_TYPE_LRU_PERCPU_HASH`, custom (`nf_conntrack` is heavier).
-Per-CPU cost is bounded by vCPU count, nearly free at 1 vCPU/1GB.
+`BPF_MAP_TYPE_LRU_HASH`, custom (`nf_conntrack` is heavier), shared not
+per-CPU — `LRU_PERCPU_HASH` broke conntrack (cross-CPU misses between
+forward-write and return-read).
 
 - **TCP/UDP/QUIC share one key shape**: `(CLIENT_IP, SRC_PORT, OTHER_IP,
   OTHER_PORT, proto)` (`OTHER`=front IP or PodIP). IPv6-primary: **37
@@ -119,9 +120,9 @@ Per-CPU cost is bounded by vCPU count, nearly free at 1 vCPU/1GB.
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
 | Front-IP map (<100 Services × ≤2 protocols) | ~25 KiB | <200 entries. |
 | Endpoint map (<1000 endpoints) | ~128 KiB | Full map on every node. |
-| Flow-affinity maps, per-CPU (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
+| Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
-| **Total** | **~4–7 MiB** | Scales linearly with vCPU count. |
+| **Total** | **~4–7 MiB** | Independent of vCPU count — maps are shared. |
 
 All maps pre-allocate their full ceiling — loxilb's "cannot start on 1GB
 node" failure mode (gate 2) — sized for u7s's envelope (<10 nodes/<100
