@@ -100,6 +100,30 @@ pub fn decode_quic_dcid_key(key: &QuicDcidKey) -> [u8; QUIC_DCID_KEY_LEN] {
     *key
 }
 
+/// Linux ARPHRD_* value (`uapi/linux/if_arp.h`) for a real Ethernet-framed
+/// device -- the only uplink type `servicelb-ebpf`'s uplink hooks treat as
+/// carrying a 14-byte L2 header.
+pub const ARPHRD_ETHER: u16 = 1;
+
+/// How many L2 header bytes `servicelb-ebpf`'s uplink hooks (`try_uplink_ingress`,
+/// `try_uplink_egress_return`) must skip before the IPv4 header starts, given
+/// the uplink interface's ARPHRD type -- resolved once by the userspace
+/// loader at load time (the no_std eBPF program has no syscall to query this
+/// itself) and written into the `CONFIG` map. A real NIC/veth (`ARPHRD_ETHER`)
+/// carries a 14-byte Ethernet header; a WireGuard (or any other L3-only/tun)
+/// uplink delivers the raw IP packet with none at all -- treating it as 14
+/// anyway reads 14 bytes into the middle of the real IP header, the
+/// EtherType/version check never matches, and the dataplane silently no-ops
+/// on every packet on that uplink (the bug this function exists to prevent a
+/// regression of).
+pub fn uplink_l2_header_len(arphrd_type: u16) -> u32 {
+    if arphrd_type == ARPHRD_ETHER {
+        14
+    } else {
+        0
+    }
+}
+
 /// Flow-table admission: forward-path decision (`servicelb-ebpf`'s
 /// `try_uplink_ingress`, `docs/decisions/servicelb-flow-admission-affinity.md`).
 /// A new flow is minted ONLY into the small, flood-exposed PENDING tier --
@@ -275,6 +299,33 @@ fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `servicelb-ebpf` used to hard-code a 14-byte Ethernet skip for every
+    // uplink, so a WireGuard (L3-only, no L2 header) uplink silently
+    // no-op'd on every packet instead of erroring -- the offset math read
+    // into the middle of the real IP header and the EtherType check never
+    // matched. These two cases must resolve to different skip lengths, or
+    // that regression is back.
+
+    #[test]
+    fn ethernet_uplink_keeps_the_14_byte_l2_skip() {
+        // The existing, already-working single-node veth smoke harness
+        // (scripts/servicelb/smoke.sh) depends on this staying 14 -- a
+        // regression here breaks the L2 path this fix must not touch, not
+        // just the new WireGuard one.
+        assert_eq!(uplink_l2_header_len(ARPHRD_ETHER), 14);
+    }
+
+    #[test]
+    fn non_ethernet_uplink_skips_no_l2_header() {
+        // ARPHRD_NONE is WireGuard's (and any other L3-only/tun device's)
+        // type -- there is no Ethernet header to skip at all. Reverting to
+        // an unconditional 14 here reproduces the exact silent no-op the
+        // WireGuard spike found: offset math lands inside the real IP
+        // header instead of past a header that was never there.
+        const ARPHRD_NONE: u16 = 0xFFFE;
+        assert_eq!(uplink_l2_header_len(ARPHRD_NONE), 0);
+    }
 
     // A conntrack keying bug corrupts flow affinity silently instead of
     // failing loudly, so every encode/decode path is round-tripped here
