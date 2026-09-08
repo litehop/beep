@@ -244,7 +244,7 @@ static REV_FLOW: LruHashMap<TcpFlowKey, RevFlowValue> = LruHashMap::with_max_ent
 /// via `bpftool map dump` without needing a kernel tracepoint. Single entry,
 /// per-CPU to avoid a shared-counter atomic on this hot path.
 #[map]
-static EGRESS_RETURN_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Host-specific runtime config the loader fills in after attach (an
 /// ifindex isn't known until then). Single entry.
@@ -714,7 +714,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         // while still stalling the connection, so drop instead. Consistent
         // with the forward decap path's equivalent miss (`geneve_ingress`'s
         // `unwrap_or(TC_ACT_SHOT)`).
-        if let Some(count) = EGRESS_RETURN_DROPS.get_ptr_mut(0) {
+        if let Some(count) = EGRESS_DROPS.get_ptr_mut(0) {
             unsafe { *count += 1 };
         }
         return Some(TC_ACT_SHOT);

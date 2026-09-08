@@ -410,12 +410,40 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()
             ebpf.map_mut("POD_TARGETS")
                 .ok_or_else(|| anyhow!("no map named `POD_TARGETS` in the eBPF object"))?,
         )?;
+        // POD_TARGETS is pinned (`MAP_NAMES`) and so reused, not
+        // recreated, across a loader restart with a different `--fixture`
+        // set: a Pod that departed since the last run otherwise leaves a
+        // stale entry here forever. That used to be harmless (this map was
+        // read-only membership metadata), but it now gates
+        // `uplink_egress_return`'s drop-on-REV_FLOW-miss decision -- a
+        // stale entry for a departed/reused Pod IP would misclassify
+        // unrelated future traffic on that address as "ours" and drop it.
+        // Prune anything the fresh fixture set no longer claims before
+        // writing it.
+        let existing_ips: Vec<u32> = pod_targets.keys().collect::<Result<_, _>>()?;
+        for ip in stale_pod_targets(&existing_ips, fixtures) {
+            pod_targets.remove(&ip)?;
+        }
         for fixture in fixtures {
             pod_targets.insert(wire_ip(fixture.pod_ip), 1u8, 0)?;
         }
     }
 
     Ok(())
+}
+
+/// Pod IPs in `existing` (POD_TARGETS's current keys, carried over from a
+/// prior loader run against the same pinned map) that no fixture in the
+/// fresh `fixtures` set claims any more. Split out of `populate_fixtures`
+/// as a pure function so the prune decision is testable without a live
+/// eBPF map.
+fn stale_pod_targets(existing: &[u32], fixtures: &[Fixture]) -> Vec<u32> {
+    let live: std::collections::HashSet<u32> = fixtures.iter().map(|f| wire_ip(f.pod_ip)).collect();
+    existing
+        .iter()
+        .copied()
+        .filter(|ip| !live.contains(ip))
+        .collect()
 }
 
 /// Bumps the memlock rlimit for kernels that still account eBPF map memory
@@ -570,6 +598,41 @@ mod tests {
             1,
             "this demonstrates why pod-IP-only keying was insufficient -- \
              both Service ports collapse to the same map key"
+        );
+    }
+
+    #[test]
+    fn departed_pod_ip_is_pruned_from_pod_targets() {
+        // POD_TARGETS is pinned and reused across loader restarts, so a Pod
+        // absent from the fresh `--fixture` set is one that's gone away.
+        // uplink_egress_return now DROPS on a POD_TARGETS hit with no
+        // matching REV_FLOW entry -- an unpruned stale entry would
+        // misclassify unrelated traffic that later reuses this address as
+        // "ours" and drop it instead of passing it through.
+        let departed_pod_ip = wire_ip(Ipv4Addr::new(10, 244, 1, 9));
+        let existing = [departed_pod_ip];
+        let fixtures: [Fixture; 0] = [];
+
+        assert_eq!(
+            stale_pod_targets(&existing, &fixtures),
+            vec![departed_pod_ip],
+            "a pod absent from the new fixture set must be pruned from \
+             POD_TARGETS, or egress traffic from a future, unrelated owner \
+             of that IP gets dropped instead of passed"
+        );
+    }
+
+    #[test]
+    fn live_pod_ip_is_not_pruned_from_pod_targets() {
+        // The other side of the same guarantee: a Pod still present in the
+        // fixture set must survive the prune, or every reconcile would
+        // drop live backends' own egress-return admission.
+        let fixture = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
+        let existing = [wire_ip(fixture.pod_ip)];
+
+        assert!(
+            stale_pod_targets(&existing, &[fixture]).is_empty(),
+            "a pod still claimed by the fixture set must not be pruned from POD_TARGETS"
         );
     }
 }

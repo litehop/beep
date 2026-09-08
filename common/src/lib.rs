@@ -201,7 +201,9 @@ pub enum EgressReturnAdmission {
 /// forward path already found its pod in this same map, so admitting on
 /// membership alone can never drop a live flow whose target port has since
 /// changed -- comparing the port too would couple this gate to a value that
-/// can change out from under an established flow.
+/// can change out from under an established flow. This is a structural
+/// guarantee, not just a documented convention: the signature takes no port,
+/// so no caller can wire one in without changing this function itself.
 pub fn egress_return_admission(is_backend_pod: bool) -> EgressReturnAdmission {
     if is_backend_pod {
         EgressReturnAdmission::BackendTraffic
@@ -960,45 +962,6 @@ mod tests {
             EgressReturnAdmission::NotBackendTraffic,
             "a packet not sourced from one of this node's backend Pods must short-circuit \
              before REV_FLOW is ever probed"
-        );
-    }
-
-    #[test]
-    fn egress_return_admission_survives_a_targetport_change_mid_flow() {
-        // Models the rolling-update hazard this bead exists to avoid: if
-        // admission instead compared the packet's source port against the
-        // Pod's CURRENT target port, changing that port mid-flow would flip
-        // an already-established flow's own reply packets to
-        // "not ours" even though the Pod itself never moved. POD_TARGETS is
-        // keyed on pod IP alone, so simulate that by deriving `is_backend_pod`
-        // purely from IP membership while TARGET_PORTS' value for the same
-        // pod changes underneath it.
-        use std::collections::HashMap;
-
-        let pod_ip: u32 = 0x0a_f4_01_07; // 10.244.1.7
-        let mut pod_targets: HashMap<u32, ()> = HashMap::new();
-        pod_targets.insert(pod_ip, ());
-        let mut target_ports: HashMap<u32, u16> = HashMap::new();
-        target_ports.insert(pod_ip, 8080);
-
-        let before_rollout = egress_return_admission(pod_targets.contains_key(&pod_ip));
-        assert_eq!(before_rollout, EgressReturnAdmission::BackendTraffic);
-
-        // The rolling update: the Deployment's containerPort changes, so the
-        // loader rewrites TARGET_PORTS for this pod -- POD_TARGETS is left
-        // untouched because the Pod itself is still present on this node.
-        target_ports.insert(pod_ip, 9090);
-        assert_ne!(
-            target_ports[&pod_ip], 8080,
-            "test invariant: the targetPort must actually have changed"
-        );
-
-        let after_rollout = egress_return_admission(pod_targets.contains_key(&pod_ip));
-        assert_eq!(
-            after_rollout,
-            EgressReturnAdmission::BackendTraffic,
-            "changing the Pod's target port must not un-admit its in-flight reply traffic -- \
-             admission is keyed on IP membership only, never on port"
         );
     }
 
