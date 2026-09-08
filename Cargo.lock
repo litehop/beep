@@ -509,6 +509,7 @@ dependencies = [
  "aya-build",
  "clap",
  "libc",
+ "u7s-servicelb-common",
 ]
 
 [[package]]

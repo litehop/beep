@@ -229,6 +229,13 @@ static REV_FLOW: LruHashMap<TcpFlowKey, RevFlowValue> = LruHashMap::with_max_ent
 pub struct Config {
     pub geneve_ifindex: u32,
     pub uplink_ifindex: u32,
+    /// `u7s_servicelb_common::uplink_l2_header_len`'s result for the uplink
+    /// iface -- 14 for a real Ethernet-framed NIC/veth, 0 for an L3-only
+    /// uplink (WireGuard or any other tun-style device with no L2 header).
+    /// `geneve0` is unaffected: it's always a real (Ethernet-framed) netdev
+    /// regardless of what the uplink is, so `geneve_ingress`'s parsing keeps
+    /// using the compile-time `ETH_HLEN` unconditionally.
+    pub uplink_l2_hlen: u32,
 }
 
 #[map]
@@ -244,19 +251,35 @@ pub fn uplink_ingress(ctx: TcContext) -> i32 {
 }
 
 fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
-    if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
+    // Runtime, not the compile-time `ETH_HLEN`-based consts below `geneve_ingress`
+    // uses: the uplink can be a real NIC/veth (14-byte Ethernet header) or an
+    // L3-only overlay like WireGuard (no L2 header at all), decided once by
+    // the loader (`Config` doc comment) since this no_std program has no
+    // syscall of its own to tell the two apart.
+    let l2_hlen = CONFIG.get(0)?.uplink_l2_hlen as usize;
+    // No Ethernet header at all on an L3-only uplink -- there's no EtherType
+    // field to check; the IP-version nibble below is this path's only gate.
+    if l2_hlen == ETH_HLEN && ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
     }
-    if ctx.load::<u8>(IP_VER_IHL).ok()? & 0x0f != 5 {
+    let ver_ihl: u8 = ctx.load(l2_hlen).ok()?;
+    if ver_ihl >> 4 != 4 || ver_ihl & 0x0f != 5 {
         return Some(TC_ACT_OK);
     }
-    let proto: u8 = ctx.load(IP_PROTO).ok()?;
+    let ip_proto = l2_hlen + 9;
+    let ip_src = l2_hlen + 12;
+    let ip_dst = l2_hlen + 16;
+    let l4_off = l2_hlen + IP_HLEN;
+    let l4_sport = l4_off;
+    let l4_dport = l4_off + 2;
+
+    let proto: u8 = ctx.load(ip_proto).ok()?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
         return Some(TC_ACT_OK);
     }
 
-    let dst_ip: u32 = ctx.load(IP_DST).ok()?;
-    let dst_port: u16 = ctx.load(L4_DPORT).ok()?;
+    let dst_ip: u32 = ctx.load(ip_dst).ok()?;
+    let dst_port: u16 = ctx.load(l4_dport).ok()?;
     let key = VipKey {
         vip_ip: dst_ip,
         vip_port: dst_port,
@@ -265,8 +288,8 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     };
     let backend = *unsafe { VIP_MAP.get(key) }?;
 
-    let src_ip: u32 = ctx.load(IP_SRC).ok()?;
-    let src_port: u16 = ctx.load(L4_SPORT).ok()?;
+    let src_ip: u32 = ctx.load(ip_src).ok()?;
+    let src_port: u16 = ctx.load(l4_sport).ok()?;
     let flow_key = encode_tcp_flow_key(
         ipv4_mapped_v6(src_ip),
         src_port,
@@ -479,7 +502,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // port is restored by the egress classifier before the packet re-enters
     // the Geneve tunnel (see RevFlowValue's doc comment). A no-op when this
     // flow wasn't remapped.
-    rewrite_l4_port(ctx, L4_SPORT, client_port, backend_src_port, proto)?;
+    rewrite_l4_port(ctx, L4_OFF, L4_SPORT, client_port, backend_src_port, proto)?;
 
     rewrite_ip_port(
         ctx,
@@ -611,23 +634,35 @@ pub fn uplink_egress_return(ctx: TcContext) -> i32 {
 }
 
 fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
-    if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
+    // See `try_uplink_ingress`'s matching comment: the uplink's L2 header
+    // length is resolved once by the loader, not assumed to be Ethernet's 14
+    // bytes.
+    let l2_hlen = CONFIG.get(0)?.uplink_l2_hlen as usize;
+    if l2_hlen == ETH_HLEN && ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
     }
-    if ctx.load::<u8>(IP_VER_IHL).ok()? & 0x0f != 5 {
+    let ver_ihl: u8 = ctx.load(l2_hlen).ok()?;
+    if ver_ihl >> 4 != 4 || ver_ihl & 0x0f != 5 {
         return Some(TC_ACT_OK);
     }
-    let proto: u8 = ctx.load(IP_PROTO).ok()?;
+    let ip_proto = l2_hlen + 9;
+    let ip_src = l2_hlen + 12;
+    let ip_dst = l2_hlen + 16;
+    let l4_off = l2_hlen + IP_HLEN;
+    let l4_sport = l4_off;
+    let l4_dport = l4_off + 2;
+
+    let proto: u8 = ctx.load(ip_proto).ok()?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
         return Some(TC_ACT_OK);
     }
 
     // This is the Pod's own raw reply: src=PodIP:TargetPort, dst=CLIENT_IP:SRC_PORT
     // (or Decision 3's remapped synthetic port -- see RevFlowValue's doc comment).
-    let pod_ip: u32 = ctx.load(IP_SRC).ok()?;
-    let target_port: u16 = ctx.load(L4_SPORT).ok()?;
-    let client_ip: u32 = ctx.load(IP_DST).ok()?;
-    let backend_dst_port: u16 = ctx.load(L4_DPORT).ok()?;
+    let pod_ip: u32 = ctx.load(ip_src).ok()?;
+    let target_port: u16 = ctx.load(l4_sport).ok()?;
+    let client_ip: u32 = ctx.load(ip_dst).ok()?;
+    let backend_dst_port: u16 = ctx.load(l4_dport).ok()?;
 
     let key = encode_tcp_flow_key(
         ipv4_mapped_v6(client_ip),
@@ -644,7 +679,8 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // backend-local remap. A no-op when this flow was never remapped.
     rewrite_l4_port(
         ctx,
-        L4_DPORT,
+        l4_off,
+        l4_dport,
         backend_dst_port,
         rev.original_client_port,
         proto,
@@ -734,9 +770,17 @@ fn rewrite_ip_port(
 /// involved, only the L4 one. Backs Decision 3's backend source-port remap
 /// (forward leg) and its un-remap (return leg); a no-op when
 /// `old_port == new_port`, so callers can invoke it unconditionally.
+///
+/// `l4_off` is the caller's own L4-header base offset, not the module's
+/// `L4_OFF` const: `try_uplink_egress_return`'s call site resolves it at
+/// runtime from `Config::uplink_l2_hlen` (an L3-only WireGuard uplink has no
+/// 14-byte Ethernet header to add), while `try_geneve_decap_forward`'s
+/// (always on `geneve0`, always Ethernet-framed) passes the compile-time
+/// `L4_OFF`.
 #[inline(always)]
 fn rewrite_l4_port(
     ctx: &TcContext,
+    l4_off: usize,
     port_off: usize,
     old_port: u16,
     new_port: u16,
@@ -745,12 +789,13 @@ fn rewrite_l4_port(
     if old_port == new_port {
         return Some(());
     }
+    let udp_csum_off = l4_off + 6;
     let l4_csum_off = if proto == IPPROTO_TCP {
-        TCP_CSUM
+        l4_off + 16
     } else {
-        UDP_CSUM
+        udp_csum_off
     };
-    if proto == IPPROTO_UDP && ctx.load::<u16>(UDP_CSUM).ok()? == 0 {
+    if proto == IPPROTO_UDP && ctx.load::<u16>(udp_csum_off).ok()? == 0 {
         ctx.store(port_off, &new_port, 0).ok()?;
         return Some(());
     }

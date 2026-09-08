@@ -204,6 +204,10 @@ unsafe impl Pod for VipBackend {}
 struct Config {
     geneve_ifindex: u32,
     uplink_ifindex: u32,
+    // Field order/types must mirror `servicelb-ebpf`'s `Config` exactly --
+    // this struct's bytes are written straight into the `CONFIG` map, and
+    // nothing else enforces the two definitions staying in sync.
+    uplink_l2_hlen: u32,
 }
 unsafe impl Pod for Config {}
 
@@ -283,13 +287,21 @@ fn main() -> anyhow::Result<()> {
 
 /// Resolves the Geneve device's ifindex (unknown until this host's `ip link`
 /// state is inspected, so it can't be a compile-time constant in the eBPF
-/// program) and writes it to the single-entry `CONFIG` map both redirecting
+/// program), the uplink's L2 header length (a WireGuard/tun uplink has no
+/// Ethernet header, unlike a real NIC/veth -- see `uplink_l2_header_len`'s
+/// doc comment), and writes both to the single-entry `CONFIG` map the
 /// classifiers read at runtime.
 fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str, uplink_iface: &str) -> anyhow::Result<()> {
     let geneve_ifindex = iface_index(geneve_iface)
         .with_context(|| format!("resolving ifindex for {geneve_iface}"))?;
     let uplink_ifindex = iface_index(uplink_iface)
         .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
+    let uplink_arphrd = iface_arphrd_type(uplink_iface)
+        .with_context(|| format!("resolving ARPHRD type for {uplink_iface}"))?;
+    let uplink_l2_hlen = u7s_servicelb_common::uplink_l2_header_len(uplink_arphrd);
+    eprintln!(
+        "uplink {uplink_iface}: ARPHRD type {uplink_arphrd}, L2 header skip {uplink_l2_hlen} byte(s)"
+    );
     let mut config: AyaArray<_, Config> = AyaArray::try_from(
         ebpf.map_mut("CONFIG")
             .ok_or_else(|| anyhow!("no map named `CONFIG` in the eBPF object"))?,
@@ -299,10 +311,23 @@ fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str, uplink_iface: &str) -> a
         Config {
             geneve_ifindex,
             uplink_ifindex,
+            uplink_l2_hlen,
         },
         0,
     )?;
     Ok(())
+}
+
+/// Reads the uplink's Linux ARPHRD_* hardware type from sysfs -- the no_std
+/// `servicelb-ebpf` classifiers have no syscall of their own to tell a real
+/// NIC/veth apart from an L3-only overlay like WireGuard, so the loader
+/// resolves it once here and feeds the result to `uplink_l2_header_len`.
+fn iface_arphrd_type(name: &str) -> anyhow::Result<u16> {
+    let path = format!("/sys/class/net/{name}/type");
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+    raw.trim()
+        .parse::<u16>()
+        .with_context(|| format!("parsing ARPHRD type from {path} (got {raw:?})"))
 }
 
 fn iface_index(name: &str) -> anyhow::Result<u32> {
