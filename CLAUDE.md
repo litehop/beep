@@ -53,18 +53,40 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+Requires a nightly toolchain with `rust-src` (pinned in `rust-toolchain.toml`)
+and `bpf-linker` on `PATH` (`cargo install bpf-linker` or an aya-rs prebuilt).
 
 ```bash
-# Example:
-# npm install
-# npm test
+cargo build --release        # build.rs cross-builds beep-ebpf and embeds it
+cargo test -p beep-common    # host unit/regression tests (run on any host)
+cd ebpf && cargo clippy --release --target bpfel-unknown-none -Z build-std=core
 ```
+
+The loader (`beep`) links Linux-only syscalls (`bpf(2)`, netlink) and only
+builds/runs on **Linux** — build and smoke-test it in CI or a Linux/Lima VM, not
+on macOS. `cargo test -p beep-common` is the only cargo step that runs on macOS.
+Load-and-round-trip smoke: `scripts/smoke.sh [--vm <lima-vm>]` locally; CI runs
+`scripts/smoke-remote.sh`.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+beep is an eBPF service load balancer (Geneve encap/decap, full-tuple conntrack)
+built on aya. Three crates:
+
+- **`beep`** (repo root, `src/main.rs`) — userspace loader: attaches the tc-bpf
+  classifiers, pins them under a bpffs dir, and populates VIP→backend maps.
+- **`beep-ebpf`** (`ebpf/`) — the `#![no_std]`, `bpfel-unknown-none` dataplane
+  program.
+- **`beep-common`** (`common/`) — shared `no_std` types (conntrack keys,
+  `Config`) depended on by both, so conntrack map key/value layouts are
+  byte-identical on each side of the kernel/user boundary.
+
+Design docs: `docs/design/ebpf-lb-dataplane.md` and the ADRs in `docs/decisions/`.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Any type shared between the loader and the eBPF program MUST live in
+  `beep-common` — never duplicated — to keep map layouts identical.
+- `beep-ebpf` is cross-built by `build.rs` (aya-build) and embedded into the
+  loader via `include_bytes_aligned!`; there is no separate build step for it.
+- Imported from the u7s monorepo (u7s@4f898a4d) with git history preserved.

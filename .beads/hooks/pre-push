@@ -22,3 +22,19 @@ if command -v bd >/dev/null 2>&1; then
   if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
 fi
 # --- END BEADS INTEGRATION v1.0.4 ---
+
+# beep: pre-push gate. The loader (beep) links Linux-only syscalls and only
+# builds on Linux, so its full clippy/build is left to CI; these steps are
+# host-agnostic and catch beep-common + eBPF-program regressions locally.
+if command -v cargo >/dev/null 2>&1; then
+  cargo clippy -p beep-common --tests -- -D warnings || exit 1
+  cargo test -p beep-common || exit 1
+  # beep-ebpf clippy needs nightly + rust-src + bpf-linker (cross-compiles to
+  # bpfel-unknown-none). Skip gracefully if bpf-linker isn't installed — CI
+  # (ebpf-build) is the backstop.
+  if command -v bpf-linker >/dev/null 2>&1; then
+    (cd ebpf && cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings) || exit 1
+  else
+    echo >&2 "beep: bpf-linker not found — skipping beep-ebpf clippy locally (CI covers it)."
+  fi
+fi

@@ -22,3 +22,12 @@ if command -v bd >/dev/null 2>&1; then
   if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
 fi
 # --- END BEADS INTEGRATION v1.0.4 ---
+
+# beep: formatting gate across the workspace (loader + ebpf + common). Fast
+# enough to run on every commit; the heavier clippy/test gate is in pre-push.
+if command -v cargo >/dev/null 2>&1; then
+  cargo fmt --check || {
+    echo >&2 "beep: 'cargo fmt --check' failed — run 'cargo fmt' and re-stage."
+    exit 1
+  }
+fi
