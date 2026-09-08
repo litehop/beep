@@ -177,6 +177,39 @@ pub fn return_authorization(in_main: bool, in_pending: bool) -> ReturnAuthorizat
     }
 }
 
+/// Uplink-egress return-path admission (`servicelb-ebpf`'s
+/// `try_uplink_egress_return`, hook 3): whether a packet leaving the node on
+/// the physical uplink is one of this node's own backend Pods replying to a
+/// client, checked BEFORE the ~37-byte REV_FLOW conntrack key is even built.
+/// This hook sees ALL uplink egress traffic, not just ServiceLB's, so most
+/// packets take the `NotBackendTraffic` branch and must never pay for a
+/// REV_FLOW lookup at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressReturnAdmission {
+    /// Source is not one of this node's backend Pods -- not ServiceLB's
+    /// traffic, pass through untouched.
+    NotBackendTraffic,
+    /// Source IS one of this node's backend Pods -- proceed to the
+    /// REV_FLOW lookup.
+    BackendTraffic,
+}
+
+/// `is_backend_pod`: `POD_TARGETS.get(src_ip)` membership on the packet's
+/// SOURCE ADDRESS ONLY -- deliberately not its port. `POD_TARGETS` is keyed
+/// on pod IP alone precisely so this stays true across a rolling update or a
+/// targetPort edit: a flow only ever earns a REV_FLOW entry because the
+/// forward path already found its pod in this same map, so admitting on
+/// membership alone can never drop a live flow whose target port has since
+/// changed -- comparing the port too would couple this gate to a value that
+/// can change out from under an established flow.
+pub fn egress_return_admission(is_backend_pod: bool) -> EgressReturnAdmission {
+    if is_backend_pod {
+        EgressReturnAdmission::BackendTraffic
+    } else {
+        EgressReturnAdmission::NotBackendTraffic
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -881,6 +914,60 @@ mod tests {
             "MAIN must contain exactly the one flow that was actually promoted via a real \
              return leg -- a flood of {} forward-only tuples must never have written MAIN",
             pending.len()
+        );
+    }
+
+    #[test]
+    fn egress_return_admission_passes_non_backend_traffic_without_a_conntrack_lookup() {
+        // uplink_egress_return sees ALL egress traffic leaving the node, not
+        // just ServiceLB's -- unrelated traffic must be recognizable from
+        // POD_TARGETS membership alone, before the caller ever builds the
+        // ~37-byte REV_FLOW key, or every unrelated packet leaving the node
+        // pays a needless conntrack lookup.
+        assert_eq!(
+            egress_return_admission(false),
+            EgressReturnAdmission::NotBackendTraffic,
+            "a packet not sourced from one of this node's backend Pods must short-circuit \
+             before REV_FLOW is ever probed"
+        );
+    }
+
+    #[test]
+    fn egress_return_admission_survives_a_targetport_change_mid_flow() {
+        // Models the rolling-update hazard this bead exists to avoid: if
+        // admission instead compared the packet's source port against the
+        // Pod's CURRENT target port, changing that port mid-flow would flip
+        // an already-established flow's own reply packets to
+        // "not ours" even though the Pod itself never moved. POD_TARGETS is
+        // keyed on pod IP alone, so simulate that by deriving `is_backend_pod`
+        // purely from IP membership while TARGET_PORTS' value for the same
+        // pod changes underneath it.
+        use std::collections::HashMap;
+
+        let pod_ip: u32 = 0x0a_f4_01_07; // 10.244.1.7
+        let mut pod_targets: HashMap<u32, ()> = HashMap::new();
+        pod_targets.insert(pod_ip, ());
+        let mut target_ports: HashMap<u32, u16> = HashMap::new();
+        target_ports.insert(pod_ip, 8080);
+
+        let before_rollout = egress_return_admission(pod_targets.contains_key(&pod_ip));
+        assert_eq!(before_rollout, EgressReturnAdmission::BackendTraffic);
+
+        // The rolling update: the Deployment's containerPort changes, so the
+        // loader rewrites TARGET_PORTS for this pod -- POD_TARGETS is left
+        // untouched because the Pod itself is still present on this node.
+        target_ports.insert(pod_ip, 9090);
+        assert_ne!(
+            target_ports[&pod_ip], 8080,
+            "test invariant: the targetPort must actually have changed"
+        );
+
+        let after_rollout = egress_return_admission(pod_targets.contains_key(&pod_ip));
+        assert_eq!(
+            after_rollout,
+            EgressReturnAdmission::BackendTraffic,
+            "changing the Pod's target port must not un-admit its in-flight reply traffic -- \
+             admission is keyed on IP membership only, never on port"
         );
     }
 }

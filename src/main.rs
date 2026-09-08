@@ -48,10 +48,11 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-const MAP_NAMES: [&str; 6] = [
+const MAP_NAMES: [&str; 7] = [
     "CONFIG",
     "VIP_MAP",
     "TARGET_PORTS",
+    "POD_TARGETS",
     "FWD_PENDING",
     "FWD_MAIN",
     "REV_FLOW",
@@ -395,6 +396,22 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()
         )?;
         for fixture in fixtures {
             target_ports.insert(fixture_key(fixture), wire_port(fixture.target_port), 0)?;
+        }
+    }
+
+    {
+        // Keyed on pod IP alone, unlike TARGET_PORTS above -- the egress-return
+        // gate this feeds (`u7s_servicelb_common::egress_return_admission`)
+        // checks only that a packet's source is one of this node's backend
+        // Pods, deliberately not which port it's replying from. Two fixtures
+        // sharing a pod IP (a multi-port Service) collapse to one entry here
+        // on purpose: membership doesn't need per-port granularity.
+        let mut pod_targets: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+            ebpf.map_mut("POD_TARGETS")
+                .ok_or_else(|| anyhow!("no map named `POD_TARGETS` in the eBPF object"))?,
+        )?;
+        for fixture in fixtures {
+            pod_targets.insert(wire_ip(fixture.pod_ip), 1u8, 0)?;
         }
     }
 

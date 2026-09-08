@@ -49,9 +49,9 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use u7s_servicelb_common::{
-    encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
-    resolve_backend_src_port, return_authorization, BackendPortDecision, ForwardAdmission,
-    ReturnAuthorization, TcpFlowKey,
+    egress_return_admission, encode_tcp_flow_key, forward_admission, ipv4_mapped_v6,
+    occupant_conflicts, resolve_backend_src_port, return_authorization, BackendPortDecision,
+    EgressReturnAdmission, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -137,6 +137,21 @@ static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
 /// <20 entries per `ebpf-lb-dataplane.md`'s sizing table.
 #[map]
 static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
+
+/// Backend-local: which pod IPs are this node's own ServiceLB backend Pods,
+/// keyed on pod IP alone -- deliberately NOT on target port, unlike
+/// `TARGET_PORTS` above. `try_uplink_egress_return` (hook 3) sees ALL
+/// uplink egress traffic, not just ServiceLB's, so it probes this cheap
+/// 4-byte-keyed membership table BEFORE building the ~37-byte REV_FLOW key,
+/// to reject unrelated traffic without ever touching the conntrack table.
+/// Membership-only is what makes this safe across a rolling update or a
+/// targetPort edit: a flow's REV_FLOW entry was written because the forward
+/// path found its pod here, so anything still live is admitted regardless of
+/// what its target port used to be (`u7s_servicelb_common::egress_return_admission`'s
+/// doc comment). Value is a bare existence marker, never read.
+/// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
+#[map]
+static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 
 /// Ingress-side forward-flow affinity, written at stamp time (step 2),
 /// rebuilt and checked at return-decap time (step 7) from the Geneve VIP
@@ -660,6 +675,17 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // This is the Pod's own raw reply: src=PodIP:TargetPort, dst=CLIENT_IP:SRC_PORT
     // (or Decision 3's remapped synthetic port -- see RevFlowValue's doc comment).
     let pod_ip: u32 = ctx.load(ip_src).ok()?;
+
+    // Reject before the remaining fields are even loaded, let alone the
+    // ~37-byte REV_FLOW key built: POD_TARGETS is a 4-byte-keyed, 32-entry
+    // map, far cheaper to probe than this hook's own conntrack table, and
+    // most packets crossing this hook (ALL uplink egress, not just
+    // ServiceLB's) take this branch.
+    let is_backend_pod = unsafe { POD_TARGETS.get(pod_ip) }.is_some();
+    if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
+        return Some(TC_ACT_OK);
+    }
+
     let target_port: u16 = ctx.load(l4_sport).ok()?;
     let client_ip: u32 = ctx.load(ip_dst).ok()?;
     let backend_dst_port: u16 = ctx.load(l4_dport).ok()?;
