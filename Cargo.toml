@@ -1,0 +1,33 @@
+[package]
+name = "beep"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# beep-ebpf is a no_std, bpfel-unknown-none crate that build.rs cross-builds
+# via aya-build and embeds into this loader binary. It and the shared
+# beep-common crate are workspace members here so beep-common can be a path
+# dependency of both the loader and the eBPF program, guaranteeing the
+# conntrack map types are byte-identical on each side of the kernel boundary.
+[workspace]
+members = ["ebpf", "common"]
+resolver = "2"
+
+[profile.release.package.beep-ebpf]
+debug = 2
+codegen-units = 1
+strip = false
+
+[dependencies]
+aya = { version = "0.14", default-features = false }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+beep-common = { path = "common" }
+
+[build-dependencies]
+aya-build = "0.2"
+
+[[bin]]
+name = "beep"
+path = "src/main.rs"

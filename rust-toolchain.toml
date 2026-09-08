@@ -1,0 +1,8 @@
+# The loader is built with stable, but the eBPF program is cross-built for
+# bpfel-unknown-none via `-Z build-std=core`, which needs nightly + rust-src.
+# aya-build (invoked from build.rs) shells out to this toolchain, so pinning it
+# here makes local + CI builds reproducible instead of depending on whatever
+# nightly happens to be installed.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "clippy", "rustfmt"]
