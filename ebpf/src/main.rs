@@ -45,12 +45,13 @@ use aya_ebpf::{
         bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use u7s_servicelb_common::{
-    encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
-    resolve_backend_src_port, return_authorization, BackendPortDecision, ForwardAdmission,
+    egress_return_admission, egress_return_outcome, encode_tcp_flow_key, forward_admission,
+    ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port, return_authorization,
+    BackendPortDecision, EgressReturnAdmission, EgressReturnOutcome, ForwardAdmission,
     ReturnAuthorization, TcpFlowKey,
 };
 
@@ -138,6 +139,21 @@ static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
 #[map]
 static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 
+/// Backend-local: which pod IPs are this node's own ServiceLB backend Pods,
+/// keyed on pod IP alone -- deliberately NOT on target port, unlike
+/// `TARGET_PORTS` above. `try_uplink_egress_return` (hook 3) sees ALL
+/// uplink egress traffic, not just ServiceLB's, so it probes this cheap
+/// 4-byte-keyed membership table BEFORE building the ~37-byte REV_FLOW key,
+/// to reject unrelated traffic without ever touching the conntrack table.
+/// Membership-only is what makes this safe across a rolling update or a
+/// targetPort edit: a flow's REV_FLOW entry was written because the forward
+/// path found its pod here, so anything still live is admitted regardless of
+/// what its target port used to be (`u7s_servicelb_common::egress_return_admission`'s
+/// doc comment). Value is a bare existence marker, never read.
+/// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
+#[map]
+static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
+
 /// Ingress-side forward-flow affinity, written at stamp time (step 2),
 /// rebuilt and checked at return-decap time (step 7) from the Geneve VIP
 /// echo plus the inner dst -- confirms the return is answering a flow this
@@ -221,6 +237,14 @@ pub struct RevFlowValue {
 
 #[map]
 static REV_FLOW: LruHashMap<TcpFlowKey, RevFlowValue> = LruHashMap::with_max_entries(8192, 0);
+
+/// Counts packets dropped by `try_uplink_egress_return` on a REV_FLOW miss
+/// for already-identified backend Pod traffic (`EgressReturnOutcome::Drop`)
+/// -- almost always an LRU eviction of `REV_FLOW`, observable from userspace
+/// via `bpftool map dump` without needing a kernel tracepoint. Single entry,
+/// per-CPU to avoid a shared-counter atomic on this hot path.
+#[map]
+static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Host-specific runtime config the loader fills in after attach (an
 /// ifindex isn't known until then). Single entry.
@@ -660,6 +684,17 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // This is the Pod's own raw reply: src=PodIP:TargetPort, dst=CLIENT_IP:SRC_PORT
     // (or Decision 3's remapped synthetic port -- see RevFlowValue's doc comment).
     let pod_ip: u32 = ctx.load(ip_src).ok()?;
+
+    // Reject before the remaining fields are even loaded, let alone the
+    // ~37-byte REV_FLOW key built: POD_TARGETS is a 4-byte-keyed, 32-entry
+    // map, far cheaper to probe than this hook's own conntrack table, and
+    // most packets crossing this hook (ALL uplink egress, not just
+    // ServiceLB's) take this branch.
+    let is_backend_pod = unsafe { POD_TARGETS.get(pod_ip) }.is_some();
+    if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
+        return Some(TC_ACT_OK);
+    }
+
     let target_port: u16 = ctx.load(l4_sport).ok()?;
     let client_ip: u32 = ctx.load(ip_dst).ok()?;
     let backend_dst_port: u16 = ctx.load(l4_dport).ok()?;
@@ -671,7 +706,20 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         target_port,
         proto,
     );
-    let rev = *unsafe { REV_FLOW.get(key) }?;
+    let rev_lookup = unsafe { REV_FLOW.get(key) };
+    if let EgressReturnOutcome::Drop = egress_return_outcome(rev_lookup.is_some()) {
+        // Positively identified backend Pod traffic with no live REV_FLOW
+        // entry (an LRU eviction, almost always) -- letting it through
+        // unencapsulated leaks a pod-CIDR source address onto the underlay
+        // while still stalling the connection, so drop instead. Consistent
+        // with the forward decap path's equivalent miss (`geneve_ingress`'s
+        // `unwrap_or(TC_ACT_SHOT)`).
+        if let Some(count) = EGRESS_DROPS.get_ptr_mut(0) {
+            unsafe { *count += 1 };
+        }
+        return Some(TC_ACT_SHOT);
+    }
+    let rev = *rev_lookup?;
 
     // Un-remap: restore the client's real port before this packet re-enters
     // the Geneve tunnel -- the ingress node's return-decap step rebuilds its
