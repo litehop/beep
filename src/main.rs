@@ -1,12 +1,12 @@
-//! Phase 2 ServiceLB eBPF dataplane loader: loads the three tc-bpf
-//! classifiers from `servicelb-ebpf` (`uplink_ingress`, `geneve_ingress`,
+//! Phase 2 beep eBPF dataplane loader: loads the three tc-bpf
+//! classifiers from `beep-ebpf` (`uplink_ingress`, `geneve_ingress`,
 //! `uplink_egress_return` -- Phase 1's separate `geneve_ingress_decap`/
 //! `geneve_ingress_return` merged into one, see that program's doc comment),
 //! attaches each at its hook point
-//! (`ai/extended-context/ebpf-lb-dataplane.md`), populates one or more static
+//! (`docs/design/ebpf-lb-dataplane.md`), populates one or more static
 //! VIP:PORT -> backend fixture entries this phase proves the mechanism
 //! against (repeatable so one Pod behind more than one Service port is
-//! expressible -- `servicelb-ebpf`'s `TARGET_PORTS` keys on the front tuple,
+//! expressible -- `beep-ebpf`'s `TARGET_PORTS` keys on the front tuple,
 //! not pod IP alone, precisely so this doesn't collide), and pins the
 //! resulting links AND maps under a bpffs directory so a loader restart
 //! re-adopts the existing attachment instead of leaving the interface
@@ -17,7 +17,7 @@
 //! eviction, or OOM kill. Real Service/EndpointSlice watching is Phase 5.
 //!
 //! `FWD_PENDING`/`FWD_MAIN` sizes are a load-time DaemonSet config knob, not
-//! a value baked into the eBPF object (`servicelb-ebpf`'s admission-control
+//! a value baked into the eBPF object (`beep-ebpf`'s admission-control
 //! doc comment) -- overridden here via `EbpfLoader::map_max_entries` before
 //! `load()`.
 
@@ -44,7 +44,7 @@ use clap::{Parser, ValueEnum};
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-// Every map `servicelb-ebpf` declares (`servicelb-ebpf/src/main.rs`'s
+// Every map `beep-ebpf` declares (`ebpf/src/main.rs`'s
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
@@ -59,7 +59,7 @@ const MAP_NAMES: [&str; 7] = [
 ];
 
 /// Defaults from the admission-control sizing derivation
-/// (`servicelb-ebpf`'s `FWD_PENDING`/`FWD_MAIN` doc comment): PENDING is the
+/// (`beep-ebpf`'s `FWD_PENDING`/`FWD_MAIN` doc comment): PENDING is the
 /// only flood-exposed tier, sized to peak concurrent half-open connections
 /// with headroom; MAIN is sized to peak legitimate established concurrency,
 /// a valid basis only because admission control keeps it unreachable by a
@@ -69,8 +69,8 @@ const DEFAULT_FWD_MAIN_MAX_ENTRIES: u32 = 8192;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "u7s-servicelb",
-    about = "Phase 2 ServiceLB eBPF loader: Geneve encap/decap, single-flow happy path"
+    name = "beep",
+    about = "Phase 2 beep eBPF loader: Geneve encap/decap, single-flow happy path"
 )]
 struct Args {
     /// Physical uplink interface (hooks: uplink ingress, uplink egress-return).
@@ -82,7 +82,7 @@ struct Args {
     geneve_iface: String,
 
     /// Directory on a bpffs mount where programs/links are pinned.
-    #[arg(long, default_value = "/sys/fs/bpf/servicelb")]
+    #[arg(long, default_value = "/sys/fs/bpf/beep")]
     pin_dir: PathBuf,
 
     /// One VIP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
@@ -96,7 +96,7 @@ struct Args {
     fixtures: Vec<Fixture>,
 
     /// `FWD_PENDING` max_entries -- the only flood-exposed conntrack tier
-    /// (admission control mints every new flow here; see `servicelb-ebpf`'s
+    /// (admission control mints every new flow here; see `beep-ebpf`'s
     /// `FWD_PENDING` doc comment). A load-time DaemonSet config knob, not a
     /// value baked into the eBPF object.
     #[arg(long, default_value_t = DEFAULT_FWD_PENDING_MAX_ENTRIES)]
@@ -167,7 +167,7 @@ fn parse_fixture(s: &str) -> Result<Fixture, String> {
 
 /// Converts a host-order value into the "raw wire token" representation the
 /// eBPF side compares packet bytes against verbatim (see
-/// `servicelb-ebpf/src/main.rs`'s module doc for why this conversion exists
+/// `ebpf/src/main.rs`'s module doc for why this conversion exists
 /// and why it's applied exactly once, here, at the map-population boundary).
 fn wire_ip(ip: Ipv4Addr) -> u32 {
     u32::from(ip).to_be()
@@ -177,7 +177,7 @@ fn wire_port(port: u16) -> u16 {
     port.to_be()
 }
 
-// Byte-layout-identical to servicelb-ebpf's types of the same name -- the
+// Byte-layout-identical to beep-ebpf's types of the same name -- the
 // eBPF side has no visibility into this crate (separate, no_std nested
 // workspace), so these are kept in sync by hand. A drift here corrupts map
 // lookups silently; the wire-value convention doc comment there is the
@@ -205,7 +205,7 @@ unsafe impl Pod for VipBackend {}
 struct Config {
     geneve_ifindex: u32,
     uplink_ifindex: u32,
-    // Field order/types must mirror `servicelb-ebpf`'s `Config` exactly --
+    // Field order/types must mirror `beep-ebpf`'s `Config` exactly --
     // this struct's bytes are written straight into the `CONFIG` map, and
     // nothing else enforces the two definitions staying in sync.
     uplink_l2_hlen: u32,
@@ -244,9 +244,9 @@ fn main() -> anyhow::Result<()> {
     let mut ebpf = loader
         .load(include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
-            "/servicelb-ebpf"
+            "/beep-ebpf"
         )))
-        .context("loading the servicelb-ebpf object")?;
+        .context("loading the beep-ebpf object")?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures).context("populating VIP_MAP/TARGET_PORTS fixture")?;
@@ -299,7 +299,7 @@ fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str, uplink_iface: &str) -> a
         .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
     let uplink_arphrd = iface_arphrd_type(uplink_iface)
         .with_context(|| format!("resolving ARPHRD type for {uplink_iface}"))?;
-    let uplink_l2_hlen = u7s_servicelb_common::uplink_l2_header_len(uplink_arphrd);
+    let uplink_l2_hlen = beep_common::uplink_l2_header_len(uplink_arphrd);
     eprintln!(
         "uplink {uplink_iface}: ARPHRD type {uplink_arphrd}, L2 header skip {uplink_l2_hlen} byte(s)"
     );
@@ -320,7 +320,7 @@ fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str, uplink_iface: &str) -> a
 }
 
 /// Reads the uplink's Linux ARPHRD_* hardware type from sysfs -- the no_std
-/// `servicelb-ebpf` classifiers have no syscall of their own to tell a real
+/// `beep-ebpf` classifiers have no syscall of their own to tell a real
 /// NIC/veth apart from an L3-only overlay like WireGuard, so the loader
 /// resolves it once here and feeds the result to `uplink_l2_header_len`.
 fn iface_arphrd_type(name: &str) -> anyhow::Result<u16> {
@@ -401,7 +401,7 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()
 
     {
         // Keyed on pod IP alone, unlike TARGET_PORTS above -- the egress-return
-        // gate this feeds (`u7s_servicelb_common::egress_return_admission`)
+        // gate this feeds (`beep_common::egress_return_admission`)
         // checks only that a packet's source is one of this node's backend
         // Pods, deliberately not which port it's replying from. Two fixtures
         // sharing a pod IP (a multi-port Service) collapse to one entry here
@@ -527,7 +527,7 @@ mod tests {
     use super::*;
 
     // Every checksum update and tunnel-key field the eBPF side touches
-    // requires the exact wire byte order (see servicelb-ebpf's module doc);
+    // requires the exact wire byte order (see beep-ebpf's module doc);
     // a regression here silently corrupts every packet this dataplane
     // touches rather than failing loudly, so the round-trip is pinned here.
     #[test]

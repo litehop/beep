@@ -151,6 +151,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "beep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aya",
+ "aya-build",
+ "beep-common",
+ "clap",
+ "libc",
+]
+
+[[package]]
+name = "beep-common"
+version = "0.1.0"
+
+[[package]]
+name = "beep-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+ "beep-common",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -498,30 +522,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
-]
-
-[[package]]
-name = "u7s-servicelb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aya",
- "aya-build",
- "clap",
- "libc",
- "u7s-servicelb-common",
-]
-
-[[package]]
-name = "u7s-servicelb-common"
-version = "0.1.0"
-
-[[package]]
-name = "u7s-servicelb-ebpf"
-version = "0.1.0"
-dependencies = [
- "aya-ebpf",
- "u7s-servicelb-common",
 ]
 
 [[package]]

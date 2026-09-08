@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VM-side half of scripts/servicelb/smoke.sh. Copied into the Lima VM and
+# VM-side half of scripts/smoke.sh. Copied into the Lima VM and
 # run there as root by smoke.sh -- not meant to be invoked directly by a
 # human. Builds a self-contained veth-pair + netns fixture so the whole
 # client->VIP->backend round trip happens on ONE VM (the original
@@ -7,7 +7,7 @@
 # client; a reproducible harness can't depend on a peer machine being
 # available). Owns geneve0 and the smoke-veth0/smoke-client fixture
 # exclusively for its duration -- do not run this alongside a real
-# servicelb deployment on the same VM.
+# beep deployment on the same VM.
 set -euo pipefail
 
 # RFC 5737 documentation ranges: deliberately disjoint from any real subnet
@@ -35,17 +35,17 @@ TARGET_PORT2="18081"
 VIP_PORT3="19102"
 TARGET_PORT3="18082"
 FLOOD_BACKEND_NODE_IP="203.0.113.250"
-PIN_DIR="/sys/fs/bpf/servicelb-smoke"
-BIN="/tmp/u7s-servicelb-smoke"
+PIN_DIR="/sys/fs/bpf/beep-smoke"
+BIN="/tmp/beep-smoke"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEMORY_SCRIPT="$SCRIPT_DIR/sample-ebpf-memory.sh"
-MEMORY_OUT_DIR="/tmp/servicelb-ebpf-memory"
-LOADER_LOG="/tmp/servicelb-smoke-loader.log"
-BACKEND_LOG="/tmp/servicelb-smoke-backend.log"
-BACKEND_LOG2="/tmp/servicelb-smoke-backend2.log"
-RESPONSE_FILE="/tmp/servicelb-smoke-response.http"
-RESPONSE_FILE2="/tmp/servicelb-smoke-response2.http"
-RPFILTER_SAVE_FILE="/tmp/servicelb-smoke-rpfilter-all.saved"
+MEMORY_OUT_DIR="/tmp/beep-ebpf-memory"
+LOADER_LOG="/tmp/beep-smoke-loader.log"
+BACKEND_LOG="/tmp/beep-smoke-backend.log"
+BACKEND_LOG2="/tmp/beep-smoke-backend2.log"
+RESPONSE_FILE="/tmp/beep-smoke-response.http"
+RESPONSE_FILE2="/tmp/beep-smoke-response2.http"
+RPFILTER_SAVE_FILE="/tmp/beep-smoke-rpfilter-all.saved"
 # Restart-preservation fixture: reuses the first VIP:PORT ->
 # backend pair above, held open across a loader restart instead of a plain
 # request/response, so the SECOND chunk's return leg depends on the
@@ -54,11 +54,11 @@ RPFILTER_SAVE_FILE="/tmp/servicelb-smoke-rpfilter-all.saved"
 # DaemonSet rollout/eviction/OOM kill must not silently drop.
 RESTART_CHUNK1="restart-preservation-chunk-1"
 RESTART_CHUNK2="restart-preservation-chunk-2"
-RESTART_FIFO="/tmp/servicelb-smoke-restart-fifo"
-RESTART_SIGNAL_FIFO="/tmp/servicelb-smoke-restart-signal"
-RESTART_BACKEND_LOG="/tmp/servicelb-smoke-restart-backend.log"
-RESTART_CLIENT_OUT="/tmp/servicelb-smoke-restart-client.out"
-RESTART_LOADER_LOG="/tmp/servicelb-smoke-loader-restart.log"
+RESTART_FIFO="/tmp/beep-smoke-restart-fifo"
+RESTART_SIGNAL_FIFO="/tmp/beep-smoke-restart-signal"
+RESTART_BACKEND_LOG="/tmp/beep-smoke-restart-backend.log"
+RESTART_CLIENT_OUT="/tmp/beep-smoke-restart-client.out"
+RESTART_LOADER_LOG="/tmp/beep-smoke-loader-restart.log"
 
 cmd="${1:-}"
 
@@ -202,7 +202,7 @@ wait_for_attach() {
   }
 }
 
-echo "==> loading servicelb-ebpf -- this is the verifier-accept gate"
+echo "==> loading beep-ebpf -- this is the verifier-accept gate"
 # Two --fixture entries sharing one Pod IP but different VIP/target ports:
 # the multi-port-Service scenario TARGET_PORTS' front-tuple keying exists
 # to disambiguate.

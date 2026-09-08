@@ -3,12 +3,12 @@
 
 //! Phase 2 (Geneve encap/decap on the symmetric-return path) plus Phase 3
 //! (conntrack full-tuple keying + backend source-port remap on conflict) of
-//! the ServiceLB eBPF dataplane
-//! (`ai/extended-context/ebpf-lb-dataplane.md`'s "Packet flow" and
+//! the beep eBPF dataplane
+//! (`docs/design/ebpf-lb-dataplane.md`'s "Packet flow" and
 //! "Conntrack & affinity" sections, `docs/decisions/servicelb-symmetric-geneve-return.md`).
 //! IPv4 only, one static VIP:PORT -> backend-node/PodIP:TargetPort mapping
 //! populated by the userspace loader at startup -- real Service/EndpointSlice
-//! watching is Phase 5. Flow-affinity keys are IPv6-primary (`u7s_servicelb_common`)
+//! watching is Phase 5. Flow-affinity keys are IPv6-primary (`beep_common`)
 //! so the same map shape covers real IPv6 flows once packet parsing grows
 //! that far; today's IPv4-only parsing embeds each address as IPv4-mapped
 //! IPv6 before keying.
@@ -33,7 +33,7 @@
 //! byte-reversed on the wire (192.168.109.3 encoded as a wire token, put
 //! straight into `remote_ipv4`, arrived as outer dst `3.109.168.192`). It
 //! must be supplied in plain host-native order -- see
-//! `crates/servicelb/src/main.rs`'s `populate_fixture` for where that
+//! `src/main.rs`'s `populate_fixture` for where that
 //! conversion happens at the map-population boundary. `tunnel_id` (VNI)
 //! also takes plain host order (the kernel applies `cpu_to_be64`
 //! internally), consistent with `remote_ipv4` here.
@@ -48,7 +48,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
-use u7s_servicelb_common::{
+use beep_common::{
     egress_return_admission, egress_return_outcome, encode_tcp_flow_key, forward_admission,
     ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port, return_authorization,
     BackendPortDecision, EgressReturnAdmission, EgressReturnOutcome, ForwardAdmission,
@@ -139,16 +139,16 @@ static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
 #[map]
 static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 
-/// Backend-local: which pod IPs are this node's own ServiceLB backend Pods,
+/// Backend-local: which pod IPs are this node's own beep backend Pods,
 /// keyed on pod IP alone -- deliberately NOT on target port, unlike
 /// `TARGET_PORTS` above. `try_uplink_egress_return` (hook 3) sees ALL
-/// uplink egress traffic, not just ServiceLB's, so it probes this cheap
+/// uplink egress traffic, not just beep's, so it probes this cheap
 /// 4-byte-keyed membership table BEFORE building the ~37-byte REV_FLOW key,
 /// to reject unrelated traffic without ever touching the conntrack table.
 /// Membership-only is what makes this safe across a rolling update or a
 /// targetPort edit: a flow's REV_FLOW entry was written because the forward
 /// path found its pod here, so anything still live is admitted regardless of
-/// what its target port used to be (`u7s_servicelb_common::egress_return_admission`'s
+/// what its target port used to be (`beep_common::egress_return_admission`'s
 /// doc comment). Value is a bare existence marker, never read.
 /// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
 #[map]
@@ -177,7 +177,7 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 ///
 /// `max_entries` below are load-time DEFAULTS, not the enforced ceiling: the
 /// userspace loader overrides both via `EbpfLoader::map_max_entries`
-/// (`crates/servicelb/src/main.rs`'s `--fwd-pending-max-entries`/
+/// (`src/main.rs`'s `--fwd-pending-max-entries`/
 /// `--fwd-main-max-entries`), so sizing is a DaemonSet config knob, not a
 /// value baked into this object.
 ///
@@ -187,7 +187,7 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 /// carries the shape aie31.21 needs -- no map-shape change once
 /// affinity-follow lands. This bead only existence-checks it.
 ///
-/// Key type: `u7s_servicelb_common::TcpFlowKey`, a flat 37-byte array, not a
+/// Key type: `beep_common::TcpFlowKey`, a flat 37-byte array, not a
 /// `#[repr(C)]` struct -- `BPF_MAP_TYPE_*_HASH` compares/hashes a key's raw
 /// bytes including any compiler-inserted alignment padding, and a struct's
 /// padding gap is left as whatever garbage was already on the call site's
@@ -253,7 +253,7 @@ static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 pub struct Config {
     pub geneve_ifindex: u32,
     pub uplink_ifindex: u32,
-    /// `u7s_servicelb_common::uplink_l2_header_len`'s result for the uplink
+    /// `beep_common::uplink_l2_header_len`'s result for the uplink
     /// iface -- 14 for a real Ethernet-framed NIC/veth, 0 for an L3-only
     /// uplink (WireGuard or any other tun-style device with no L2 header).
     /// `geneve0` is unaffected: it's always a real (Ethernet-framed) netdev
@@ -268,7 +268,7 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 /// Hook 1: ingress classifier on the physical uplink, every node (forward
 /// leg). Classifies VIP:PORT traffic, stamps Geneve metadata, redirects to
 /// `geneve0`. Everything else passes through untouched -- this hook sees
-/// all uplink traffic, not just ServiceLB's.
+/// all uplink traffic, not just beep's.
 #[classifier]
 pub fn uplink_ingress(ctx: TcContext) -> i32 {
     try_uplink_ingress(&ctx).unwrap_or(TC_ACT_OK)
@@ -650,8 +650,8 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
 
 /// Hook 3: egress classifier on the physical uplink, backend node (return
 /// leg). Every non-matching packet -- i.e. everything that isn't a
-/// ServiceLB backend Pod's reply -- passes through untouched; this hook
-/// sees all uplink egress traffic, not just ServiceLB's.
+/// beep backend Pod's reply -- passes through untouched; this hook
+/// sees all uplink egress traffic, not just beep's.
 #[classifier]
 pub fn uplink_egress_return(ctx: TcContext) -> i32 {
     try_uplink_egress_return(&ctx).unwrap_or(TC_ACT_OK)
@@ -689,7 +689,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // ~37-byte REV_FLOW key built: POD_TARGETS is a 4-byte-keyed, 32-entry
     // map, far cheaper to probe than this hook's own conntrack table, and
     // most packets crossing this hook (ALL uplink egress, not just
-    // ServiceLB's) take this branch.
+    // beep's) take this branch.
     let is_backend_pod = unsafe { POD_TARGETS.get(pod_ip) }.is_some();
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);

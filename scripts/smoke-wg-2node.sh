@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Tier-1 eBPF ServiceLB cross-node harness: 2 real Lima VMs linked by a real
+# Tier-1 eBPF beep cross-node harness: 2 real Lima VMs linked by a real
 # WireGuard tunnel, standing in for the operator's fleet's WireGuard/
-# Tailscale mesh (`ai/extended-context/ebpf-lb-dataplane.md`'s "Must work
+# Tailscale mesh (`docs/design/ebpf-lb-dataplane.md`'s "Must work
 # across four underlay scenarios ... WireGuard/Tailscale mesh"). Unlike
-# scripts/servicelb/smoke.sh (one VM, a local veth pair standing in for a
+# scripts/smoke.sh (one VM, a local veth pair standing in for a
 # client), this drives Geneve encap/decap across TWO real kernels connected
-# by a real wg0 uplink -- the scenario servicelb-ebpf's L2-header-skip fix
-# (`u7s_servicelb_common::uplink_l2_header_len`) targets.
+# by a real wg0 uplink -- the scenario beep-ebpf's L2-header-skip fix
+# (`beep_common::uplink_l2_header_len`) targets.
 #
 # CURRENT STATUS (as of this rig's introduction): the WireGuard tunnel comes
 # up correctly and the L2-header-skip fix correctly parses a real L3
@@ -24,7 +24,7 @@
 # documented, non-zero "ROUND-TRIP: FAIL (known blocker)" rather than a
 # false pass; every step before that is a genuine, asserted PASS.
 #
-# Usage: scripts/servicelb/smoke-wg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
+# Usage: scripts/smoke-wg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
 # Defaults match this rig's assigned VMs: lima-node-2 (ingress, owns the VIP)
 # and lima-node-4 (backend Pod + the "client" -- see remote script header on
 # why a 2-node rig's client is the backend node's own root netns).
@@ -50,10 +50,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SERVICELB_DIR="$REPO_ROOT/crates/servicelb"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BEEP_DIR="$REPO_ROOT"
 REMOTE_SCRIPT="$SCRIPT_DIR/smoke-wg-2node-remote.sh"
-BIN_NAME="u7s-servicelb-wg2node"
+BIN_NAME="beep-wg2node"
 
 # RFC 5737 documentation ranges + a 10.99.0.0/24 tunnel subnet deliberately
 # disjoint from either VM's real eth0/cni0 ranges.
@@ -117,9 +117,9 @@ for vm in "$VM_A" "$VM_B"; do
   limactl shell "$vm" -- bash -c 'command -v wg >/dev/null || sudo apt-get install -y wireguard-tools' >/dev/null
 done
 
-echo "==> [2/6] cross-building servicelb-ebpf + u7s-servicelb (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
-( cd "$SERVICELB_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
-BIN="$SERVICELB_DIR/target/aarch64-unknown-linux-gnu/release/u7s-servicelb"
+echo "==> [2/6] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
+( cd "$BEEP_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
+BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
 [ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
 
 for vm in "$VM_A" "$VM_B"; do
@@ -156,7 +156,7 @@ echo "==> [4/6] creating geneve0 on both nodes"
 remote "$VM_A" setup-geneve
 remote "$VM_B" setup-geneve
 
-echo "==> [5/6] loading servicelb-ebpf on both nodes (uplink=wg0) -- this is the verifier-accept gate on a real L3 WireGuard uplink"
+echo "==> [5/6] loading beep-ebpf on both nodes (uplink=wg0) -- this is the verifier-accept gate on a real L3 WireGuard uplink"
 FIXTURE="${WG_SUBNET_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 remote "$VM_A" start-loader --fixture "$FIXTURE"
 remote "$VM_B" start-loader --fixture "$FIXTURE"

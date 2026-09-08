@@ -1,19 +1,19 @@
 [package]
-name = "u7s-servicelb"
+name = "beep"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
-# servicelb-ebpf is a no_std, bpfel-unknown-none crate that cannot compile as
-# part of the outer u7s workspace (see the root Cargo.toml's `exclude`).
-# Cargo workspace members must be hierarchical, so it nests here instead of
-# living alongside this crate; build.rs invokes aya-build to cross-build it
-# and embed the resulting object.
+# beep-ebpf is a no_std, bpfel-unknown-none crate that build.rs cross-builds
+# via aya-build and embeds into this loader binary. It and the shared
+# beep-common crate are workspace members here so beep-common can be a path
+# dependency of both the loader and the eBPF program, guaranteeing the
+# conntrack map types are byte-identical on each side of the kernel boundary.
 [workspace]
-members = ["servicelb-ebpf", "servicelb-common"]
+members = ["ebpf", "common"]
 resolver = "2"
 
-[profile.release.package.u7s-servicelb-ebpf]
+[profile.release.package.beep-ebpf]
 debug = 2
 codegen-units = 1
 strip = false
@@ -23,11 +23,11 @@ aya = { version = "0.14", default-features = false }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-u7s-servicelb-common = { path = "servicelb-common" }
+beep-common = { path = "common" }
 
 [build-dependencies]
 aya-build = "0.2"
 
 [[bin]]
-name = "u7s-servicelb"
+name = "beep"
 path = "src/main.rs"

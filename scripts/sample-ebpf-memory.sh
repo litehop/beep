@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# eBPF map-memory + servicelb loader-RSS sampler.
+# eBPF map-memory + beep loader-RSS sampler.
 #
 # Standalone: unlike scripts/conformance/sample-run-metrics.sh, this has no
 # dependency on a run-all.sh workdir/kubeconfig/VM convention -- only a
 # bpffs pin-dir and (optionally) a loader binary name. That's deliberate:
-# u7s-servicelb runs today inside the Tier-1 smoke fixture
-# (scripts/servicelb/smoke-remote.sh, its own disjoint VM/CI job with no
+# beep runs today inside the Tier-1 smoke fixture
+# (scripts/smoke-remote.sh, its own disjoint VM/CI job with no
 # apiserver/kubelet involved) and, per Phase-4 gate-2, as a standalone
 # loader against a real fleet node -- never colocated with a run-all.sh
 # conformance session. This script must run unmodified in all three places.
 #
 # Map discovery walks the pinned tc-bpf programs under --pin-dir
-# (<pin-dir>/*-prog, as attach_and_pin in crates/servicelb/src/main.rs
+# (<pin-dir>/*-prog, as attach_and_pin in src/main.rs
 # names them) via `bpftool prog show pinned <path> --json`, unions their
 # `map_ids` (map ids are per-boot -- never hardcode one), and reads each
 # map's name/type/max_entries/bytes_memlock via `bpftool map show id <id>
-# --json`. This walks only the maps the servicelb programs actually
+# --json`. This walks only the maps the beep programs actually
 # reference, not the host's full (and much noisier) `bpftool map show`.
 #
 # Two CSV outputs, header written once, appended thereafter:
@@ -58,8 +58,8 @@ case "$SUBCOMMAND" in
 esac
 
 PIN_DIR=""
-LOADER_BIN_NAME="u7s-servicelb"
-OUT_DIR="$PWD/servicelb-ebpf-memory"
+LOADER_BIN_NAME="beep"
+OUT_DIR="$PWD/beep-ebpf-memory"
 INTERVAL=30
 
 while [[ $# -gt 0 ]]; do

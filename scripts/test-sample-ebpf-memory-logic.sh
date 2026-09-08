@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Unit test for scripts/servicelb/sample-ebpf-memory.sh (+ its CI sibling
-# scripts/servicelb/assert-ebpf-map-memory.sh).
+# Unit test for scripts/sample-ebpf-memory.sh (+ its CI sibling
+# scripts/assert-ebpf-map-memory.sh).
 #
 # Exercises the REAL scripts as subprocesses, mirroring
 # scripts/conformance/test-sample-run-metrics-logic.sh's own approach for the
@@ -39,9 +39,9 @@
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-SCRIPT="$REPO/scripts/servicelb/sample-ebpf-memory.sh"
-ASSERT_SCRIPT="$REPO/scripts/servicelb/assert-ebpf-map-memory.sh"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT="$REPO/scripts/sample-ebpf-memory.sh"
+ASSERT_SCRIPT="$REPO/scripts/assert-ebpf-map-memory.sh"
 
 PASS=0
 FAIL=0

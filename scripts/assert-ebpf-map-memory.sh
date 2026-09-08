@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# CI assertion for scripts/servicelb/sample-ebpf-memory.sh's
+# CI assertion for scripts/sample-ebpf-memory.sh's
 # ebpf-map-memory.csv. Its own script (not inlined in
-# .github/workflows/test.yaml) so scripts/servicelb/test-sample-ebpf-memory-logic.sh
+# .github/workflows/test.yaml) so scripts/test-sample-ebpf-memory-logic.sh
 # can exercise the REAL assertion logic against constructed CSVs instead of a
 # copied-out fragment that could silently drift from what CI actually runs.
 #
@@ -15,7 +15,7 @@
 # ambiguity a fresh single-tick file avoids by construction rather than by
 # parsing around it.
 #
-# Asserts the discovered map set is EXACTLY the 8 known servicelb maps, not
+# Asserts the discovered map set is EXACTLY the 8 known beep maps, not
 # just a byte-count ceiling: a partial-discovery regression (e.g. only 7 of 8
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
@@ -47,7 +47,7 @@ expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
   exit 1
 }
 [ "$actual_sorted" = "$expected_sorted" ] || {
-  echo "FAIL: discovered map names don't match the known servicelb map set" >&2
+  echo "FAIL: discovered map names don't match the known beep map set" >&2
   echo "  expected: ${expected[*]}" >&2
   echo "  actual:   ${names[*]}" >&2
   exit 1
@@ -56,4 +56,4 @@ expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
 limit=$((4 * 1024 * 1024))
 [ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 4 MiB gross-regression ceiling" >&2; exit 1; }
 
-echo "PASS: exactly ${#expected[@]} known servicelb maps discovered, total bytes_memlock=$total is within the gross-regression ceiling"
+echo "PASS: exactly ${#expected[@]} known beep maps discovered, total bytes_memlock=$total is within the gross-regression ceiling"

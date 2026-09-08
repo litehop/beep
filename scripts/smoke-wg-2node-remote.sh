@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# VM-side half of scripts/servicelb/smoke-wg-2node.sh. Copied into each Lima
+# VM-side half of scripts/smoke-wg-2node.sh. Copied into each Lima
 # VM and run there as root by the host driver -- not meant to be invoked
 # directly by a human. One copy of this script runs on BOTH nodes; which
 # steps actually apply to a given node is decided by which subcommand the
 # host driver calls, not by a baked-in role.
 #
 # Requires wireguard-tools (`apt-get install wireguard-tools`) and bpftool
-# (already present on the assigned Lima images from prior servicelb work).
+# (already present on the assigned Lima images from prior beep work).
 set -euo pipefail
 
 WG_IFACE="wg0"
 GENEVE_IFACE="geneve0"
-PIN_DIR="/sys/fs/bpf/servicelb-wg2node"
-BIN="/tmp/u7s-servicelb-wg2node"
-LOADER_LOG="/tmp/servicelb-wg2node-loader.log"
-RPFILTER_SAVE_FILE="/tmp/servicelb-wg2node-rpfilter-all.saved"
+PIN_DIR="/sys/fs/bpf/beep-wg2node"
+BIN="/tmp/beep-wg2node"
+LOADER_LOG="/tmp/beep-wg2node-loader.log"
+RPFILTER_SAVE_FILE="/tmp/beep-wg2node-rpfilter-all.saved"
 # Canonical's wg AppArmor profile (`/etc/apparmor.d/wg`, confirmed present on
 # the Ubuntu Lima image this rig targets) grants `/usr/bin/wg` file rw ONLY
 # under `/etc/wireguard/**` -- no `dac_override`/`dac_read_search`

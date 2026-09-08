@@ -1,11 +1,11 @@
 //! Pure-Rust conntrack key encode/decode + backend source-port remap logic
-//! for the ServiceLB eBPF dataplane, extracted out of `servicelb-ebpf` so it
+//! for the beep eBPF dataplane, extracted out of `beep-ebpf` so it
 //! is unit-testable outside a kernel (a conntrack keying bug is not
-//! verifiable by inspection alone). Shared by `servicelb-ebpf` as a no_std
+//! verifiable by inspection alone). Shared by `beep-ebpf` as a no_std
 //! dependency; `cargo test` here runs natively with `std`'s test harness
 //! (see `Cargo.toml`).
 //!
-//! Design settled in `ai/extended-context/ebpf-lb-dataplane.md`'s "Conntrack
+//! Design settled in `docs/design/ebpf-lb-dataplane.md`'s "Conntrack
 //! & affinity" section and its "Settled wire-format decisions".
 #![cfg_attr(not(test), no_std)]
 
@@ -14,13 +14,13 @@
 /// hashes/compares a `BPF_MAP_TYPE_*_HASH` key's raw bytes, and a padded
 /// struct leaves compiler-inserted alignment gaps as uninitialized garbage
 /// that differs between independent call sites even when every named field
-/// matches (the exact bug `servicelb-ebpf`'s old `FlowKey` hit on a live
+/// matches (the exact bug `beep-ebpf`'s old `FlowKey` hit on a live
 /// kernel). A byte array has no such gap by construction.
 pub const TCP_FLOW_KEY_LEN: usize = 37;
 pub type TcpFlowKey = [u8; TCP_FLOW_KEY_LEN];
 
 /// Embeds an IPv4 address (already in the wire-token representation --
-/// exact bytes as read off the packet, see `servicelb-ebpf`'s module doc)
+/// exact bytes as read off the packet, see `beep-ebpf`'s module doc)
 /// as an IPv4-mapped IPv6 address (RFC 4291 SS2.5.5.2: `::ffff:a.b.c.d`),
 /// so one 37-byte key shape covers both address families -- IPv4 flows and
 /// real IPv6 flows never collide, since a genuine IPv6 address can't carry
@@ -101,11 +101,11 @@ pub fn decode_quic_dcid_key(key: &QuicDcidKey) -> [u8; QUIC_DCID_KEY_LEN] {
 }
 
 /// Linux ARPHRD_* value (`uapi/linux/if_arp.h`) for a real Ethernet-framed
-/// device -- the only uplink type `servicelb-ebpf`'s uplink hooks treat as
+/// device -- the only uplink type `beep-ebpf`'s uplink hooks treat as
 /// carrying a 14-byte L2 header.
 pub const ARPHRD_ETHER: u16 = 1;
 
-/// How many L2 header bytes `servicelb-ebpf`'s uplink hooks (`try_uplink_ingress`,
+/// How many L2 header bytes `beep-ebpf`'s uplink hooks (`try_uplink_ingress`,
 /// `try_uplink_egress_return`) must skip before the IPv4 header starts, given
 /// the uplink interface's ARPHRD type -- resolved once by the userspace
 /// loader at load time (the no_std eBPF program has no syscall to query this
@@ -124,7 +124,7 @@ pub fn uplink_l2_header_len(arphrd_type: u16) -> u32 {
     }
 }
 
-/// Flow-table admission: forward-path decision (`servicelb-ebpf`'s
+/// Flow-table admission: forward-path decision (`beep-ebpf`'s
 /// `try_uplink_ingress`, `docs/decisions/servicelb-flow-admission-affinity.md`).
 /// A new flow is minted ONLY into the small, flood-exposed PENDING tier --
 /// this enum has no variant that writes MAIN, so an off-path flood of
@@ -149,7 +149,7 @@ pub fn forward_admission(in_main: bool) -> ForwardAdmission {
     }
 }
 
-/// Flow-table admission: return-path decision (`servicelb-ebpf`'s
+/// Flow-table admission: return-path decision (`beep-ebpf`'s
 /// `try_geneve_decap_return`, step 7). A MAIN hit is already-established and
 /// authorized outright. A PENDING hit is this flow's FIRST observed return
 /// leg -- proof of bidirectionality that an off-path spoofer cannot produce
@@ -177,16 +177,16 @@ pub fn return_authorization(in_main: bool, in_pending: bool) -> ReturnAuthorizat
     }
 }
 
-/// Uplink-egress return-path admission (`servicelb-ebpf`'s
+/// Uplink-egress return-path admission (`beep-ebpf`'s
 /// `try_uplink_egress_return`, hook 3): whether a packet leaving the node on
 /// the physical uplink is one of this node's own backend Pods replying to a
 /// client, checked BEFORE the ~37-byte REV_FLOW conntrack key is even built.
-/// This hook sees ALL uplink egress traffic, not just ServiceLB's, so most
+/// This hook sees ALL uplink egress traffic, not just beep's, so most
 /// packets take the `NotBackendTraffic` branch and must never pay for a
 /// REV_FLOW lookup at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressReturnAdmission {
-    /// Source is not one of this node's backend Pods -- not ServiceLB's
+    /// Source is not one of this node's backend Pods -- not beep's
     /// traffic, pass through untouched.
     NotBackendTraffic,
     /// Source IS one of this node's backend Pods -- proceed to the
@@ -295,7 +295,7 @@ pub const PROBE_LIMIT: u16 = 16;
 /// `is_reverse_key_taken`: probes REV_FLOW -- the actual source of
 /// occupancy truth -- for whether a candidate synthetic port's resulting
 /// reverse key is already held by some OTHER flow. Injectable so this
-/// stays pure and unit-testable outside a kernel: `servicelb-ebpf` passes
+/// stays pure and unit-testable outside a kernel: `beep-ebpf` passes
 /// a closure that performs the real map lookup; tests pass a closure over
 /// a plain `HashSet`.
 pub fn resolve_backend_src_port(
@@ -366,7 +366,7 @@ fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
 mod tests {
     use super::*;
 
-    // `servicelb-ebpf` used to hard-code a 14-byte Ethernet skip for every
+    // `beep-ebpf` used to hard-code a 14-byte Ethernet skip for every
     // uplink, so a WireGuard (L3-only, no L2 header) uplink silently
     // no-op'd on every packet instead of erroring -- the offset math read
     // into the middle of the real IP header and the EtherType check never
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn ethernet_uplink_keeps_the_14_byte_l2_skip() {
         // The existing, already-working single-node veth smoke harness
-        // (scripts/servicelb/smoke.sh) depends on this staying 14 -- a
+        // (scripts/smoke.sh) depends on this staying 14 -- a
         // regression here breaks the L2 path this fix must not touch, not
         // just the new WireGuard one.
         assert_eq!(uplink_l2_header_len(ARPHRD_ETHER), 14);
@@ -894,7 +894,7 @@ mod tests {
         // source ports must not be able to touch -- let alone evict -- an
         // already-established flow sitting in MAIN. Simulates both tiers as
         // plain sets and drives the two pure decision functions exactly as
-        // `servicelb-ebpf` would, without a kernel.
+        // `beep-ebpf` would, without a kernel.
         use std::collections::HashSet;
 
         let mut main: HashSet<u32> = HashSet::new();
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn egress_return_admission_passes_non_backend_traffic_without_a_conntrack_lookup() {
         // uplink_egress_return sees ALL egress traffic leaving the node, not
-        // just ServiceLB's -- unrelated traffic must be recognizable from
+        // just beep's -- unrelated traffic must be recognizable from
         // POD_TARGETS membership alone, before the caller ever builds the
         // ~37-byte REV_FLOW key, or every unrelated packet leaving the node
         // pays a needless conntrack lookup.
@@ -995,7 +995,7 @@ mod tests {
         // The two-stage split this bead relies on: admission (source
         // membership) gates whether `egress_return_outcome` is ever
         // consulted at all. Unrelated egress traffic (this hook sees ALL of
-        // it, not just ServiceLB's) must keep passing untouched -- only a
+        // it, not just beep's) must keep passing untouched -- only a
         // packet already positively identified as a backend Pod's reply
         // reaches the new drop-on-miss behavior.
         assert_eq!(
