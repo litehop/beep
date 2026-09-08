@@ -2,6 +2,103 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Rules
+
+Bias: caution over speed on non-trivial work. Use judgment on trivial tasks.
+
+### Rule 1 — State Success Before You Start
+Before any tool call: write one sentence naming the done-when criterion.
+If you cannot state it, ask — do not start. If mid-task you lose track of
+what "done" looks like, stop and restate it before continuing.
+
+### Rule 2 — Simplicity First
+For every piece of code you are about to write, ask: would removing this
+leave the test passing and the feature working? If yes, remove it. No
+speculative features. No abstractions for single-use code. No fallbacks for
+scenarios that cannot happen.
+
+### Rule 3 — Surgical Changes
+Gate: does this file path appear in the task description, the failing test
+output, or the diff you were asked to produce? If not, do not touch it.
+Clean up only your own mess. Match existing style without comment.
+
+### Rule 4 — Goal-Driven Execution
+Define done-when criteria before the first tool call. At each checkpoint,
+compare actual state to those criteria — not to a checklist of steps. If
+the steps are done but the criteria aren't met, keep going. If the criteria
+are met before the steps are done, stop.
+
+### Rule 5 — Use the Model Only for Judgment Calls
+Use for: classification, drafting, summarization, extraction.
+Not for: routing, retries, regex, JSON parsing, deterministic transforms.
+If code can answer, code answers.
+
+### Rule 6 — Surface Budget Pressure
+If a single task is burning more than ~20,000 tokens without a clear
+checkpoint, stop and summarize what's done, what's verified, and what
+remains. Overruns happen; silent overruns without a handoff are the problem.
+
+### Rule 7 — Surface Conflicts, Don't Average Them
+If two patterns contradict, pick the more recent or more tested one, explain
+the choice in one line, and flag the other for cleanup. Never blend
+conflicting patterns into a third thing neither was.
+
+### Rule 8 — Read Before You Write
+Before adding code, read exports, immediate callers, and shared utilities.
+"Looks orthogonal" is not safe. If you do not know why something is
+structured a certain way, ask before changing it.
+
+### Rule 9 — Tests Verify Intent, Not Just Behavior
+A test that cannot fail when business logic breaks is wrong. Test names and
+assertion messages must state WHY the behaviour matters (what breaks for a
+user if it regresses), not just WHAT the code does.
+
+### Rule 10 — Checkpoint After Every Significant Step
+After each meaningful unit of work: one sentence on what changed, one
+sentence on what's verified, one sentence on what's next. If you find
+yourself in step 4 without having done this at step 2, stop and do it now.
+
+### Rule 11 — Match the Codebase's Conventions
+Conformance over taste. If you genuinely believe a convention is harmful,
+surface it with a concrete example — then follow it while you wait for a
+decision. Do not silently fork.
+
+### Rule 12 — Fail Loud
+"Completed" means done AND verified. "Tests pass" means all tests ran, none
+were skipped. If anything was skipped or assumed, say so explicitly. Default
+to surfacing uncertainty rather than papering over it.
+
+### Rule 13 — Prefer Native Tooling
+Use Bash and Rust over Python. Do not introduce Python scripts or Python
+dependencies. For file I/O: Read over cat/head/tail; Edit over sed/awk;
+Write over echo>/heredoc; Grep over shell grep/find. Bash is for runtime
+commands only: git, cargo, gh, kubectl, bd.
+
+### Rule 14 — Every Bug Fix Ships with a Regression Test
+Gate: can this test fail if the fix is reverted? If not, it is not a
+regression test — it is documentation. Extract untestable async handler logic
+into a pure function and test that. A fix without a failing-on-revert test is
+not complete.
+
+### Rule 15 — Prefer Merge Commits for PRs
+Use `gh pr merge --merge` by default. Use `--squash` only for branches with
+many noisy fixup commits — and say why in the merge message. Never `--rebase`
+(rewrites SHAs, breaks history). Resolve merge conflicts by merging `main`
+into the branch; do not force-push.
+
+### Rule 16 — Prose Is Code
+Rule 2 applies to sentences. Cut every clause that restates a doc you linked,
+narrates how a decision was reached, defends against an objection nobody
+raised, or reports what "this session" did. A concise "why" is sufficient if
+something is not obvious, but otherwise text (comments, commits) should be as
+concise and factual as possible.
+
+### Rule 17 — Answer First
+Every artefact written for another agent to read cold — bead note, PR body,
+dashboard entry, findings doc, worker brief — opens with a single-sentence
+answer or decision before any evidence, mechanism, or chronology. Evidence
+supports the answer; it does not precede it.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
 
