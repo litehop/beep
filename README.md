@@ -1,4 +1,6 @@
-# beep (Phase 2+3: Geneve encap/decap, conntrack full-tuple keying)
+# Beep
+
+An eBPF-based service load balancer for Kubernetes.
 
 Loader for the beep eBPF dataplane
 (`docs/design/ebpf-lb-dataplane.md`,
