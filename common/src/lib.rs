@@ -210,6 +210,37 @@ pub fn egress_return_admission(is_backend_pod: bool) -> EgressReturnAdmission {
     }
 }
 
+/// Outcome of the REV_FLOW lookup for a packet already confirmed
+/// `EgressReturnAdmission::BackendTraffic`. A miss here can no longer be
+/// treated as "not ours" the way `EgressReturnAdmission::NotBackendTraffic`
+/// is -- the source has already been positively identified as one of this
+/// node's own backend Pods, most likely evicted from the LRU REV_FLOW table
+/// rather than genuinely unrelated. Letting an identified backend Pod's
+/// reply through unencapsulated would leak a pod-CIDR-sourced packet onto
+/// the underlay while still stalling the connection either way, so dropping
+/// is strictly better -- consistent with the forward decap path's
+/// equivalent miss (`geneve_ingress`'s `try_geneve_decap_return`, mapped to
+/// `TC_ACT_SHOT` via `unwrap_or`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressReturnOutcome {
+    /// No live REV_FLOW entry for this identified backend Pod's packet --
+    /// drop it rather than forward it raw onto the underlay.
+    Drop,
+    /// A live REV_FLOW entry exists -- proceed with the un-DNAT + re-encap.
+    Forward,
+}
+
+/// `has_rev_flow_entry`: result of a `REV_FLOW.get(key)` lookup, for a
+/// packet the caller has already gated through
+/// `EgressReturnAdmission::BackendTraffic`.
+pub fn egress_return_outcome(has_rev_flow_entry: bool) -> EgressReturnOutcome {
+    if has_rev_flow_entry {
+        EgressReturnOutcome::Forward
+    } else {
+        EgressReturnOutcome::Drop
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -968,6 +999,54 @@ mod tests {
             EgressReturnAdmission::BackendTraffic,
             "changing the Pod's target port must not un-admit its in-flight reply traffic -- \
              admission is keyed on IP membership only, never on port"
+        );
+    }
+
+    #[test]
+    fn egress_return_outcome_drops_an_identified_backend_pods_evicted_flow() {
+        // This is the fix `egress_return_outcome` exists for: BEFORE it, a
+        // REV_FLOW miss on already-identified backend traffic fell back to
+        // TC_ACT_OK, so an LRU eviction let the backend Pod's raw reply
+        // leave the node unencapsulated, carrying a pod-CIDR source address
+        // onto the underlay -- a stalled connection AND a pod-source packet
+        // leak. If this assertion ever reverts to `Forward`, that leak comes
+        // back.
+        assert_eq!(
+            egress_return_outcome(false),
+            EgressReturnOutcome::Drop,
+            "an identified backend Pod's packet with no live REV_FLOW entry must be dropped, \
+             not forwarded raw onto the underlay"
+        );
+    }
+
+    #[test]
+    fn egress_return_outcome_forwards_a_live_flow() {
+        // The happy path this bead must not regress: a genuinely live flow
+        // (REV_FLOW hit) still gets un-DNAT'd and re-encapsulated, not
+        // dropped just because it's now backend-identified traffic.
+        assert_eq!(egress_return_outcome(true), EgressReturnOutcome::Forward);
+    }
+
+    #[test]
+    fn dropping_identified_backend_misses_never_touches_unrelated_egress_traffic() {
+        // The two-stage split this bead relies on: admission (source
+        // membership) gates whether `egress_return_outcome` is ever
+        // consulted at all. Unrelated egress traffic (this hook sees ALL of
+        // it, not just ServiceLB's) must keep passing untouched -- only a
+        // packet already positively identified as a backend Pod's reply
+        // reaches the new drop-on-miss behavior.
+        assert_eq!(
+            egress_return_admission(false),
+            EgressReturnAdmission::NotBackendTraffic,
+            "unrelated egress traffic must never reach egress_return_outcome -- only \
+             identified backend Pod traffic may be dropped on a REV_FLOW miss"
+        );
+        assert_eq!(
+            egress_return_outcome(false),
+            EgressReturnOutcome::Drop,
+            "meanwhile, identified backend traffic with the same REV_FLOW miss must drop, not \
+             pass -- the two outcomes for the same has_rev_flow_entry value diverge precisely \
+             because admission already separated the two cases"
         );
     }
 }

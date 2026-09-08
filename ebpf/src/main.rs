@@ -45,13 +45,14 @@ use aya_ebpf::{
         bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use u7s_servicelb_common::{
-    egress_return_admission, encode_tcp_flow_key, forward_admission, ipv4_mapped_v6,
-    occupant_conflicts, resolve_backend_src_port, return_authorization, BackendPortDecision,
-    EgressReturnAdmission, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
+    egress_return_admission, egress_return_outcome, encode_tcp_flow_key, forward_admission,
+    ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port, return_authorization,
+    BackendPortDecision, EgressReturnAdmission, EgressReturnOutcome, ForwardAdmission,
+    ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -236,6 +237,14 @@ pub struct RevFlowValue {
 
 #[map]
 static REV_FLOW: LruHashMap<TcpFlowKey, RevFlowValue> = LruHashMap::with_max_entries(8192, 0);
+
+/// Counts packets dropped by `try_uplink_egress_return` on a REV_FLOW miss
+/// for already-identified backend Pod traffic (`EgressReturnOutcome::Drop`)
+/// -- almost always an LRU eviction of `REV_FLOW`, observable from userspace
+/// via `bpftool map dump` without needing a kernel tracepoint. Single entry,
+/// per-CPU to avoid a shared-counter atomic on this hot path.
+#[map]
+static EGRESS_RETURN_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Host-specific runtime config the loader fills in after attach (an
 /// ifindex isn't known until then). Single entry.
@@ -697,7 +706,20 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         target_port,
         proto,
     );
-    let rev = *unsafe { REV_FLOW.get(key) }?;
+    let rev_lookup = unsafe { REV_FLOW.get(key) };
+    if let EgressReturnOutcome::Drop = egress_return_outcome(rev_lookup.is_some()) {
+        // Positively identified backend Pod traffic with no live REV_FLOW
+        // entry (an LRU eviction, almost always) -- letting it through
+        // unencapsulated leaks a pod-CIDR source address onto the underlay
+        // while still stalling the connection, so drop instead. Consistent
+        // with the forward decap path's equivalent miss (`geneve_ingress`'s
+        // `unwrap_or(TC_ACT_SHOT)`).
+        if let Some(count) = EGRESS_RETURN_DROPS.get_ptr_mut(0) {
+            unsafe { *count += 1 };
+        }
+        return Some(TC_ACT_SHOT);
+    }
+    let rev = *rev_lookup?;
 
     // Un-remap: restore the client's real port before this packet re-enters
     // the Geneve tunnel -- the ingress node's return-decap step rebuilds its
