@@ -30,7 +30,7 @@ use std::{
 use anyhow::{anyhow, Context};
 use aya::{
     include_bytes_aligned,
-    maps::{Array as AyaArray, HashMap as AyaHashMap},
+    maps::{Array as AyaArray, HashMap as AyaHashMap, MapData},
     programs::{
         links::{FdLink, LinkError, PinnedLink},
         tc::{SchedClassifierLink, TcAttachOptions},
@@ -381,6 +381,31 @@ fn main() -> anyhow::Result<()> {
             "attached {name} on {iface} ({attach_type:?}), pinned under {}",
             pin_dir.display()
         );
+    }
+
+    // The parsed object -- BTF, relocation state, and the embedded ELF blob
+    // -- has no further use once every hook is attached: every hook's link
+    // and every map (the loop above, `MAP_NAMES`) are pinned, so this
+    // process doesn't need the `Ebpf` handle to keep the dataplane live.
+    // Dropping it here rather than letting it live through the blocking
+    // loop below is what keeps this DaemonSet container's steady-state RSS
+    // below its load-time peak.
+    drop(ebpf);
+    // glibc doesn't return freed heap to the OS on its own -- without an
+    // explicit trim the drop above frees the allocator's own bookkeeping
+    // but resident memory stays at the load-time high-water mark.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+
+    // Prove the drop above didn't strand map access: every map must still
+    // open from its pin file alone, the same path a future Phase 5
+    // Service/EndpointSlice watcher would use to get map handles without
+    // ever holding the parsed object.
+    for name in MAP_NAMES {
+        let path = pin_dir.join(name);
+        MapData::from_pin(&path)
+            .with_context(|| format!("reopening pinned map `{name}` from {}", path.display()))?;
     }
 
     eprintln!(
