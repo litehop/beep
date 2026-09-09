@@ -4,24 +4,19 @@ beep is a resource-conscious [eBPF](https://ebpf.io) service load balancer for K
 
 > ⚠️ **Pre-alpha — not for production.** beep is under active early development: APIs, map layouts, and behavior change without notice, core pieces (Service/EndpointSlice watching, cross-node WireGuard) are still unfinished, and known dataplane blockers remain. Don't run it against real traffic yet.
 
-Loader for the beep eBPF dataplane
-(`docs/design/ebpf-lb-dataplane.md`,
-`docs/decisions/ebpf-toolchain-aya.md`). Attaches three tc-bpf classifiers
-(Phase 1's separate `geneve_ingress_decap`/`geneve_ingress_return` merged
-into one `geneve_ingress`, dispatched by VNI -- see that program's doc
-comment for why), pins them under a bpffs directory, and populates one or
-more static VIP:PORT -> backend-node/PodIP:TargetPort mappings this phase
-proves the mechanism against (repeat `--fixture` for one Pod behind more
-than one Service port). Real Service/EndpointSlice watching is Phase 5.
+## What this loader does
 
-This crate has `beep-ebpf` as its no_std program sibling. It links Linux-only
-syscalls (`bpf(2)`, netlink), so it only builds and runs on Linux.
+This crate is beep's userspace loader. See `docs/design/ebpf-lb-dataplane.md` and `docs/decisions/ebpf-toolchain-aya.md` for the design behind it.
+
+The loader attaches three tc-bpf classifiers and pins them under a bpffs directory. (Phase 1 had two separate classifiers, `geneve_ingress_decap` and `geneve_ingress_return`; they're now one `geneve_ingress` classifier that dispatches by VNI — see that program's doc comment for why.)
+
+For now, you supply the loader with static VIP:PORT -> backend-node/PodIP:TargetPort mappings via `--fixture`, to prove the mechanism works — real Service/EndpointSlice watching is Phase 5. Repeat `--fixture` if one Pod sits behind more than one Service port.
+
+`beep-ebpf` is this crate's no_std sibling — the actual dataplane program. This loader links Linux-only syscalls (`bpf(2)`, netlink), so it only builds and runs on Linux.
 
 ## Building
 
-Requires a `nightly` toolchain with the `rust-src` component, and
-`bpf-linker` on `PATH` (`cargo install bpf-linker` or a prebuilt release
-from https://github.com/aya-rs/bpf-linker/releases).
+You need a `nightly` toolchain with the `rust-src` component, and `bpf-linker` on your `PATH`. Install `bpf-linker` with `cargo install bpf-linker`, or grab a prebuilt release from https://github.com/aya-rs/bpf-linker/releases.
 
 ```console
 $ rustup toolchain install nightly --component rust-src
@@ -29,12 +24,11 @@ $ cargo install bpf-linker
 $ cargo build --release   # from this directory; builds beep-ebpf too
 ```
 
-`build.rs` cross-builds `beep-ebpf` for `bpfel-unknown-none`/
-`bpfeb-unknown-none` (endianness matched to the host) via `aya-build`, using
-`.cargo/config.toml`'s `linker = "bpf-linker"` for that target, and embeds
-the resulting object into the loader binary.
+`build.rs` cross-builds `beep-ebpf` for `bpfel-unknown-none` or `bpfeb-unknown-none`, matching your host's endianness. It uses `aya-build`, with `.cargo/config.toml` setting `linker = "bpf-linker"` for that target, and it embeds the resulting object into the loader binary.
 
 ## Running
+
+Run the loader as root, pointing it at your interfaces and at least one fixture:
 
 ```console
 $ sudo ./target/release/beep \
@@ -43,9 +37,7 @@ $ sudo ./target/release/beep \
     --fixture 10.0.0.5:8080:tcp:10.0.0.6:10.244.1.7:80
 ```
 
-`--fixture` is `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`,
-repeatable -- one Pod behind two Service ports (e.g. 80->8080 alongside
-443->8443) needs two `--fixture` entries sharing the same `pod_ip`:
+`--fixture` takes `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`, and you can repeat the flag. For example, one Pod behind two Service ports (80->8080 and 443->8443) needs two `--fixture` entries that share the same `pod_ip`:
 
 ```console
 $ sudo ./target/release/beep \
@@ -55,51 +47,50 @@ $ sudo ./target/release/beep \
     --fixture 10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443
 ```
 
-`--pod-cidr` rejects the loader at startup if any `--fixture` vip_ip falls
-inside it: a hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP)
-space, so a VIP inside the pod CIDR is not disjoint from pod-IP space by
-construction and can byte-collide a forward and reverse flow key.
+`--pod-cidr` guards against a real collision: a hostNetwork Pod's IP equals its node's IP, so that IP lives in front-IP (VIP) space, not pod-IP space. If a `--fixture`'s vip_ip falls inside `--pod-cidr`, the two spaces overlap, and a forward flow key can byte-collide with a reverse one. The loader checks this at startup and refuses to run if it happens.
 
-`geneve0` must already exist as a "collect metadata" external Geneve device
-(`ip link add geneve0 type geneve external && ip link set geneve0 up`) --
-this loader only attaches classifiers to it, it does not create it.
+`geneve0` must exist before you run the loader, as a "collect metadata" external Geneve device:
 
-Requires `CAP_BPF`/`CAP_NET_ADMIN` (root, or the DaemonSet's intended
-capability set in later phases). Attaches all three hooks, populates the
-fixture maps, and pins each link under `--pin-dir`; killing the process
-leaves the attachment (and pins) in place, since state lives in the pinned
-kernel objects, not the process. Re-running the binary re-adopts existing
-pins in place rather than double-attaching, and overwrites the fixture
-map entries with whatever `--fixture` values are passed that run.
+```console
+$ ip link add geneve0 type geneve external
+$ ip link set geneve0 up
+```
+
+The loader only attaches classifiers to `geneve0` — it doesn't create the device for you.
+
+You need `CAP_BPF` and `CAP_NET_ADMIN` (root today, or the DaemonSet's intended capability set in later phases). On a successful run, the loader attaches all three classifiers, populates the fixture maps, and pins each link under `--pin-dir`.
+
+Killing the process doesn't tear anything down: the attachment and its pins live in the pinned kernel objects, not in the process. Re-running the binary re-adopts the existing pins instead of double-attaching, and it overwrites the fixture map entries with whatever `--fixture` values you pass on that run.
 
 ## Local eBPF verifier gate
 
-`ebpf-build` CI only proves the `bpfel-unknown-none` object *compiles* --
-not that the kernel verifier *accepts* it at load, or that a packet
-actually completes the encap/decap round trip. Run
-`scripts/smoke.sh [--vm <lima-vm-name>]` (default
-`lima-node-5`) locally before merging any beep-ebpf PR: it
-cross-builds this crate, loads the 3 tc-bpf classifiers into a real
-kernel on an already-provisioned Lima VM, asserts the verifier accepted
-them, and drives two client -> VIP -> backend TCP round trips (two
-Service ports on one backend Pod) through a self-contained veth/netns
-fixture. See the script's own header comment for prerequisites and what
-each step does.
+`ebpf-build` CI only proves that the `bpfel-unknown-none` object *compiles*. It doesn't prove that the kernel verifier *accepts* it at load, or that a packet actually completes the encap/decap round trip.
+
+Before merging any beep-ebpf PR, run the smoke test locally:
+
+```console
+$ scripts/smoke.sh                    # uses the default VM: lima-node-5
+$ scripts/smoke.sh --vm my-vm         # or target a different Lima VM
+```
+
+It cross-builds this crate, loads the three tc-bpf classifiers into a real kernel on an already-provisioned Lima VM, and confirms the verifier accepts them. Then it drives two client -> VIP -> backend TCP round trips (two Service ports on one backend Pod) through a self-contained veth/netns fixture. See the script's own header comment for prerequisites and what each step does.
 
 ## Memory observability
 
-Per `docs/decisions/ebpf-toolchain-aya.md`, both sides of memory use must
-stay independently monitorable, not just estimated at prototype time:
+Per `docs/decisions/ebpf-toolchain-aya.md`, you need to monitor both sides of memory use independently — estimating them at prototype time isn't enough.
 
-**Userspace RSS** — normal OS tooling, no special build:
+### Userspace RSS
+
+Normal OS tooling works, with no special build:
 
 ```console
 $ ps -o rss= -p "$(pgrep beep)"                    # KiB
 $ cat /proc/"$(pgrep beep)"/status | grep VmRSS
 ```
 
-**eBPF map memory (actual, not the pre-allocated ceiling)** — `bpftool`,
-against the maps this loader's programs reference:
+### eBPF map memory
+
+Use `bpftool` against the maps this loader's programs reference. This shows actual usage, not the pre-allocated ceiling:
 
 ```console
 $ sudo bpftool prog show pinned /sys/fs/bpf/beep/uplink_ingress-prog
@@ -107,15 +98,10 @@ $ sudo bpftool map show                     # lists every loaded map with id, ty
 $ sudo bpftool map dump id <id>             # actual live entries, not the ceiling
 ```
 
-This is the command path to inspect Phase 3's conntrack maps through:
-`FWD_PENDING` (2048-entry default), `FWD_MAIN` (8192-entry default), and
-`REV_FLOW` (8192-entry) are `LRU_HASH`, full-tuple
-(`beep_common::TcpFlowKey`) keyed. `FWD_PENDING`/`FWD_MAIN` split the
-old single `FWD_FLOW` table into a promote-on-bidirectionality admission
-scheme: new flows mint into `FWD_PENDING` only, promoting to
-`FWD_MAIN` once the return leg is observed, so a flood of new flows can never
-evict an established one. Both ceilings are configurable at load time via
-`--fwd-pending-max-entries`/`--fwd-main-max-entries`, not baked into the
-object. `VIP_MAP`/`TARGET_PORTS` remain Phase 2's naive small-scale fixture
-maps, both keyed on the same VIP:PORT:proto front tuple -- real
-Service/EndpointSlice sizing is Phase 5.
+### Conntrack maps
+
+Use this same command path to inspect Phase 3's conntrack maps. `FWD_PENDING` (2048 entries by default), `FWD_MAIN` (8192 entries by default), and `REV_FLOW` (8192 entries) are all `LRU_HASH` maps, keyed on the full tuple (`beep_common::TcpFlowKey`).
+
+`FWD_PENDING` and `FWD_MAIN` replace the old single `FWD_FLOW` table with a promote-on-bidirectionality scheme: a new flow mints into `FWD_PENDING` only, then promotes to `FWD_MAIN` once its return leg is observed. This way, a flood of new flows can never evict an established one. You configure both ceilings at load time, with `--fwd-pending-max-entries` and `--fwd-main-max-entries` — they aren't baked into the object.
+
+`VIP_MAP` and `TARGET_PORTS` are still Phase 2's simple, small-scale fixture maps, both keyed on the same VIP:PORT:proto front tuple. Real Service/EndpointSlice sizing is Phase 5.
