@@ -88,7 +88,7 @@ block from `mayor-dispatch-template.md` and require a `scripts/smoke.sh --vm
 does not exercise the loaded programs. Assign each such worker one Lima VM
 from the fixed pool: `beep-smoke` for single-node dataplane beads,
 `beep-node-a` + `beep-node-b` paired for cross-node WireGuard beads (the
-known-blocker path, bead mayor-f3ru5). Workers must use only their assigned
+known-blocker path, bead beep-n24). Workers must use only their assigned
 VM — never hard-code `beep-smoke` as if it were the only one, and never
 assume an unassigned VM is free.
 

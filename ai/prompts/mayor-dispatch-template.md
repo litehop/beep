@@ -445,17 +445,18 @@ gate holds even if an MCP server connection is down.
 
 ### Known blocker — `beep-node-a`/`beep-node-b` cross-node rig
 
-`scripts/smoke-wg-2node.sh` reaches a real, documented, non-flaky failure:
-`bpf_redirect` from the L3-only `wg0` uplink into the Ethernet-type `geneve0`
-device is dropped inside the kernel (confirmed via `trace-cmd` and
-`geneve0`'s TX `dropped` counter — see bead **mayor-f3ru5** for the full
-evidence trail and candidate fix direction, `BPF_ADJ_ROOM_MAC`). Every step
-before that redirect is a genuine, asserted PASS; the script's own output
-ends in a documented "ROUND-TRIP: FAIL (known blocker)" rather than a false
-green. Do not treat a `beep-node-a`/`beep-node-b` dispatch as "broken" just
-because the final round trip fails — only escalate if a step BEFORE the
-redirect regresses, or if the failure signature changes from the one
-`mayor-f3ru5` documents.
+The original blocker (`bpf_redirect` from `wg0` into `geneve0` dropped
+in-kernel) is fixed by PR #9 (bead `mayor-f3ru5`). `scripts/smoke-wg-2node.sh`
+now reaches a different, documented, non-flaky failure: the rig co-locates
+the "client" with the backend node, so the DNAT'd forward packet gets
+martian-source-dropped at `ip_rcv_finish_core` — see bead **beep-n24** for
+the full evidence trail and candidate fix directions. Every step through
+decap+DNAT+`REV_FLOW` population is a genuine, asserted PASS; the script's
+own output ends in a documented "ROUND-TRIP: FAIL (known blocker)" rather
+than a false green. Do not treat a `beep-node-a`/`beep-node-b` dispatch as
+"broken" just because the final round trip fails — only escalate if a step
+BEFORE that regresses, or if the failure signature differs from `beep-n24`'s
+martian-source-drop.
 
 ### Verification protocol
 

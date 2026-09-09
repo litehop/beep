@@ -191,7 +191,7 @@ proves the eBPF program compiles, not that it loads and forwards packets.
 Verify those on **Lima Linux VMs**: `beep-smoke` is the single-node smoke
 gate (`scripts/smoke.sh`), and `beep-node-a` + `beep-node-b` are a
 same-network pair for cross-node WireGuard verification — currently the
-known-blocker path (bead `mayor-f3ru5`). Agent-driven in-VM inspection
+known-blocker path (bead `beep-n24`). Agent-driven in-VM inspection
 (`bpftool map dump`, `ip -s link`, `dmesg`) goes through the `mcp__beep-*`
 MCP tools registered for each VM.
 

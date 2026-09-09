@@ -26,8 +26,9 @@ Three named VMs, fixed roles:
   drives packets through the Geneve encap/decap dataplane on one node.
 - **`beep-node-a`** + **`beep-node-b`** — cross-node WireGuard pair, used by
   `scripts/smoke-wg-2node.sh`. This is the known-blocker path (bead
-  mayor-f3ru5): cross-node conntrack/WireGuard behavior that single-node
-  smoke can't exercise.
+  beep-n24; the original mayor-f3ru5 redirect-drop blocker is fixed by
+  PR #9): cross-node conntrack/WireGuard behavior that single-node smoke
+  can't exercise.
 
 Assign one VM per concurrent dataplane worker — two workers must not share
 a VM, since each smoke run loads/unloads real bpf programs and mutates live
@@ -72,6 +73,14 @@ Prefer these tools over ad hoc `limactl shell` commands when the task is
 inspection rather than mutation — they keep the VM's state legible to other
 sessions watching the same pool.
 
+**The MCP server needs its VM already started.** `limactl mcp` attaches to a
+running VM; against a stopped or not-yet-provisioned VM it errors, so
+`mcp__beep-<vm>__*` shows `CONNECTION_CLOSED` at session start until
+`lima-up.sh` has brought the VM up. Read that as "VMs not started yet," not a
+misconfiguration — the servers connect once each VM is running. The smoke
+scripts drive Lima via `limactl` directly, so the dataplane gate still holds
+while MCP is down.
+
 ## Host prerequisites
 
 Required on the macOS host before any of the above works:
@@ -93,5 +102,6 @@ it runs before starting.
 - `lima/beep.yaml` — the VM image definition `lima-up.sh` provisions from.
 - `docs/design/ebpf-lb-dataplane.md` — why the dataplane needs a live
   verifier smoke test at all (verifier rejection under churn/scale).
-- bead mayor-f3ru5 — the cross-node WireGuard blocker `beep-node-a` /
-  `beep-node-b` exist to reproduce.
+- bead beep-n24 — the cross-node WireGuard blocker `beep-node-a` /
+  `beep-node-b` exist to reproduce (mayor-f3ru5's original redirect-drop
+  blocker is fixed by PR #9).
