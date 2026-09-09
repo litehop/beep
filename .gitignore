@@ -1,8 +1,21 @@
-
-# Rust build output
-/target
-
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
+
+target
+.claude/scheduled_tasks.lock
+ai/worktrees/
+.aqua/
+
+# Local dev state (scripts/u7s-start.sh); temp/u7s/ lives in each worktree
+temp/*
+!temp/.gitkeep
+
+.claude/scheduled_tasks.json
+.claude/plans/
+.claude/mayor-tick-state.json
+
+# Critical-reviewer queue: hook writes review-request markers here; ephemeral.
+.claude/review-queue/*
+!.claude/review-queue/.gitkeep
