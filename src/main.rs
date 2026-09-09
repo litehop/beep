@@ -181,15 +181,21 @@ struct Ipv4Cidr {
 }
 
 impl Ipv4Cidr {
-    fn contains(self, ip: Ipv4Addr) -> bool {
-        // prefix_len == 0 (match everything) would overflow a `<< 32` shift,
-        // so it's handled as its own case rather than folded into the
-        // general shift below.
-        let mask: u32 = if self.prefix_len == 0 {
+    // prefix_len == 0 (match everything) would overflow a `<< 32` shift
+    // (Rust's `<<` masks the shift amount mod 32, so `u32::MAX << 32` wraps
+    // to `u32::MAX << 0`, silently turning "match everything" into "match
+    // only the exact network address"), so it's handled as its own case
+    // rather than folded into the general shift below.
+    fn mask(prefix_len: u8) -> u32 {
+        if prefix_len == 0 {
             0
         } else {
-            u32::MAX << (32 - self.prefix_len)
-        };
+            u32::MAX << (32 - prefix_len)
+        }
+    }
+
+    fn contains(self, ip: Ipv4Addr) -> bool {
+        let mask = Self::mask(self.prefix_len);
         (u32::from(ip) & mask) == (u32::from(self.network) & mask)
     }
 }
@@ -213,6 +219,10 @@ fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
     if prefix_len > 32 {
         return Err(format!("pod_cidr prefix_len `{prefix_len}` must be 0..=32"));
     }
+    // Mask off host bits so Display/error text always shows the canonical
+    // network address (e.g. `10.244.0.0/16`, not `10.244.1.7/16`); `contains`
+    // masks both operands anyway, so this doesn't change matching behavior.
+    let network = Ipv4Addr::from(u32::from(network) & Ipv4Cidr::mask(prefix_len));
     Ok(Ipv4Cidr {
         network,
         prefix_len,
@@ -689,6 +699,55 @@ mod tests {
         // An invalid prefix length must fail loud at arg-parse time, not
         // silently produce a mask that under- or over-matches at runtime.
         assert!(parse_ipv4_cidr("10.244.0.0/33").is_err());
+    }
+
+    #[test]
+    fn pod_cidr_slash_zero_rejects_every_vip_as_inside() {
+        // A /0 pod CIDR must be treated as "contains every address", so
+        // every VIP is rejected. Rust's `<<` masks its shift amount mod 32,
+        // so deleting the `prefix_len == 0` special case in `Ipv4Cidr::mask`
+        // would make `u32::MAX << 32` silently wrap to `u32::MAX << 0`,
+        // turning "match everything" into "match only the exact network
+        // address" -- this VIP (not equal to the network address) would then
+        // wrongly be accepted instead of rejected.
+        let pod_cidr = parse_ipv4_cidr("0.0.0.0/0").unwrap();
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(203, 0, 113, 1), pod_cidr).is_err(),
+            "a /0 pod CIDR spans the entire address space, so every VIP must be rejected"
+        );
+    }
+
+    #[test]
+    fn pod_cidr_slash_32_rejects_only_the_exact_address() {
+        // A /32 pod CIDR is a single host route: it must reject a VIP equal
+        // to that address, but accept every other address. An off-by-one in
+        // the mask shift (e.g. treating 32 like 0, or vice versa) would
+        // either widen this to reject everything or narrow it to reject
+        // nothing.
+        let pod_cidr = parse_ipv4_cidr("10.244.5.9/32").unwrap();
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(10, 244, 5, 9), pod_cidr).is_err(),
+            "a VIP equal to the /32 pod CIDR's single address must be rejected"
+        );
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(10, 244, 5, 10), pod_cidr).is_ok(),
+            "a VIP one address away from a /32 pod CIDR must be accepted"
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_cidr_stores_canonical_network_address() {
+        // Operators read this address back out of error/Display text when a
+        // VIP is rejected; if host bits leak through unmasked, that message
+        // shows a misleading, non-canonical network (e.g. `10.244.1.7/16`
+        // instead of `10.244.0.0/16`), even though matching itself is
+        // unaffected (`contains` masks both operands).
+        let pod_cidr = parse_ipv4_cidr("10.244.1.7/16").unwrap();
+        assert_eq!(
+            pod_cidr.to_string(),
+            "10.244.0.0/16",
+            "the stored network address must be masked to its canonical form at parse time"
+        );
     }
 
     #[test]
