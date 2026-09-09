@@ -49,10 +49,10 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use beep_common::{
-    egress_return_admission, egress_return_outcome, encode_tcp_flow_key, forward_admission,
-    ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port, return_authorization,
-    BackendPortDecision, EgressReturnAdmission, EgressReturnOutcome, ForwardAdmission,
-    ReturnAuthorization, TcpFlowKey,
+    egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
+    forward_admission, ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port,
+    return_authorization, BackendPortDecision, EgressReturnAdmission, EgressReturnOutcome,
+    FlowDirection, FlowKey, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -143,43 +143,41 @@ static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 /// keyed on pod IP alone -- deliberately NOT on target port, unlike
 /// `TARGET_PORTS` above. `try_uplink_egress_return` (hook 3) sees ALL
 /// uplink egress traffic, not just beep's, so it probes this cheap
-/// 4-byte-keyed membership table BEFORE building the ~37-byte REV_FLOW key,
-/// to reject unrelated traffic without ever touching the conntrack table.
-/// Membership-only is what makes this safe across a rolling update or a
-/// targetPort edit: a flow's REV_FLOW entry was written because the forward
-/// path found its pod here, so anything still live is admitted regardless of
-/// what its target port used to be (`beep_common::egress_return_admission`'s
-/// doc comment). Value is a bare existence marker, never read.
+/// 4-byte-keyed membership table BEFORE building the ~38-byte FLOW_TABLE
+/// key, to reject unrelated traffic without ever touching the conntrack
+/// table. Membership-only is what makes this safe across a rolling update or
+/// a targetPort edit: a flow's FLOW_TABLE reverse-tagged entry was written
+/// because the forward path found its pod here, so anything still live is
+/// admitted regardless of what its target port used to be
+/// (`beep_common::egress_return_admission`'s doc comment). Value is a bare
+/// existence marker, never read.
 /// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
 #[map]
 static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 
-/// Ingress-side forward-flow affinity, written at stamp time (step 2),
-/// rebuilt and checked at return-decap time (step 7) from the Geneve VIP
-/// echo plus the inner dst -- confirms the return is answering a flow this
-/// node actually forwarded, not stale/spoofed.
+/// Ingress-side forward-flow ADMISSION tier, written at stamp time (step
+/// 2): every new flow mints here, and ONLY here (`try_uplink_ingress`, on a
+/// `FLOW_TABLE` forward-tagged miss) -- so this is the only flood-exposed
+/// conntrack table. A single floodable table let ~8192 packets from varying
+/// source ports evict every established flow's forward entry in
+/// milliseconds, since BPF LRU evicts strictly by recency with no notion of
+/// "established" (`docs/decisions/servicelb-flow-admission-affinity.md`).
+/// Modelled on nf_conntrack's unreplied/assured split: a flow reaches
+/// `FLOW_TABLE`'s forward role exclusively via `try_geneve_decap_return`'s
+/// promotion once the return leg proves the flow is genuinely bidirectional
+/// -- a round trip an off-path spoofer cannot produce. A flood can churn
+/// `FWD_PENDING` but can never evict a promoted forward entry out of
+/// `FLOW_TABLE`. Kept as its OWN physical map rather than folded into
+/// `FLOW_TABLE` as a third tag value, because BPF LRU eviction isn't
+/// predicate-aware -- it cannot be told to skip assured entries, so a
+/// flood-exposed tier must never share a physical LRU pool with an
+/// admission-gated one. Both stay LRU (not plain HASH) so genuine
+/// over-capacity degrades gracefully instead of returning E2BIG.
 ///
-/// Split into two LRU tiers (promote-on-bidirectionality,
-/// `docs/decisions/servicelb-flow-admission-affinity.md`):
-/// a single floodable table let ~8192 packets from varying source ports
-/// evict every established flow's forward entry in milliseconds, since BPF
-/// LRU evicts strictly by recency with no notion of "established". Modelled
-/// on nf_conntrack's unreplied/assured split: `FWD_PENDING` is the ONLY
-/// place a new flow is minted (`try_uplink_ingress`, on a `FWD_MAIN` miss)
-/// and is therefore the only flood-exposed tier; a flow reaches `FWD_MAIN`
-/// exclusively via `try_geneve_decap_return`'s promotion once the return leg
-/// proves the flow is genuinely bidirectional -- a round trip an off-path
-/// spoofer cannot produce. A flood can churn `FWD_PENDING` but can never
-/// evict an entry out of `FWD_MAIN`. Two PHYSICAL maps, not one map with an
-/// "assured" flag, because BPF LRU eviction isn't predicate-aware -- it
-/// cannot be told to skip assured entries. Both stay LRU (not plain HASH)
-/// so genuine over-capacity degrades gracefully instead of returning E2BIG.
-///
-/// `max_entries` below are load-time DEFAULTS, not the enforced ceiling: the
-/// userspace loader overrides both via `EbpfLoader::map_max_entries`
-/// (`src/main.rs`'s `--fwd-pending-max-entries`/
-/// `--fwd-main-max-entries`), so sizing is a DaemonSet config knob, not a
-/// value baked into this object.
+/// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
+/// userspace loader overrides it via `EbpfLoader::map_max_entries`
+/// (`src/main.rs`'s `--fwd-pending-max-entries`), so sizing is a DaemonSet
+/// config knob, not a value baked into this object.
 ///
 /// Value type is `VipBackend`, the full backend identity
 /// (`backend_node_ip` + `pod_ip`), not just the node IP: aie31.21 pins this
@@ -194,7 +192,8 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 /// stack, differing between independent call sites despite every named
 /// field matching (Phase 2 hit exactly this on a live kernel: a byte-
 /// identical insert+lookup, microseconds apart, still missed). A byte array
-/// has no such gap.
+/// has no such gap. `FLOW_TABLE` below widens this same shape by one tag
+/// byte rather than reusing it unmodified -- see its own doc comment.
 ///
 /// `LRU_HASH`, not the doc's `LRU_PERCPU_HASH`: a per-CPU map keeps a
 /// SEPARATE value per key per CPU, so a write on one CPU is invisible to a
@@ -210,8 +209,19 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 #[map]
 static FWD_PENDING: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_entries(2048, 0);
 
-#[map]
-static FWD_MAIN: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_entries(8192, 0);
+/// Union of the two roles `FLOW_TABLE` stores, discriminated by the
+/// `FlowDirection` tag in its key. `forward` is the promoted,
+/// established-affinity value `FWD_MAIN` used to store; `reverse` is the
+/// backend-side un-DNAT conntrack value `REV_FLOW` used to store.
+/// Callers must only ever read the field matching the key's own tag -- the
+/// other field's bytes are whatever the last write to that slot happened to
+/// leave there, exactly like reading the wrong arm of any tagged union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union FlowValue {
+    pub forward: VipBackend,
+    pub reverse: RevFlowValue,
+}
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
@@ -235,14 +245,64 @@ pub struct RevFlowValue {
     pub original_client_port: u16,
 }
 
+/// Unified forward(established)+reverse conntrack table, replacing the
+/// former separate `FWD_MAIN`/`REV_FLOW` maps. Both roles key on the
+/// identical 5-tuple shape for a given flow -- front tuple for forward,
+/// backend tuple for reverse -- so `beep_common::FlowKey`'s explicit
+/// `FlowDirection` tag byte, NOT VIP-vs-pod-CIDR address disjointness, is
+/// what keeps the two from aliasing the same slot (that disjointness
+/// invariant does not hold for a hostNetwork Pod, whose IP can equal a
+/// VIP -- the tag is the fix for that exact misdelivery class). Value is
+/// `FlowValue`, sized to the larger of the two prior maps (12 bytes,
+/// `RevFlowValue`'s shape) -- see its own doc comment.
+///
+/// A node serving BOTH roles at once (common at small/single-digit endpoint
+/// counts) now shares one LRU capacity pool between them: `FWD_PENDING`'s
+/// isolation guarantee above still holds for the ADMISSION-GATED forward
+/// role, but the reverse role has no admission gate of its own -- it writes
+/// unconditionally on a backend node's first forward-decap for a flow, no
+/// return leg required. On a dual-role node, a large enough burst of
+/// reverse-role writes can therefore now evict an established forward-role
+/// entry it could never reach while the two lived in separate physical
+/// maps. Accepted trade-off for the tag-byte design's simplicity; the
+/// entry-count ceiling below is sized to keep this a large-burst-only
+/// concern, not a routine one, but the residual risk is real and worth a
+/// follow-up if a dual-role deployment's reverse-role churn rate turns out
+/// to be routine rather than exceptional.
+///
+/// `max_entries` below is a load-time DEFAULT, not the enforced ceiling
+/// (`src/main.rs`'s `--flow-table-max-entries`), same as `FWD_PENDING`.
+/// 16384, not 8192: bpftool-measured bytes_memlock shows unifying at 8192
+/// would halve today's combined FWD_MAIN+REV_FLOW capacity for a
+/// single-role node while still halving worst-case capacity for a
+/// dual-role one, whereas 16384 costs only ~64 KiB more than the 8192+8192
+/// pair it replaces and gives back the full combined capacity as one
+/// flexible pool -- strictly dominates 8192 for both node shapes.
 #[map]
-static REV_FLOW: LruHashMap<TcpFlowKey, RevFlowValue> = LruHashMap::with_max_entries(8192, 0);
+static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries(16384, 0);
 
-/// Counts packets dropped by `try_uplink_egress_return` on a REV_FLOW miss
-/// for already-identified backend Pod traffic (`EgressReturnOutcome::Drop`)
-/// -- almost always an LRU eviction of `REV_FLOW`, observable from userspace
-/// via `bpftool map dump` without needing a kernel tracepoint. Single entry,
-/// per-CPU to avoid a shared-counter atomic on this hot path.
+/// `FLOW_TABLE.get` plus the union-field read for the caller's own role,
+/// each wrapped so every call site names which role it expects instead of
+/// repeating the `unsafe` union read inline. `#[inline(always)]` for the
+/// same reason `try_geneve_decap_forward`/`_return` are (module doc):
+/// several call sites, no downside to forcing inlining, and it sidesteps
+/// this toolchain's non-inlined-BPF-to-BPF-call miscompile risk outright.
+#[inline(always)]
+fn flow_table_get_forward(key: FlowKey) -> Option<VipBackend> {
+    unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.forward })
+}
+
+#[inline(always)]
+fn flow_table_get_reverse(key: FlowKey) -> Option<RevFlowValue> {
+    unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.reverse })
+}
+
+/// Counts packets dropped by `try_uplink_egress_return` on a FLOW_TABLE
+/// reverse-tagged miss for already-identified backend Pod traffic
+/// (`EgressReturnOutcome::Drop`) -- almost always an LRU eviction,
+/// observable from userspace via `bpftool map dump` without needing a
+/// kernel tracepoint. Single entry, per-CPU to avoid a shared-counter atomic
+/// on this hot path.
 #[map]
 static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
@@ -314,20 +374,27 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
 
     let src_ip: u32 = ctx.load(ip_src).ok()?;
     let src_port: u16 = ctx.load(l4_sport).ok()?;
-    let flow_key = encode_tcp_flow_key(
-        ipv4_mapped_v6(src_ip),
+    let client_ip_v6 = ipv4_mapped_v6(src_ip);
+    let vip_ip_v6 = ipv4_mapped_v6(dst_ip);
+    // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
+    // comment) uses this shape.
+    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, vip_ip_v6, dst_port, proto);
+    let fwd_key = encode_flow_key(
+        client_ip_v6,
         src_port,
-        ipv4_mapped_v6(dst_ip),
+        vip_ip_v6,
         dst_port,
         proto,
+        FlowDirection::Forward,
     );
-    // Admission control: an established flow (FWD_MAIN hit)
-    // needs no write at all -- the lookup itself refreshed its LRU recency.
-    // A new flow mints ONLY into FWD_PENDING, never FWD_MAIN directly, so an
-    // off-path flood of forward-only packets can churn FWD_PENDING but can
-    // never touch an established flow's FWD_MAIN entry.
+    // Admission control: an established flow (FLOW_TABLE forward-tagged
+    // hit) needs no write at all -- the lookup itself refreshed its LRU
+    // recency. A new flow mints ONLY into FWD_PENDING, never FLOW_TABLE
+    // directly, so an off-path flood of forward-only packets can churn
+    // FWD_PENDING but can never touch an established flow's FLOW_TABLE
+    // entry.
     if let ForwardAdmission::MintPending =
-        forward_admission(unsafe { FWD_MAIN.get(flow_key) }.is_some())
+        forward_admission(unsafe { FLOW_TABLE.get(fwd_key) }.is_some())
     {
         FWD_PENDING.insert(flow_key, backend, 0).ok()?;
     }
@@ -481,8 +548,14 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     let pod_ip_v6 = ipv4_mapped_v6(pod_ip);
-    let natural_rev_key =
-        encode_tcp_flow_key(client_ip_v6, client_port, pod_ip_v6, target_port, proto);
+    let natural_rev_key = encode_flow_key(
+        client_ip_v6,
+        client_port,
+        pod_ip_v6,
+        target_port,
+        proto,
+        FlowDirection::Reverse,
+    );
 
     // Decision 3 (`ebpf-lb-dataplane.md`): two Services with different front
     // addresses sharing this backend Pod:targetPort, hit by a client
@@ -493,28 +566,34 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // refreshing, or the first writer. Front alone isn't enough: a distinct
     // flow through this same front whose real source port happens to equal
     // another flow's already-committed synthetic port would otherwise be
-    // misread as that flow's own state and clobber its REV_FLOW entry.
-    let existing_occupant = unsafe { REV_FLOW.get(natural_rev_key) }.map(|v| {
+    // misread as that flow's own state and clobber its reverse-tagged entry.
+    let existing_occupant = flow_table_get_reverse(natural_rev_key).map(|v| {
         (
             (ipv4_mapped_v6(v.vip_ip), v.vip_port),
             v.original_client_port,
         )
     });
     let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
-    // The probe's occupancy check: REV_FLOW itself is the source of truth
-    // for which candidate ports are actually free, not a derived guess --
-    // a single low-entropy hash of the front address only guaranteed
-    // uniqueness for exactly 2 conflicting fronts. An occupant matching both
-    // our own front and our own original client port is a prior packet of
-    // this exact flow's already-committed remap, not a conflict -- without
-    // that full comparison the flow (or an unrelated flow reusing its
-    // synthetic port as a real source port) reads state back as "taken"/
-    // "mine" incorrectly and either churns ports until PROBE_LIMIT is
-    // exhausted, or silently clobbers another flow's entry.
+    // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
+    // the source of truth for which candidate ports are actually free, not
+    // a derived guess -- a single low-entropy hash of the front address only
+    // guaranteed uniqueness for exactly 2 conflicting fronts. An occupant
+    // matching both our own front and our own original client port is a
+    // prior packet of this exact flow's already-committed remap, not a
+    // conflict -- without that full comparison the flow (or an unrelated
+    // flow reusing its synthetic port as a real source port) reads state
+    // back as "taken"/"mine" incorrectly and either churns ports until
+    // PROBE_LIMIT is exhausted, or silently clobbers another flow's entry.
     let is_reverse_key_taken = |candidate_port: u16| {
-        let candidate_key =
-            encode_tcp_flow_key(client_ip_v6, candidate_port, pod_ip_v6, target_port, proto);
-        let occupant = unsafe { REV_FLOW.get(candidate_key) }.map(|v| {
+        let candidate_key = encode_flow_key(
+            client_ip_v6,
+            candidate_port,
+            pod_ip_v6,
+            target_port,
+            proto,
+            FlowDirection::Reverse,
+        );
+        let occupant = flow_table_get_reverse(candidate_key).map(|v| {
             (
                 (ipv4_mapped_v6(v.vip_ip), v.vip_port),
                 v.original_client_port,
@@ -530,7 +609,14 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     ) {
         BackendPortDecision::NoRemap => (natural_rev_key, client_port),
         BackendPortDecision::Remap(synthetic_port) => (
-            encode_tcp_flow_key(client_ip_v6, synthetic_port, pod_ip_v6, target_port, proto),
+            encode_flow_key(
+                client_ip_v6,
+                synthetic_port,
+                pod_ip_v6,
+                target_port,
+                proto,
+                FlowDirection::Reverse,
+            ),
             synthetic_port,
         ),
         // Every candidate in the bounded probe window was already taken --
@@ -545,7 +631,9 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         vip_port,
         original_client_port: client_port,
     };
-    REV_FLOW.insert(rev_key, rev_value, 0).ok()?;
+    FLOW_TABLE
+        .insert(rev_key, FlowValue { reverse: rev_value }, 0)
+        .ok()?;
 
     // Remap only touches the backend<->Pod segment: the client's real src
     // port is restored by the egress classifier before the packet re-enters
@@ -616,26 +704,40 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
     let client_ip: u32 = ctx.load(IP_DST).ok()?;
     let client_port: u16 = ctx.load(L4_DPORT).ok()?;
 
-    let key = encode_tcp_flow_key(
-        ipv4_mapped_v6(client_ip),
+    let client_ip_v6 = ipv4_mapped_v6(client_ip);
+    let vip_ip_v6 = ipv4_mapped_v6(vip_ip);
+    // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
+    // comment) uses this shape.
+    let key = encode_tcp_flow_key(client_ip_v6, client_port, vip_ip_v6, vip_port, proto);
+    let fwd_key = encode_flow_key(
+        client_ip_v6,
         client_port,
-        ipv4_mapped_v6(vip_ip),
+        vip_ip_v6,
         vip_port,
         proto,
+        FlowDirection::Forward,
     );
-    // Admission control: a MAIN hit is already established
-    // and authorized -- skip the PENDING lookup entirely (the doc's stated
-    // steady-state cost is one lookup, matching the pre-split FWD_FLOW.get).
-    // A PENDING hit is this flow's FIRST observed return leg -- proof of
-    // bidirectionality an off-path spoofer cannot produce -- so promote it
-    // into MAIN and drop the PENDING copy. A miss in both is stale or
-    // spoofed, same drop the pre-split FWD_FLOW.get()? performed.
-    let in_main = unsafe { FWD_MAIN.get(key) }.is_some();
+    // Admission control: a FLOW_TABLE forward-tagged hit is already
+    // established and authorized -- skip the PENDING lookup entirely (the
+    // doc's stated steady-state cost is one lookup, matching the pre-split
+    // FWD_FLOW.get). A PENDING hit is this flow's FIRST observed return leg
+    // -- proof of bidirectionality an off-path spoofer cannot produce -- so
+    // promote it into FLOW_TABLE and drop the PENDING copy. A miss in both
+    // is stale or spoofed, same drop the pre-split FWD_FLOW.get()? performed.
+    let in_main = flow_table_get_forward(fwd_key).is_some();
     if !in_main {
         let pending_value = unsafe { FWD_PENDING.get(key) }.copied();
         match return_authorization(false, pending_value.is_some()) {
             ReturnAuthorization::Promote => {
-                FWD_MAIN.insert(key, pending_value?, 0).ok()?;
+                FLOW_TABLE
+                    .insert(
+                        fwd_key,
+                        FlowValue {
+                            forward: pending_value?,
+                        },
+                        0,
+                    )
+                    .ok()?;
                 let _ = FWD_PENDING.remove(key);
             }
             ReturnAuthorization::Drop => return None,
@@ -711,7 +813,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     let pod_ip: u32 = ctx.load(ip_src).ok()?;
 
     // Reject before the remaining fields are even loaded, let alone the
-    // ~37-byte REV_FLOW key built: POD_TARGETS is a 4-byte-keyed, 32-entry
+    // ~38-byte FLOW_TABLE key built: POD_TARGETS is a 4-byte-keyed, 32-entry
     // map, far cheaper to probe than this hook's own conntrack table, and
     // most packets crossing this hook (ALL uplink egress, not just
     // beep's) take this branch.
@@ -724,27 +826,28 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     let client_ip: u32 = ctx.load(ip_dst).ok()?;
     let backend_dst_port: u16 = ctx.load(l4_dport).ok()?;
 
-    let key = encode_tcp_flow_key(
+    let key = encode_flow_key(
         ipv4_mapped_v6(client_ip),
         backend_dst_port,
         ipv4_mapped_v6(pod_ip),
         target_port,
         proto,
+        FlowDirection::Reverse,
     );
-    let rev_lookup = unsafe { REV_FLOW.get(key) };
+    let rev_lookup = flow_table_get_reverse(key);
     if let EgressReturnOutcome::Drop = egress_return_outcome(rev_lookup.is_some()) {
-        // Positively identified backend Pod traffic with no live REV_FLOW
-        // entry (an LRU eviction, almost always) -- letting it through
-        // unencapsulated leaks a pod-CIDR source address onto the underlay
-        // while still stalling the connection, so drop instead. Consistent
-        // with the forward decap path's equivalent miss (`geneve_ingress`'s
-        // `unwrap_or(TC_ACT_SHOT)`).
+        // Positively identified backend Pod traffic with no live
+        // FLOW_TABLE reverse-tagged entry (an LRU eviction, almost always)
+        // -- letting it through unencapsulated leaks a pod-CIDR source
+        // address onto the underlay while still stalling the connection, so
+        // drop instead. Consistent with the forward decap path's equivalent
+        // miss (`geneve_ingress`'s `unwrap_or(TC_ACT_SHOT)`).
         if let Some(count) = EGRESS_DROPS.get_ptr_mut(0) {
             unsafe { *count += 1 };
         }
         return Some(TC_ACT_SHOT);
     }
-    let rev = *rev_lookup?;
+    let rev = rev_lookup?;
 
     // Un-remap: restore the client's real port before this packet re-enters
     // the Geneve tunnel -- the ingress node's return-decap step rebuilds its

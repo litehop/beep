@@ -106,8 +106,8 @@ $ sudo bpftool map dump id <id>             # actual live entries, not the ceili
 
 ### Conntrack maps
 
-Use this same command path to inspect Phase 3's conntrack maps. `FWD_PENDING` (2048 entries by default), `FWD_MAIN` (8192 entries by default), and `REV_FLOW` (8192 entries) are all `LRU_HASH` maps, keyed on the full tuple (`beep_common::TcpFlowKey`).
+Use this same command path to inspect Phase 3's conntrack maps. `FWD_PENDING` (2048 entries by default, keyed on `beep_common::TcpFlowKey`) and `FLOW_TABLE` (16384 entries by default, keyed on `beep_common::FlowKey` — `TcpFlowKey` plus an explicit forward/reverse tag byte) are both `LRU_HASH` maps. `FLOW_TABLE` is the merged forward-established and reverse conntrack table: a forward-tagged entry pins the same state `FWD_MAIN` used to hold, a reverse-tagged entry the same state `REV_FLOW` used to hold, sharing one physical map instead of two.
 
-A new flow mints into `FWD_PENDING` only, then promotes to `FWD_MAIN` once its return leg is observed. This way, a flood of new flows can never evict an established one. You configure both ceilings at load time, with `--fwd-pending-max-entries` and `--fwd-main-max-entries` — they aren't baked into the object.
+A new flow mints into `FWD_PENDING` only, then promotes to a forward-tagged `FLOW_TABLE` entry once its return leg is observed. This way, a flood of new flows can never evict an established one. You configure both ceilings at load time, with `--fwd-pending-max-entries` and `--flow-table-max-entries` — they aren't baked into the object.
 
 `VIP_MAP` and `TARGET_PORTS` are still Phase 2's simple, small-scale fixture maps, both keyed on the same VIP:PORT:proto front tuple. Real Service/EndpointSlice sizing is Phase 5.

@@ -15,19 +15,19 @@
 # ambiguity a fresh single-tick file avoids by construction rather than by
 # parsing around it.
 #
-# Asserts the discovered map set is EXACTLY the 8 known beep maps, not
-# just a byte-count ceiling: a partial-discovery regression (e.g. only 7 of 8
+# Asserts the discovered map set is EXACTLY the 7 known beep maps, not
+# just a byte-count ceiling: a partial-discovery regression (e.g. only 6 of 7
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
 # is > 0 and under a gross-regression ceiling (not a tight bound, just a
 # tripwire for an accidental max_entries blow-up). The ceiling is 4 MiB:
-# LRU_HASH conntrack maps (FWD_PENDING/FWD_MAIN/REV_FLOW/etc) preallocate for
-# their full max_entries capacity regardless of active-flow count, and
-# pa0ze's Phase-3 8192-entry sizing (#1567) measured ~1.82 MiB (1,909,072
-# bytes) preallocated per node for the old single-tier FWD_FLOW+REV_FLOW
-# pair (16384 entries total); the FWD_PENDING/FWD_MAIN split adds a smaller
-# PENDING tier on top (2048 entries by default, ~+240 KiB) -- 4 MiB still
-# leaves comfortable headroom over that real, near-constant footprint.
+# LRU_HASH conntrack maps (FWD_PENDING/FLOW_TABLE) preallocate for their
+# full max_entries capacity regardless of active-flow count. FLOW_TABLE
+# merged the former separate FWD_MAIN+REV_FLOW maps into one 16384-entry
+# table, measured at ~1.88 MiB (1,966,976 bytes) preallocated per node;
+# FWD_PENDING adds a smaller tier on top (2048 entries by default, ~+240
+# KiB) -- 4 MiB still leaves comfortable headroom over that real,
+# near-constant footprint.
 set -euo pipefail
 
 csv="${1:?usage: $0 <ebpf-map-memory.csv>}"
@@ -38,7 +38,7 @@ total=$(awk -F, 'NR>1 { sum += $6 } END { print sum+0 }' "$csv")
 echo "discovered maps (${#names[@]}): ${names[*]:-none}"
 echo "total bytes_memlock: $total"
 
-expected=(CONFIG FWD_PENDING FWD_MAIN TARGET_PORTS REV_FLOW VIP_MAP POD_TARGETS EGRESS_DROPS)
+expected=(CONFIG FWD_PENDING FLOW_TABLE TARGET_PORTS VIP_MAP POD_TARGETS EGRESS_DROPS)
 actual_sorted="$(printf '%s\n' "${names[@]}" | sort -u)"
 expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
 

@@ -100,14 +100,19 @@ forward-write and return-read).
   server/backend-chosen (RFC 9000 §7.2), unmintable/unobservable by a
   non-terminating dataplane; CID-based keying is deferred, needing
   u7s-owned server_id distribution (`bd show mayor-xjy5o`). No longer
-  exempt from the remap remedy below.
+  exempt from the remap remedy below. The merged forward+reverse table
+  below widens this to **38 bytes** (one added direction-tag byte) for its
+  own key; the admission-only `FWD_PENDING` tier keeps the plain 37.
 - **Admission + affinity** (`docs/decisions/servicelb-flow-admission-affinity.md`,
   `bd show mayor-aie31.11`/`mayor-aie31.21`): the forward map splits into
-  `FWD_PENDING` (new) and `FWD_MAIN` (promoted on the observed return
-  leg); sizes DaemonSet-configurable at load, never hard-coded.
-  `FWD_FLOW`'s value pins the full backend identity
-  (`backend_node_ip`+`pod_ip`); eviction fires only on endpoint removal
-  (`FWD_FLOW` mandatory for UDP, `REV_FLOW` both protocols).
+  `FWD_PENDING` (new, flood-exposed) and a promoted, established-affinity
+  role (promoted on the observed return leg); sizes DaemonSet-configurable
+  at load, never hard-coded. The promoted value pins the full backend
+  identity (`backend_node_ip`+`pod_ip`); eviction fires only on endpoint
+  removal. The promoted-forward and reverse (backend-side un-DNAT
+  conntrack) roles share one physical `FLOW_TABLE`, discriminated by an
+  explicit direction-tag byte rather than address-space disjointness (see
+  the Cross-node drift invariant below).
 - **Cross-node drift invariant** (`bd show mayor-tavxy`): per-node
   controllers can lag on the same EndpointSlice event, so state diverges
   for seconds. The **delivery node**, not ingress, must be authoritative:

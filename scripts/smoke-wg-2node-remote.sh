@@ -217,8 +217,8 @@ dump_evidence() {
   bpftool map dump pinned "$PIN_DIR/VIP_MAP" 2>&1 || true
   echo "== bpftool map dump: FWD_PENDING =="
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
-  echo "== bpftool map dump: FWD_MAIN =="
-  bpftool map dump pinned "$PIN_DIR/FWD_MAIN" 2>&1 || true
+  echo "== bpftool map dump: FLOW_TABLE =="
+  bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" 2>&1 || true
   echo "== geneve0 counters =="
   ip -s link show "$GENEVE_IFACE" 2>&1 || true
   echo "== wg0 counters =="

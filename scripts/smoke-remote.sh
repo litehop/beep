@@ -28,12 +28,12 @@ TARGET_PORT="18080"
 # pod-IP-only key can't tell these two fronts apart at all).
 VIP_PORT2="19101"
 TARGET_PORT2="18081"
-# A third front for the anti-flush (FWD_PENDING-churn-vs-FWD_MAIN-survival)
+# A third front for the anti-flush (FWD_PENDING-churn-vs-FLOW_TABLE-survival)
 # demonstration below: UDP, so a burst never needs a real handshake, and
 # `FLOOD_BACKEND_NODE_IP` is deliberately an address nothing on this VM
 # answers to -- the encap'd packet has nowhere to complete a round trip, so
 # every flood packet MUST mint into FWD_PENDING and can never be promoted
-# into FWD_MAIN (admission control's only mint site is the forward path;
+# into FLOW_TABLE (admission control's only mint site is the forward path;
 # promotion requires an observed return leg, which this front can never
 # produce).
 VIP_PORT3="19102"
@@ -53,9 +53,10 @@ RPFILTER_SAVE_FILE="/tmp/beep-smoke-rpfilter-all.saved"
 # Restart-preservation fixture: reuses the first VIP:PORT ->
 # backend pair above, held open across a loader restart instead of a plain
 # request/response, so the SECOND chunk's return leg depends on the
-# FWD_MAIN/REV_FLOW conntrack entries the FIRST chunk's forward leg (and its
-# own return leg's promotion) wrote BEFORE the restart -- exactly the state a
-# DaemonSet rollout/eviction/OOM kill must not silently drop.
+# FLOW_TABLE conntrack entries (both forward- and reverse-tagged) the FIRST
+# chunk's forward leg (and its own return leg's promotion) wrote BEFORE the
+# restart -- exactly the state a DaemonSet rollout/eviction/OOM kill must
+# not silently drop.
 RESTART_CHUNK1="restart-preservation-chunk-1"
 RESTART_CHUNK2="restart-preservation-chunk-2"
 RESTART_FIFO="/tmp/beep-smoke-restart-fifo"
@@ -271,20 +272,22 @@ map_entry_count() {
   jq 'length' <<<"$json" 2>/dev/null || echo ""
 }
 
-echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FWD_MAIN entry"
-# The two round trips above already promoted their flows into FWD_MAIN.
-# Flood a THIRD, never-returning front (VIP_PORT3, see its definition above
-# for why the flood can never produce a return leg) from many distinct
-# client source ports -- a stand-in for an off-path spoofed-source flood --
-# and confirm FWD_MAIN's established entries survive untouched while
-# FWD_PENDING absorbs the churn.
-main_before=$(map_entry_count "$PIN_DIR/FWD_MAIN")
+echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
+# The two round trips above already promoted their flows into FLOW_TABLE
+# (forward-tagged) and wrote their reverse-tagged counterparts. Flood a
+# THIRD, never-returning front (VIP_PORT3, see its definition above for why
+# the flood can never produce a return leg, and therefore never reaches
+# FLOW_TABLE at all -- FLOOD_BACKEND_NODE_IP answers to nothing) from many
+# distinct client source ports -- a stand-in for an off-path spoofed-source
+# flood -- and confirm FLOW_TABLE's established entries survive untouched
+# while FWD_PENDING absorbs the churn.
+flow_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 pending_before=$(map_entry_count "$PIN_DIR/FWD_PENDING")
-[ -n "$main_before" ] && [ "$main_before" -ge 2 ] || {
-  echo "FAIL: expected at least 2 established flows in FWD_MAIN before the flood (from the two round trips above), got '$main_before'" >&2
+[ -n "$flow_before" ] && [ "$flow_before" -ge 4 ] || {
+  echo "FAIL: expected at least 4 FLOW_TABLE entries before the flood (forward+reverse tags for the two round trips above), got '$flow_before'" >&2
   exit 1
 }
-echo "before flood: FWD_MAIN=$main_before entries, FWD_PENDING=$pending_before entries"
+echo "before flood: FLOW_TABLE=$flow_before entries, FWD_PENDING=$pending_before entries"
 
 FLOOD_COUNT=200
 ip netns exec smoke-client bash -c "
@@ -294,19 +297,19 @@ ip netns exec smoke-client bash -c "
   true
 "
 
-main_after=$(map_entry_count "$PIN_DIR/FWD_MAIN")
+flow_after=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 pending_after=$(map_entry_count "$PIN_DIR/FWD_PENDING")
-echo "after flood: FWD_MAIN=$main_after entries, FWD_PENDING=$pending_after entries"
+echo "after flood: FLOW_TABLE=$flow_after entries, FWD_PENDING=$pending_after entries"
 
 [ -n "$pending_after" ] && [ "$pending_after" -gt "$pending_before" ] || {
   echo "FAIL: FWD_PENDING gained no entries from the $FLOOD_COUNT-packet flood ($pending_before -> $pending_after) -- the flood fixture itself never reached admission control, so this run proves nothing about the anti-flush property" >&2
   exit 1
 }
-[ "$main_after" = "$main_before" ] || {
-  echo "FAIL: FWD_MAIN entry count changed ($main_before -> $main_after) after a burst of $FLOOD_COUNT new-flow-only UDP packets that never received a return leg -- admission control must confine an unpromoted flood to FWD_PENDING and must never let it touch an established flow's FWD_MAIN entry" >&2
+[ "$flow_after" = "$flow_before" ] || {
+  echo "FAIL: FLOW_TABLE entry count changed ($flow_before -> $flow_after) after a burst of $FLOOD_COUNT new-flow-only UDP packets that never received a return leg -- admission control must confine an unpromoted flood to FWD_PENDING and must never let it touch an established flow's FLOW_TABLE entry" >&2
   exit 1
 }
-echo "ANTI-FLUSH: PASS (FWD_MAIN unchanged at $main_after entries across a $FLOOD_COUNT-packet forward-only flood that grew FWD_PENDING from $pending_before to $pending_after)"
+echo "ANTI-FLUSH: PASS (FLOW_TABLE unchanged at $flow_after entries across a $FLOOD_COUNT-packet forward-only flood that grew FWD_PENDING from $pending_before to $pending_after)"
 
 echo "==> establishing a flow to hold open across a loader restart (a DaemonSet rollout/eviction/OOM kill must not silently drop an established connection)"
 # The backend sends chunk 1, then blocks on a single `read` from a second
@@ -321,8 +324,19 @@ echo "==> establishing a flow to hold open across a loader restart (a DaemonSet 
 # a single blocking read has no such steady-state forking.
 # No further forward-direction traffic occurs while it waits (client has
 # nothing to ACK until chunk 2 arrives), so the restart can only be masked
-# by FWD_MAIN/REV_FLOW surviving it, not by a fresh forward packet
-# re-populating them.
+# by FLOW_TABLE surviving it, not by a fresh forward packet re-populating it.
+#
+# Baseline captured BEFORE the fixture below starts, not a bare ">0" gate
+# after: FLOW_TABLE already holds the two earlier round trips' forward- and
+# reverse-tagged entries, so this flow's own arrival must be seen as an
+# INCREASE of (at least) 2 -- one forward-tagged entry from its return-leg
+# promotion, one reverse-tagged entry from the backend's forward-decap --
+# over that pre-existing count. Capturing it any later races the fixture:
+# on a fast local VM the handshake below can complete (and both tags land)
+# before this script gets back around to reading FLOW_TABLE, which would
+# silently fold the very entries this check is waiting for into the
+# "baseline" and make the +2 threshold unreachable.
+flow_baseline=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 rm -f "$RESTART_FIFO" "$RESTART_SIGNAL_FIFO"
 mkfifo "$RESTART_FIFO" "$RESTART_SIGNAL_FIFO"
 nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESTART_FIFO" >"$RESTART_BACKEND_LOG" 2>&1 &
@@ -335,20 +349,15 @@ restart_client_pid=$!
 disown
 
 for _ in $(seq 1 30); do
-  fwd_before=$(map_entry_count "$PIN_DIR/FWD_MAIN")
-  [ -n "$fwd_before" ] && [ "$fwd_before" -gt 0 ] && break
+  fwd_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
+  [ -n "$fwd_before" ] && [ "$fwd_before" -ge "$((flow_baseline + 2))" ] && break
   sleep 0.2
 done
-rev_before=$(map_entry_count "$PIN_DIR/REV_FLOW")
-[ -n "$fwd_before" ] && [ "$fwd_before" -gt 0 ] || {
-  echo "FAIL: FWD_MAIN (pinned at $PIN_DIR/FWD_MAIN) never gained an entry for the restart-preservation flow within 6s -- its handshake's return leg should have promoted it well before this timeout" >&2
+[ -n "$fwd_before" ] && [ "$fwd_before" -ge "$((flow_baseline + 2))" ] || {
+  echo "FAIL: FLOW_TABLE (pinned at $PIN_DIR/FLOW_TABLE) never gained both a forward- and reverse-tagged entry for the restart-preservation flow within 6s (baseline $flow_baseline, saw $fwd_before) -- its handshake's return leg should have promoted the forward entry, and the backend's decap should have written the reverse entry, well before this timeout" >&2
   exit 1
 }
-[ -n "$rev_before" ] && [ "$rev_before" -gt 0 ] || {
-  echo "FAIL: REV_FLOW (pinned at $PIN_DIR/REV_FLOW) has no entries before the restart -- expected the flow just established above to have populated it" >&2
-  exit 1
-}
-echo "conntrack before restart: FWD_MAIN=$fwd_before entries, REV_FLOW=$rev_before entries"
+echo "conntrack before restart: FLOW_TABLE=$fwd_before entries (baseline $flow_baseline)"
 
 echo "==> restarting the loader against the same --pin-dir (simulates a DaemonSet image rollout/eviction/OOM kill)"
 pkill -f "$BIN" 2>/dev/null || true
@@ -365,21 +374,19 @@ start_loader "$RESTART_LOADER_LOG"
 wait_for_attach "$RESTART_LOADER_LOG"
 echo "RESTART VERIFIER-ACCEPT: PASS"
 
-fwd_after=$(map_entry_count "$PIN_DIR/FWD_MAIN")
-rev_after=$(map_entry_count "$PIN_DIR/REV_FLOW")
+fwd_after=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 # Non-decreasing, not exact equality: an already-established flow's forward
-# packets (e.g. a delayed TCP ACK) skip the FWD_MAIN write entirely
-# (admission control only writes it via return-leg promotion), but other
-# legitimate forward-direction traffic landing during the restart window can
-# still mint a fresh FWD_PENDING->FWD_MAIN entry for an unrelated flow --
-# observed live, harmlessly, on a correctly-fixed loader. What must never
-# happen is entries LOST, especially a reset to zero, which is exactly what
-# an unpinned restart does.
-[ "$fwd_after" -ge "$fwd_before" ] && [ "$rev_after" -ge "$rev_before" ] || {
-  echo "FAIL: conntrack entries did not survive the loader restart -- FWD_MAIN ${fwd_before}->${fwd_after}, REV_FLOW ${rev_before}->${rev_after}. A restart must reuse the pinned maps, not swap in an empty set that silently drops every established flow." >&2
+# packets (e.g. a delayed TCP ACK) skip the FLOW_TABLE forward-tagged write
+# entirely (admission control only writes it via return-leg promotion), but
+# other legitimate traffic landing during the restart window can still mint
+# a fresh entry for an unrelated flow -- observed live, harmlessly, on a
+# correctly-fixed loader. What must never happen is entries LOST, especially
+# a reset to zero, which is exactly what an unpinned restart does.
+[ "$fwd_after" -ge "$fwd_before" ] || {
+  echo "FAIL: conntrack entries did not survive the loader restart -- FLOW_TABLE ${fwd_before}->${fwd_after}. A restart must reuse the pinned maps, not swap in an empty set that silently drops every established flow." >&2
   exit 1
 }
-echo "RESTART MAP PRESERVATION: PASS (FWD_MAIN=$fwd_after entries, REV_FLOW=$rev_after entries, unchanged across the restart)"
+echo "RESTART MAP PRESERVATION: PASS (FLOW_TABLE=$fwd_after entries, unchanged or grown across the restart)"
 
 # Only now does the backend send chunk 2 -- strictly after the restart is
 # confirmed complete, so the second chunk's return leg genuinely exercises
