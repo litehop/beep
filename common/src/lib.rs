@@ -292,6 +292,40 @@ pub fn egress_return_outcome(has_rev_flow_entry: bool) -> EgressReturnOutcome {
     }
 }
 
+/// Inbound decap-forward pod-membership gate (`beep-ebpf`'s
+/// `try_geneve_decap_forward`, hook 4) -- the egress-side analogue of
+/// `EgressReturnAdmission` above, mirrored onto the opposite hook.
+/// `TARGET_PORTS.get(front tuple)` only confirms this node hosts SOME
+/// backend for the front; it never confirms the specific `pod_ip` the
+/// ingress node stamped into the Geneve option is still one of this node's
+/// own pods. Under cross-node convergence drift a lagging ingress can replay
+/// a stale forward pin naming a pod IP that's since been evicted here and
+/// reused by an unrelated pod -- trusting it unconditionally misdelivers to
+/// that live, unrelated workload instead of dropping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecapForwardPodAdmission {
+    /// `pod_ip` is not a member of this node's current `POD_TARGETS` --
+    /// drop rather than DNAT+deliver to a pod this node no longer owns.
+    Drop,
+    /// `pod_ip` is a current member -- proceed with the DNAT+deliver.
+    Deliver,
+}
+
+/// `is_local_pod`: `POD_TARGETS.get(pod_ip)` membership on the Geneve
+/// option's stamped pod IP alone -- deliberately the same pod-IP-only key
+/// `egress_return_admission` gates on for `try_uplink_egress_return`, not a
+/// (front tuple, pod_ip) pair. `POD_TARGETS` has exactly one membership
+/// notion today (this node's current backend Pods), and reusing it here
+/// makes the delivery node -- not the ingress node -- the authoritative
+/// consistency point for both directions of a flow with the same map.
+pub fn decap_forward_pod_admission(is_local_pod: bool) -> DecapForwardPodAdmission {
+    if is_local_pod {
+        DecapForwardPodAdmission::Deliver
+    } else {
+        DecapForwardPodAdmission::Drop
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -1098,6 +1132,36 @@ mod tests {
             "meanwhile, identified backend traffic with the same REV_FLOW miss must drop, not \
              pass -- the two outcomes for the same has_rev_flow_entry value diverge precisely \
              because admission already separated the two cases"
+        );
+    }
+
+    #[test]
+    fn decap_forward_drops_a_geneve_pod_ip_no_longer_in_the_local_serving_set() {
+        // This is the fix this gate exists for: under cross-node
+        // convergence drift, a lagging ingress node can replay a stale
+        // Geneve pod_ip that this node has since evicted from POD_TARGETS
+        // and reassigned to an unrelated pod. Before this gate,
+        // try_geneve_decap_forward DNAT'd to that pod_ip unconditionally --
+        // misdelivering a client's traffic to a live, unrelated workload. If
+        // this assertion ever reverts to `Deliver`, that cross-pod leak
+        // comes back.
+        assert_eq!(
+            decap_forward_pod_admission(false),
+            DecapForwardPodAdmission::Drop,
+            "a pod_ip that is not a current POD_TARGETS member must be dropped, never DNAT'd \
+             and delivered -- ingress-side drift must degrade to a boundary drop, not a \
+             cross-pod leak"
+        );
+    }
+
+    #[test]
+    fn decap_forward_delivers_a_pod_ip_still_in_the_local_serving_set() {
+        // The happy path this bead must not regress: a genuinely live,
+        // still-serving pod's flow keeps being delivered, not dropped just
+        // because the membership gate now exists.
+        assert_eq!(
+            decap_forward_pod_admission(true),
+            DecapForwardPodAdmission::Deliver
         );
     }
 }
