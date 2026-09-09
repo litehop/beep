@@ -246,7 +246,7 @@ pub union FlowValue {
 /// ingress node's own return-decap step has no knowledge of any backend-
 /// local remap and must see the true client port in the inner dst.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct RevFlowValue {
     pub ingress_node_ip: u32,
     pub vip_ip: u32,
@@ -405,7 +405,16 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     if let ForwardAdmission::MintPending =
         forward_admission(unsafe { FLOW_TABLE.get(fwd_key) }.is_some())
     {
-        FWD_PENDING.insert(flow_key, backend, 0).ok()?;
+        // A PENDING lookup is an RCU read that already refreshes this
+        // entry's LRU recency, so once minted the backend choice never
+        // needs rewriting -- a write takes the bucket's raw_spinlock and can
+        // run the LRU shrink path, unlike a read. Existence alone is enough
+        // to skip it: the backend picked on this flow's first packet is the
+        // one affinity should keep, not whatever VIP_MAP would pick if
+        // re-run on a later pre-promotion packet.
+        if unsafe { FWD_PENDING.get(flow_key) }.is_none() {
+            FWD_PENDING.insert(flow_key, backend, 0).ok()?;
+        }
     }
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
@@ -653,9 +662,15 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         vip_port,
         original_client_port: client_port,
     };
-    FLOW_TABLE
-        .insert(rev_key, FlowValue { reverse: rev_value }, 0)
-        .ok()?;
+    // Unlike FWD_PENDING's value, this one can legitimately change under the
+    // SAME key -- e.g. the ingress node for this flow changes -- so the gate
+    // is exists-AND-matches, not existence alone: a write is skipped only
+    // when it would be a byte-for-byte no-op.
+    if flow_table_get_reverse(rev_key) != Some(rev_value) {
+        FLOW_TABLE
+            .insert(rev_key, FlowValue { reverse: rev_value }, 0)
+            .ok()?;
+    }
 
     // Remap only touches the backend<->Pod segment: the client's real src
     // port is restored by the egress classifier before the packet re-enters
