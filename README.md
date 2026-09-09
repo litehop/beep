@@ -75,8 +75,8 @@ $ sudo rm -rf /sys/fs/bpf/beep
 Before merging any beep-ebpf PR, run the smoke test locally to check that the kernel verifier accepts the compiled program and that a packet completes the encap/decap round trip:
 
 ```console
-$ scripts/smoke.sh                    # uses the default VM: lima-node-5
-$ scripts/smoke.sh --vm my-vm         # or target a different Lima VM
+$ scripts/smoke.sh                    # uses the default VM: beep-smoke
+$ scripts/smoke.sh --vm beep-node-a   # or target another Lima VM
 ```
 
 It cross-builds this crate, loads the three tc-bpf classifiers into a real kernel on an already-provisioned Lima VM, and confirms the verifier accepts them. Then it drives two client -> VIP -> backend TCP round trips (two Service ports on one backend Pod) through a self-contained veth/netns fixture. See the script's own header comment for prerequisites and what each step does.
