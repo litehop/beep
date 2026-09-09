@@ -554,7 +554,9 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i
         // map-discovery walk (and the CI memory-smoke gate) counts as a 9th
         // "map".
         let ethertype = ETH_P_IPV4;
-        ctx.store(12, &ethertype, 0).ok()?;
+        if ctx.store(12, &ethertype, 0).is_err() {
+            return Some(TC_ACT_SHOT);
+        }
     }
 
     if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
@@ -1091,7 +1093,9 @@ fn try_uplink_egress_return_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Op
         // See try_uplink_ingress's matching comment on why this is a local,
         // not `&ETH_P_IPV4` directly.
         let ethertype = ETH_P_IPV4;
-        ctx.store(12, &ethertype, 0).ok()?;
+        if ctx.store(12, &ethertype, 0).is_err() {
+            return Some(TC_ACT_SHOT);
+        }
     }
 
     if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
