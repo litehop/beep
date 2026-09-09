@@ -250,6 +250,36 @@ assert "a REAL bead-ID reference (mayor-kfabq) in test-critical-reviewer-hook.sh
   "$([ "$RC8_ROT" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 9. beep's own native `beep-` bead IDs must be caught the same way `mayor-`
+#    ones are -- a synthetic `beep-abc` reference in tracked source fails.
+# ---------------------------------------------------------------------------
+S9="$SANDBOX_ROOT/9-beep-bead-id"
+new_sandbox "$S9"
+mkdir -p "$S9/src"
+printf '// worked around the race here (beep-abc)\nfn f() {}\n' > "$S9/src/lib.rs"
+commit_tree "$S9"
+RC9=$(run_gate "$S9")
+assert "native beep- bead ID (beep-abc) is caught" "$([ "$RC9" -ne 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 10. beep's fixed crate/VM/binary names -- beep-ebpf, beep-common, beep-smoke,
+#     beep-node-a -- are `beep-[a-z0-9]{3,5}`-shaped by coincidence and must
+#     NOT be flagged. This is the exact false-positive a naive `beep-` arm
+#     would introduce (beep-common/-node-a truncate to beep-commo/beep-node
+#     under the regex's 3-5 char cap): a real bead-ID guard that also flags
+#     ~100 permanent crate/VM references would get silenced or ignored,
+#     defeating its purpose entirely.
+# ---------------------------------------------------------------------------
+S10="$SANDBOX_ROOT/10-beep-fixed-names"
+new_sandbox "$S10"
+mkdir -p "$S10/src"
+printf '// beep-ebpf embeds into beep-common via beep-smoke on beep-node-a\nfn f() {}\n' > "$S10/src/lib.rs"
+commit_tree "$S10"
+RC10=$(run_gate "$S10")
+assert "fixed crate/VM names (beep-ebpf/beep-common/beep-smoke/beep-node-a) are NOT flagged" \
+  "$([ "$RC10" -eq 0 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

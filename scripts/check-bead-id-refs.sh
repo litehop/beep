@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Fails if a bead-ID-shaped reference (mayor-XXXXX) appears in tracked source.
+# Fails if a bead-ID-shaped reference (mayor-XXXXX or beep-XXXXX) appears in
+# tracked source.
 #
 # Bead IDs rot: a comment citing one reads fine the day it's written, but once
 # that bead closes it's an unexplained token nobody can resolve. Historical
 # context belongs in git/PR history, not a live token in source.
 #
-# Scope note (beep): this guard matches `mayor-` IDs only, NOT beep's own
-# native `beep-` bead IDs. beep's crate and VM names -- beep-ebpf, beep-common,
-# beep-smoke, beep-node-a, beep-node-b -- all match `beep-[a-z0-9]{3,5}`, so a
-# `beep-` arm would false-positive on ~100 non-bead tokens across tracked
-# source. Guarding `beep-` IDs needs a bd-ID-format-aware matcher (tracked as a
-# follow-up bead). The migrated servicelb backlog -- the IDs that actually get
-# cited in code comments -- is all `mayor-`, so the guard stays useful as-is.
+# Scope note (beep): beep's own crate/VM/binary names -- beep-ebpf,
+# beep-common, beep-smoke, beep-node-a, beep-node-b, beep-wg2node -- are
+# `beep-[a-z0-9]{3,5}`-shaped too (the regex's 3-5 char cap truncates
+# beep-common/beep-node-a/beep-wg2node to beep-commo/beep-node/beep-wg2no), so
+# a naive `beep-` arm would false-positive on ~100 non-bead tokens across
+# tracked source. BEEP_NAME_ALLOWED_TOKENS below filters exactly those known
+# fixed names back out, so only a real `beep-` bead ID (e.g. beep-htf) trips
+# this guard.
 #
 # Exclusions:
 #   .beads/  -- bd's own JSONL export legitimately contains bead IDs.
@@ -93,10 +95,29 @@ if [ -n "$critical_reviewer_hook_matches" ]; then
 }$critical_reviewer_hook_matches"
 fi
 
+# beep's own native `beep-` bead IDs rot the same way `mayor-` ones do. Sweep
+# the whole tree for the shape (same base exclusions as the mayor- sweep,
+# plus this guard and its own regression test -- both spell out `beep-`
+# example tokens to prove the guard works, same reason they're excluded from
+# the mayor- sweep above), then filter out beep's fixed crate/VM/binary
+# names via the SAME allowlist-then-rescan pattern as
+# MAYOR_TICK_ALLOWED_TOKENS above, so only a real bead ID (e.g. beep-htf,
+# beep-vph) survives to trip this arm.
+BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|commo|smoke|node|wg2no)$'
+beep_matches=$(git grep -n -oE 'beep-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
+  ':!.beads' ':!ai' ':!docs' ':!.github' \
+  ':!scripts/check-bead-id-refs.sh' \
+  ':!scripts/test-check-bead-id-refs-logic.sh' \
+  2>/dev/null | grep -vE ":${BEEP_NAME_ALLOWED_TOKENS}" || true)
+if [ -n "$beep_matches" ]; then
+  matches="${matches:+$matches
+}$beep_matches"
+fi
+
 if [ -n "$matches" ]; then
   echo "bead-id-refs: found bead-ID reference(s) that will rot once the bead closes:" >&2
   echo "$matches" >&2
-  echo "Strip the mayor-XXXXX token -- the context lives in git/PR history instead." >&2
+  echo "Strip the mayor-XXXXX/beep-XXXXX token -- the context lives in git/PR history instead." >&2
   exit 1
 fi
 
