@@ -371,7 +371,11 @@ pub const PROBE_LIMIT: u16 = 16;
 /// distinct flow through the same front, whose real source port happens to
 /// equal some other flow's already-committed synthetic port, misread that
 /// other flow's entry as its own earlier commit and silently clobber it.
-/// `new_front`: the front address the current packet arrived through.
+/// `new_front`: the front address the current packet arrived through -- a
+/// raw `(vip_ip, vip_port)` scalar pair, not an `ipv4_mapped_v6`-widened
+/// shape: this dataplane's front is always IPv4 at the wire level and
+/// `RevFlowValue`'s stored `vip_ip` is already a bare `u32`, so widening it
+/// just to compare is pure overhead with no correctness benefit.
 /// `original_port`: the client's real source port -- excluded as a
 /// candidate remap value so the remapped reverse key can never collide
 /// with the natural (unremapped) one.
@@ -380,12 +384,14 @@ pub const PROBE_LIMIT: u16 = 16;
 /// reverse key is already held by some OTHER flow. Injectable so this
 /// stays pure and unit-testable outside a kernel: `beep-ebpf` passes
 /// a closure that performs the real map lookup; tests pass a closure over
-/// a plain `HashSet`.
+/// a plain `HashSet`. `FnMut`, not `Fn`: the eBPF caller's closure patches a
+/// hoisted key buffer's port bytes in place per candidate rather than
+/// rebuilding the whole key from scratch every probe iteration.
 pub fn resolve_backend_src_port(
-    existing_occupant: Option<(([u8; 16], u16), u16)>,
-    new_front: ([u8; 16], u16),
+    existing_occupant: Option<((u32, u16), u16)>,
+    new_front: (u32, u16),
     original_port: u16,
-    is_reverse_key_taken: impl Fn(u16) -> bool,
+    mut is_reverse_key_taken: impl FnMut(u16) -> bool,
 ) -> BackendPortDecision {
     if !occupant_conflicts(existing_occupant, new_front, original_port) {
         return BackendPortDecision::NoRemap;
@@ -415,8 +421,8 @@ pub fn resolve_backend_src_port(
 /// packet's committed remap; anything else -- different front, or same
 /// front with a different client port -- is a genuine conflict.
 pub fn occupant_conflicts(
-    occupant: Option<(([u8; 16], u16), u16)>,
-    resolving_front: ([u8; 16], u16),
+    occupant: Option<((u32, u16), u16)>,
+    resolving_front: (u32, u16),
     resolving_client_port: u16,
 ) -> bool {
     matches!(occupant, Some(identity) if identity != (resolving_front, resolving_client_port))
@@ -437,11 +443,9 @@ pub const REMAP_PORT_RANGE: u16 = u16::MAX - REMAP_PORT_BASE + 1; // 16384
 /// seeds can coincide, and did for the majority of realistic front pairs)
 /// -- `resolve_backend_src_port`'s occupancy probe is what actually
 /// guarantees uniqueness.
-fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
-    let ip_word = u32::from_ne_bytes(front_ip[12..16].try_into().unwrap())
-        ^ u32::from_ne_bytes(front_ip[0..4].try_into().unwrap());
+fn synthetic_port_seed(front_ip: u32, front_port: u16) -> u16 {
     let mixed =
-        ip_word ^ ip_word.rotate_right(16) ^ (front_port as u32) ^ ((front_port as u32) << 3);
+        front_ip ^ front_ip.rotate_right(16) ^ (front_port as u32) ^ ((front_port as u32) << 3);
     (mixed as u16) % REMAP_PORT_RANGE
 }
 
@@ -578,7 +582,7 @@ mod tests {
         // The happy path (first writer, or the same flow's later packets)
         // must never remap -- doing so on every packet would break the
         // client's real connection identity for the common case.
-        let vip_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
+        let vip_a = (0x0100_000au32, 0x5000u16);
         assert_eq!(
             resolve_backend_src_port(None, vip_a, 0x9999, |_| false),
             BackendPortDecision::NoRemap
@@ -601,8 +605,8 @@ mod tests {
         let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
         let target_port = 0x1f90u16;
         let client_src_port = 0x9999u16;
-        let front_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
-        let front_b = (ipv4_mapped_v6(0x0200_000a), 0x5001u16);
+        let front_a = (0x0100_000au32, 0x5000u16);
+        let front_b = (0x0200_000au32, 0x5001u16);
 
         // Service A's flow writes first: no existing entry, no conflict.
         let decision_a = resolve_backend_src_port(None, front_a, client_src_port, |_| false);
@@ -645,11 +649,11 @@ mod tests {
         // octets 30/94/158/222, all on VIP port 31000 -- a stride of 64
         // that resonates with the old formula's `rotate_right(16)` mixing)
         // all hash to the identical seed:
-        let colliding_fronts: [([u8; 16], u16); 4] = [
-            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000),
-            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 94])), 31000),
-            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 158])), 31000),
-            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 222])), 31000),
+        let colliding_fronts: [(u32, u16); 4] = [
+            (u32::from_ne_bytes([10, 0, 0, 30]), 31000),
+            (u32::from_ne_bytes([10, 0, 0, 94]), 31000),
+            (u32::from_ne_bytes([10, 0, 0, 158]), 31000),
+            (u32::from_ne_bytes([10, 0, 0, 222]), 31000),
         ];
         let shared_seed = synthetic_port_seed(colliding_fronts[0].0, colliding_fronts[0].1);
         for front in &colliding_fronts[1..] {
@@ -665,7 +669,7 @@ mod tests {
         let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
         let target_port = 0x1f90u16;
         let client_src_port = 0x9999u16;
-        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
+        let first_writer = (u32::from_ne_bytes([10, 0, 0, 1]), 6000u16);
 
         // First writer: no existing entry, natural reverse key holds the
         // client's real port unremapped.
@@ -742,10 +746,7 @@ mod tests {
         let mut fronts = Vec::new();
         for ip_octet in 0u8..=250 {
             for port in [5000u16, 5001, 5002, 8080, 8443, 30000, 31000, 32000] {
-                fronts.push((
-                    ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, ip_octet])),
-                    port,
-                ));
+                fronts.push((u32::from_ne_bytes([10, 0, 0, ip_octet]), port));
             }
         }
         let first_writer = fronts[0];
@@ -802,18 +803,18 @@ mod tests {
         use std::collections::HashMap;
 
         let client_src_port = 0x9999u16;
-        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
-        let front_a = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000u16);
+        let first_writer = (u32::from_ne_bytes([10, 0, 0, 1]), 6000u16);
+        let front_a = (u32::from_ne_bytes([10, 0, 0, 30]), 31000u16);
 
         // Sim of REV_FLOW keyed by candidate port -> the (front,
         // original_client_port) identity that committed a reverse-flow
-        // entry there (main.rs's occupant lookup maps a full 37-byte key to
+        // entry there (main.rs's occupant lookup maps a full 38-byte key to
         // a `RevFlowValue`; the port is enough here since every candidate in
         // this test shares client/pod/target).
-        let mut rev_flow: HashMap<u16, (([u8; 16], u16), u16)> = HashMap::new();
+        let mut rev_flow: HashMap<u16, ((u32, u16), u16)> = HashMap::new();
         rev_flow.insert(client_src_port, (first_writer, client_src_port));
 
-        let resolve = |rev_flow: &HashMap<u16, (([u8; 16], u16), u16)>| {
+        let resolve = |rev_flow: &HashMap<u16, ((u32, u16), u16)>| {
             resolve_backend_src_port(
                 Some((first_writer, client_src_port)),
                 front_a,
@@ -850,7 +851,7 @@ mod tests {
         // A genuinely different conflicting front must still land on its
         // own, distinct port -- idempotency for one flow must not collapse
         // distinctness across flows.
-        let front_b = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 94])), 31000u16);
+        let front_b = (u32::from_ne_bytes([10, 0, 0, 94]), 31000u16);
         let decision_b = resolve_backend_src_port(
             Some((first_writer, client_src_port)),
             front_b,
@@ -885,12 +886,12 @@ mod tests {
         use std::collections::HashMap;
 
         let client_port_a = 0x1111u16;
-        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
-        let front_a = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000u16);
+        let first_writer = (u32::from_ne_bytes([10, 0, 0, 1]), 6000u16);
+        let front_a = (u32::from_ne_bytes([10, 0, 0, 30]), 31000u16);
 
         // Sim of REV_FLOW keyed by candidate port -> (front,
         // original_client_port), mirroring main.rs's occupant lookup.
-        let mut rev_flow: HashMap<u16, (([u8; 16], u16), u16)> = HashMap::new();
+        let mut rev_flow: HashMap<u16, ((u32, u16), u16)> = HashMap::new();
         rev_flow.insert(client_port_a, (first_writer, client_port_a));
 
         // Flow A: conflicts with first_writer at its natural key, gets

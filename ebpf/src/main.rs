@@ -592,13 +592,14 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // flow through this same front whose real source port happens to equal
     // another flow's already-committed synthetic port would otherwise be
     // misread as that flow's own state and clobber its reverse-tagged entry.
-    let existing_occupant = flow_table_get_reverse(natural_rev_key).map(|v| {
-        (
-            (ipv4_mapped_v6(v.vip_ip), v.vip_port),
-            v.original_client_port,
-        )
-    });
-    let new_front = (ipv4_mapped_v6(vip_ip), vip_port);
+    let existing_occupant = flow_table_get_reverse(natural_rev_key)
+        .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
+    // Raw scalars, not an `ipv4_mapped_v6`-widened pair: `RevFlowValue`'s
+    // `vip_ip` and this packet's `vip_ip` are already bare `u32`s, and the
+    // mapping is injective, so comparing the wire values directly is exactly
+    // equivalent to comparing their v6-mapped forms and turns a 20-byte
+    // compare into an 8-byte one on every probe iteration.
+    let new_front = (vip_ip, vip_port);
     // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
     // the source of truth for which candidate ports are actually free, not
     // a derived guess -- a single low-entropy hash of the front address only
@@ -609,21 +610,25 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // flow reusing its synthetic port as a real source port) reads state
     // back as "taken"/"mine" incorrectly and either churns ports until
     // PROBE_LIMIT is exhausted, or silently clobbers another flow's entry.
+    //
+    // `candidate_key` is built ONCE and patched in place per candidate: its
+    // address escapes into `bpf_map_lookup_elem` on every probe call, so the
+    // compiler can't hoist the build itself, and PROBE_LIMIT's constant trip
+    // count means this loop very likely fully unrolls -- re-encoding all 38
+    // bytes per iteration would put 16 copies of that build into program
+    // text for the sake of the 2 bytes (the port) that actually change.
+    let mut candidate_key = encode_flow_key(
+        client_ip_v6,
+        0,
+        pod_ip_v6,
+        target_port,
+        proto,
+        FlowDirection::Reverse,
+    );
     let is_reverse_key_taken = |candidate_port: u16| {
-        let candidate_key = encode_flow_key(
-            client_ip_v6,
-            candidate_port,
-            pod_ip_v6,
-            target_port,
-            proto,
-            FlowDirection::Reverse,
-        );
-        let occupant = flow_table_get_reverse(candidate_key).map(|v| {
-            (
-                (ipv4_mapped_v6(v.vip_ip), v.vip_port),
-                v.original_client_port,
-            )
-        });
+        candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
+        let occupant = flow_table_get_reverse(candidate_key)
+            .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
         occupant_conflicts(occupant, new_front, client_port)
     };
     let (rev_key, backend_src_port) = match resolve_backend_src_port(
@@ -633,17 +638,9 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         is_reverse_key_taken,
     ) {
         BackendPortDecision::NoRemap => (natural_rev_key, client_port),
-        BackendPortDecision::Remap(synthetic_port) => (
-            encode_flow_key(
-                client_ip_v6,
-                synthetic_port,
-                pod_ip_v6,
-                target_port,
-                proto,
-                FlowDirection::Reverse,
-            ),
-            synthetic_port,
-        ),
+        // The probe's last iteration already patched `candidate_key` to
+        // exactly this winning port -- reuse it instead of re-encoding.
+        BackendPortDecision::Remap(synthetic_port) => (candidate_key, synthetic_port),
         // Every candidate in the bounded probe window was already taken --
         // drop rather than reuse an occupied reverse key, which would
         // silently reproduce the exact clobbering bug Decision 3 closes.
