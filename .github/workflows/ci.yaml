@@ -52,6 +52,14 @@ jobs:
       - name: Test (beep-common)
         run: cargo test -p beep-common
 
+      # The beep loader crate's own #[cfg(test)] tests (src/main.rs) compile
+      # as part of `cargo clippy --tests` but nothing runs them. Without this
+      # a loader regression (e.g. POD_TARGETS node-scoping) could be reverted
+      # with nothing in CI to catch it. Linux-only, so it runs here, not on
+      # the beep-common host test step above (which also runs on macOS).
+      - name: Test (beep)
+        run: cargo test -p beep
+
       # beep-ebpf is #![no_std] and only builds for bpfel-unknown-none; clippy
       # needs the same target + build-std the real build uses, run from ebpf/.
       - name: Clippy (beep-ebpf)
