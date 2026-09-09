@@ -74,19 +74,29 @@ pub fn decode_tcp_flow_key(key: &TcpFlowKey) -> ([u8; 16], u16, [u8; 16], u16, u
 }
 
 /// Discriminates entries in `beep-ebpf`'s unified flow table
-/// (`FLOW_TABLE`): forward-role (ingress-node, established-affinity) and
-/// reverse-role (backend-node, un-DNAT conntrack) entries share one physical
-/// `LRU_HASH` keyed on the same 5-tuple shape for a given flow, so this
-/// explicit tag byte is the only thing keeping the two roles from colliding
-/// -- deliberately NOT VIP-vs-pod-CIDR address disjointness, which does not
-/// hold for a hostNetwork Pod (`docs/design/ebpf-lb-dataplane.md`'s
+/// (`FLOW_TABLE`): forward-role (ingress-node, established-affinity),
+/// reverse-role (backend-node, un-DNAT conntrack), and port-memo-role
+/// (backend-node, persisted backend-src-port remap decision) entries share
+/// one physical `LRU_HASH` keyed on the same 5-tuple shape for a given flow,
+/// so this explicit tag byte is the only thing keeping the roles from
+/// colliding -- deliberately NOT VIP-vs-pod-CIDR address disjointness, which
+/// does not hold for a hostNetwork Pod (`docs/design/ebpf-lb-dataplane.md`'s
 /// disjointness correction; a hostNetwork Pod's IP can equal a VIP, which is
-/// the exact misdelivery this tag exists to prevent).
+/// the exact misdelivery this tag exists to prevent). The same disjointness
+/// gap is why `PortMemo` needs its own tag rather than reusing `Reverse`'s:
+/// address-based aliasing avoidance was never sound, and the port-memo key
+/// (client, real client port, pod, target port) is a legitimate 5-tuple a
+/// `Reverse`-tagged entry could also carry for a different flow.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowDirection {
     Forward = 0,
     Reverse = 1,
+    /// Persists `resolve_backend_src_port`'s decision for a flow keyed on
+    /// its natural (client, real client port, pod, target port) tuple --
+    /// see `backend_port_resolution`'s doc comment for why re-deriving the
+    /// port from scratch on every packet is unsafe under LRU eviction.
+    PortMemo = 2,
 }
 
 /// `encode_tcp_flow_key`'s 37 bytes plus one `FlowDirection` tag byte. Only
@@ -449,6 +459,42 @@ fn synthetic_port_seed(front_ip: u32, front_port: u16) -> u16 {
     (mixed as u16) % REMAP_PORT_RANGE
 }
 
+/// Whether `try_geneve_decap_forward` should reuse a previously-committed
+/// backend-src-port for this flow, or run `resolve_backend_src_port`'s probe
+/// fresh. `resolve_backend_src_port`'s occupancy check only proves
+/// idempotency while every occupant already in the probe's window stays
+/// alive: with no persisted decision, an LRU eviction of some UNRELATED
+/// occupant at an EARLIER probe index, between two packets of THIS flow,
+/// makes a fresh probe land back on that now-free earlier candidate instead
+/// of continuing on to this flow's actual committed port -- a reverse-path-
+/// breaking mid-connection port change the ingress node has no way to learn
+/// about. Persisting the first resolution (under `FlowDirection::PortMemo`)
+/// and reusing it makes every later packet's outcome independent of any
+/// other flow's occupancy in the table -- a structural guarantee, not one
+/// that depends on address disjointness (round-1 of this fix, a second
+/// REV_FLOW key keyed on VIP+client, relied on exactly that and broke for a
+/// hostNetwork Pod).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendPortResolution {
+    /// A port was already committed for this flow on an earlier packet --
+    /// reuse it unconditionally. No probe, so no other flow's table churn
+    /// can ever change it.
+    Memoized(u16),
+    /// No commitment persisted yet (this flow's first packet, or its memo
+    /// entry was itself evicted) -- run `resolve_backend_src_port`'s probe.
+    Probe,
+}
+
+/// `memoized_port`: the result of a `FLOW_TABLE` `PortMemo`-tagged lookup
+/// for this flow's natural (client, real client port, pod, target port)
+/// key, if any.
+pub fn backend_port_resolution(memoized_port: Option<u16>) -> BackendPortResolution {
+    match memoized_port {
+        Some(port) => BackendPortResolution::Memoized(port),
+        None => BackendPortResolution::Probe,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,12 +582,12 @@ mod tests {
 
     #[test]
     fn same_5_tuple_forward_and_reverse_tagged_keys_never_collide() {
-        // A hostNetwork Pod's IP can equal a VIP, so the forward and
-        // reverse roles can share the identical (client_ip, client_port,
-        // other_ip, other_port, proto) 5-tuple. Without the explicit tag, a
-        // forward-role entry and a reverse-role entry for that shared tuple
+        // A hostNetwork Pod's IP can equal a VIP, so the forward, reverse,
+        // and port-memo roles can all share the identical (client_ip,
+        // client_port, other_ip, other_port, proto) 5-tuple. Without the
+        // explicit tag, entries for two of these roles on that shared tuple
         // would alias the same map slot and one role would silently
-        // clobber the other's state.
+        // clobber another's state.
         let client_ip = ipv4_mapped_v6(0x0100_000a);
         let other_ip = ipv4_mapped_v6(0x0200_000a);
         let fwd_key = encode_flow_key(
@@ -560,8 +606,22 @@ mod tests {
             6,
             FlowDirection::Reverse,
         );
+        let port_memo_key = encode_flow_key(
+            client_ip,
+            0x1234,
+            other_ip,
+            0x5678,
+            6,
+            FlowDirection::PortMemo,
+        );
         assert_ne!(fwd_key, rev_key);
+        assert_ne!(fwd_key, port_memo_key);
+        assert_ne!(rev_key, port_memo_key);
         assert_eq!(&fwd_key[..TCP_FLOW_KEY_LEN], &rev_key[..TCP_FLOW_KEY_LEN]);
+        assert_eq!(
+            &fwd_key[..TCP_FLOW_KEY_LEN],
+            &port_memo_key[..TCP_FLOW_KEY_LEN]
+        );
     }
 
     #[test]
@@ -941,6 +1001,89 @@ mod tests {
             rev_flow.get(&client_port_a).copied(),
             Some((first_writer, client_port_a)),
             "first_writer's original entry must also survive untouched"
+        );
+    }
+
+    #[test]
+    fn evicting_an_unrelated_earlier_probe_occupant_does_not_change_a_memoized_ports_resolution() {
+        // resolve_backend_src_port probes REV_FLOW occupancy in a fixed,
+        // deterministic order on EVERY packet. If an UNRELATED
+        // flow occupying an EARLIER probe candidate gets evicted by the LRU
+        // between two packets of THIS flow, a naive re-probe finds that
+        // earlier slot free now and commits to a DIFFERENT port than the one
+        // this flow already committed -- breaking the reverse path
+        // mid-connection, since the ingress node's un-remap still expects
+        // the ORIGINAL port. Memoizing the first resolution and reusing it
+        // (`backend_port_resolution`) must make this flow's outcome
+        // independent of any other flow's table churn.
+        use std::collections::HashMap;
+
+        let client_src_port = 0x9999u16;
+        let first_writer = (0x0a00_0001u32, 6000u16); // occupies the natural key
+        let front_a = (0x0a00_001eu32, 31000u16); // conflicts -> triggers a probe
+
+        let mut rev_flow: HashMap<u16, ((u32, u16), u16)> = HashMap::new();
+        rev_flow.insert(client_src_port, (first_writer, client_src_port));
+
+        // An UNRELATED flow occupies the probe's very first candidate (seed
+        // offset 0) -- this is the earlier-probe-index occupant the
+        // eviction below frees.
+        let seed = synthetic_port_seed(front_a.0, front_a.1);
+        let earliest_candidate = REMAP_PORT_BASE.wrapping_add(seed);
+        let unrelated_earlier_occupant = ((0x0a00_00ffu32, 9999u16), 1234u16);
+        rev_flow.insert(earliest_candidate, unrelated_earlier_occupant);
+
+        let resolve_fresh = |rev_flow: &HashMap<u16, ((u32, u16), u16)>| {
+            resolve_backend_src_port(
+                Some((first_writer, client_src_port)),
+                front_a,
+                client_src_port,
+                |candidate| {
+                    occupant_conflicts(rev_flow.get(&candidate).copied(), front_a, client_src_port)
+                },
+            )
+        };
+
+        // Packet 1: no memo yet -- the real probe must skip the occupied
+        // earliest candidate and land on the next free one.
+        let BackendPortDecision::Remap(port_x) = resolve_fresh(&rev_flow) else {
+            panic!("expected a remap on front-address conflict");
+        };
+        assert_ne!(
+            port_x, earliest_candidate,
+            "fixture invariant broken: the earliest candidate must be occupied so packet 1's \
+             probe is actually forced past it, or this test doesn't exercise the bug at all"
+        );
+        rev_flow.insert(port_x, (front_a, client_src_port));
+        let memo = Some(port_x);
+
+        // Between packet 1 and packet 2, an UNRELATED flow's entry at the
+        // earlier probe index gets evicted by the LRU -- nothing to do with
+        // this flow.
+        rev_flow.remove(&earliest_candidate);
+
+        // Demonstrates the bug precondition: WITHOUT the memo, a fresh
+        // re-probe of the SAME flow now finds the earlier candidate free and
+        // commits to a DIFFERENT port than packet 1's.
+        let BackendPortDecision::Remap(churned_port) = resolve_fresh(&rev_flow) else {
+            panic!("expected a remap on repeat resolution");
+        };
+        assert_eq!(
+            churned_port, earliest_candidate,
+            "fixture invariant broken: freeing the earlier occupant must change what a fresh \
+             re-probe returns, or this test isn't exercising the bug at all"
+        );
+
+        // The fix: packet 2 must never re-probe -- it reuses the memoized
+        // port from packet 1, so the just-freed earlier candidate (or any
+        // other unrelated table churn) has no way to reach the decision.
+        assert_eq!(
+            backend_port_resolution(memo),
+            BackendPortResolution::Memoized(port_x),
+            "packet 2 of the same flow must reuse packet 1's committed port ({port_x}) even \
+             though an unrelated occupant at an earlier probe index was freed in between -- \
+             reusing the memo instead of re-probing is what keeps the reverse path from \
+             breaking mid-connection"
         );
     }
 

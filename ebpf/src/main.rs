@@ -49,11 +49,11 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use beep_common::{
-    decap_forward_pod_admission, egress_return_admission, egress_return_outcome, encode_flow_key,
-    encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
-    resolve_backend_src_port, return_authorization, BackendPortDecision, DecapForwardPodAdmission,
-    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission,
-    ReturnAuthorization, TcpFlowKey,
+    backend_port_resolution, decap_forward_pod_admission, egress_return_admission,
+    egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission, ipv4_mapped_v6,
+    occupant_conflicts, resolve_backend_src_port, return_authorization, BackendPortDecision,
+    BackendPortResolution, DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome,
+    FlowDirection, FlowKey, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -218,10 +218,12 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 #[map]
 static FWD_PENDING: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_entries(2048, 0);
 
-/// Union of the two roles `FLOW_TABLE` stores, discriminated by the
+/// Union of the three roles `FLOW_TABLE` stores, discriminated by the
 /// `FlowDirection` tag in its key. `forward` is the promoted,
 /// established-affinity value `FWD_MAIN` used to store; `reverse` is the
-/// backend-side un-DNAT conntrack value `REV_FLOW` used to store.
+/// backend-side un-DNAT conntrack value `REV_FLOW` used to store;
+/// `port_memo` persists a backend-src-port remap decision so it survives
+/// unrelated LRU churn instead of being re-derived per packet.
 /// Callers must only ever read the field matching the key's own tag -- the
 /// other field's bytes are whatever the last write to that slot happened to
 /// leave there, exactly like reading the wrong arm of any tagged union.
@@ -230,6 +232,7 @@ static FWD_PENDING: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_en
 pub union FlowValue {
     pub forward: VipBackend,
     pub reverse: RevFlowValue,
+    pub port_memo: PortMemoValue,
 }
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
@@ -252,6 +255,21 @@ pub struct RevFlowValue {
     pub vip_ip: u32,
     pub vip_port: u16,
     pub original_client_port: u16,
+}
+
+/// Backend-side persisted port-remap decision, keyed under
+/// `FlowDirection::PortMemo` on the flow's natural (client, real client
+/// port, pod, target port) tuple. `resolve_backend_src_port`'s occupancy
+/// probe only guarantees a STABLE answer while every occupant in its probe
+/// window stays alive; without this memo, an LRU eviction of some unrelated
+/// occupant at an earlier probe index between two packets of the same flow
+/// makes a fresh probe land on a DIFFERENT port than the one already in use
+/// -- breaking the reverse path mid-connection. See
+/// `beep_common::backend_port_resolution`'s doc comment.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PortMemoValue {
+    pub backend_src_port: u16,
 }
 
 /// Unified forward(established)+reverse conntrack table, replacing the
@@ -304,6 +322,11 @@ fn flow_table_get_forward(key: FlowKey) -> Option<VipBackend> {
 #[inline(always)]
 fn flow_table_get_reverse(key: FlowKey) -> Option<RevFlowValue> {
     unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.reverse })
+}
+
+#[inline(always)]
+fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
+    unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.port_memo })
 }
 
 /// Counts packets dropped by `try_uplink_egress_return` on a FLOW_TABLE
@@ -590,70 +613,119 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         proto,
         FlowDirection::Reverse,
     );
-
-    // Decision 3 (`ebpf-lb-dataplane.md`): two Services with different front
-    // addresses sharing this backend Pod:targetPort, hit by a client
-    // reusing one source port across both, would otherwise write this same
-    // reverse key twice. Check whether a DIFFERENT (front, original client
-    // port) identity already holds it before trusting the natural key -- a
-    // matching identity (or no entry at all) means this is the same flow
-    // refreshing, or the first writer. Front alone isn't enough: a distinct
-    // flow through this same front whose real source port happens to equal
-    // another flow's already-committed synthetic port would otherwise be
-    // misread as that flow's own state and clobber its reverse-tagged entry.
-    let existing_occupant = flow_table_get_reverse(natural_rev_key)
-        .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
-    // Raw scalars, not an `ipv4_mapped_v6`-widened pair: `RevFlowValue`'s
-    // `vip_ip` and this packet's `vip_ip` are already bare `u32`s, and the
-    // mapping is injective, so comparing the wire values directly is exactly
-    // equivalent to comparing their v6-mapped forms and turns a 20-byte
-    // compare into an 8-byte one on every probe iteration.
-    let new_front = (vip_ip, vip_port);
-    // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
-    // the source of truth for which candidate ports are actually free, not
-    // a derived guess -- a single low-entropy hash of the front address only
-    // guaranteed uniqueness for exactly 2 conflicting fronts. An occupant
-    // matching both our own front and our own original client port is a
-    // prior packet of this exact flow's already-committed remap, not a
-    // conflict -- without that full comparison the flow (or an unrelated
-    // flow reusing its synthetic port as a real source port) reads state
-    // back as "taken"/"mine" incorrectly and either churns ports until
-    // PROBE_LIMIT is exhausted, or silently clobbers another flow's entry.
-    //
-    // `candidate_key` is built ONCE and patched in place per candidate: its
-    // address escapes into `bpf_map_lookup_elem` on every probe call, so the
-    // compiler can't hoist the build itself, and PROBE_LIMIT's constant trip
-    // count means this loop very likely fully unrolls -- re-encoding all 38
-    // bytes per iteration would put 16 copies of that build into program
-    // text for the sake of the 2 bytes (the port) that actually change.
-    let mut candidate_key = encode_flow_key(
+    // Keyed on the flow's natural (real client port, never a remapped one)
+    // tuple, so it's the same key on every packet of this flow regardless of
+    // whether the flow ends up remapped -- see
+    // `beep_common::backend_port_resolution`'s doc comment for why
+    // re-deriving the port from `resolve_backend_src_port`'s probe on every
+    // packet is unsafe under LRU eviction.
+    let port_memo_key = encode_flow_key(
         client_ip_v6,
-        0,
+        client_port,
         pod_ip_v6,
         target_port,
         proto,
-        FlowDirection::Reverse,
+        FlowDirection::PortMemo,
     );
-    let is_reverse_key_taken = |candidate_port: u16| {
-        candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
-        let occupant = flow_table_get_reverse(candidate_key)
-            .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
-        occupant_conflicts(occupant, new_front, client_port)
-    };
-    let (rev_key, backend_src_port) = match resolve_backend_src_port(
-        existing_occupant,
-        new_front,
-        client_port,
-        is_reverse_key_taken,
-    ) {
-        BackendPortDecision::NoRemap => (natural_rev_key, client_port),
-        // The probe's last iteration already patched `candidate_key` to
-        // exactly this winning port -- reuse it instead of re-encoding.
-        BackendPortDecision::Remap(synthetic_port) => (candidate_key, synthetic_port),
-        // Every candidate in the bounded probe window was already taken --
-        // drop rather than reuse an occupied reverse key, which would
-        // silently reproduce the exact clobbering bug Decision 3 closes.
-        BackendPortDecision::Exhausted => return Some(TC_ACT_SHOT),
+    let memoized_port = flow_table_get_port_memo(port_memo_key).map(|v| v.backend_src_port);
+
+    let (rev_key, backend_src_port) = match backend_port_resolution(memoized_port) {
+        BackendPortResolution::Memoized(port) => (
+            encode_flow_key(
+                client_ip_v6,
+                port,
+                pod_ip_v6,
+                target_port,
+                proto,
+                FlowDirection::Reverse,
+            ),
+            port,
+        ),
+        BackendPortResolution::Probe => {
+            // Decision 3 (`ebpf-lb-dataplane.md`): two Services with different front
+            // addresses sharing this backend Pod:targetPort, hit by a client
+            // reusing one source port across both, would otherwise write this same
+            // reverse key twice. Check whether a DIFFERENT (front, original client
+            // port) identity already holds it before trusting the natural key -- a
+            // matching identity (or no entry at all) means this is the same flow
+            // refreshing, or the first writer. Front alone isn't enough: a distinct
+            // flow through this same front whose real source port happens to equal
+            // another flow's already-committed synthetic port would otherwise be
+            // misread as that flow's own state and clobber its reverse-tagged entry.
+            let existing_occupant = flow_table_get_reverse(natural_rev_key)
+                .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
+            // Raw scalars, not an `ipv4_mapped_v6`-widened pair: `RevFlowValue`'s
+            // `vip_ip` and this packet's `vip_ip` are already bare `u32`s, and the
+            // mapping is injective, so comparing the wire values directly is exactly
+            // equivalent to comparing their v6-mapped forms and turns a 20-byte
+            // compare into an 8-byte one on every probe iteration.
+            let new_front = (vip_ip, vip_port);
+            // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
+            // the source of truth for which candidate ports are actually free, not
+            // a derived guess -- a single low-entropy hash of the front address only
+            // guaranteed uniqueness for exactly 2 conflicting fronts. An occupant
+            // matching both our own front and our own original client port is a
+            // prior packet of this exact flow's already-committed remap, not a
+            // conflict -- without that full comparison the flow (or an unrelated
+            // flow reusing its synthetic port as a real source port) reads state
+            // back as "taken"/"mine" incorrectly and either churns ports until
+            // PROBE_LIMIT is exhausted, or silently clobbers another flow's entry.
+            //
+            // `candidate_key` is built ONCE and patched in place per candidate: its
+            // address escapes into `bpf_map_lookup_elem` on every probe call, so the
+            // compiler can't hoist the build itself, and PROBE_LIMIT's constant trip
+            // count means this loop very likely fully unrolls -- re-encoding all 38
+            // bytes per iteration would put 16 copies of that build into program
+            // text for the sake of the 2 bytes (the port) that actually change.
+            let mut candidate_key = encode_flow_key(
+                client_ip_v6,
+                0,
+                pod_ip_v6,
+                target_port,
+                proto,
+                FlowDirection::Reverse,
+            );
+            let is_reverse_key_taken = |candidate_port: u16| {
+                candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
+                let occupant = flow_table_get_reverse(candidate_key)
+                    .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
+                occupant_conflicts(occupant, new_front, client_port)
+            };
+            match resolve_backend_src_port(
+                existing_occupant,
+                new_front,
+                client_port,
+                is_reverse_key_taken,
+            ) {
+                BackendPortDecision::NoRemap => (natural_rev_key, client_port),
+                BackendPortDecision::Remap(synthetic_port) => {
+                    // Persist so every later packet of this flow reuses this
+                    // exact port instead of re-probing. Never written for
+                    // NoRemap: that outcome is already stable across any
+                    // table churn (it never depends on other occupants), so
+                    // it needs no memo.
+                    FLOW_TABLE
+                        .insert(
+                            port_memo_key,
+                            FlowValue {
+                                port_memo: PortMemoValue {
+                                    backend_src_port: synthetic_port,
+                                },
+                            },
+                            0,
+                        )
+                        .ok()?;
+                    // The probe's last iteration already patched
+                    // `candidate_key` to exactly this winning port -- reuse
+                    // it instead of re-encoding.
+                    (candidate_key, synthetic_port)
+                }
+                // Every candidate in the bounded probe window was already taken --
+                // drop rather than reuse an occupied reverse key, which would
+                // silently reproduce the exact clobbering bug Decision 3 closes.
+                BackendPortDecision::Exhausted => return Some(TC_ACT_SHOT),
+            }
+        }
     };
 
     let rev_value = RevFlowValue {
