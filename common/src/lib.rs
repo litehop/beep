@@ -73,6 +73,55 @@ pub fn decode_tcp_flow_key(key: &TcpFlowKey) -> ([u8; 16], u16, [u8; 16], u16, u
     (client_ip, client_port, other_ip, other_port, proto)
 }
 
+/// Discriminates entries in `beep-ebpf`'s unified flow table
+/// (`FLOW_TABLE`): forward-role (ingress-node, established-affinity) and
+/// reverse-role (backend-node, un-DNAT conntrack) entries share one physical
+/// `LRU_HASH` keyed on the same 5-tuple shape for a given flow, so this
+/// explicit tag byte is the only thing keeping the two roles from colliding
+/// -- deliberately NOT VIP-vs-pod-CIDR address disjointness, which does not
+/// hold for a hostNetwork Pod (`docs/design/ebpf-lb-dataplane.md`'s
+/// disjointness correction; a hostNetwork Pod's IP can equal a VIP, which is
+/// the exact misdelivery this tag exists to prevent).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowDirection {
+    Forward = 0,
+    Reverse = 1,
+}
+
+/// `encode_tcp_flow_key`'s 37 bytes plus one `FlowDirection` tag byte. Only
+/// `FLOW_TABLE` (the merged forward+reverse table) uses this wider key --
+/// `FWD_PENDING` (the flood-exposed admission tier, never merged: eviction
+/// there must never reach an established entry) keeps the plain,
+/// untagged `TcpFlowKey`. Free: BPF pads an `LRU_HASH` element's key size up
+/// to a multiple of 8 regardless, so 37->38 costs the same bytes_memlock as
+/// 37, confirmed by measuring both against a live kernel.
+pub const FLOW_KEY_LEN: usize = TCP_FLOW_KEY_LEN + 1;
+pub type FlowKey = [u8; FLOW_KEY_LEN];
+
+/// Packs a `FlowKey` for `FLOW_TABLE`: `encode_tcp_flow_key`'s bytes plus the
+/// direction tag that keeps a forward-role and reverse-role entry for the
+/// same 5-tuple from aliasing each other in the shared table.
+pub fn encode_flow_key(
+    client_ip: [u8; 16],
+    client_port: u16,
+    other_ip: [u8; 16],
+    other_port: u16,
+    proto: u8,
+    direction: FlowDirection,
+) -> FlowKey {
+    let mut key = [0u8; FLOW_KEY_LEN];
+    key[0..TCP_FLOW_KEY_LEN].copy_from_slice(&encode_tcp_flow_key(
+        client_ip,
+        client_port,
+        other_ip,
+        other_port,
+        proto,
+    ));
+    key[TCP_FLOW_KEY_LEN] = direction as u8;
+    key
+}
+
 /// QUIC flow-affinity key: a fixed-length prefix of the Destination
 /// Connection ID the LB itself mints into the RFC 9000 SS17.2 Initial-packet
 /// DCID -- not derived from the client's address, so it carries no
@@ -436,6 +485,45 @@ mod tests {
         // disjoint.
         let real_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert_eq!(unmap_ipv4(&real_v6), None);
+    }
+
+    #[test]
+    fn flow_key_is_38_bytes_the_tcp_key_plus_one_tag_byte() {
+        // Adding a tag byte instead of relying on VIP-vs-pod-CIDR
+        // disjointness is only justified because it's free (BPF rounds key
+        // size up to a multiple of 8 regardless) -- a length regression here
+        // would silently make that trade-off no longer hold.
+        assert_eq!(FLOW_KEY_LEN, 38);
+    }
+
+    #[test]
+    fn same_5_tuple_forward_and_reverse_tagged_keys_never_collide() {
+        // A hostNetwork Pod's IP can equal a VIP, so the forward and
+        // reverse roles can share the identical (client_ip, client_port,
+        // other_ip, other_port, proto) 5-tuple. Without the explicit tag, a
+        // forward-role entry and a reverse-role entry for that shared tuple
+        // would alias the same map slot and one role would silently
+        // clobber the other's state.
+        let client_ip = ipv4_mapped_v6(0x0100_000a);
+        let other_ip = ipv4_mapped_v6(0x0200_000a);
+        let fwd_key = encode_flow_key(
+            client_ip,
+            0x1234,
+            other_ip,
+            0x5678,
+            6,
+            FlowDirection::Forward,
+        );
+        let rev_key = encode_flow_key(
+            client_ip,
+            0x1234,
+            other_ip,
+            0x5678,
+            6,
+            FlowDirection::Reverse,
+        );
+        assert_ne!(fwd_key, rev_key);
+        assert_eq!(&fwd_key[..TCP_FLOW_KEY_LEN], &rev_key[..TCP_FLOW_KEY_LEN]);
     }
 
     #[test]

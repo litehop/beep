@@ -11,13 +11,13 @@
 //! resulting links AND maps under a bpffs directory so a loader restart
 //! re-adopts the existing attachment instead of leaving the interface
 //! unprotected or double-attaching, and REUSES the existing `FWD_PENDING`/
-//! `FWD_MAIN`/`REV_FLOW` conntrack tables instead of swapping in an empty
+//! `FLOW_TABLE` conntrack tables instead of swapping in an empty
 //! set -- `Ebpf::load` alone creates a fresh map set on every call, which
 //! would silently drop every established flow on each DaemonSet rollout,
 //! eviction, or OOM kill. Real Service/EndpointSlice watching is Phase 5.
 //!
-//! `FWD_PENDING`/`FWD_MAIN` sizes are a load-time DaemonSet config knob, not
-//! a value baked into the eBPF object (`beep-ebpf`'s admission-control
+//! `FWD_PENDING`/`FLOW_TABLE` sizes are a load-time DaemonSet config knob,
+//! not a value baked into the eBPF object (`beep-ebpf`'s admission-control
 //! doc comment) -- overridden here via `EbpfLoader::map_max_entries` before
 //! `load()`.
 
@@ -48,24 +48,24 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-const MAP_NAMES: [&str; 7] = [
+const MAP_NAMES: [&str; 6] = [
     "CONFIG",
     "VIP_MAP",
     "TARGET_PORTS",
     "POD_TARGETS",
     "FWD_PENDING",
-    "FWD_MAIN",
-    "REV_FLOW",
+    "FLOW_TABLE",
 ];
 
 /// Defaults from the admission-control sizing derivation
-/// (`beep-ebpf`'s `FWD_PENDING`/`FWD_MAIN` doc comment): PENDING is the
+/// (`beep-ebpf`'s `FWD_PENDING`/`FLOW_TABLE` doc comments): PENDING is the
 /// only flood-exposed tier, sized to peak concurrent half-open connections
-/// with headroom; MAIN is sized to peak legitimate established concurrency,
-/// a valid basis only because admission control keeps it unreachable by a
-/// flood.
+/// with headroom; FLOW_TABLE (the merged forward-established+reverse
+/// conntrack table) is sized to peak legitimate established concurrency for
+/// BOTH roles combined, a valid basis for its forward role only because
+/// admission control keeps that role unreachable by a flood.
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
-const DEFAULT_FWD_MAIN_MAX_ENTRIES: u32 = 8192;
+const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -111,11 +111,14 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FWD_PENDING_MAX_ENTRIES)]
     fwd_pending_max_entries: u32,
 
-    /// `FWD_MAIN` max_entries -- reachable only via a flow's promoted (i.e.
-    /// bidirectionally-confirmed) conntrack entry, sized to legitimate peak
-    /// established concurrency.
-    #[arg(long, default_value_t = DEFAULT_FWD_MAIN_MAX_ENTRIES)]
-    fwd_main_max_entries: u32,
+    /// `FLOW_TABLE` max_entries -- the unified forward-established+reverse
+    /// conntrack table. The forward role is reachable only via a flow's
+    /// promoted (i.e. bidirectionally-confirmed) entry; the reverse role
+    /// writes on a backend node's first forward-decap for a flow. Sized to
+    /// legitimate peak established concurrency across BOTH roles combined,
+    /// since they now share one physical capacity pool.
+    #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
+    flow_table_max_entries: u32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -302,7 +305,7 @@ fn main() -> anyhow::Result<()> {
         fixtures,
         pod_cidr,
         fwd_pending_max_entries,
-        fwd_main_max_entries,
+        flow_table_max_entries,
     } = Args::parse();
 
     for fixture in &fixtures {
@@ -327,7 +330,7 @@ fn main() -> anyhow::Result<()> {
     // intended behavior -- sizing is decided once at initial provisioning,
     // not resized on every restart (the declined-runtime-resize decision).
     loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
-    loader.map_max_entries("FWD_MAIN", fwd_main_max_entries);
+    loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
     let mut ebpf = loader
         .load(include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
@@ -502,9 +505,10 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()
         // set: a Pod that departed since the last run otherwise leaves a
         // stale entry here forever. That used to be harmless (this map was
         // read-only membership metadata), but it now gates
-        // `uplink_egress_return`'s drop-on-REV_FLOW-miss decision -- a
-        // stale entry for a departed/reused Pod IP would misclassify
-        // unrelated future traffic on that address as "ours" and drop it.
+        // `uplink_egress_return`'s drop-on-FLOW_TABLE-reverse-tagged-miss
+        // decision -- a stale entry for a departed/reused Pod IP would
+        // misclassify unrelated future traffic on that address as "ours"
+        // and drop it.
         // Prune anything the fresh fixture set no longer claims before
         // writing it.
         let existing_ips: Vec<u32> = pod_targets.keys().collect::<Result<_, _>>()?;
@@ -814,9 +818,9 @@ mod tests {
         // POD_TARGETS is pinned and reused across loader restarts, so a Pod
         // absent from the fresh `--fixture` set is one that's gone away.
         // uplink_egress_return now DROPS on a POD_TARGETS hit with no
-        // matching REV_FLOW entry -- an unpruned stale entry would
-        // misclassify unrelated traffic that later reuses this address as
-        // "ours" and drop it instead of passing it through.
+        // matching FLOW_TABLE reverse-tagged entry -- an unpruned stale
+        // entry would misclassify unrelated traffic that later reuses this
+        // address as "ours" and drop it instead of passing it through.
         let departed_pod_ip = wire_ip(Ipv4Addr::new(10, 244, 1, 9));
         let existing = [departed_pod_ip];
         let fixtures: [Fixture; 0] = [];

@@ -63,7 +63,7 @@ jobs:
 
   # Loads the real programs and drives one client->VIP->backend round trip
   # natively on ubuntu-latest (no Lima/cross-build), then asserts the discovered
-  # map set is EXACTLY the 8 known maps (catches partial-discovery regressions a
+  # map set is EXACTLY the 7 known maps (catches partial-discovery regressions a
   # byte-sum-only check would miss) under a gross-regression bytes_memlock ceiling.
   ebpf-memory-smoke:
     runs-on: ubuntu-latest
@@ -115,7 +115,7 @@ jobs:
             --pin-dir /sys/fs/bpf/beep-smoke \
             --out-dir /tmp/beep-ebpf-memory-assert
 
-      - name: Assert the discovered map set is exactly the 8 known maps, under the gross-regression byte ceiling
+      - name: Assert the discovered map set is exactly the 7 known maps, under the gross-regression byte ceiling
         run: bash scripts/assert-ebpf-map-memory.sh /tmp/beep-ebpf-memory-assert/ebpf-map-memory.csv
 
       - name: Cleanup
