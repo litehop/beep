@@ -62,6 +62,7 @@ WG_SUBNET_B="10.99.0.4"
 WG_PORT="51820"
 VIP_PORT="19100"
 POD_IP="198.51.100.60"
+POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18090"
 
 for tool in cargo-zigbuild limactl; do
@@ -158,8 +159,8 @@ remote "$VM_B" setup-geneve
 
 echo "==> [5/6] loading beep-ebpf on both nodes (uplink=wg0) -- this is the verifier-accept gate on a real L3 WireGuard uplink"
 FIXTURE="${WG_SUBNET_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
-remote "$VM_A" start-loader --fixture "$FIXTURE"
-remote "$VM_B" start-loader --fixture "$FIXTURE"
+remote "$VM_A" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR"
+remote "$VM_B" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR"
 
 remote "$VM_B" setup-backend --pod-ip "$POD_IP"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"

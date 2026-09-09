@@ -37,6 +37,7 @@ the resulting object into the loader binary.
 ```console
 $ sudo ./target/release/beep \
     --uplink-iface eth0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/beep \
+    --pod-cidr 10.244.0.0/16 \
     --fixture 10.0.0.5:8080:tcp:10.0.0.6:10.244.1.7:80
 ```
 
@@ -47,9 +48,15 @@ repeatable -- one Pod behind two Service ports (e.g. 80->8080 alongside
 ```console
 $ sudo ./target/release/beep \
     --uplink-iface eth0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/beep \
+    --pod-cidr 10.244.0.0/16 \
     --fixture 10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080 \
     --fixture 10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443
 ```
+
+`--pod-cidr` rejects the loader at startup if any `--fixture` vip_ip falls
+inside it: a hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP)
+space, so a VIP inside the pod CIDR is not disjoint from pod-IP space by
+construction and can byte-collide a forward and reverse flow key.
 
 `geneve0` must already exist as a "collect metadata" external Geneve device
 (`ip link add geneve0 type geneve external && ip link set geneve0 up`) --

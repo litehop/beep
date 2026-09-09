@@ -123,18 +123,21 @@ setup_backend() {
 }
 
 start_loader() {
-  local uplink_iface="$WG_IFACE" fixture=""
+  local uplink_iface="$WG_IFACE" fixture="" pod_cidr=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --fixture) fixture="$2"; shift 2 ;;
+      --pod-cidr) pod_cidr="$2"; shift 2 ;;
       *) echo "start-loader: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
   [ -n "$fixture" ] || { echo "start-loader: --fixture required" >&2; exit 1; }
+  [ -n "$pod_cidr" ] || { echo "start-loader: --pod-cidr required" >&2; exit 1; }
   mkdir -p "$PIN_DIR"
 
   nohup "$BIN" \
     --uplink-iface "$uplink_iface" --geneve-iface "$GENEVE_IFACE" --pin-dir "$PIN_DIR" \
+    --pod-cidr "$pod_cidr" \
     --fixture "$fixture" \
     >"$LOADER_LOG" 2>&1 &
   loader_pid=$!
