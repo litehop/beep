@@ -8,9 +8,9 @@ beep is a resource-conscious [eBPF](https://ebpf.io) service load balancer for K
 
 This crate is beep's userspace loader. See `docs/design/ebpf-lb-dataplane.md` and `docs/decisions/ebpf-toolchain-aya.md` for the design behind it.
 
-The loader attaches three tc-bpf classifiers and pins them under a bpffs directory. (Phase 1 had two separate classifiers, `geneve_ingress_decap` and `geneve_ingress_return`; they're now one `geneve_ingress` classifier that dispatches by VNI — see that program's doc comment for why.)
+The loader attaches three tc-bpf classifiers and pins them under a bpffs directory.
 
-For now, you supply the loader with static VIP:PORT -> backend-node/PodIP:TargetPort mappings via `--fixture`, to prove the mechanism works — real Service/EndpointSlice watching is Phase 5. Repeat `--fixture` if one Pod sits behind more than one Service port.
+For now, you supply the loader with static VIP:PORT -> backend-node/PodIP:TargetPort mappings via `--fixture`, to prove the mechanism works. Repeat `--fixture` if one Pod sits behind more than one Service port.
 
 `beep-ebpf` is this crate's no_std sibling — the actual dataplane program. This loader links Linux-only syscalls (`bpf(2)`, netlink), so it only builds and runs on Linux.
 
@@ -62,11 +62,17 @@ You need `CAP_BPF` and `CAP_NET_ADMIN` (root today, or the DaemonSet's intended 
 
 Killing the process doesn't tear anything down: the attachment and its pins live in the pinned kernel objects, not in the process. Re-running the binary re-adopts the existing pins instead of double-attaching, and it overwrites the fixture map entries with whatever `--fixture` values you pass on that run.
 
+To detach the programs, remove their pins: each classifier is attached as a TCX link (`bpf_link`, not a classic tc filter or clsact qdisc), and its pin under `--pin-dir` is the only thing keeping it alive once the loader process exits. Delete that directory and the kernel drops the attachment:
+
+```console
+$ sudo rm -rf /sys/fs/bpf/beep
+```
+
+`scripts/smoke-remote.sh cleanup` does exactly this between runs.
+
 ## Local eBPF verifier gate
 
-`ebpf-build` CI only proves that the `bpfel-unknown-none` object *compiles*. It doesn't prove that the kernel verifier *accepts* it at load, or that a packet actually completes the encap/decap round trip.
-
-Before merging any beep-ebpf PR, run the smoke test locally:
+Before merging any beep-ebpf PR, run the smoke test locally to check that the kernel verifier accepts the compiled program and that a packet completes the encap/decap round trip:
 
 ```console
 $ scripts/smoke.sh                    # uses the default VM: lima-node-5
@@ -102,6 +108,6 @@ $ sudo bpftool map dump id <id>             # actual live entries, not the ceili
 
 Use this same command path to inspect Phase 3's conntrack maps. `FWD_PENDING` (2048 entries by default), `FWD_MAIN` (8192 entries by default), and `REV_FLOW` (8192 entries) are all `LRU_HASH` maps, keyed on the full tuple (`beep_common::TcpFlowKey`).
 
-`FWD_PENDING` and `FWD_MAIN` replace the old single `FWD_FLOW` table with a promote-on-bidirectionality scheme: a new flow mints into `FWD_PENDING` only, then promotes to `FWD_MAIN` once its return leg is observed. This way, a flood of new flows can never evict an established one. You configure both ceilings at load time, with `--fwd-pending-max-entries` and `--fwd-main-max-entries` — they aren't baked into the object.
+A new flow mints into `FWD_PENDING` only, then promotes to `FWD_MAIN` once its return leg is observed. This way, a flood of new flows can never evict an established one. You configure both ceilings at load time, with `--fwd-pending-max-entries` and `--fwd-main-max-entries` — they aren't baked into the object.
 
 `VIP_MAP` and `TARGET_PORTS` are still Phase 2's simple, small-scale fixture maps, both keyed on the same VIP:PORT:proto front tuple. Real Service/EndpointSlice sizing is Phase 5.
