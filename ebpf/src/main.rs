@@ -295,7 +295,9 @@ pub struct PortMemoValue {
 /// entry-count ceiling below is sized to keep this a large-burst-only
 /// concern, not a routine one, but the residual risk is real and worth a
 /// follow-up if a dual-role deployment's reverse-role churn rate turns out
-/// to be routine rather than exceptional.
+/// to be routine rather than exceptional. A remapped flow spends a third
+/// slot in this same pool -- its `PortMemo` entry -- so it costs more than
+/// the two slots a plain forward+reverse flow already occupies.
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling
 /// (`src/main.rs`'s `--flow-table-max-entries`), same as `FWD_PENDING`.
