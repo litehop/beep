@@ -49,10 +49,11 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use beep_common::{
-    egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
-    forward_admission, ipv4_mapped_v6, occupant_conflicts, resolve_backend_src_port,
-    return_authorization, BackendPortDecision, EgressReturnAdmission, EgressReturnOutcome,
-    FlowDirection, FlowKey, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
+    decap_forward_pod_admission, egress_return_admission, egress_return_outcome, encode_flow_key,
+    encode_tcp_flow_key, forward_admission, ipv4_mapped_v6, occupant_conflicts,
+    resolve_backend_src_port, return_authorization, BackendPortDecision, DecapForwardPodAdmission,
+    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission,
+    ReturnAuthorization, TcpFlowKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -151,6 +152,14 @@ static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
 /// admitted regardless of what its target port used to be
 /// (`beep_common::egress_return_admission`'s doc comment). Value is a bare
 /// existence marker, never read.
+///
+/// `try_geneve_decap_forward` (hook 4, the opposite direction) reuses this
+/// same map and the same pod-IP-only key, not a (front tuple, pod_ip) pair:
+/// this map has exactly one membership notion (this node's current backend
+/// Pods), and a pod that's still one of this node's own is still one of
+/// this node's own regardless of which front named it in the packet --
+/// giving both directions of a flow one authoritative membership check
+/// instead of two that could disagree.
 /// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
 #[map]
 static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
@@ -500,12 +509,15 @@ pub fn geneve_ingress(ctx: TcContext) -> i32 {
     }
 }
 
-/// Backend role (step 4): read `VIP_IP:VIP_PORT` off the still-untouched
-/// inner dst BEFORE rewriting anything, record the reverse-flow entry, DNAT
-/// dst to `PodIP:TargetPort` (src untouched -- the Pod must see the real
-/// client IP at L3), then hand the packet to the normal receive path:
-/// `TC_ACT_OK` on an inbound decap leaves the now-foreign-dst'd packet to
-/// the kernel's own routing, which is flannel's job from here, not ours.
+/// Backend role (step 4): gate the Geneve option's stamped pod_ip on
+/// POD_TARGETS membership -- this node, not a possibly-lagging ingress, is
+/// the authoritative consistency point for whether that pod is still one of
+/// its own -- read `VIP_IP:VIP_PORT` off the still-untouched inner dst
+/// BEFORE rewriting anything, record the reverse-flow entry, DNAT dst to
+/// `PodIP:TargetPort` (src untouched -- the Pod must see the real client IP
+/// at L3), then hand the packet to the normal receive path: `TC_ACT_OK` on
+/// an inbound decap leaves the now-foreign-dst'd packet to the kernel's own
+/// routing, which is flannel's job from here, not ours.
 #[inline(always)]
 fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32> {
     if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
@@ -528,6 +540,19 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
         return Some(TC_ACT_SHOT);
     }
     let pod_ip = u32::from_ne_bytes(opt[4..8].try_into().ok()?);
+
+    // Membership gate: TARGET_PORTS below only confirms this node hosts
+    // SOME backend for the front, never that this specific pod_ip -- as
+    // stamped by the ingress node, possibly stale under cross-node
+    // convergence drift -- is still one of this node's own pods. Same
+    // pod-IP-only POD_TARGETS membership `try_uplink_egress_return` gates
+    // its own direction on (`egress_return_admission`'s doc comment),
+    // checked here before the front-tuple TARGET_PORTS lookup so a
+    // not-our-pod packet is rejected off the cheaper 4-byte key first.
+    let is_local_pod = unsafe { POD_TARGETS.get(pod_ip) }.is_some();
+    if let DecapForwardPodAdmission::Drop = decap_forward_pod_admission(is_local_pod) {
+        return Some(TC_ACT_SHOT);
+    }
 
     let client_ip: u32 = ctx.load(IP_SRC).ok()?;
     let client_port: u16 = ctx.load(L4_SPORT).ok()?;
