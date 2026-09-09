@@ -72,6 +72,14 @@ Prefer these tools over ad hoc `limactl shell` commands when the task is
 inspection rather than mutation — they keep the VM's state legible to other
 sessions watching the same pool.
 
+**The MCP server needs its VM already started.** `limactl mcp` attaches to a
+running VM; against a stopped or not-yet-provisioned VM it errors, so
+`mcp__beep-<vm>__*` shows `CONNECTION_CLOSED` at session start until
+`lima-up.sh` has brought the VM up. Read that as "VMs not started yet," not a
+misconfiguration — the servers connect once each VM is running. The smoke
+scripts drive Lima via `limactl` directly, so the dataplane gate still holds
+while MCP is down.
+
 ## Host prerequisites
 
 Required on the macOS host before any of the above works:
