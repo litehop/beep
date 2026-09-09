@@ -41,8 +41,8 @@
 use aya_ebpf::{
     bindings::{bpf_tunnel_key, BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT},
     helpers::{
-        bpf_redirect, bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt,
-        bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
+        bpf_redirect, bpf_skb_change_head, bpf_skb_change_type, bpf_skb_get_tunnel_key,
+        bpf_skb_get_tunnel_opt, bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
@@ -359,6 +359,26 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
         != 0
     {
         return Some(TC_ACT_SHOT);
+    }
+
+    // An L3-only (WireGuard) uplink never gave this skb a MAC header, but
+    // geneve0 is always Ethernet-type: dev_queue_xmit's redirect path drops
+    // any skb with mac_len==0 targeting an Ethernet device (confirmed via a
+    // live kfree_skb trace, __bpf_redirect, reason NOT_SPECIFIED).
+    // bpf_skb_change_head resets both mac_header and mac_len, satisfying
+    // that contract; the zeroed 14 bytes it inserts become the Geneve
+    // inner frame's L2 header, which decap's hard-coded ETH_HLEN skip
+    // already expects (see try_geneve_decap_forward/_return). The inserted
+    // bytes are otherwise zero, so the EtherType field must be stamped
+    // explicitly -- decap's own ETH_P_IPV4 check (unconditional, since
+    // geneve0's inner frame is always "real" Ethernet from its point of
+    // view) would otherwise silently no-op on a live-captured all-zero
+    // EtherType (confirmed via a raw packet capture on the peer's wg0).
+    if l2_hlen == 0 {
+        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
+            return Some(TC_ACT_SHOT);
+        }
+        ctx.store(12, &ETH_P_IPV4, 0).ok()?;
     }
 
     if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
@@ -762,6 +782,17 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         != 0
     {
         return Some(TC_ACT_SHOT);
+    }
+
+    // See try_uplink_ingress's matching comment: this node's uplink can be
+    // the same L3-only WireGuard device, so its geneve0 redirect needs the
+    // same synthesized MAC header (including the EtherType stamp decap
+    // relies on).
+    if l2_hlen == 0 {
+        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
+            return Some(TC_ACT_SHOT);
+        }
+        ctx.store(12, &ETH_P_IPV4, 0).ok()?;
     }
 
     if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
