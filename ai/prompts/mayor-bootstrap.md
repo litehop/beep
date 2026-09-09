@@ -125,7 +125,7 @@ hygiene loop body" sections below, in this file; paste verbatim or adapt
 as needed.
 
 **Mayor tick loop body — GitHub Merge Queue is active on this repo.** The
-main-branch ruleset (`<RULESET_ID: filled in by WS6 operator step>`) requires
+main-branch ruleset (`22605658`) requires
 these status checks, enforced: `ebpf-build`, `ebpf-memory-smoke`. Queue
 config: MERGE method, all-green grouping, min 1 / max 5,
 `allow_auto_merge=true`. `strict_required_status_checks_policy` is deliberately
