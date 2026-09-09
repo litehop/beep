@@ -334,6 +334,41 @@ pub struct Config {
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 
+/// `TcContext::load`'s underlying helper (`bpf_skb_load_bytes`) is a
+/// per-field helper call; `try_uplink_ingress`/`try_uplink_egress_return`
+/// see every packet crossing the node's uplink, not just beep's, and pay
+/// that cost on each header field before either hook can even reject
+/// non-beep traffic. `ctx.data()`/`ctx.data_end()` expose the skb's linear
+/// head directly, so a single bounds check against `data_end` is enough for
+/// the verifier to accept a raw pointer read in its place. Linear-head-only
+/// (no `bpf_skb_pull_data`), which is what both callers' headers are in
+/// practice. Same raw-wire-token semantics as `TcContext::load` (module
+/// doc): an unaligned copy of the bytes as they sit on the wire, no
+/// byte-swap.
+///
+/// `offset` must be a compile-time constant at every call site, and NEVER
+/// literally 0 -- confirmed against a live 6.8 kernel. A register-sourced
+/// offset (even one the verifier can prove is a single exact value via
+/// branch narrowing or a bitmask) never gets the bounds check's safe-range
+/// credit; `try_uplink_ingress`/`try_uplink_egress_return` dispatch on a
+/// const generic for exactly this reason (their doc comments). A literal
+/// `0` offset fails too, for a different reason: `start + 0` optimizes away
+/// the add entirely, so the pointer being checked is byte-for-byte the same
+/// register `ctx.data()` produced, and that specific case never gets the
+/// same credit a nonzero literal offset does either. Both are read as
+/// "the verifier only credits a packet pointer that carries a nonzero
+/// constant delta from `ctx.data()`" -- callers needing offset 0 must use
+/// `TcContext::load` instead.
+#[inline(always)]
+fn load_direct<T: Copy>(ctx: &TcContext, offset: usize) -> Option<T> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + offset + core::mem::size_of::<T>() > end {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_unaligned((start + offset) as *const T) })
+}
+
 /// Hook 1: ingress classifier on the physical uplink, every node (forward
 /// leg). Classifies VIP:PORT traffic, stamps Geneve metadata, redirects to
 /// `geneve0`. Everything else passes through untouched -- this hook sees
@@ -350,29 +385,55 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // the loader (`Config` doc comment) since this no_std program has no
     // syscall of its own to tell the two apart.
     let l2_hlen = CONFIG.get(0)?.uplink_l2_hlen as usize;
+    // Dispatch on a const generic rather than threading `l2_hlen` through as
+    // a runtime header-relative offset: this kernel's verifier never
+    // re-establishes a packet pointer's safe range after a bounds check once
+    // a register-sourced value has gone into the pointer arithmetic, even
+    // when that register is provably a single constant (confirmed
+    // empirically -- narrowing the value via an equality branch, and via a
+    // bitmask, both still left `load_direct`'s read rejected as "offset is
+    // outside of the packet"). Every `load_direct` offset in
+    // `try_uplink_ingress_headers` needs to fold to a literal at compile
+    // time, which only a const generic guarantees.
+    match l2_hlen {
+        0 => try_uplink_ingress_headers::<0>(ctx),
+        ETH_HLEN => try_uplink_ingress_headers::<ETH_HLEN>(ctx),
+        _ => Some(TC_ACT_OK),
+    }
+}
+
+fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i32> {
     // No Ethernet header at all on an L3-only uplink -- there's no EtherType
     // field to check; the IP-version nibble below is this path's only gate.
-    if l2_hlen == ETH_HLEN && ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
+    if L2_HLEN == ETH_HLEN && load_direct::<u16>(ctx, 12)? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
     }
-    let ver_ihl: u8 = ctx.load(l2_hlen).ok()?;
+    // `load_direct`'s doc comment: offset 0 (the L3-only/WireGuard branch,
+    // L2_HLEN==0) can't go through it, so this one field on that branch
+    // stays on the helper call; every other read on both branches has a
+    // nonzero literal offset and gets direct access.
+    let ver_ihl: u8 = if L2_HLEN == 0 {
+        ctx.load(0).ok()?
+    } else {
+        load_direct(ctx, L2_HLEN)?
+    };
     if ver_ihl >> 4 != 4 || ver_ihl & 0x0f != 5 {
         return Some(TC_ACT_OK);
     }
-    let ip_proto = l2_hlen + 9;
-    let ip_src = l2_hlen + 12;
-    let ip_dst = l2_hlen + 16;
-    let l4_off = l2_hlen + IP_HLEN;
+    let ip_proto = L2_HLEN + 9;
+    let ip_src = L2_HLEN + 12;
+    let ip_dst = L2_HLEN + 16;
+    let l4_off = L2_HLEN + IP_HLEN;
     let l4_sport = l4_off;
     let l4_dport = l4_off + 2;
 
-    let proto: u8 = ctx.load(ip_proto).ok()?;
+    let proto: u8 = load_direct(ctx, ip_proto)?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
         return Some(TC_ACT_OK);
     }
 
-    let dst_ip: u32 = ctx.load(ip_dst).ok()?;
-    let dst_port: u16 = ctx.load(l4_dport).ok()?;
+    let dst_ip: u32 = load_direct(ctx, ip_dst)?;
+    let dst_port: u16 = load_direct(ctx, l4_dport)?;
     let key = VipKey {
         vip_ip: dst_ip,
         vip_port: dst_port,
@@ -381,8 +442,8 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     };
     let backend = *unsafe { VIP_MAP.get(key) }?;
 
-    let src_ip: u32 = ctx.load(ip_src).ok()?;
-    let src_port: u16 = ctx.load(l4_sport).ok()?;
+    let src_ip: u32 = load_direct(ctx, ip_src)?;
+    let src_port: u16 = load_direct(ctx, l4_sport)?;
     let client_ip_v6 = ipv4_mapped_v6(src_ip);
     let vip_ip_v6 = ipv4_mapped_v6(dst_ip);
     // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
@@ -450,7 +511,7 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // geneve0's inner frame is always "real" Ethernet from its point of
     // view) would otherwise silently no-op on a live-captured all-zero
     // EtherType (confirmed via a raw packet capture on the peer's wg0).
-    if l2_hlen == 0 {
+    if L2_HLEN == 0 {
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
         }
@@ -814,28 +875,44 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // length is resolved once by the loader, not assumed to be Ethernet's 14
     // bytes.
     let l2_hlen = CONFIG.get(0)?.uplink_l2_hlen as usize;
-    if l2_hlen == ETH_HLEN && ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
+    // See `try_uplink_ingress`'s matching comment: dispatches on a const
+    // generic so every `load_direct` offset below is a compile-time literal.
+    match l2_hlen {
+        0 => try_uplink_egress_return_headers::<0>(ctx),
+        ETH_HLEN => try_uplink_egress_return_headers::<ETH_HLEN>(ctx),
+        _ => Some(TC_ACT_OK),
+    }
+}
+
+fn try_uplink_egress_return_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i32> {
+    if L2_HLEN == ETH_HLEN && load_direct::<u16>(ctx, 12)? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
     }
-    let ver_ihl: u8 = ctx.load(l2_hlen).ok()?;
+    // See `try_uplink_ingress_headers`'s matching comment: offset 0 can't go
+    // through `load_direct`.
+    let ver_ihl: u8 = if L2_HLEN == 0 {
+        ctx.load(0).ok()?
+    } else {
+        load_direct(ctx, L2_HLEN)?
+    };
     if ver_ihl >> 4 != 4 || ver_ihl & 0x0f != 5 {
         return Some(TC_ACT_OK);
     }
-    let ip_proto = l2_hlen + 9;
-    let ip_src = l2_hlen + 12;
-    let ip_dst = l2_hlen + 16;
-    let l4_off = l2_hlen + IP_HLEN;
+    let ip_proto = L2_HLEN + 9;
+    let ip_src = L2_HLEN + 12;
+    let ip_dst = L2_HLEN + 16;
+    let l4_off = L2_HLEN + IP_HLEN;
     let l4_sport = l4_off;
     let l4_dport = l4_off + 2;
 
-    let proto: u8 = ctx.load(ip_proto).ok()?;
+    let proto: u8 = load_direct(ctx, ip_proto)?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
         return Some(TC_ACT_OK);
     }
 
     // This is the Pod's own raw reply: src=PodIP:TargetPort, dst=CLIENT_IP:SRC_PORT
     // (or Decision 3's remapped synthetic port -- see RevFlowValue's doc comment).
-    let pod_ip: u32 = ctx.load(ip_src).ok()?;
+    let pod_ip: u32 = load_direct(ctx, ip_src)?;
 
     // Reject before the remaining fields are even loaded, let alone the
     // ~38-byte FLOW_TABLE key built: POD_TARGETS is a 4-byte-keyed, 32-entry
@@ -847,9 +924,9 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         return Some(TC_ACT_OK);
     }
 
-    let target_port: u16 = ctx.load(l4_sport).ok()?;
-    let client_ip: u32 = ctx.load(ip_dst).ok()?;
-    let backend_dst_port: u16 = ctx.load(l4_dport).ok()?;
+    let target_port: u16 = load_direct(ctx, l4_sport)?;
+    let client_ip: u32 = load_direct(ctx, ip_dst)?;
+    let backend_dst_port: u16 = load_direct(ctx, l4_dport)?;
 
     let key = encode_flow_key(
         ipv4_mapped_v6(client_ip),
@@ -921,7 +998,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // the same L3-only WireGuard device, so its geneve0 redirect needs the
     // same synthesized MAC header (including the EtherType stamp decap
     // relies on).
-    if l2_hlen == 0 {
+    if L2_HLEN == 0 {
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
         }
