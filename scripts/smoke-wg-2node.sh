@@ -25,8 +25,8 @@
 # false pass; every step before that is a genuine, asserted PASS.
 #
 # Usage: scripts/smoke-wg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
-# Defaults match this rig's assigned VMs: lima-node-2 (ingress, owns the VIP)
-# and lima-node-4 (backend Pod + the "client" -- see remote script header on
+# Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the VIP)
+# and beep-node-b (backend Pod + the "client" -- see remote script header on
 # why a 2-node rig's client is the backend node's own root netns).
 # Both VMs must be on the SAME Lima network (directly reachable over their
 # real eth0/underlay) so the WireGuard handshake has a path to establish --
@@ -39,8 +39,8 @@
 # `trace-cmd` for evidence capture on failure.
 set -euo pipefail
 
-VM_A="lima-node-2"
-VM_B="lima-node-4"
+VM_A="beep-node-a"
+VM_B="beep-node-b"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
