@@ -1,6 +1,8 @@
 # Beep
 
-An eBPF-based service load balancer for Kubernetes.
+beep is a resource-conscious [eBPF](https://ebpf.io) service load balancer for Kubernetes. It runs the load-balancing dataplane entirely in the Linux kernel — tc-bpf classifiers plus Geneve encapsulation, with no userspace proxy in the packet path — so it stays light enough for small, memory-constrained nodes where a conventional proxy-based load balancer would not fit.
+
+> ⚠️ **Pre-alpha — not for production.** beep is under active early development: APIs, map layouts, and behavior change without notice, core pieces (Service/EndpointSlice watching, cross-node WireGuard) are still unfinished, and known dataplane blockers remain. Don't run it against real traffic yet.
 
 Loader for the beep eBPF dataplane
 (`docs/design/ebpf-lb-dataplane.md`,
