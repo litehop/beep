@@ -378,7 +378,12 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
         }
-        ctx.store(12, &ETH_P_IPV4, 0).ok()?;
+        // A stack local, not `&ETH_P_IPV4` directly: referencing the const
+        // promotes it into a shared `.rodata` allocation, which bpftool's
+        // map-discovery walk (and the CI memory-smoke gate) counts as a 9th
+        // "map".
+        let ethertype = ETH_P_IPV4;
+        ctx.store(12, &ethertype, 0).ok()?;
     }
 
     if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
@@ -792,7 +797,10 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
         }
-        ctx.store(12, &ETH_P_IPV4, 0).ok()?;
+        // See try_uplink_ingress's matching comment on why this is a local,
+        // not `&ETH_P_IPV4` directly.
+        let ethertype = ETH_P_IPV4;
+        ctx.store(12, &ethertype, 0).ok()?;
     }
 
     if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
