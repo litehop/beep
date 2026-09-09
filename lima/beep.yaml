@@ -1,0 +1,44 @@
+# Lima VM for beep-ebpf smoke testing (scripts/smoke.sh,
+# scripts/smoke-wg-2node.sh) -- a Linux kernel to load the compiled eBPF
+# object into and drive real packets through, since beep-ebpf only builds
+# for bpfel-unknown-none and beep's loader is Linux-only.
+#
+# Usage:
+#   scripts/lima-up.sh [vm-name]
+
+vmType: vz
+
+cpus: 1
+memory: "2GiB"
+disk: "10GiB"
+
+# Plain unprivileged switch so multiple VMs (e.g. beep-node-a/beep-node-b for
+# smoke-wg-2node.sh) can reach each other directly. Needs no socket_vmnet/
+# sudoers host setup, unlike shared/bridged/host.
+networks:
+  - lima: user-v2
+
+images:
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    arch: x86_64
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+
+      apt-get update -qq
+
+      # bpftool: not always packaged for the running kernel. Try the generic
+      # package first, then the kernel-specific one; if neither is available,
+      # leave a clear message instead of failing provisioning outright --
+      # smoke-remote.sh's own bpftool checks will fail loud if it's truly
+      # missing.
+      apt-get install -y linux-tools-generic \
+        || apt-get install -y "linux-tools-$(uname -r)" \
+        || echo "WARNING: bpftool package unavailable for this kernel -- install manually" >&2
+
+      apt-get install -y wireguard-tools netcat-openbsd curl jq

@@ -1,26 +1,78 @@
 {
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(bash -n *)",
+      "Bash(bd *)",
+      "Bash(cargo *)",
+      "Bash(gh pr *)",
+      "Bash(gh run *)",
+      "Bash(git *)",
+      "Bash(jq *)",
+      "Bash(limactl *)",
+      "Bash(rustc *)",
+      "Bash(rustup *)",
+      "mcp__beep-smoke__*",
+      "mcp__beep-node-a__*",
+      "mcp__beep-node-b__*",
+      "mcp__mcpls__*"
+    ]
+  },
+  "worktree": {
+    "baseRef": "fresh"
+  },
   "hooks": {
+    "WorktreeCreate": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "bash scripts/create-worktree.sh", "timeout": 30 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "bash scripts/assert-worktree-boundary.sh", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command // \"\"' 2>/dev/null || echo ''); case \"$cmd\" in *\"git push\"*|*\"gh pr create\"*|*\"gh pr edit\"*) bash scripts/check-doc-budget.sh && if [ \"$(uname)\" = \"Linux\" ]; then cargo fmt --check && cargo clippy --tests -- -D warnings && cargo test -p beep-common && ( cd ebpf && cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings ) && cargo build --release; else cargo fmt --check && cargo test -p beep-common; fi ;; esac" }
+        ]
+      }
+    ],
     "PreCompact": [
       {
+        "matcher": "",
         "hooks": [
-          {
-            "command": "bd prime",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
+          { "type": "command", "command": "bash scripts/bd-prime-slim.sh" }
+        ]
       }
     ],
     "SessionStart": [
       {
+        "matcher": "",
         "hooks": [
-          {
-            "command": "bd prime",
-            "type": "command"
-          }
-        ],
-        "matcher": ""
+          { "type": "command", "command": "bash scripts/bd-prime-slim.sh" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "bash scripts/critical-reviewer-dispatch.sh", "timeout": 30 }
+        ]
       }
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "beep-smoke",
+    "beep-node-a",
+    "beep-node-b",
+    "mcpls"
+  ]
 }

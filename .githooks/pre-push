@@ -1,0 +1,135 @@
+#!/bin/sh
+set -e
+
+# beep quality gate. The loader links Linux-only bpf(2)/netlink syscalls and
+# beep-ebpf cross-builds for bpfel-unknown-none, so the full 5-command gate
+# only runs on Linux; on macOS only fmt + the beep-common host tests run (CI's
+# ebpf-build job enforces the full gate on every PR). Keep these commands
+# byte-identical to settings.json's PreToolUse Bash hook and
+# .claude/agents/worker.md -- scripts/test-quality-gate-consistency.sh asserts
+# the three agree.
+if [ "$(uname)" = "Linux" ]; then
+  cargo fmt --check
+  cargo clippy --tests -- -D warnings
+  cargo test -p beep-common
+  ( cd ebpf && cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings )
+  cargo build --release
+else
+  cargo fmt --check
+  cargo test -p beep-common
+fi
+
+# --- Test-file-change visibility (non-blocking) ---
+#
+# Prints a non-blocking test-file-change summary for EVERY push -- workers
+# legitimately edit tests, so a hook must not block that outright, but a
+# shrunk/weakened/deleted test sailing through unnoticed is how a regression
+# goes unreviewed. See bd memory `surface-test-edits-for-review-not-block`.
+#
+# (u7s's sonobuoy --focus conformance gate is not ported -- beep has no
+# apiserver/e2e suite; CI's ebpf-build + ebpf-memory-smoke are the merge gate.)
+
+ZERO_OID=0000000000000000000000000000000000000000
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+# Prints a prominent, NON-BLOCKING summary of test-file changes in diff range
+# $1. Scope: files under tests/ or matching *_test.rs are reported whole-file;
+# for any other changed .rs file, only hunks whose git-computed enclosing
+# context (mod/fn signature -- git's own default funcname heuristic, which
+# picks the nearest preceding unindented line) mentions "test" are counted --
+# so editing a plain function above an untouched #[cfg(test)] module doesn't
+# trip this. Known gap: a hunk at the very top of a brand-new file has no
+# preceding context to match on, so a new file's own inline tests can be
+# missed -- acceptable for a review aid whose backstop is the reviewer's own
+# diff read (see bd memory `surface-test-edits-for-review-not-block`).
+print_test_change_summary() {
+  range="$1"
+  files_tmp=$(mktemp)
+  git diff --name-only "$range" -- '*.rs' >"$files_tmp" 2>/dev/null || true
+  if [ ! -s "$files_tmp" ]; then
+    rm -f "$files_tmp"
+    return 0
+  fi
+
+  total_files=0
+  total_added=0
+  total_removed=0
+  detail_tmp=$(mktemp)
+
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+      tests/*|*/tests/*|*_test.rs)
+        stat_line=$(git diff --numstat "$range" -- "$f" 2>/dev/null | head -1)
+        added=$(printf '%s' "$stat_line" | awk '{print $1}')
+        removed=$(printf '%s' "$stat_line" | awk '{print $2}')
+        [ "$added" = "-" ] && added=0
+        [ "$removed" = "-" ] && removed=0
+        ;;
+      *)
+        counts=$(git diff --unified=0 "$range" -- "$f" 2>/dev/null | awk '
+          /^@@/ {
+            ctx = $0
+            sub(/^@@[^@]*@@[ \t]*/, "", ctx)
+            in_test = (ctx ~ /test/) ? 1 : 0
+            next
+          }
+          /^\+\+\+/ || /^---/ { next }
+          in_test && /^\+/ { added++; next }
+          in_test && /^-/  { removed++; next }
+          END { printf "%d %d", added + 0, removed + 0 }
+        ')
+        added=$(printf '%s' "$counts" | awk '{print $1}')
+        removed=$(printf '%s' "$counts" | awk '{print $2}')
+        ;;
+    esac
+    added=${added:-0}
+    removed=${removed:-0}
+    if [ "$added" -eq 0 ] && [ "$removed" -eq 0 ]; then
+      continue
+    fi
+    total_files=$((total_files + 1))
+    total_added=$((total_added + added))
+    total_removed=$((total_removed + removed))
+    printf '    %s (+%s/-%s)\n' "$f" "$added" "$removed" >>"$detail_tmp"
+  done <"$files_tmp"
+  rm -f "$files_tmp"
+
+  if [ "$total_files" -eq 0 ]; then
+    rm -f "$detail_tmp"
+    return 0
+  fi
+
+  echo ""
+  echo "################################################################"
+  echo "# [pre-push] TEST-FILE CHANGES DETECTED -- review before merge"
+  echo "################################################################"
+  echo "  files: $total_files   lines: +$total_added/-$total_removed"
+  cat "$detail_tmp"
+  rm -f "$detail_tmp"
+  echo ""
+  echo "  Legitimate: new regression tests, assertions updated for a genuine"
+  echo "  API change. Suspect: a test shrunk/weakened/deleted/#[ignore]'d with"
+  echo "  no PR-body justification. See bd memory"
+  echo "  'surface-test-edits-for-review-not-block' for the full checklist."
+  echo "  (non-blocking -- for review visibility only)"
+  echo "################################################################"
+  echo ""
+}
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [ "$local_oid" = "$ZERO_OID" ] && continue
+
+  if [ "$remote_oid" = "$ZERO_OID" ]; then
+    base=$(git merge-base "$local_oid" origin/main 2>/dev/null || true)
+    if [ -z "$base" ]; then
+      base=$(git merge-base "$local_oid" main 2>/dev/null || true)
+    fi
+    [ -z "$base" ] && base="$EMPTY_TREE"
+    range="$base..$local_oid"
+  else
+    range="$remote_oid..$local_oid"
+  fi
+
+  print_test_change_summary "$range"
+done

@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "beep-smoke": {
+      "transport": "stdio",
+      "command": "limactl",
+      "args": ["mcp", "serve", "beep-smoke"]
+    },
+    "beep-node-a": {
+      "transport": "stdio",
+      "command": "limactl",
+      "args": ["mcp", "serve", "beep-node-a"]
+    },
+    "beep-node-b": {
+      "transport": "stdio",
+      "command": "limactl",
+      "args": ["mcp", "serve", "beep-node-b"]
+    },
+    "mcpls": {
+      "command": "mcpls",
+      "args": []
+    }
+  }
+}

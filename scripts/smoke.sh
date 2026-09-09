@@ -8,7 +8,7 @@
 # load time (the exact risk `docs/design/ebpf-lb-dataplane.md`
 # flags for "verifier rejection under churn/scale").
 #
-# What it does, on one already-provisioned Lima VM (default lima-node-5):
+# What it does, on one already-provisioned Lima VM (default beep-smoke):
 #   1. cross-builds beep-ebpf + beep on this (macOS) host via
 #      nightly + bpf-linker + cargo-zigbuild, targeting the VM's aarch64
 #      Linux (see README.md's "Building" section for the
@@ -34,11 +34,11 @@
 #   rustup toolchain install nightly --component rust-src
 #   rustup target add aarch64-unknown-linux-gnu --toolchain nightly
 #   cargo install bpf-linker cargo-zigbuild
-# VM prerequisite: bpftool (already present on lima-node-5 from prior
+# VM prerequisite: bpftool (already present on beep-smoke from prior
 # beep work; otherwise `apt-get install linux-tools-$(uname -r)`).
 set -euo pipefail
 
-VM="lima-node-5"
+VM="beep-smoke"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) VM="$2"; shift 2 ;;
