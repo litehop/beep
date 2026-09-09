@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+bash scripts/check-findings-bead-refs.sh
+cargo fmt --check
+bash scripts/check-bead-id-refs.sh
