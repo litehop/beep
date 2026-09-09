@@ -104,6 +104,19 @@ struct Args {
     #[arg(long = "pod-cidr", value_parser = parse_ipv4_cidr)]
     pod_cidr: Ipv4Cidr,
 
+    /// This node's own address -- the value a `--fixture`'s
+    /// `backend_node_ip` names when THIS node is the one hosting that
+    /// fixture's pod. Interim stand-in for real node identity (the eventual
+    /// answer is a controller populating `POD_TARGETS` from a live
+    /// per-node EndpointSlice watch): scopes `POD_TARGETS`, the LOCAL
+    /// backend-membership map the decap and egress-return admission gates
+    /// check, to fixtures whose `backend_node_ip` matches this address.
+    /// `VIP_MAP`/`TARGET_PORTS` (the forwarding tables) stay unfiltered --
+    /// any node can be ingress for any VIP, so they need every fixture
+    /// regardless of which node hosts the backend.
+    #[arg(long = "node-ip")]
+    node_ip: Ipv4Addr,
+
     /// `FWD_PENDING` max_entries -- the only flood-exposed conntrack tier
     /// (admission control mints every new flow here; see `beep-ebpf`'s
     /// `FWD_PENDING` doc comment). A load-time DaemonSet config knob, not a
@@ -304,6 +317,7 @@ fn main() -> anyhow::Result<()> {
         pin_dir,
         fixtures,
         pod_cidr,
+        node_ip,
         fwd_pending_max_entries,
         flow_table_max_entries,
     } = Args::parse();
@@ -339,7 +353,8 @@ fn main() -> anyhow::Result<()> {
         .context("loading the beep-ebpf object")?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
-    populate_fixtures(&mut ebpf, &fixtures).context("populating VIP_MAP/TARGET_PORTS fixture")?;
+    populate_fixtures(&mut ebpf, &fixtures, node_ip)
+        .context("populating VIP_MAP/TARGET_PORTS/POD_TARGETS fixture")?;
 
     let hooks: [(&str, &str, TcAttachType); 3] = [
         (
@@ -455,7 +470,11 @@ fn fixture_key(fixture: &Fixture) -> VipKey {
     }
 }
 
-fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()> {
+fn populate_fixtures(
+    ebpf: &mut Ebpf,
+    fixtures: &[Fixture],
+    node_ip: Ipv4Addr,
+) -> anyhow::Result<()> {
     {
         let mut vip_map: AyaHashMap<_, VipKey, VipBackend> = AyaHashMap::try_from(
             ebpf.map_mut("VIP_MAP")
@@ -491,15 +510,22 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()
 
     {
         // Keyed on pod IP alone, unlike TARGET_PORTS above -- the egress-return
-        // gate this feeds (`beep_common::egress_return_admission`)
-        // checks only that a packet's source is one of this node's backend
-        // Pods, deliberately not which port it's replying from. Two fixtures
-        // sharing a pod IP (a multi-port Service) collapse to one entry here
-        // on purpose: membership doesn't need per-port granularity.
+        // gate this feeds (`beep_common::egress_return_admission`), and the
+        // decap gate (`beep_common::decap_forward_pod_admission`), check only
+        // that a pod is one of THIS node's own backends, deliberately not
+        // which port it's replying from. Two fixtures sharing a pod IP (a
+        // multi-port Service) collapse to one entry here on purpose:
+        // membership doesn't need per-port granularity. Unlike VIP_MAP/
+        // TARGET_PORTS above, this map is scoped to `node_ip` via
+        // `local_pod_ips`: any node can be ingress for any VIP, but only
+        // the node actually running a pod may claim it as a local backend --
+        // otherwise both gates' "is this still one of MY pods" check always
+        // passes cluster-wide and never drops a misdelivered/drifted packet.
         let mut pod_targets: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
             ebpf.map_mut("POD_TARGETS")
                 .ok_or_else(|| anyhow!("no map named `POD_TARGETS` in the eBPF object"))?,
         )?;
+        let local_ips = local_pod_ips(fixtures, node_ip);
         // POD_TARGETS is pinned (`MAP_NAMES`) and so reused, not
         // recreated, across a loader restart with a different `--fixture`
         // set: a Pod that departed since the last run otherwise leaves a
@@ -508,28 +534,40 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture]) -> anyhow::Result<()
         // `uplink_egress_return`'s drop-on-FLOW_TABLE-reverse-tagged-miss
         // decision -- a stale entry for a departed/reused Pod IP would
         // misclassify unrelated future traffic on that address as "ours"
-        // and drop it.
-        // Prune anything the fresh fixture set no longer claims before
-        // writing it.
+        // and drop it. Pruned against the same local set this block writes,
+        // not the full fixture list, or a pod that moved OFF this node
+        // would never be pruned from its former host's POD_TARGETS.
         let existing_ips: Vec<u32> = pod_targets.keys().collect::<Result<_, _>>()?;
-        for ip in stale_pod_targets(&existing_ips, fixtures) {
+        for ip in stale_pod_targets(&existing_ips, &local_ips) {
             pod_targets.remove(&ip)?;
         }
-        for fixture in fixtures {
-            pod_targets.insert(wire_ip(fixture.pod_ip), 1u8, 0)?;
+        for pod_ip in &local_ips {
+            pod_targets.insert(pod_ip, 1u8, 0)?;
         }
     }
 
     Ok(())
 }
 
+/// Wire-form pod_ips of fixtures THIS node itself backs (`backend_node_ip
+/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `VIP_MAP`/
+/// `TARGET_PORTS` which every node populates identically from the full
+/// fixture set since any node can be ingress for any VIP.
+fn local_pod_ips(fixtures: &[Fixture], node_ip: Ipv4Addr) -> Vec<u32> {
+    fixtures
+        .iter()
+        .filter(|f| f.backend_node_ip == node_ip)
+        .map(|f| wire_ip(f.pod_ip))
+        .collect()
+}
+
 /// Pod IPs in `existing` (POD_TARGETS's current keys, carried over from a
-/// prior loader run against the same pinned map) that no fixture in the
-/// fresh `fixtures` set claims any more. Split out of `populate_fixtures`
-/// as a pure function so the prune decision is testable without a live
-/// eBPF map.
-fn stale_pod_targets(existing: &[u32], fixtures: &[Fixture]) -> Vec<u32> {
-    let live: std::collections::HashSet<u32> = fixtures.iter().map(|f| wire_ip(f.pod_ip)).collect();
+/// prior loader run against the same pinned map) that `live` (this run's
+/// local serving-set, i.e. `local_pod_ips`'s output) no longer claims. Split
+/// out of `populate_fixtures` as a pure function so the prune decision is
+/// testable without a live eBPF map.
+fn stale_pod_targets(existing: &[u32], live: &[u32]) -> Vec<u32> {
+    let live: std::collections::HashSet<u32> = live.iter().copied().collect();
     existing
         .iter()
         .copied()
@@ -814,6 +852,35 @@ mod tests {
     }
 
     #[test]
+    fn pod_targets_excludes_pods_backed_by_a_different_node() {
+        // POD_TARGETS is the LOCAL serving-set the decap
+        // (`decap_forward_pod_admission`) and egress-return
+        // (`egress_return_admission`) gates check to answer "is this pod
+        // still one of MY backends" -- before this fix, `populate_fixtures`
+        // wrote every `--fixture`'s pod_ip into POD_TARGETS on every node
+        // regardless of `backend_node_ip`, so both gates' membership check
+        // always passed cluster-wide and never caught a misdelivered or
+        // drifted packet. If `local_pod_ips` regresses to node-blind
+        // filtering, this must fail by including the non-local pod.
+        let node_ip = Ipv4Addr::new(10, 0, 0, 6);
+        let other_node_ip = Ipv4Addr::new(10, 0, 0, 7);
+        let local_fixture = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
+        let remote_fixture = parse_fixture("10.0.0.5:81:tcp:10.0.0.7:10.244.1.8:8081").unwrap();
+        assert_eq!(local_fixture.backend_node_ip, node_ip);
+        assert_eq!(remote_fixture.backend_node_ip, other_node_ip);
+        let fixtures = [local_fixture, remote_fixture];
+
+        assert_eq!(
+            local_pod_ips(&fixtures, node_ip),
+            vec![wire_ip(local_fixture.pod_ip)],
+            "POD_TARGETS must contain only pods this node's own fixtures back \
+             (backend_node_ip == node_ip) -- a pod backed by a different node \
+             must never appear, or the decap/egress-return membership gates \
+             pass traffic for pods that don't actually live here"
+        );
+    }
+
+    #[test]
     fn departed_pod_ip_is_pruned_from_pod_targets() {
         // POD_TARGETS is pinned and reused across loader restarts, so a Pod
         // absent from the fresh `--fixture` set is one that's gone away.
@@ -823,10 +890,10 @@ mod tests {
         // address as "ours" and drop it instead of passing it through.
         let departed_pod_ip = wire_ip(Ipv4Addr::new(10, 244, 1, 9));
         let existing = [departed_pod_ip];
-        let fixtures: [Fixture; 0] = [];
+        let live: [u32; 0] = [];
 
         assert_eq!(
-            stale_pod_targets(&existing, &fixtures),
+            stale_pod_targets(&existing, &live),
             vec![departed_pod_ip],
             "a pod absent from the new fixture set must be pruned from \
              POD_TARGETS, or egress traffic from a future, unrelated owner \
@@ -840,11 +907,11 @@ mod tests {
         // fixture set must survive the prune, or every reconcile would
         // drop live backends' own egress-return admission.
         let fixture = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
-        let existing = [wire_ip(fixture.pod_ip)];
+        let live = [wire_ip(fixture.pod_ip)];
 
         assert!(
-            stale_pod_targets(&existing, &[fixture]).is_empty(),
-            "a pod still claimed by the fixture set must not be pruned from POD_TARGETS"
+            stale_pod_targets(&live, &live).is_empty(),
+            "a pod still claimed by the local serving-set must not be pruned from POD_TARGETS"
         );
     }
 }

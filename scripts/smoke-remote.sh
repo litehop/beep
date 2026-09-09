@@ -171,7 +171,7 @@ start_loader() {
   local log="$1"
   nohup "$BIN" \
     --uplink-iface smoke-veth0 --geneve-iface geneve0 --pin-dir "$PIN_DIR" \
-    --pod-cidr "$POD_CIDR" \
+    --pod-cidr "$POD_CIDR" --node-ip "$VIP_IP" \
     --fixture "${VIP_IP}:${VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT}" \
     --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
     --fixture "${VIP_IP}:${VIP_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
