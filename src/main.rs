@@ -95,6 +95,15 @@ struct Args {
     #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
     fixtures: Vec<Fixture>,
 
+    /// Cluster pod CIDR (e.g. `10.244.0.0/16`). Every `--fixture` vip_ip is
+    /// rejected at startup if it falls inside this range: a hostNetwork
+    /// Pod's IP equals its node's IP, i.e. front-IP (VIP) space, so a VIP
+    /// inside the pod CIDR is not disjoint from pod-IP space by
+    /// construction and can byte-collide a forward and reverse flow key
+    /// (the `ebpf-lb-dataplane.md` disjointness correction).
+    #[arg(long = "pod-cidr", value_parser = parse_ipv4_cidr)]
+    pod_cidr: Ipv4Cidr,
+
     /// `FWD_PENDING` max_entries -- the only flood-exposed conntrack tier
     /// (admission control mints every new flow here; see `beep-ebpf`'s
     /// `FWD_PENDING` doc comment). A load-time DaemonSet config knob, not a
@@ -165,6 +174,69 @@ fn parse_fixture(s: &str) -> Result<Fixture, String> {
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Ipv4Cidr {
+    network: Ipv4Addr,
+    prefix_len: u8,
+}
+
+impl Ipv4Cidr {
+    fn contains(self, ip: Ipv4Addr) -> bool {
+        // prefix_len == 0 (match everything) would overflow a `<< 32` shift,
+        // so it's handled as its own case rather than folded into the
+        // general shift below.
+        let mask: u32 = if self.prefix_len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - self.prefix_len)
+        };
+        (u32::from(ip) & mask) == (u32::from(self.network) & mask)
+    }
+}
+
+impl std::fmt::Display for Ipv4Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
+    let (network, prefix_len) = s
+        .split_once('/')
+        .ok_or_else(|| format!("expected network_ip/prefix_len, got `{s}`"))?;
+    let network: Ipv4Addr = network
+        .parse()
+        .map_err(|e| format!("pod_cidr network `{network}`: {e}"))?;
+    let prefix_len: u8 = prefix_len
+        .parse()
+        .map_err(|e| format!("pod_cidr prefix_len `{prefix_len}`: {e}"))?;
+    if prefix_len > 32 {
+        return Err(format!("pod_cidr prefix_len `{prefix_len}` must be 0..=32"));
+    }
+    Ok(Ipv4Cidr {
+        network,
+        prefix_len,
+    })
+}
+
+/// A hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP) space,
+/// so front-IP space and pod CIDR are disjoint only by configuration, not
+/// by construction (the `ebpf-lb-dataplane.md` disjointness correction) --
+/// a VIP placed inside the pod CIDR lets a forward flow key (keyed on VIP)
+/// and a reverse flow key (keyed on a Pod's source IP) byte-collide.
+/// Rejecting at startup is the only way to guarantee the two stay disjoint.
+fn vip_outside_pod_cidr(vip: Ipv4Addr, pod_cidr: Ipv4Cidr) -> Result<(), String> {
+    if pod_cidr.contains(vip) {
+        Err(format!(
+            "vip_ip `{vip}` falls inside pod CIDR `{pod_cidr}`: a hostNetwork Pod's IP equals \
+             its node's IP (front-IP space), so this VIP can byte-collide a forward and \
+             reverse flow key"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Converts a host-order value into the "raw wire token" representation the
 /// eBPF side compares packet bytes against verbatim (see
 /// `ebpf/src/main.rs`'s module doc for why this conversion exists
@@ -218,9 +290,14 @@ fn main() -> anyhow::Result<()> {
         geneve_iface,
         pin_dir,
         fixtures,
+        pod_cidr,
         fwd_pending_max_entries,
         fwd_main_max_entries,
     } = Args::parse();
+
+    for fixture in &fixtures {
+        vip_outside_pod_cidr(fixture.vip_ip, pod_cidr).map_err(|e| anyhow!(e))?;
+    }
 
     bump_memlock_rlimit();
 
@@ -540,6 +617,78 @@ mod tests {
     fn wire_port_matches_network_byte_order() {
         // 8080 = 0x1F90; on the wire the high byte (0x1F) comes first.
         assert_eq!(wire_port(8080).to_le_bytes(), [0x1F, 0x90]);
+    }
+
+    // A hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP)
+    // space -- so a VIP placed inside the pod CIDR is not disjoint from
+    // pod-IP space by construction, only by configuration, and lets a
+    // forward flow key (keyed on the VIP) and a reverse flow key (keyed on
+    // a Pod's source IP) byte-collide. These four cases pin the boundary
+    // of that rejection exactly at the CIDR's own edges.
+    #[test]
+    fn vip_inside_pod_cidr_is_rejected() {
+        let pod_cidr = parse_ipv4_cidr("10.244.0.0/16").unwrap();
+        let vip = Ipv4Addr::new(10, 244, 5, 9);
+
+        let err = vip_outside_pod_cidr(vip, pod_cidr)
+            .expect_err("a VIP inside the pod CIDR must be rejected, or it can byte-collide a forward and reverse flow key");
+        assert!(
+            err.contains("10.244.5.9") && err.contains("10.244.0.0/16"),
+            "rejection must name both the offending VIP and the pod CIDR so an operator can fix the config: got `{err}`"
+        );
+    }
+
+    #[test]
+    fn vip_outside_pod_cidr_is_accepted() {
+        let pod_cidr = parse_ipv4_cidr("10.244.0.0/16").unwrap();
+        // Matches scripts/smoke-remote.sh's RFC 5737 VIP, deliberately
+        // disjoint from the pod range -- this is the legitimate-config path
+        // that must keep loading.
+        let vip = Ipv4Addr::new(203, 0, 113, 1);
+
+        assert!(
+            vip_outside_pod_cidr(vip, pod_cidr).is_ok(),
+            "a VIP outside the pod CIDR is a legitimate config and must not be rejected"
+        );
+    }
+
+    #[test]
+    fn vip_at_pod_cidr_network_or_broadcast_address_is_rejected() {
+        // The network and broadcast addresses are still member addresses of
+        // the block (a Pod CAN be assigned either, depending on the CNI),
+        // so both boundary values must reject exactly like an interior VIP.
+        let pod_cidr = parse_ipv4_cidr("10.244.0.0/16").unwrap();
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(10, 244, 0, 0), pod_cidr).is_err(),
+            "the pod CIDR's network address is still inside the block and must be rejected"
+        );
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(10, 244, 255, 255), pod_cidr).is_err(),
+            "the pod CIDR's broadcast address is still inside the block and must be rejected"
+        );
+    }
+
+    #[test]
+    fn vip_one_address_outside_pod_cidr_boundary_is_accepted() {
+        // The addresses immediately below the network address and above the
+        // broadcast address are the tightest legitimate VIPs possible --
+        // an off-by-one in the mask calculation would reject these.
+        let pod_cidr = parse_ipv4_cidr("10.244.0.0/16").unwrap();
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(10, 243, 255, 255), pod_cidr).is_ok(),
+            "one address below the pod CIDR's network address must be accepted"
+        );
+        assert!(
+            vip_outside_pod_cidr(Ipv4Addr::new(10, 245, 0, 0), pod_cidr).is_ok(),
+            "one address above the pod CIDR's broadcast address must be accepted"
+        );
+    }
+
+    #[test]
+    fn pod_cidr_prefix_len_over_32_is_rejected_at_parse_time() {
+        // An invalid prefix length must fail loud at arg-parse time, not
+        // silently produce a mask that under- or over-matches at runtime.
+        assert!(parse_ipv4_cidr("10.244.0.0/33").is_err());
     }
 
     #[test]

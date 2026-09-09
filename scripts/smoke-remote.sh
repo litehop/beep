@@ -16,6 +16,10 @@ VIP_IP="203.0.113.1"
 CLIENT_IP="203.0.113.2"
 VIP_PORT="19100"
 POD_IP="198.51.100.53"
+# Covers POD_IP (TEST-NET-2) while staying disjoint from VIP_IP/CLIENT_IP
+# (TEST-NET-3) -- exercises the vip-outside-pod-cidr startup check against a
+# legitimate config, which must load, not reject.
+POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18080"
 # A second Service port on the SAME Pod (multi-port Service, e.g. 80->8080
 # alongside 443->8443) -- proves the backend's TARGET_PORTS lookup resolves
@@ -166,6 +170,7 @@ start_loader() {
   local log="$1"
   nohup "$BIN" \
     --uplink-iface smoke-veth0 --geneve-iface geneve0 --pin-dir "$PIN_DIR" \
+    --pod-cidr "$POD_CIDR" \
     --fixture "${VIP_IP}:${VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT}" \
     --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
     --fixture "${VIP_IP}:${VIP_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
