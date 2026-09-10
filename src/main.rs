@@ -390,6 +390,15 @@ fn main() -> anyhow::Result<()> {
     // Dropping it here rather than letting it live through the blocking
     // loop below is what keeps this DaemonSet container's steady-state RSS
     // below its load-time peak.
+    //
+    // On a restart, attach_and_pin's reused-link branch tracks the link via
+    // `attach_to_link` rather than `take_link`, so the `SchedClassifier` here
+    // still owns it -- this drop therefore runs the program's implicit
+    // unload-driven detach on every restart, not only on abnormal process
+    // death. That's safe: the bpffs pin at `{name}-link` (not this process's
+    // fd) anchors the kernel link object, so the implicit detach only
+    // releases this process's handle to it and leaves the tc attachment
+    // live for the next loader to reattach to.
     drop(ebpf);
     // glibc doesn't return freed heap to the OS on its own -- without an
     // explicit trim the drop above frees the allocator's own bookkeeping
