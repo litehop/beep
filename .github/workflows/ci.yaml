@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  test-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -40,8 +40,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - run: cargo test -p "${{ matrix.component }}"
+  
+  test-gate:
+    if: ${{ always() }}
+    needs: test-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix status
+        if: ${{ needs.test-matrix.result != 'success' }}
+        run: |
+          echo "One or more component tests failed."
+          exit 1
 
-  lint:
+  lint-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -77,6 +88,17 @@ jobs:
         # needs the same target + build-std the real build uses, run from ebpf/.
         working-directory: ebpf
         run: cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings
+
+  lint-gate:
+    if: ${{ always() }}
+    needs: lint-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix status
+        if: ${{ needs.lint-matrix.result != 'success' }}
+        run: |
+          echo "One or more component lint checks failed."
+          exit 1
 
   fmt:
     runs-on: ubuntu-latest
