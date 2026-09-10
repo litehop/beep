@@ -24,12 +24,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # CI's taiki-e/install-action step installs.
 RUN set -eux; \
     case "${TARGETARCH}" in \
-        amd64) bpf_linker_arch=x86_64 ;; \
-        arm64) bpf_linker_arch=aarch64 ;; \
+        amd64) bpf_linker_arch=x86_64; \
+               bpf_linker_sha256=e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8 ;; \
+        arm64) bpf_linker_arch=aarch64; \
+               bpf_linker_sha256=341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380 ;; \
         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/bpf-linker.tar.zst \
         "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-${bpf_linker_arch}-unknown-linux-musl.tar.zst"; \
+    echo "${bpf_linker_sha256}  /tmp/bpf-linker.tar.zst" | sha256sum -c -; \
     tar --zstd -xf /tmp/bpf-linker.tar.zst -C /usr/local/bin; \
     rm /tmp/bpf-linker.tar.zst; \
     chmod +x /usr/local/bin/bpf-linker
