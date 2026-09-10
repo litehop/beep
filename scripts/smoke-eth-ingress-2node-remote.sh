@@ -242,7 +242,13 @@ dump_evidence() {
 }
 
 cleanup() {
-  pkill -f "$BIN" 2>/dev/null || true
+  # Matches "--uplink-iface", not just "$BIN", so this can never match its
+  # OWN invocation (`bash .../beep-ethingress2node-remote.sh cleanup`) --
+  # $BIN's basename is a literal prefix of this script's own filename, so a
+  # bare `pkill -f "$BIN"` self-SIGTERMs the running cleanup script before
+  # it reaches the rest of these teardown steps (ip link del, sysctl
+  # restore), silently leaving wg0/geneve0/the pin dir behind.
+  pkill -f "$BIN --uplink-iface" 2>/dev/null || true
   pkill -f "nc -l -N .* ${TARGET_PORT}" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   rm -f /tmp/ethingress2node-response.http /tmp/ethingress2node-backend.log "$LOADER_LOG"
