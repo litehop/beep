@@ -285,6 +285,16 @@ impl WatchState {
         }
     }
 
+    /// Every currently-tracked `type=LoadBalancer` Service's identity --
+    /// used to fan out `status::ensure_node_ingress` after a Service watch
+    /// event. Per beep's node-owned-address model every node running this
+    /// DaemonSet re-asserts its own address on every Service it fronts, not
+    /// just newly-observed ones, so this covers the full known set rather
+    /// than just what changed in the triggering event.
+    pub fn service_keys(&self) -> impl Iterator<Item = &ServiceKey> {
+        self.services.keys()
+    }
+
     /// Aggregates every known Service's `reconcile_service` output into one
     /// desired map state -- the controller writes all fronts from a single
     /// pass, not one dataplane write per Service.
