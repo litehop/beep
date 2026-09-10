@@ -20,7 +20,7 @@ use beep_controller::{
     apply::PinnedMaps,
     reconcile::{Ipv4Cidr, NodeContext},
     status::ensure_node_ingress,
-    watch::{run_list_watch, WatchState},
+    watch::{run_list_watch, ServiceKey, WatchState},
 };
 use beep_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use clap::Parser;
@@ -103,25 +103,23 @@ fn apply_reconcile(state: &Mutex<WatchState>, maps: &Mutex<PinnedMaps>, node: &N
 }
 
 /// Re-asserts this node's own address in `status.loadBalancer.ingress` for
-/// every currently-tracked `LoadBalancer` Service. Fans out one
-/// `tokio::spawn`ed task per Service rather than awaiting them in the
+/// the ONE Service `key` that just changed -- not every tracked Service --
+/// since a Service watch event only ever means that Service's own status
+/// could be stale. `tokio::spawn`s rather than awaiting inline in the
 /// (synchronous) watch-event callback: `run_list_watch`'s `on_event` is a
 /// plain `FnMut`, not an async fn, so a network round trip here can't be
 /// awaited inline without blocking the single `current_thread` runtime this
 /// process's other two list-watches also depend on.
-fn publish_ingress(client: &Arc<HyperApiClient>, state: &Mutex<WatchState>, node_ip: Ipv4Addr) {
-    let keys: Vec<_> = state.lock().unwrap().service_keys().cloned().collect();
-    for key in keys {
-        let client = Arc::clone(client);
-        tokio::spawn(async move {
-            if let Err(e) = ensure_node_ingress(&client, &key.namespace, &key.name, node_ip).await {
-                eprintln!(
-                    "controller: publishing status.loadBalancer.ingress for {}/{} failed: {e:#}",
-                    key.namespace, key.name
-                );
-            }
-        });
-    }
+fn publish_ingress(client: &Arc<HyperApiClient>, key: ServiceKey, node_ip: Ipv4Addr) {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        if let Err(e) = ensure_node_ingress(&client, &key.namespace, &key.name, node_ip).await {
+            eprintln!(
+                "controller: publishing status.loadBalancer.ingress for {}/{} failed: {e:#}",
+                key.namespace, key.name
+            );
+        }
+    });
 }
 
 /// Runs the three list-watches (Service/EndpointSlice/Node) concurrently on
@@ -140,9 +138,11 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let client = Arc::clone(&client);
         move |event: Value| {
-            state.lock().unwrap().apply_service_event(&event);
+            let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &node);
-            publish_ingress(&client, &state, node.node_ip);
+            if let Some(key) = changed {
+                publish_ingress(&client, key, node.node_ip);
+            }
         }
     };
     let on_endpoint_slice = {

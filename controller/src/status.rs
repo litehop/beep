@@ -23,7 +23,7 @@
 //! 409 Conflict from a racing writer, is the only clobber-free option left
 //! against an atomic list.
 
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::Context;
 use beep_kubeconfig::HyperApiClient;
@@ -55,6 +55,19 @@ pub fn merged_ingress(existing: &[Value], node_ip: Ipv4Addr) -> Option<Vec<Value
 /// on to the next event.
 const MAX_CONFLICT_RETRIES: u32 = 5;
 
+/// Backoff between conflict retries: without it, every node racing to add
+/// its own entry to the same hot Service would retry back-to-back, each
+/// attempt just as likely to re-collide with the others' PATCH as the last.
+/// Grows with each attempt so a persistently contended Service backs off
+/// further, but stays small and capped -- this loop's total worst case is
+/// already bounded by `MAX_CONFLICT_RETRIES`.
+const CONFLICT_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+const CONFLICT_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
+
+fn conflict_retry_delay(attempt: u32) -> Duration {
+    (CONFLICT_RETRY_BASE_DELAY.saturating_mul(1 << attempt.min(8))).min(CONFLICT_RETRY_MAX_DELAY)
+}
+
 /// Idempotently ensures `node_ip` is present in the named Service's
 /// `status.loadBalancer.ingress`. Safe to call repeatedly (every reconcile
 /// tick re-asserts this node's own entry): a no-op GET when the entry is
@@ -68,7 +81,7 @@ pub async fn ensure_node_ingress(
     let get_path = format!("/api/v1/namespaces/{namespace}/services/{name}");
     let status_path = format!("{get_path}/status");
 
-    for _ in 0..MAX_CONFLICT_RETRIES {
+    for attempt in 0..MAX_CONFLICT_RETRIES {
         let (status, body) = client
             .request(Method::GET, &get_path, None)
             .await
@@ -111,6 +124,7 @@ pub async fn ensure_node_ingress(
             return Ok(());
         }
         if status == hyper::StatusCode::CONFLICT {
+            tokio::time::sleep(conflict_retry_delay(attempt)).await;
             continue;
         }
         anyhow::bail!("PATCH {status_path} returned HTTP {status}: {resp_body}");
@@ -121,6 +135,37 @@ pub async fn ensure_node_ingress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Without a backoff, N nodes racing to add their own entry to the same
+    // Service would retry a 409 Conflict back-to-back -- each attempt lands
+    // at the same instant as the others' PATCH, so the collision just
+    // repeats until MAX_CONFLICT_RETRIES is exhausted instead of a later
+    // attempt succeeding once the retries are staggered.
+    #[test]
+    fn conflict_retry_delay_grows_with_attempt() {
+        assert!(
+            conflict_retry_delay(0) > Duration::ZERO,
+            "the very first retry must still wait, or a revert to no delay wouldn't be caught"
+        );
+        assert!(
+            conflict_retry_delay(1) > conflict_retry_delay(0),
+            "later attempts against a persistently hot Service must back off further than the \
+             first retry"
+        );
+    }
+
+    // MAX_CONFLICT_RETRIES already bounds the number of attempts; the delay
+    // itself must also stay capped, or a hot Service could still make this
+    // node's reconcile loop wait an unreasonably long time on one Service
+    // before moving on to the next watch event.
+    #[test]
+    fn conflict_retry_delay_is_capped() {
+        assert_eq!(
+            conflict_retry_delay(MAX_CONFLICT_RETRIES),
+            CONFLICT_RETRY_MAX_DELAY,
+            "the delay must not grow past the cap even after several retries"
+        );
+    }
 
     // An empty ingress list must gain this node's entry, or no client (and
     // no jig.WaitForLoadBalancer-style e2e spec) can ever discover where to
