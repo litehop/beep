@@ -35,39 +35,37 @@
 #     either.
 # Given both routes to a genuinely foreign client identity are closed,
 # this rig -- like smoke-wg-2node.sh already does for the SAME reason --
-# uses node-b's own root netns as the client. That reproduces the SAME
-# class of problem smoke-wg-2node.sh's own rig hits (client co-located
-# with the backend node), and going further, this rig's investigation
-# established WHY it can never be fixed by a test-rig-only sysctl or
-# netns trick: `ip route get <node-b's own address>` on node-b
-# unconditionally resolves to `local ... dev lo` (Linux's local routing
-# table always wins over any other route for a locally-owned destination,
-# in any netns configuration). The backend's response is addressed back
-# to the ORIGINAL CLIENT's identity -- which in this co-located topology
-# IS node-b's own address -- so the kernel can never select the
-# Geneve-transport uplink (wg0) as the response's egress device for
-# `uplink_egress_return` to intercept; it always short-circuits to `lo`
-# instead. This is a structural property of "client == backend node" 2-VM
-# topologies, not a bug this rig's setup steps can work around
-# (`net.ipv4.conf.*.accept_local=1`, added below, clears a DIFFERENT,
-# shallower martian-source drop on the FORWARD leg, but does not and
-# cannot fix this). See this script's own dump-evidence output for the
-# reproduction; a real fix needs either a 3rd VM (so the client's address
-# is genuinely foreign to node-b) or is out of scope for a scripts/-only
-# test rig.
+# uses node-b's own root netns as the client.
 #
-# RESULT: with the two assigned VMs, this rig proves every mechanical
-# piece of the eth0-in/wg0-out path up to that wall -- eth0 ingress
-# classification, VIP_MAP match, FWD_PENDING admission, Geneve
-# encap/transport (node-a's geneve0 TX packet count exactly matches
-# node-b's geneve0 RX count every run), and node-b's decap+DNAT (writes
-# the correct REV_FLOW entry with the exact expected pod_ip:target_port).
-# The client's own SYN never reaches its target listening socket though
-# (confirmed via /proc/net/snmp: TCP PassiveOpens on node-b never
-# increments across attempts; `trace-cmd record -e skb:kfree_skb` shows
-# the decap'd packet dropped at `tcp_v4_rcv+0x98 reason: NO_SOCKET`), so
-# the forward leg does not complete end-to-end and the return leg can
-# never be exercised at all in this topology.
+# RESULT: the forward leg is PROVEN end-to-end on the two assigned VMs --
+# eth0 ingress classification, VIP_MAP match, FWD_PENDING admission,
+# Geneve encap/transport (node-a's geneve0 TX packet count exactly
+# matches node-b's geneve0 RX count every run), node-b's decap+DNAT
+# (writes the correct REV_FLOW entry), and nc's real listening socket on
+# node-b emitting a genuine SYN-ACK (captured on `lo`; a parallel
+# `trace-cmd record -e skb:kfree_skb` run across the same attempt recorded
+# zero drops). The eBPF mechanism works cross-node.
+#
+# What fails is the RETURN leg, and it is a rig-topology limit, not a
+# dataplane bug: the SYN-ACK's dst is the client's address, which in this
+# 2-VM rig IS node-b's own address (node-b hosts both the backend and the
+# client), so `ip route get <that address>` on node-b unconditionally
+# resolves to `local ... dev lo` -- the kernel can never select the
+# Geneve-transport uplink (wg0) as the SYN-ACK's egress device, regardless
+# of eBPF logic or sysctls (`net.ipv4.conf.*.accept_local=1`, added below,
+# clears a DIFFERENT, shallower martian-source drop on the FORWARD leg,
+# but does not and cannot fix this). The SYN-ACK loops back via `lo` with
+# src=pod_ip:target_port, which doesn't match curl's SYN-SENT socket
+# (expecting a reply from VIP:port), so node-b's own stack RSTs it
+# immediately.
+#
+# Same structural class as smoke-wg-2node.sh's own client-colocation
+# blocker -- there it's a forward-leg martian-source drop, here it's a
+# return-leg RST, but the root cause is identical: the "client" can't be
+# genuinely foreign to the backend node in a 2-VM rig. Real fix needs a
+# 3rd VM (client address genuinely foreign to node-b's own addresses); out
+# of this rig's 2-VM scope. See this script's own dump-evidence output for
+# the reproduction.
 #
 # Usage: scripts/smoke-eth-ingress-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
 # Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the
