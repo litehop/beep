@@ -1,0 +1,43 @@
+# Lima VM for the cross-node smoke rigs' CLIENT role (scripts/smoke-wg-2node.sh,
+# scripts/smoke-eth-ingress-2node.sh). A genuinely separate machine, not a
+# netns on beep-node-b: the 2-VM rigs' backend node cannot prove
+# symmetric-return because a client co-located with it has an address LOCAL
+# to that node, so its own kernel replies via `lo`/veth instead of out the
+# real uplink -- beep's return hook never runs. This VM's address must be
+# (a) reachable from node-a's user-v2 address and (b) NON-LOCAL to node-b's
+# routing table; joining the same `user-v2` switch as beep-node-a/
+# beep-node-b satisfies both, since Lima's user-v2 gives every VM a
+# directly-reachable peer address on a shared subnet without making it a
+# local address of any other VM on that switch.
+#
+# Unlike lima/beep.yaml (dataplane nodes), this VM never loads the eBPF
+# program or runs WireGuard -- it only originates TCP client traffic -- so
+# it skips bpftool/wireguard-tools provisioning.
+#
+# Usage:
+#   limactl start --tty=false --name=beep-client lima/beep-client.yaml
+
+vmType: vz
+
+cpus: 1
+memory: "1GiB"
+disk: "5GiB"
+
+# Same `user-v2` network as beep-node-a/beep-node-b (see header) -- this is
+# the whole point of this profile, not an incidental default.
+networks:
+  - lima: user-v2
+
+images:
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    arch: x86_64
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      apt-get update -qq
+      apt-get install -y netcat-openbsd curl
