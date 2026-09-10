@@ -19,7 +19,7 @@ VM you didn't provision breaks whoever is mid-task on it.
 
 ## The VM pool
 
-Three named VMs, fixed roles:
+Four named VMs, fixed roles:
 
 - **`beep-smoke`** — single-node smoke gate. `scripts/smoke.sh` targets this
   by default: loads the tc-bpf classifiers into a real kernel verifier and
@@ -29,12 +29,23 @@ Three named VMs, fixed roles:
   beep-n24; the original mayor-f3ru5 redirect-drop blocker is fixed by
   PR #9): cross-node conntrack/WireGuard behavior that single-node smoke
   can't exercise.
+- **`beep-client`** (`lima/beep-client.yaml`, started via
+  `limactl start --tty=false --name=beep-client lima/beep-client.yaml`) — the
+  3rd-VM client for the cross-node rigs (bead beep-vuh). A 2-VM rig's client
+  is necessarily co-located with `beep-node-b`, so its address is LOCAL to
+  that node and the return leg never leaves `lo`/veth to exercise beep's
+  tunnel-return hook. `beep-client` joins the same `user-v2` switch as
+  `beep-node-a`/`beep-node-b`, which is verified to give it a peer address
+  reachable from `beep-node-a` while remaining non-local to `beep-node-b`
+  (`ip route get <beep-client-addr>` on `beep-node-b` resolves via `eth0`,
+  not `local … dev lo`). Not yet wired into the smoke scripts — provisioning
+  and topology verification only so far.
 
 Assign one VM per concurrent dataplane worker — two workers must not share
 a VM, since each smoke run loads/unloads real bpf programs and mutates live
 netns/veth fixtures. A worker touching `beep-ebpf` or conntrack logic claims
-one of the three VMs for the duration of its task; a worker doing
-host-only or `beep-common` work needs none.
+one of the pool VMs for the duration of its task; a worker doing host-only
+or `beep-common` work needs none.
 
 ## Host build + copy model
 

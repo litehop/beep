@@ -8,13 +8,13 @@
 #
 # Scope note (beep): beep's own crate/VM/binary names -- beep-ebpf,
 # beep-common, beep-smoke, beep-node-a, beep-node-b, beep-wg2node,
-# beep-ethingress2node -- are `beep-[a-z0-9]{3,5}`-shaped too (the regex's
-# 3-5 char cap truncates beep-common/beep-node-a/beep-wg2node/
-# beep-ethingress2node to beep-commo/beep-node/beep-wg2no/beep-ethin), so
-# a naive `beep-` arm would false-positive on ~100 non-bead tokens across
-# tracked source. BEEP_NAME_ALLOWED_TOKENS below filters exactly those known
-# fixed names back out, so only a real `beep-` bead ID (e.g. beep-htf) trips
-# this guard.
+# beep-ethingress2node, beep-client -- are `beep-[a-z0-9]{3,5}`-shaped too
+# (the regex's 3-5 char cap truncates beep-common/beep-node-a/beep-wg2node/
+# beep-ethingress2node/beep-client to beep-commo/beep-node/beep-wg2no/
+# beep-ethin/beep-clien), so a naive `beep-` arm would false-positive on
+# ~100 non-bead tokens across tracked source. BEEP_NAME_ALLOWED_TOKENS below
+# filters exactly those known fixed names back out, so only a real `beep-`
+# bead ID (e.g. beep-htf) trips this guard.
 #
 # Exclusions:
 #   .beads/  -- bd's own JSONL export legitimately contains bead IDs.
@@ -104,7 +104,7 @@ fi
 # names via the SAME allowlist-then-rescan pattern as
 # MAYOR_TICK_ALLOWED_TOKENS above, so only a real bead ID (e.g. beep-htf,
 # beep-vph) survives to trip this arm.
-BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|commo|smoke|node|wg2no|ethin)$'
+BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|commo|smoke|node|wg2no|ethin|clien)$'
 beep_matches=$(git grep -n -oE 'beep-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!.beads' ':!ai' ':!docs' ':!.github' \
   ':!scripts/check-bead-id-refs.sh' \
