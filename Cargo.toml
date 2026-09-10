@@ -9,8 +9,10 @@ license = "Apache-2.0"
 # beep-common crate are workspace members here so beep-common can be a path
 # dependency of both the loader and the eBPF program, guaranteeing the
 # conntrack map types are byte-identical on each side of the kernel boundary.
+# beep-controller is the per-node userspace control plane's pure reconcile
+# logic; a separate crate so it stays free of aya/k8s-client dependencies.
 [workspace]
-members = ["ebpf", "common"]
+members = ["ebpf", "common", "controller"]
 resolver = "2"
 
 [profile.release.package.beep-ebpf]
