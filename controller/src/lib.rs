@@ -11,4 +11,4 @@
 pub mod apply;
 pub mod reconcile;
 pub mod status;
-pub mod watcha;
+pub mod watch;
