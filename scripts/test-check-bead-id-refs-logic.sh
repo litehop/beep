@@ -311,6 +311,54 @@ assert "...and the failure output names both offending tokens" \
   "$(grep -qF 'beep-abc' "$S11_ROT/.gate-out" && grep -qF 'mayor-abc12' "$S11_ROT/.gate-out" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 12. A fatal `git grep -P` error (e.g. a git built without PCRE support,
+#     which every sweep in the gate depends on for its word-anchoring
+#     lookahead) must FAIL LOUD, not silently degrade to "bead-id-refs: ok".
+#     The original `git grep -P ... 2>/dev/null || true` pattern swallowed
+#     this exact failure into an empty match set, so a non-PCRE git build
+#     would pass a tree full of real bead-ID refs. Simulates the fatal with a
+#     stub `git` (ahead of the real one on PATH) that fails any `-P`/`-oP`
+#     invocation with a non-1 exit code, exactly as a non-PCRE git build
+#     would, while passing every other git subcommand through to the real
+#     binary so the sandbox setup above still works.
+# ---------------------------------------------------------------------------
+S12="$SANDBOX_ROOT/12-pcre-unsupported"
+new_sandbox "$S12"
+mkdir -p "$S12/src"
+printf 'fn add(a: i32, b: i32) -> i32 { a + b }\n' > "$S12/src/lib.rs"
+commit_tree "$S12"
+
+REAL_GIT="$(command -v git)"
+STUB_DIR="$SANDBOX_ROOT/12-stub-bin"
+mkdir -p "$STUB_DIR"
+cat > "$STUB_DIR/git" <<STUBEOF
+#!/usr/bin/env bash
+if [ "\$1" = "grep" ]; then
+  for a in "\$@"; do
+    case "\$a" in
+      -P|-oP)
+        echo "fatal: -P, --perl-regexp is not supported (simulated for test)" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+exec "$REAL_GIT" "\$@"
+STUBEOF
+chmod +x "$STUB_DIR/git"
+
+set +e
+(cd "$S12" && PATH="$STUB_DIR:$PATH" bash "$SCRIPT") >"$S12/.gate-out" 2>&1
+RC12=$?
+set -e
+assert "a fatal 'git grep -P' error (simulating a non-PCRE git build) fails loud instead of silently passing" \
+  "$([ "$RC12" -ne 0 ] && echo 1 || echo 0)"
+assert "...and the failure output names the git grep -P / PCRE requirement, not a generic error" \
+  "$(grep -qi 'PCRE' "$S12/.gate-out" && echo 1 || echo 0)"
+assert "...and the failure output never prints the false-clean 'bead-id-refs: ok' line" \
+  "$(! grep -q 'bead-id-refs: ok' "$S12/.gate-out" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

@@ -46,28 +46,59 @@
 # word -- e.g. beep-servicelb's "servicelb" run is 9 alnum chars, so no 3-5
 # char slice of it sits at a word boundary and the token is left alone.
 # `git grep -E` (POSIX ERE) has no lookahead or \b support here, so the
-# sweeps below use `git grep -P` (PCRE) instead.
+# sweeps below use `git grep -P` (PCRE) instead -- via pcre_grep(), which
+# fails loud (see below) if this git build lacks PCRE support, rather than
+# letting the sweep go dark.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-matches=$(git grep -n -P 'mayor-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- . \
+# `git grep -P` exits 1 for "no match" (expected, not an error) but a higher
+# code (e.g. 128) for a real failure -- most notably a git built without PCRE
+# support, which every sweep below depends on for the lookahead. The naive
+# `git grep -P ... 2>/dev/null || true` pattern this replaced could not tell
+# those apart: it swallowed a PCRE-unsupported fatal into an empty result,
+# so the guard printed "bead-id-refs: ok" and passed silently instead of
+# catching bead-ID refs, on any git build without PCRE. Route every `-P`
+# sweep through this helper so that failure surfaces instead.
+pcre_grep() {
+  local stderr_file rc output
+  stderr_file=$(mktemp)
+  if output=$(git grep "$@" 2>"$stderr_file"); then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ge 2 ]; then
+    echo "bead-id-refs: 'git grep -P' failed (exit $rc) -- this guard requires a git build with PCRE support (git grep --perl-regexp)." >&2
+    cat "$stderr_file" >&2
+    rm -f "$stderr_file"
+    exit 1
+  fi
+  rm -f "$stderr_file"
+  printf '%s' "$output"
+}
+
+matches=$(pcre_grep -n -P 'mayor-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- . \
   ':!.beads' ':!ai' ':!docs' ':!.github' \
   ':!scripts/test-critical-reviewer-hook.sh' \
   ':!scripts/test-check-bead-id-refs-logic.sh' \
   ':!scripts/check-bead-id-refs.sh' \
   ':!scripts/mayor-tick.sh' ':!scripts/test-mayor-tick-logic.sh' \
-  ':!.gitignore' \
-  2>/dev/null || true)
+  ':!.gitignore')
 
 # scripts/mayor-tick.sh + scripts/test-mayor-tick-logic.sh are skipped above
 # (their own name matches the regex), but that must not silently swallow a real
 # bead-ID reference in their body content -- re-scan the two files
 # match-by-match (not whole-file) and tolerate only the exact known-safe tokens.
-MAYOR_TICK_ALLOWED_TOKENS='mayor-(tick|owned|abcd|efgh|aaaa|bbbb|cccc|dddd|abc[1-4]|boots)$'
-mayor_tick_matches=$(git grep -n -oP 'mayor-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- \
-  scripts/mayor-tick.sh scripts/test-mayor-tick-logic.sh 2>/dev/null \
-  | grep -vE ":${MAYOR_TICK_ALLOWED_TOKENS}" || true)
+MAYOR_TICK_ALLOWED_TOKENS='mayor-(tick|owned|abcd|efgh|aaaa|bbbb|cccc|dddd|abc[1-4])$'
+mayor_tick_raw=$(pcre_grep -n -oP 'mayor-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- \
+  scripts/mayor-tick.sh scripts/test-mayor-tick-logic.sh)
+if [ -n "$mayor_tick_raw" ]; then
+  mayor_tick_matches=$(printf '%s' "$mayor_tick_raw" | grep -vE ":${MAYOR_TICK_ALLOWED_TOKENS}" || true)
+else
+  mayor_tick_matches=""
+fi
 if [ -n "$mayor_tick_matches" ]; then
   matches="${matches:+$matches
 }$mayor_tick_matches"
@@ -77,9 +108,13 @@ fi
 # fixture is synthetic test input); re-scan match-by-match and tolerate only
 # the fixture token.
 CRITICAL_REVIEWER_HOOK_ALLOWED_TOKENS='mayor-abc12$'
-critical_reviewer_hook_matches=$(git grep -n -oP 'mayor-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- \
-  scripts/test-critical-reviewer-hook.sh 2>/dev/null \
-  | grep -vE ":${CRITICAL_REVIEWER_HOOK_ALLOWED_TOKENS}" || true)
+critical_reviewer_hook_raw=$(pcre_grep -n -oP 'mayor-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- \
+  scripts/test-critical-reviewer-hook.sh)
+if [ -n "$critical_reviewer_hook_raw" ]; then
+  critical_reviewer_hook_matches=$(printf '%s' "$critical_reviewer_hook_raw" | grep -vE ":${CRITICAL_REVIEWER_HOOK_ALLOWED_TOKENS}" || true)
+else
+  critical_reviewer_hook_matches=""
+fi
 if [ -n "$critical_reviewer_hook_matches" ]; then
   matches="${matches:+$matches
 }$critical_reviewer_hook_matches"
@@ -94,11 +129,15 @@ fi
 # MAYOR_TICK_ALLOWED_TOKENS above, so only a real bead ID (e.g. beep-xxx,
 # beep-yyy) survives to trip this arm.
 BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|smoke|node)$'
-beep_matches=$(git grep -n -oP 'beep-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- . \
+beep_raw=$(pcre_grep -n -oP 'beep-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- . \
   ':!.beads' ':!ai' ':!docs' ':!.github' \
   ':!scripts/check-bead-id-refs.sh' \
-  ':!scripts/test-check-bead-id-refs-logic.sh' \
-  2>/dev/null | grep -vE ":${BEEP_NAME_ALLOWED_TOKENS}" || true)
+  ':!scripts/test-check-bead-id-refs-logic.sh')
+if [ -n "$beep_raw" ]; then
+  beep_matches=$(printf '%s' "$beep_raw" | grep -vE ":${BEEP_NAME_ALLOWED_TOKENS}" || true)
+else
+  beep_matches=""
+fi
 if [ -n "$beep_matches" ]; then
   matches="${matches:+$matches
 }$beep_matches"
