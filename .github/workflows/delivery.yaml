@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      push:
+        description: "Push to Docker Hub"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,7 +18,7 @@ jobs:
   # Cross-builds beep-controller for both target arches on this one amd64
   # runner (cargo-zigbuild, same cross-build technique scripts/smoke.sh uses
   # for its macOS-host -> Linux-VM build), then COPYs the two prebuilt gnu
-  # binaries into a debian:bookworm-slim image. This replaces compiling
+  # binaries into a debian:trixie-slim image. This replaces compiling
   # inside the image under QEMU emulation (~37min) with a native/cross
   # build that Swatinem/rust-cache can actually reuse across runs.
   image:
@@ -46,22 +51,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # cargo-zigbuild shells out to `zig cc` as its cross-linker; fetch
-      # zig's official release directly, hash-verified, same trust pattern
-      # as the bpf-linker/bpftool fetches elsewhere in this repo.
-      - name: Install zig
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/zig.tar.xz \
-            https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
-          echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz" | sha256sum -c -
-          tar -xJf /tmp/zig.tar.xz -C /usr/local
-          ln -s /usr/local/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
-          zig version
+      # cargo-zigbuild shells out to `zig cc` as its cross-linker.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
 
-      # glibc is pinned to 2.36 (Debian bookworm's version) via
-      # cargo-zigbuild's target-suffix syntax, so the binary never requires
-      # a glibc newer than the runtime image (debian:bookworm-slim) ships.
+      # glibc is pinned to 2.36 via cargo-zigbuild's target-suffix syntax
+      # (conservative floor, not tied to the runtime image's glibc); the
+      # binary is forward-compatible with debian:trixie-slim's glibc 2.41.
       - name: Cross-build beep-controller (gnu, both arches)
         run: |
           set -euo pipefail
@@ -79,12 +76,14 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # No QEMU needed: the Dockerfile only COPYs a prebuilt binary per
-      # platform, it never RUNs anything for the foreign arch.
+      # platform, it never RUNs anything for the foreign arch. A manual
+      # dispatch defaults to a dry-run build of both arches (push: false);
+      # pass push=true, or merge to main, to actually publish.
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' || inputs.push }}
           tags: |
             docker.io/valerauko/beep-lb:latest
             docker.io/valerauko/beep-lb:${{ github.sha }}
