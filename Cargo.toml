@@ -30,6 +30,10 @@ beep-common = { path = "common", features = ["user"] }
 [build-dependencies]
 aya-build = "0.2"
 
+[lib]
+name = "beep"
+path = "src/lib.rs"
+
 [[bin]]
 name = "beep"
 path = "src/main.rs"
