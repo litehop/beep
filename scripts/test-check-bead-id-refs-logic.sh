@@ -280,6 +280,37 @@ assert "fixed crate/VM names (beep-ebpf/beep-common/beep-smoke/beep-node-a) are 
   "$([ "$RC10" -eq 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 11. Word-anchoring regression (bidirectional): the fix must reject only
+#     genuine long-word false positives, not weaken real bead-ID detection.
+#     11a: beep-servicelb/beep-client (the exact tokens that tripped the
+#     unanchored regex) must NOT be flagged -- their alnum run continues past
+#     the 3-5 char cap, so no 3-5 char slice of it sits at a word boundary.
+#     11b: a real beep-abc and mayor-abc12 in ordinary source (not one of the
+#     name-specific rescanned files above) must still be caught -- proves the
+#     lookahead only narrows the match, it doesn't silently stop catching
+#     real, un-allowlisted bead IDs.
+# ---------------------------------------------------------------------------
+S11_CLEAN="$SANDBOX_ROOT/11-word-anchor-clean"
+new_sandbox "$S11_CLEAN"
+mkdir -p "$S11_CLEAN/src"
+printf '// beep-servicelb talks to beep-client over the tunnel\nfn f() {}\n' > "$S11_CLEAN/src/lib.rs"
+commit_tree "$S11_CLEAN"
+RC11_CLEAN=$(run_gate "$S11_CLEAN")
+assert "beep-servicelb/beep-client (longer names) are NOT flagged (word-anchored suffix match)" \
+  "$([ "$RC11_CLEAN" -eq 0 ] && echo 1 || echo 0)"
+
+S11_ROT="$SANDBOX_ROOT/11-word-anchor-rot"
+new_sandbox "$S11_ROT"
+mkdir -p "$S11_ROT/src"
+printf '// beep-abc and mayor-abc12 both still rot like any other bead ID\nfn f() {}\n' > "$S11_ROT/src/lib.rs"
+commit_tree "$S11_ROT"
+RC11_ROT=$(run_gate "$S11_ROT")
+assert "a real beep-abc and mayor-abc12 are still caught (anchoring narrows, not disables, real-ID detection)" \
+  "$([ "$RC11_ROT" -ne 0 ] && echo 1 || echo 0)"
+assert "...and the failure output names both offending tokens" \
+  "$(grep -qF 'beep-abc' "$S11_ROT/.gate-out" && grep -qF 'mayor-abc12' "$S11_ROT/.gate-out" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
