@@ -165,6 +165,9 @@ dependencies = [
 [[package]]
 name = "beep-common"
 version = "0.1.0"
+dependencies = [
+ "aya",
+]
 
 [[package]]
 name = "beep-ebpf"

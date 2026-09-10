@@ -8,3 +8,11 @@ license = "Apache-2.0"
 # lets `cargo test` run natively on any host while `beep-ebpf` still
 # pulls it in as a no_std, core-only dependency for bpfel-unknown-none.
 [dependencies]
+# Optional, gated behind the `user` feature: only the loader/controller
+# side needs `aya::Pod` for the controller-written map types below. Kept
+# out of `beep-ebpf`'s dependency graph (it depends on this crate with
+# default features) so the no_std, bpfel-unknown-none build never sees it.
+aya = { version = "0.14", default-features = false, optional = true }
+
+[features]
+user = ["dep:aya"]

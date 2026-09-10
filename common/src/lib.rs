@@ -183,6 +183,67 @@ pub fn uplink_l2_header_len(arphrd_type: u16) -> u32 {
     }
 }
 
+/// Converts a host-order value (e.g. `u32::from(Ipv4Addr)`) into the "raw
+/// wire token" representation `beep-ebpf` compares packet bytes against
+/// verbatim (see `beep-ebpf`'s module doc for why this conversion exists
+/// and why it's applied exactly once, at the map-population boundary).
+pub fn wire_ip(ip: u32) -> u32 {
+    ip.to_be()
+}
+
+pub fn wire_port(port: u16) -> u16 {
+    port.to_be()
+}
+
+/// Loader-populated VIP:PORT(+proto) front-tuple key -- shared by
+/// `beep-ebpf`'s `VIP_MAP` and `TARGET_PORTS`, which key on the same front
+/// tuple for two different roles (ingress backend selection, backend
+/// target-port selection). `#[repr(C)]`, byte-identical on both sides of the
+/// kernel boundary is the whole point: aya's userspace `HashMap<K, V>`
+/// requires `K: Pod`, and the kernel's `BPF_MAP_TYPE_HASH` hashes/compares
+/// this struct's raw bytes.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VipKey {
+    pub vip_ip: u32,
+    pub vip_port: u16,
+    pub proto: u8,
+    pub _pad: u8,
+}
+
+/// `VIP_MAP`/`FWD_PENDING` value: the backend identity a `VipKey` resolves
+/// to.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VipBackend {
+    /// Geneve remote for the forward leg -- the node hosting the chosen Pod.
+    pub backend_node_ip: u32,
+    /// Pod-identifier stamped as the forward-leg Geneve option.
+    pub pod_ip: u32,
+}
+
+/// Host-specific runtime config the loader fills in after attach (an
+/// ifindex isn't known until then). Single entry (`CONFIG` map).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Config {
+    pub geneve_ifindex: u32,
+    pub uplink_ifindex: u32,
+    /// `uplink_l2_header_len`'s result for the uplink iface -- 14 for a
+    /// real Ethernet-framed NIC/veth, 0 for an L3-only uplink (WireGuard or
+    /// any other tun-style device with no L2 header). `geneve0` is
+    /// unaffected: it's always a real (Ethernet-framed) netdev regardless
+    /// of what the uplink is.
+    pub uplink_l2_hlen: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for VipKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for VipBackend {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Config {}
+
 /// Flow-table admission: forward-path decision (`beep-ebpf`'s
 /// `try_uplink_ingress`, `docs/decisions/servicelb-flow-admission-affinity.md`).
 /// A new flow is minted ONLY into the small, flood-exposed PENDING tier --
@@ -524,6 +585,23 @@ mod tests {
         // header instead of past a header that was never there.
         const ARPHRD_NONE: u16 = 0xFFFE;
         assert_eq!(uplink_l2_header_len(ARPHRD_NONE), 0);
+    }
+
+    // Every checksum update and tunnel-key field the eBPF side touches
+    // requires the exact wire byte order (see beep-ebpf's module doc);
+    // a regression here silently corrupts every packet this dataplane
+    // touches rather than failing loudly, so the round-trip is pinned here.
+    #[test]
+    fn wire_ip_matches_dotted_octet_order() {
+        // u32::from(Ipv4Addr::new(10, 0, 0, 1)) == this literal.
+        let ip = u32::from_be_bytes([10, 0, 0, 1]);
+        assert_eq!(wire_ip(ip).to_le_bytes(), [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn wire_port_matches_network_byte_order() {
+        // 8080 = 0x1F90; on the wire the high byte (0x1F) comes first.
+        assert_eq!(wire_port(8080).to_le_bytes(), [0x1F, 0x90]);
     }
 
     // A conntrack keying bug corrupts flow affinity silently instead of
