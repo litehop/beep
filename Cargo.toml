@@ -12,7 +12,7 @@ license = "Apache-2.0"
 # beep-controller is the per-node userspace control plane's pure reconcile
 # logic; a separate crate so it stays free of aya/k8s-client dependencies.
 [workspace]
-members = ["ebpf", "common", "controller"]
+members = ["ebpf", "common", "controller", "kubeconfig"]
 resolver = "2"
 
 [profile.release.package.beep-ebpf]
