@@ -51,10 +51,10 @@ use aya_ebpf::{
 use beep_common::{
     backend_port_resolution, decap_forward_pod_admission, egress_return_admission,
     egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission, ipv4_mapped_v6,
-    occupant_conflicts, resolve_backend_src_port, return_authorization, BackendPortDecision,
-    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
-    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
-    VipBackend, VipKey,
+    is_redirected_return_mark, occupant_conflicts, resolve_backend_src_port, return_authorization,
+    BackendPortDecision, BackendPortResolution, Config, DecapForwardPodAdmission,
+    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission,
+    ReturnAuthorization, TcpFlowKey, VipBackend, VipKey, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -914,6 +914,16 @@ fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i3
     // the same "receive on one device, redirect for transmit on another"
     // pattern `uplink_ingress` already uses for the forward leg's geneve0
     // redirect, just in the opposite direction.
+    //
+    // That same redirect re-enters the uplink's OWN egress pipeline, so
+    // `try_uplink_egress_return` (hook 3) sees this already-un-DNAT'd,
+    // client-bound packet a second time with src == vip_ip. Stamp it before
+    // redirecting so hook 3 can recognize and skip its own redirected-back
+    // packet: without this, vip_ip == pod_ip -- a hostNetwork Service
+    // fronted by a same-node backend's own address -- fools hook 3's
+    // POD_TARGETS admission into misreading this packet as the pod's raw
+    // reply and dropping it.
+    ctx.set_mark(REDIRECTED_RETURN_MARK);
     let uplink_ifindex = CONFIG.get(0)?.uplink_ifindex;
     if unsafe { bpf_redirect(uplink_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
         return Some(TC_ACT_SHOT);
@@ -931,6 +941,21 @@ pub fn uplink_egress_return(ctx: TcContext) -> i32 {
 }
 
 fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
+    // `try_geneve_decap_return`'s final redirect re-enters this same uplink's
+    // egress pipeline, so this hook sees that already-processed,
+    // already-un-DNAT'd client-bound packet a SECOND time before the
+    // POD_TARGETS admission below ever runs. When vip_ip == pod_ip -- a
+    // hostNetwork Service fronted by a same-node backend's own address --
+    // that second pass spuriously matches POD_TARGETS and gets misread as
+    // the pod's raw reply, then dropped. Recognize and pass it through
+    // untouched instead. Cleared rather than left stamped: nothing else in
+    // this datapath reads skb->mark today, but leaving a stale internal
+    // marker on a packet leaving the node is a needless landmine for any
+    // future mark-based tc/iptables rule on this uplink.
+    if is_redirected_return_mark(unsafe { (*ctx.skb.skb).mark }) {
+        ctx.set_mark(0);
+        return Some(TC_ACT_OK);
+    }
     // See `try_uplink_ingress`'s matching comment: the uplink's L2 header
     // length is resolved once by the loader, not assumed to be Ethernet's 14
     // bytes.

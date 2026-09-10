@@ -363,6 +363,29 @@ pub fn egress_return_outcome(has_rev_flow_entry: bool) -> EgressReturnOutcome {
     }
 }
 
+/// `skb->mark` value `try_geneve_decap_return` stamps on the final,
+/// already-un-DNAT'd, client-bound packet just before its `bpf_redirect`
+/// back onto the physical uplink. That redirect re-enters the SAME uplink's
+/// egress pipeline, so `try_uplink_egress_return` (hook 3) sees this packet
+/// a second time with `src == vip_ip`; when a Service's front VIP equals a
+/// hostNetwork backend Pod's own IP (same-node ingress+backend), that
+/// second pass also matches `POD_TARGETS.get(ip_src)` and hook 3
+/// misinterprets the client-bound packet as the pod's own raw reply,
+/// building a wrong FLOW_TABLE key and dropping it. This mark lets hook 3
+/// recognize and skip its own redirected-back packet before that admission
+/// check ever runs. Arbitrary 32-bit value -- no other `skb->mark` use
+/// exists anywhere in this datapath to collide with.
+pub const REDIRECTED_RETURN_MARK: u32 = 0xbeeb_0001;
+
+/// Hook 3's very first gate, run before `egress_return_admission`: is this
+/// packet the one `try_geneve_decap_return` already fully processed and
+/// redirected back onto the uplink (see `REDIRECTED_RETURN_MARK`)? If so it
+/// must pass through untouched -- it is not a backend Pod's reply at all,
+/// regardless of what `POD_TARGETS.get(ip_src)` says.
+pub fn is_redirected_return_mark(mark: u32) -> bool {
+    mark == REDIRECTED_RETURN_MARK
+}
+
 /// Inbound decap-forward pod-membership gate (`beep-ebpf`'s
 /// `try_geneve_decap_forward`, hook 4) -- the egress-side analogue of
 /// `EgressReturnAdmission` above, mirrored onto the opposite hook.
@@ -1354,6 +1377,33 @@ mod tests {
             "meanwhile, identified backend traffic with the same REV_FLOW miss must drop, not \
              pass -- the two outcomes for the same has_rev_flow_entry value diverge precisely \
              because admission already separated the two cases"
+        );
+    }
+
+    #[test]
+    fn is_redirected_return_mark_recognizes_the_decap_return_stamp() {
+        // Without recognizing its own stamp, hook 3 treats the
+        // redirected-back, already-un-DNAT'd client packet as a backend
+        // Pod's raw reply whenever vip_ip == pod_ip (hostNetwork same-node),
+        // builds a wrong FLOW_TABLE key, and drops it -- silent client
+        // timeout on an otherwise-healthy connection.
+        assert!(
+            is_redirected_return_mark(REDIRECTED_RETURN_MARK),
+            "hook 3 must recognize the exact mark try_geneve_decap_return stamps, or the \
+             redirected-back packet falls straight back into the POD_TARGETS misread this \
+             mark exists to prevent"
+        );
+    }
+
+    #[test]
+    fn is_redirected_return_mark_rejects_an_unmarked_packet() {
+        // Genuine backend Pod replies never carry this mark -- if this ever
+        // matched an arbitrary/zero mark, hook 3 would wave through real pod
+        // traffic without the REV_FLOW admission check it needs.
+        assert!(
+            !is_redirected_return_mark(0),
+            "an unmarked packet (the normal case for a genuine backend Pod reply) must still \
+             go through hook 3's POD_TARGETS admission, not skip it"
         );
     }
 
