@@ -1,0 +1,65 @@
+# Lima VM for the k3s-on-Lima Tier-2 integration cluster (beep-node-a as k3s
+# server, beep-node-b as k3s agent) -- k3s + flannel + kube-proxy + a backend
+# Pod alongside beep's own tc-bpf/Geneve/WireGuard dataplane need more
+# headroom than lima/beep.yaml's 2GiB smoke profile. Kept as a SEPARATE
+# profile so the fast Tier-1 smoke gate's provisioning cost is unchanged --
+# scripts/smoke.sh and scripts/smoke-wg-2node.sh still default to whatever
+# profile their VMs were actually provisioned from, they don't read this file.
+#
+# Usage:
+#   limactl start --tty=false --name=beep-node-a lima/beep-k3s.yaml
+#   limactl start --tty=false --name=beep-node-b lima/beep-k3s.yaml
+#   scripts/k3s-up.sh   # installs+joins k3s on top of the two VMs above
+
+vmType: vz
+
+cpus: 2
+memory: "4GiB"
+disk: "15GiB"
+
+# Same plain unprivileged user-v2 switch as lima/beep.yaml so beep-node-a and
+# beep-node-b keep reaching each other directly (required by both k3s
+# server<->agent traffic and scripts/smoke-wg-2node.sh's WireGuard tunnel).
+networks:
+  - lima: user-v2
+
+images:
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    arch: x86_64
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+
+      apt-get update -qq
+
+      # bpftool: not always packaged for the running kernel. Try the generic
+      # package first, then the kernel-specific one; if neither is available,
+      # leave a clear message instead of failing provisioning outright --
+      # smoke-remote.sh's own bpftool checks will fail loud if it's truly
+      # missing.
+      apt-get install -y linux-tools-generic \
+        || apt-get install -y "linux-tools-$(uname -r)" \
+        || echo "WARNING: bpftool package unavailable for this kernel -- install manually" >&2
+
+      apt-get install -y wireguard-tools netcat-openbsd curl jq
+
+      # Standard k8s node prep: flannel's VXLAN + kube-proxy's iptables rules
+      # need forwarding enabled and bridged-traffic visible to iptables, and
+      # br_netfilter loaded at boot (not just for this session) since these
+      # VMs get stopped/restarted across smoke runs.
+      modprobe overlay
+      modprobe br_netfilter
+      cat > /etc/modules-load.d/k3s.conf <<'EOF'
+      overlay
+      br_netfilter
+      EOF
+      cat > /etc/sysctl.d/99-k3s.conf <<'EOF'
+      net.bridge.bridge-nf-call-iptables = 1
+      net.ipv4.ip_forward = 1
+      EOF
+      sysctl --system >/dev/null
