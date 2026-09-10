@@ -6,16 +6,17 @@
 # that bead closes it's an unexplained token nobody can resolve. Historical
 # context belongs in git/PR history, not a live token in source.
 #
-# Scope note (beep): beep's own crate/VM/binary names -- beep-ebpf,
+# Scope note (beep): beep's own crate/VM/binary/profile names -- beep-ebpf,
 # beep-common, beep-smoke, beep-node-a, beep-node-b, beep-wg2node,
-# beep-ethingress2node, beep-client -- are `beep-[a-z0-9]{3,5}`-shaped too.
-# The word-anchored regex below (see the regex note further down) already
-# rules out beep-common/beep-node-a/beep-wg2node/beep-ethingress2node/
-# beep-client: their alnum run continues past 5 chars, so no 3-5 char slice
-# of it sits at a word boundary. beep-ebpf ("ebpf") and beep-smoke/-node-a
-# ("smoke"/"node", up to the next hyphen) still coincide exactly with a real
-# bead-ID's length; BEEP_NAME_ALLOWED_TOKENS below filters those back out,
-# so only a real `beep-` bead ID (e.g. beep-xxx) trips this guard.
+# beep-ethingress2node, beep-client, beep-k3s -- are `beep-[a-z0-9]{3,5}`-shaped
+# too. The word-anchored regex below (see the regex note further down)
+# already rules out beep-common/beep-node-a/beep-wg2node/
+# beep-ethingress2node/beep-client: their alnum run continues past 5 chars,
+# so no 3-5 char slice of it sits at a word boundary. beep-ebpf ("ebpf"),
+# beep-smoke/-node-a ("smoke"/"node", up to the next hyphen), and beep-k3s
+# ("k3s") still coincide exactly with a real bead-ID's length;
+# BEEP_NAME_ALLOWED_TOKENS below filters those back out, so only a real
+# `beep-` bead ID (e.g. beep-xxx) trips this guard.
 #
 # Exclusions:
 #   .beads/  -- bd's own JSONL export legitimately contains bead IDs.
@@ -128,7 +129,7 @@ fi
 # names via the SAME allowlist-then-rescan pattern as
 # MAYOR_TICK_ALLOWED_TOKENS above, so only a real bead ID (e.g. beep-xxx,
 # beep-yyy) survives to trip this arm.
-BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|smoke|node)$'
+BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|smoke|node|k3s)$'
 beep_raw=$(pcre_grep -n -oP 'beep-[a-z0-9]{3,5}(?![a-z0-9])(\.[0-9]+)?' -- . \
   ':!.beads' ':!ai' ':!docs' ':!.github' \
   ':!scripts/check-bead-id-refs.sh' \
