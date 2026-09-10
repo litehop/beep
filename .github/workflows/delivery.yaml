@@ -12,10 +12,10 @@ concurrency:
 jobs:
   # Cross-builds beep-controller for both target arches on this one amd64
   # runner (cargo-zigbuild, same cross-build technique scripts/smoke.sh uses
-  # for its macOS-host -> Linux-VM build), then COPYs the two prebuilt
-  # static binaries into a scratch image. This replaces compiling inside
-  # the image under QEMU emulation (~37min) with a native/cross build that
-  # Swatinem/rust-cache can actually reuse across runs.
+  # for its macOS-host -> Linux-VM build), then COPYs the two prebuilt gnu
+  # binaries into a debian:bookworm-slim image. This replaces compiling
+  # inside the image under QEMU emulation (~37min) with a native/cross
+  # build that Swatinem/rust-cache can actually reuse across runs.
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -26,11 +26,11 @@ jobs:
 
       # beep-controller's build.rs cross-builds beep-ebpf via aya-build,
       # which needs nightly + rust-src regardless of the host build's own
-      # target. The musl targets are for beep-controller itself.
+      # target. The gnu targets are for beep-controller itself.
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
           components: rust-src
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
       # Namespaced by job id automatically, so this doesn't collide with
       # ci.yaml's caches; keyed on Cargo.lock (Swatinem/rust-cache's
@@ -59,18 +59,17 @@ jobs:
           ln -s /usr/local/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
           zig version
 
-      # Static musl binaries need no glibc/CA-bundle in the runtime image
-      # (beep-kubeconfig builds its TLS root store from the CA cert in the
-      # mounted kubeconfig, not the OS trust store), so the Dockerfile can
-      # just COPY these into `scratch`.
-      - name: Cross-build beep-controller (musl, both arches)
+      # glibc is pinned to 2.36 (Debian bookworm's version) via
+      # cargo-zigbuild's target-suffix syntax, so the binary never requires
+      # a glibc newer than the runtime image (debian:bookworm-slim) ships.
+      - name: Cross-build beep-controller (gnu, both arches)
         run: |
           set -euo pipefail
-          cargo +nightly zigbuild --release -p beep-controller --target x86_64-unknown-linux-musl
-          cargo +nightly zigbuild --release -p beep-controller --target aarch64-unknown-linux-musl
+          cargo +nightly zigbuild --release -p beep-controller --target x86_64-unknown-linux-gnu.2.36
+          cargo +nightly zigbuild --release -p beep-controller --target aarch64-unknown-linux-gnu.2.36
           mkdir -p dist/linux/amd64 dist/linux/arm64
-          cp target/x86_64-unknown-linux-musl/release/beep-controller dist/linux/amd64/beep-controller
-          cp target/aarch64-unknown-linux-musl/release/beep-controller dist/linux/arm64/beep-controller
+          cp target/x86_64-unknown-linux-gnu/release/beep-controller dist/linux/amd64/beep-controller
+          cp target/aarch64-unknown-linux-gnu/release/beep-controller dist/linux/arm64/beep-controller
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
