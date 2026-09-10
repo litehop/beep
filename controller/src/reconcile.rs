@@ -74,7 +74,18 @@ impl Ipv4Cidr {
 /// before trusting an `EndpointSliceView` entry's `node_ip` as one of this
 /// node's own backends -- an `EndpointSlice` object is a value another
 /// component wrote, and `node_ip` alone can't be cross-checked without a
-/// second field to disagree with it.
+/// second field to disagree with it. A pod is admitted if it's in
+/// `pod_cidr` OR it carries the hostNetwork signature (`pod_ip == node_ip`):
+/// bare metal has no cloud LB / BGP virtual IP, beep fronts the node's
+/// physical IP directly, so a hostNetwork pod's IP IS the node IP and must
+/// be servable as a backend. An arbitrary `pod_ip` that is neither in
+/// `pod_cidr` nor equal to `node_ip` is still rejected -- anti-spoof for a
+/// value another (untrusted) component wrote. Locking down which
+/// control-plane ports may be fronted this way is deliberately out of
+/// beep's scope: that's the firewall's job (ufw/NetworkPolicy), not the
+/// load balancer's. The loader's own `local_pod_ips` (node_ip-only, driven
+/// by trusted fixture args, not EndpointSlice input) intentionally stays
+/// laxer than this -- no loader change accompanies this relaxation.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeContext {
     pub node_ip: Ipv4Addr,
@@ -163,9 +174,22 @@ pub fn reconcile_service(
     // POD_TARGETS is this node's own local serving-set, port-agnostic by
     // design (`beep_common::egress_return_admission`'s doc comment) --
     // membership must never depend on which front port an endpoint answers,
-    // only on whether THIS node hosts it and is ready to serve it.
+    // only on whether THIS node hosts it and is ready to serve it. An
+    // endpoint is admitted if its pod_ip is in this node's pod_cidr OR it
+    // carries the hostNetwork signature (pod_ip == node_ip): in bare metal
+    // (no cloud LB, no BGP -- beep fronts the node's physical IP) a
+    // hostNetwork pod's IP IS the node IP, so without this a Service backed
+    // by a hostNetwork pod would be silently excluded here and every
+    // forward packet dropped at decap admission. Guarding which control-
+    // plane ports (6443/10250/2379/...) may be fronted this way is
+    // deliberately out of scope -- that's perimeter/firewall policy
+    // (ufw/NetworkPolicy), not the load balancer's job. Arbitrary out-of-
+    // cidr pod_ips that are also != node_ip are still rejected below.
     for ep in &endpoints {
-        if ep.ready && ep.node_ip == node.node_ip && node.pod_cidr.contains(ep.pod_ip) {
+        if ep.ready
+            && ep.node_ip == node.node_ip
+            && (node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip)
+        {
             desired.pod_targets.insert(wire_ip(u32::from(ep.pod_ip)));
         }
     }
@@ -592,15 +616,16 @@ mod tests {
         );
     }
 
-    // pod_cidr containment is a second, independent signal a caller can't
-    // spoof by only controlling `node_ip` -- an EndpointSlice entry that
-    // claims this node's IP but reports a pod address outside this node's
-    // actual pod subnet must not be trusted as a local backend either.
+    // node_ip matching alone must not be sufficient to admit a pod into
+    // POD_TARGETS -- pod_cidr containment (or the hostNetwork pod_ip ==
+    // node_ip signature) is the cross-check that catches a claim node_ip
+    // can't. An arbitrary pod_ip that is neither in pod_cidr nor equal to
+    // node_ip must still be rejected as a local backend.
     #[test]
     fn endpoint_reporting_a_pod_ip_outside_the_node_cidr_is_excluded_from_pod_targets() {
         let this_node = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
-        let implausible_pod = Ipv4Addr::new(192, 168, 1, 9); // outside 10.244.0.0/16
+        let implausible_pod = Ipv4Addr::new(192, 168, 1, 9); // outside 10.244.0.0/16, != node_ip
         let slices = vec![EndpointSliceView {
             endpoints: vec![ready_endpoint(implausible_pod, this_node, vec![8080])],
         }];
@@ -609,8 +634,33 @@ mod tests {
 
         assert!(
             desired.pod_targets.is_empty(),
-            "node_ip matching alone must not be sufficient to admit a pod into POD_TARGETS -- \
-             pod_cidr containment is the cross-check that catches a claim node_ip can't"
+            "an out-of-cidr pod_ip that also isn't the hostNetwork signature (pod_ip == \
+             node_ip) must not be admitted into POD_TARGETS -- node_ip alone is a claim an \
+             untrusted EndpointSlice entry can't be trusted on without this cross-check"
+        );
+    }
+
+    // A hostNetwork pod's IP IS the node IP in bare metal (no cloud LB, no
+    // BGP -- beep fronts the node's physical IP), so it's outside pod_cidr
+    // by construction. Before this fix that meant a hostNetwork Service
+    // backend was silently excluded from POD_TARGETS on every node, and its
+    // forward packets were dropped at decap admission -- reverting the
+    // `|| ep.pod_ip == ep.node_ip` relaxation reintroduces that black hole.
+    #[test]
+    fn hostnetwork_endpoint_with_pod_ip_equal_to_node_ip_is_admitted_into_pod_targets() {
+        let this_node = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![ready_endpoint(this_node, this_node, vec![8080])],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(this_node));
+
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([wire_ip(u32::from(this_node))]),
+            "a hostNetwork backend (pod_ip == node_ip, outside pod_cidr) must be admitted into \
+             POD_TARGETS or its forward traffic is dropped at decap on every node"
         );
     }
 
