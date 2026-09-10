@@ -5,4 +5,4 @@
 # nightly happens to be installed.
 [toolchain]
 channel = "nightly"
-components = ["rust-src", "clippy", "rustfmt"]
+components = ["rust-src", "clippy", "rustfmt", "rust-analyzer"]
