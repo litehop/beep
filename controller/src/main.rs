@@ -230,6 +230,9 @@ async fn main() -> anyhow::Result<()> {
     // parsed `Ebpf` handle to keep the dataplane live -- dropping it here
     // keeps this DaemonSet's steady-state RSS below its load-time peak.
     drop(ebpf);
+    // malloc_trim is a glibc extension; musl's allocator has no equivalent,
+    // so the RSS-return optimization is simply skipped on musl builds.
+    #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);
     }

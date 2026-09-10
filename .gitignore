@@ -4,6 +4,7 @@
 .beads-credential-key
 
 target
+dist
 .claude/scheduled_tasks.lock
 ai/worktrees/
 .aqua/
