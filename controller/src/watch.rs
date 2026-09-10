@@ -195,27 +195,33 @@ fn parse_node_internal_ip(obj: &Value) -> Option<Ipv4Addr> {
 }
 
 impl WatchState {
-    pub fn apply_service_event(&mut self, event: &Value) {
-        let Some(kind) = event_kind(event) else {
-            return;
-        };
+    /// Returns the event's `ServiceKey` when it left the Service tracked as
+    /// `type=LoadBalancer` (a fresh ADDED/MODIFIED), or `None` for a delete,
+    /// a type change away from LoadBalancer, or an event this state doesn't
+    /// track at all. Callers use this to scope a status-publish (or any
+    /// other per-event follow-up) to just the Service that actually
+    /// changed, instead of re-verifying every tracked Service on every
+    /// event.
+    pub fn apply_service_event(&mut self, event: &Value) -> Option<ServiceKey> {
+        let kind = event_kind(event)?;
         let obj = &event["object"];
-        let Some(key) = service_key(obj) else {
-            return;
-        };
+        let key = service_key(obj)?;
         match kind {
             EventKind::Delete => {
                 self.services.remove(&key);
+                None
             }
             // A Service that changed type away from LoadBalancer must stop
             // fronting traffic just like a delete -- `parse_service`
             // returning `None` here and `services.remove` covers both.
             EventKind::Upsert => match parse_service(obj) {
                 Some(raw) => {
-                    self.services.insert(key, raw);
+                    self.services.insert(key.clone(), raw);
+                    Some(key)
                 }
                 None => {
                     self.services.remove(&key);
+                    None
                 }
             },
         }
@@ -562,6 +568,57 @@ mod tests {
             "object": add["object"],
         }));
         assert!(state.services.is_empty());
+    }
+
+    // The caller (`publish_ingress`) uses this return value to scope a
+    // status-publish to only the Service that actually changed -- a `None`
+    // here for a delete/non-LB transition must not trigger a wasted (or
+    // outright failing, for a since-deleted Service) status GET/PATCH.
+    #[test]
+    fn apply_service_event_returns_key_only_for_a_tracked_upsert() {
+        let mut state = WatchState::default();
+        let added = state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        assert_eq!(
+            added,
+            Some(ServiceKey {
+                namespace: "default".to_owned(),
+                name: "svc-a".to_owned(),
+            }),
+            "an ADDED LoadBalancer Service must yield its own key, so publish_ingress targets \
+             just this Service"
+        );
+
+        let deleted = state.apply_service_event(&serde_json::json!({
+            "type": "DELETED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        assert_eq!(
+            deleted, None,
+            "a DELETED event must not yield a key -- publishing status for a Service that no \
+             longer exists would just fail the GET"
+        );
+
+        let non_lb = state.apply_service_event(&serde_json::json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-b"},
+                "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        assert_eq!(
+            non_lb, None,
+            "a Service that isn't type=LoadBalancer must not yield a key -- this dataplane never \
+             fronts it, so there is no status to publish"
+        );
     }
 
     // A Service sharded across two EndpointSlices (the real-world shape once
