@@ -1,9 +1,10 @@
 # Docs Style Guide
 
 Governs future user-facing docs — README, install/operator guides, design
-docs, and other docs written for people setting up or operating beep. It
-does not require rewriting docs that already exist; apply it going forward
-and whenever an existing doc is next substantially edited.
+docs, and other docs written for people setting up, operating, or
+contributing to beep. It does not require rewriting docs that already
+exist; apply it going forward and whenever an existing doc is next
+substantially edited.
 
 Base: [Google's developer documentation style guide](https://developers.google.com/style).
 This distills the subset that matters for a small infra project into
