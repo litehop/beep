@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: servicelb-controller
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: servicelb-controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: servicelb-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: servicelb-controller
+    spec:
+      serviceAccountName: servicelb-controller
+      hostNetwork: true
+      # hostNetwork pods need this to resolve in-cluster DNS names correctly;
+      # the default dnsPolicy breaks under hostNetwork.
+      dnsPolicy: ClusterFirstWithHostNet
+      # Runs on every node, including control-plane nodes: the dataplane
+      # this controller programs must be present wherever Service traffic
+      # can land, not just on worker nodes.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: servicelb-controller
+          # Registry decision is still OPEN (GHCR ruled out: IPv4-only pulls,
+          # incompatible with IPv6-only nodes; Docker Hub pending an
+          # IPv6-pull verification; otherwise self-host or a NAT64/DNS64
+          # gateway). Do not treat this as a real image reference.
+          image: PLACEHOLDER_IMAGE
+          securityContext:
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "NET_ADMIN"]
+          volumeMounts:
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+          # TODO(controller binary): map names, pin-dir path, and any other
+          # map-schema-dependent args/env are not wired here -- that lands
+          # with the controller binary itself, not this manifest skeleton.
+      volumes:
+        # bpffs must already be mounted at this path on the host (it is on
+        # any kernel new enough to run this dataplane); pins under it survive
+        # container restarts so a rollout doesn't drop established flows.
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
