@@ -14,7 +14,7 @@
 # beep-ethin/beep-clien), so a naive `beep-` arm would false-positive on
 # ~100 non-bead tokens across tracked source. BEEP_NAME_ALLOWED_TOKENS below
 # filters exactly those known fixed names back out, so only a real `beep-`
-# bead ID (e.g. beep-htf) trips this guard.
+# bead ID (e.g. beep-xxx) trips this guard.
 #
 # Exclusions:
 #   .beads/  -- bd's own JSONL export legitimately contains bead IDs.
@@ -102,8 +102,8 @@ fi
 # example tokens to prove the guard works, same reason they're excluded from
 # the mayor- sweep above), then filter out beep's fixed crate/VM/binary
 # names via the SAME allowlist-then-rescan pattern as
-# MAYOR_TICK_ALLOWED_TOKENS above, so only a real bead ID (e.g. beep-htf,
-# beep-vph) survives to trip this arm.
+# MAYOR_TICK_ALLOWED_TOKENS above, so only a real bead ID (e.g. beep-xxx,
+# beep-yyy) survives to trip this arm.
 BEEP_NAME_ALLOWED_TOKENS='beep-(ebpf|commo|smoke|node|wg2no|ethin|clien)$'
 beep_matches=$(git grep -n -oE 'beep-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!.beads' ':!ai' ':!docs' ':!.github' \
