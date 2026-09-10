@@ -1,15 +1,11 @@
 # deploy/
 
-Manifest skeleton for the beep servicelb controller. This is deployment
-scaffolding only, not a runnable deployment yet:
+Manifest skeleton for the beep servicelb controller.
 
-- **No controller binary exists.** `daemonset.yaml` points at
-  `PLACEHOLDER_IMAGE`; the controller's Service/EndpointSlice watch-and-
-  program logic is a separate, gated piece of work.
-- **The image registry is undecided.** GHCR is ruled out (IPv4-only pulls).
-  Docker Hub is a candidate pending an IPv6-pull verification. Self-hosting
-  or a NAT64/DNS64 gateway are the fallbacks. Swap `PLACEHOLDER_IMAGE` for a
-  real reference once that lands.
+- `daemonset.yaml` points at `docker.io/valerauko/beep-lb:latest`, a
+  dual-arch (linux/amd64 + linux/arm64) image built by the root
+  `Dockerfile` and published by `.github/workflows/delivery.yaml`'s
+  `image` job on every push to `main`.
 - **RBAC is scoped to exactly what the design calls for:** list/watch/get on
   `Service` and `discovery.k8s.io/EndpointSlice`. Nothing broader.
 
