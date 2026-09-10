@@ -38,7 +38,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - run: cargo test -p "${ matrix.component }"
+      - run: cargo test -p "${{ matrix.component }}"
 
   lint:
     runs-on: ubuntu-latest
@@ -68,7 +68,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - if: ${{ matrix.component != "beep-ebpf" }}
-        run: cargo clippy --tests -p "${ matrix.component }" -- -D warnings
+        run: cargo clippy --tests -p "${{ matrix.component }}" -- -D warnings
 
       - if: ${{ matrix.component == "beep-ebpf" }}
         # beep-ebpf is #![no_std] and only builds for bpfel-unknown-none; clippy
