@@ -52,6 +52,12 @@ jobs:
       - name: Test (beep-common)
         run: cargo test -p beep-common
 
+      # beep-controller is a pure userspace lib (no aya, no k8s client, no
+      # I/O) -- same reasoning as the beep-common step above: it needs an
+      # explicit -p and runs on any host.
+      - name: Test (beep-controller)
+        run: cargo test -p beep-controller
+
       # The beep loader crate's own #[cfg(test)] tests (src/main.rs) compile
       # as part of `cargo clippy --tests` but nothing runs them. Without this
       # a loader regression (e.g. POD_TARGETS node-scoping) could be reverted

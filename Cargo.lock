@@ -170,6 +170,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "beep-controller"
+version = "0.1.0"
+dependencies = [
+ "beep-common",
+]
+
+[[package]]
 name = "beep-ebpf"
 version = "0.1.0"
 dependencies = [
