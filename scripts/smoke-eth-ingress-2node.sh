@@ -11,78 +11,51 @@
 # is Ethernet (mac_len=14), so the redirect-into-geneve0 never hits that
 # L3-only-uplink code path at all.
 #
-# CLIENT TOPOLOGY NOTE: the bead this rig implements asked for the client
-# to be the macOS host itself, reached via a Lima port-forward. That was
-# investigated and found infeasible with this Lima version/network mode:
-#   - Lima's automatic guest-port-forward dials the GUEST'S OWN loopback
-#     address from a process (sshd) running INSIDE the guest's netns
-#     (confirmed via the host-agent log: "Forwarding TCP from 0.0.0.0:PORT
-#     to 127.0.0.1:PORT") -- any such packet takes the guest kernel's
-#     local/loopback route and never reaches eth0's tc-ingress qdisc at
-#     all, which would silently defeat the entire premise of an
-#     "Ethernet ingress" test.
-#   - `limactl tunnel`'s SOCKS bridge accepts the CONNECT (protocol-level
-#     "request granted") for both node-a's and node-b's real eth0
-#     addresses, but delivers zero bytes and produces zero packets on the
-#     target's eth0 (confirmed via tcpdump) -- not currently a working
-#     host<->guest bridge for this network type.
-#   - A synthetic (non-VM-owned) source IP forwarded out node-b's real
-#     eth0 toward node-a is dropped somewhere in Lima's virtual network
-#     (confirmed via tcpdump on node-a: zero packets received for a
-#     spoofed-source ping that a plain `ip route`-based forward sent) --
-#     Lima's user-v2 switch does not allow off-lease source addresses to
-#     transit, so a synthetic-client-identity workaround isn't available
-#     either.
-# Given both routes to a genuinely foreign client identity are closed,
-# this rig -- like smoke-wg-2node.sh already does for the SAME reason --
-# uses node-b's own root netns as the client.
+# CLIENT TOPOLOGY: the client is a genuinely separate 3rd Lima VM
+# (lima/beep-client.yaml, default name beep-client) on the same user-v2
+# network as node-a/node-b, but non-local to both. This replaces an
+# earlier version of this rig that used node-b's own root netns as the
+# client -- that could only prove the FORWARD leg (client SYN -> VIP ->
+# decap+DNAT -> backend), because a reply destined to node-b's own address
+# resolves to `local ... dev lo` on node-b, so the kernel never selects
+# the Geneve-transport uplink as egress and beep's return hook never
+# fires.
 #
-# RESULT: the forward leg is PROVEN end-to-end on the two assigned VMs --
-# eth0 ingress classification, VIP_MAP match, FWD_PENDING admission,
-# Geneve encap/transport (node-a's geneve0 TX packet count exactly
-# matches node-b's geneve0 RX count every run), node-b's decap+DNAT
-# (writes the correct REV_FLOW entry), and nc's real listening socket on
-# node-b emitting a genuine SYN-ACK (captured on `lo`; a parallel
-# `trace-cmd record -e skb:kfree_skb` run across the same attempt recorded
-# zero drops). The eBPF mechanism works cross-node.
+# RESULT: with a genuinely foreign client, the full symmetric-return round
+# trip is PROVEN cross-node (client -> VIP -> decap+DNAT -> backend nc ->
+# un-DNAT+re-encap -> ingress node -> client, real HTTP response
+# received) -- PROVIDED node-b's uplink-iface is set to the SAME real NIC
+# as node-a's (both below), not left at the wg0 default. wg0 here is pure
+# Geneve-transport substrate between the two nodes, not either node's
+# client/return-facing device; `uplink_egress_return` only sees traffic
+# actually egressing the device it's attached to, and node-b's kernel
+# routes a reply to a client on the shared user-v2 subnet out its real
+# NIC, not out wg0 (confirmed via tcpdump: with uplink-iface left at wg0,
+# the backend's raw un-DNAT'd reply leaks out node-b's real NIC
+# unencapsulated and the client never completes its handshake).
 #
-# What fails is the RETURN leg, and it is a rig-topology limit, not a
-# dataplane bug: the SYN-ACK's dst is the client's address, which in this
-# 2-VM rig IS node-b's own address (node-b hosts both the backend and the
-# client), so `ip route get <that address>` on node-b unconditionally
-# resolves to `local ... dev lo` -- the kernel can never select the
-# Geneve-transport uplink (wg0) as the SYN-ACK's egress device, regardless
-# of eBPF logic or sysctls (`net.ipv4.conf.*.accept_local=1`, added below,
-# clears a DIFFERENT, shallower martian-source drop on the FORWARD leg,
-# but does not and cannot fix this). The SYN-ACK loops back via `lo` with
-# src=pod_ip:target_port, which doesn't match curl's SYN-SENT socket
-# (expecting a reply from VIP:port), so node-b's own stack RSTs it
-# immediately.
-#
-# Same structural class as smoke-wg-2node.sh's own client-colocation
-# blocker -- there it's a forward-leg martian-source drop, here it's a
-# return-leg RST, but the root cause is identical: the "client" can't be
-# genuinely foreign to the backend node in a 2-VM rig. Real fix needs a
-# 3rd VM (client address genuinely foreign to node-b's own addresses); out
-# of this rig's 2-VM scope. See this script's own dump-evidence output for
-# the reproduction.
-#
-# Usage: scripts/smoke-eth-ingress-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
+# Usage: scripts/smoke-eth-ingress-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
 # Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the
-# VIP) and beep-node-b (backend Pod + client). Both VMs must be on the
-# SAME Lima network (directly reachable over their real eth0/underlay).
+# VIP), beep-node-b (backend Pod), beep-client (client). All three VMs
+# must be on the SAME Lima network (directly reachable over their real
+# eth0/underlay).
 #
 # Same host prerequisites as smoke.sh; VM prerequisites: bpftool (already
 # present) plus `wireguard-tools` (installed automatically below via apt
-# if missing) and `trace-cmd` for evidence capture on failure.
+# if missing) and `trace-cmd` for evidence capture on failure. beep-client
+# has no MCP server and never runs the dataplane/WG -- it's driven
+# directly via `limactl shell` from this host script, not via the
+# remote.sh subcommand protocol node-a/node-b use.
 set -euo pipefail
 
 VM_A="beep-node-a"
 VM_B="beep-node-b"
+VM_CLIENT="beep-client"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
     --vm-b) VM_B="$2"; shift 2 ;;
+    --vm-client) VM_CLIENT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -142,13 +115,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> [1/7] bringing up $VM_A and $VM_B"
+echo "==> [1/7] bringing up $VM_A, $VM_B, and $VM_CLIENT"
 for vm in "$VM_A" "$VM_B"; do
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm}[[:space:]]+Running"; then
     limactl start "$vm"
   fi
   limactl shell "$vm" -- bash -c 'command -v wg >/dev/null || sudo apt-get install -y wireguard-tools' >/dev/null
 done
+if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
+  limactl start "$VM_CLIENT"
+fi
 
 echo "==> [2/7] confirming node-a's user-v2 NIC name (must not be assumed)"
 IFACE_A_ACTUAL="$(limactl shell "$VM_A" -- bash -c "ip -4 -o addr show | awk '\$4 !~ /^127\\./ {print \$2; exit}'")"
@@ -195,23 +171,42 @@ remote "$VM_A" setup-geneve
 remote "$VM_B" setup-geneve
 remote "$VM_A" check-uplink "$UPLINK_IFACE_A"
 
-echo "==> [6/7] loading beep-ebpf: $VM_A uplink=$UPLINK_IFACE_A (client-facing Ethernet ingress), $VM_B uplink=wg0 (default, Geneve transport)"
+echo "==> [6/7] loading beep-ebpf: $VM_A and $VM_B both uplink=$UPLINK_IFACE_A (their shared real underlay NIC; wg0 is pure Geneve transport substrate on top of it, not either node's client/return-facing device)"
 FIXTURE="${IP_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$IP_A"
-remote "$VM_B" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
+# --uplink-iface must match $VM_A's (not the wg0 default): the backend
+# node's kernel routes a reply to a client on the shared user-v2 subnet
+# out its real NIC (eth0), not out wg0 (which only has a connected route
+# for the 10.99.0.0/24 WG-transport subnet) -- `uplink_egress_return`
+# only sees traffic actually egressing the device it's attached to, so
+# leaving this at the wg0 default means the hook never fires and the raw
+# backend-pod-sourced reply leaks onto the wire un-encapsulated,
+# un-un-DNAT'd (confirmed via tcpdump: `198.51.100.60.PORT >
+# <client>.PORT` on $VM_B's real eth0, never entering geneve0 at all).
+remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
 
 remote "$VM_B" setup-backend --pod-ip "$POD_IP"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
 
-echo "==> [7/7] driving one client -> node-a's real Ethernet VIP -> cross-node backend round trip"
-# Client = vm-b's own root netns dialing vm-a's REAL eth0 address (not
-# wg0) -- see this script's header for why the client can't be the macOS
-# host or a synthetic address in this environment, and why it's still
-# node-b (not node-a) playing the client role.
-if remote "$VM_B" run-client --vip-ip "$IP_A" --vip-port "$VIP_PORT"; then
-  echo "GATE 1 TIER-1 MECHANISM: PASS (eth0-ingress, wg0-transport)"
+echo "==> [7/7] driving one client ($VM_CLIENT) -> node-a's real Ethernet VIP -> cross-node backend round trip"
+# Client = the genuinely separate beep-client VM dialing vm-a's REAL eth0
+# address -- driven directly via limactl, not the remote.sh subcommand
+# protocol (beep-client has no /tmp/${BIN_NAME}-remote.sh copy and no MCP
+# server; see this script's header). A 20s cap, not 5s: the first
+# connection pays for ARP resolution of the client's MAC on $VM_B plus
+# the WG tunnel's own handshake, so the first SYN(-ACK) round trip alone
+# can take several seconds -- confirmed empirically, a 5s cap flakes on a
+# cold rig even though the dataplane mechanism itself is correct.
+set +e
+CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${VIP_PORT}/" 2>&1)"
+CLIENT_RC=$?
+set -e
+if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
+  echo "ROUND-TRIP: PASS (client $VM_CLIENT -> VIP ${IP_A}:${VIP_PORT} -> cross-node backend -> response 'OK')"
+  echo "GATE 1 TIER-1 MECHANISM: PASS (eth0-ingress, wg0-transport, symmetric return proven from a genuinely foreign client)"
   exit 0
 fi
+echo "ROUND-TRIP: FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY')" >&2
 
 echo ""
 echo "==> round trip did not complete -- collecting evidence"

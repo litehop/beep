@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# VM-side half of scripts/smoke-eth-ingress-2node.sh. Copied into each Lima
-# VM and run there as root by the host driver -- not meant to be invoked
-# directly by a human. One copy of this script runs on BOTH nodes; which
-# steps actually apply to a given node is decided by which subcommand the
-# host driver calls, not by a baked-in role. Adapted from
-# smoke-wg-2node-remote.sh: same wg0 tunnel + geneve0 setup + node-b-is-
-# both-client-and-backend client role, but node-a's beep instance binds
-# its uplink hooks to eth0 (the real user-v2 NIC) instead of wg0.
+# VM-side half of scripts/smoke-eth-ingress-2node.sh. Copied into node-a
+# and node-b (NOT the client VM, which has no MCP server and is driven
+# directly via `limactl shell` from the host script) and run there as root
+# by the host driver -- not meant to be invoked directly by a human. One
+# copy of this script runs on both nodes; which steps actually apply to a
+# given node is decided by which subcommand the host driver calls, not by
+# a baked-in role. Adapted from smoke-wg-2node-remote.sh: same wg0 tunnel
+# + geneve0 setup, but node-a's beep instance binds its uplink hooks to
+# eth0 (the real user-v2 NIC) instead of wg0.
 #
 # Requires wireguard-tools (`apt-get install wireguard-tools`) and bpftool
 # (already present on the assigned Lima images from prior beep work).
@@ -97,16 +98,11 @@ check_uplink() {
 # Same rp_filter workaround smoke-wg-2node-remote.sh documents: the
 # forward-decap program re-delivers the DNAT'd packet locally via `lo`
 # while it physically arrived on geneve0, and Linux's reverse-path filter
-# drops that mismatch. Also disables accept_local: the client here is
-# node-b's OWN root netns dialing node-a's VIP (see
-# smoke-eth-ingress-2node.sh's header for why it isn't a synthetic
-# address), so the decap'd packet's source address is one of node-b's OWN
-# local addresses, arriving back at node-b on a non-loopback device
-# (geneve0) -- exactly the martian-source case
-# net.ipv4.conf.*.accept_local exists to allow (default 0, "packet with
-# local source address arriving on a non-lo device"). Saved/restored so
-# this rig never leaves the VM's global rp_filter/accept_local
-# permanently changed.
+# drops that mismatch. accept_local is set for the same reason as a
+# defensive belt-and-suspenders measure, even though the client is now a
+# genuinely foreign 3rd VM (beep-client) rather than one of node-b's own
+# addresses. Saved/restored so this rig never leaves the VM's global
+# rp_filter/accept_local permanently changed.
 setup_backend() {
   local pod_ip=""
   while [[ $# -gt 0 ]]; do
@@ -193,34 +189,6 @@ start_backend_responder() {
   sleep 0.5
 }
 
-# Drives the client request from node-b's own ROOT netns (same convention
-# smoke-wg-2node-remote.sh uses, and for the same reason: a synthetic,
-# non-node-b-owned source address forwarded out node-b's real eth0 does
-# not survive Lima's user-v2 virtual switch -- confirmed empirically while
-# building this rig, see smoke-eth-ingress-2node.sh's header) and reports
-# the outcome either way -- must FAIL LOUD with the map/counter evidence
-# rather than hang or claim a false pass.
-run_client() {
-  local vip_ip="" vip_port=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --vip-ip) vip_ip="$2"; shift 2 ;;
-      --vip-port) vip_port="$2"; shift 2 ;;
-      *) echo "run-client: unknown argument: $1" >&2; exit 1 ;;
-    esac
-  done
-  set +e
-  body=$(curl -sS -m 5 "http://${vip_ip}:${vip_port}/" 2>&1)
-  rc=$?
-  set -e
-  if [ "$rc" -eq 0 ] && [ "$body" = "OK" ]; then
-    echo "ROUND-TRIP: PASS (client -> VIP ${vip_ip}:${vip_port} -> cross-node backend -> response 'OK')"
-    return 0
-  fi
-  echo "ROUND-TRIP: FAIL (curl rc=$rc, body='$body') -- run 'dump-evidence' on both nodes" >&2
-  return 1
-}
-
 # bpftool + geneve0/wg0/eth0 counters + routes -- eth0 is the NEW evidence
 # this rig needs beyond smoke-wg-2node-remote.sh's set, since the ingress
 # leg under test here is eth0, not wg0.
@@ -273,11 +241,10 @@ case "$cmd" in
   setup-backend) setup_backend "$@" ;;
   start-loader) start_loader "$@" ;;
   start-backend-responder) start_backend_responder "$@" ;;
-  run-client) run_client "$@" ;;
   dump-evidence) dump_evidence ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 {setup-wg|pubkey|setup-geneve|check-uplink|setup-backend|start-loader|start-backend-responder|run-client|dump-evidence|cleanup} [args...]" >&2
+    echo "usage: $0 {setup-wg|pubkey|setup-geneve|check-uplink|setup-backend|start-loader|start-backend-responder|dump-evidence|cleanup} [args...]" >&2
     exit 1
     ;;
 esac
