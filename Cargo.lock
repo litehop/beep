@@ -253,7 +253,16 @@ dependencies = [
 name = "beep-controller"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "aya",
+ "beep",
  "beep-common",
+ "beep-kubeconfig",
+ "clap",
+ "hyper",
+ "libc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

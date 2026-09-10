@@ -4,5 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+# aya + beep-common's "user" feature pull in real bpf(2)/netlink syscalls
+# (same as the beep loader), so this crate only builds/runs on Linux.
 [dependencies]
-beep-common = { path = "../common" }
+beep-common = { path = "../common", features = ["user"] }
+beep = { path = ".." }
+beep-kubeconfig = { path = "../kubeconfig" }
+aya = { version = "0.14", default-features = false }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hyper = "1"
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
