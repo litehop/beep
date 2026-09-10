@@ -37,8 +37,9 @@ use aya::{
         LinkOrder, SchedClassifier, TcAttachType,
     },
     sys::SyscallError,
-    Ebpf, EbpfLoader, Pod,
+    Ebpf, EbpfLoader,
 };
+use beep_common::{wire_ip, wire_port, Config, VipBackend, VipKey};
 use clap::{Parser, ValueEnum};
 
 const IPPROTO_TCP: u8 = 6;
@@ -263,53 +264,6 @@ fn vip_outside_pod_cidr(vip: Ipv4Addr, pod_cidr: Ipv4Cidr) -> Result<(), String>
     }
 }
 
-/// Converts a host-order value into the "raw wire token" representation the
-/// eBPF side compares packet bytes against verbatim (see
-/// `ebpf/src/main.rs`'s module doc for why this conversion exists
-/// and why it's applied exactly once, here, at the map-population boundary).
-fn wire_ip(ip: Ipv4Addr) -> u32 {
-    u32::from(ip).to_be()
-}
-
-fn wire_port(port: u16) -> u16 {
-    port.to_be()
-}
-
-// Byte-layout-identical to beep-ebpf's types of the same name -- the
-// eBPF side has no visibility into this crate (separate, no_std nested
-// workspace), so these are kept in sync by hand. A drift here corrupts map
-// lookups silently; the wire-value convention doc comment there is the
-// source of truth for what each field must contain.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct VipKey {
-    vip_ip: u32,
-    vip_port: u16,
-    proto: u8,
-    _pad: u8,
-}
-unsafe impl Pod for VipKey {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VipBackend {
-    backend_node_ip: u32,
-    pod_ip: u32,
-}
-unsafe impl Pod for VipBackend {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Config {
-    geneve_ifindex: u32,
-    uplink_ifindex: u32,
-    // Field order/types must mirror `beep-ebpf`'s `Config` exactly --
-    // this struct's bytes are written straight into the `CONFIG` map, and
-    // nothing else enforces the two definitions staying in sync.
-    uplink_l2_hlen: u32,
-}
-unsafe impl Pod for Config {}
-
 fn main() -> anyhow::Result<()> {
     let Args {
         uplink_iface,
@@ -497,7 +451,7 @@ fn iface_index(name: &str) -> anyhow::Result<u32> {
 /// own target port instead of the last-written one silently winning.
 fn fixture_key(fixture: &Fixture) -> VipKey {
     VipKey {
-        vip_ip: wire_ip(fixture.vip_ip),
+        vip_ip: wire_ip(u32::from(fixture.vip_ip)),
         vip_port: wire_port(fixture.vip_port),
         proto: fixture.proto.as_ip_proto(),
         _pad: 0,
@@ -525,7 +479,7 @@ fn populate_fixtures(
                     // 3.109.168.192): host-native order, unlike every other
                     // address/port field in this crate.
                     backend_node_ip: u32::from(fixture.backend_node_ip),
-                    pod_ip: wire_ip(fixture.pod_ip),
+                    pod_ip: wire_ip(u32::from(fixture.pod_ip)),
                 },
                 0,
             )?;
@@ -591,7 +545,7 @@ fn local_pod_ips(fixtures: &[Fixture], node_ip: Ipv4Addr) -> Vec<u32> {
     fixtures
         .iter()
         .filter(|f| f.backend_node_ip == node_ip)
-        .map(|f| wire_ip(f.pod_ip))
+        .map(|f| wire_ip(u32::from(f.pod_ip)))
         .collect()
 }
 
@@ -688,22 +642,6 @@ fn attach_and_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Every checksum update and tunnel-key field the eBPF side touches
-    // requires the exact wire byte order (see beep-ebpf's module doc);
-    // a regression here silently corrupts every packet this dataplane
-    // touches rather than failing loudly, so the round-trip is pinned here.
-    #[test]
-    fn wire_ip_matches_dotted_octet_order() {
-        let ip = Ipv4Addr::new(10, 0, 0, 1);
-        assert_eq!(wire_ip(ip).to_le_bytes(), [10, 0, 0, 1]);
-    }
-
-    #[test]
-    fn wire_port_matches_network_byte_order() {
-        // 8080 = 0x1F90; on the wire the high byte (0x1F) comes first.
-        assert_eq!(wire_port(8080).to_le_bytes(), [0x1F, 0x90]);
-    }
 
     // A hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP)
     // space -- so a VIP placed inside the pod CIDR is not disjoint from
@@ -875,7 +813,7 @@ mod tests {
         // represent this at all -- both fixtures collapse to the same entry.
         let mut old_pod_targets: HashMap<u32, u16> = HashMap::new();
         for f in &fixtures {
-            old_pod_targets.insert(wire_ip(f.pod_ip), wire_port(f.target_port));
+            old_pod_targets.insert(wire_ip(u32::from(f.pod_ip)), wire_port(f.target_port));
         }
         assert_eq!(
             old_pod_targets.len(),
@@ -906,7 +844,7 @@ mod tests {
 
         assert_eq!(
             local_pod_ips(&fixtures, node_ip),
-            vec![wire_ip(local_fixture.pod_ip)],
+            vec![wire_ip(u32::from(local_fixture.pod_ip))],
             "POD_TARGETS must contain only pods this node's own fixtures back \
              (backend_node_ip == node_ip) -- a pod backed by a different node \
              must never appear, or the decap/egress-return membership gates \
@@ -922,7 +860,7 @@ mod tests {
         // matching FLOW_TABLE reverse-tagged entry -- an unpruned stale
         // entry would misclassify unrelated traffic that later reuses this
         // address as "ours" and drop it instead of passing it through.
-        let departed_pod_ip = wire_ip(Ipv4Addr::new(10, 244, 1, 9));
+        let departed_pod_ip = wire_ip(u32::from(Ipv4Addr::new(10, 244, 1, 9)));
         let existing = [departed_pod_ip];
         let live: [u32; 0] = [];
 
@@ -941,7 +879,7 @@ mod tests {
         // fixture set must survive the prune, or every reconcile would
         // drop live backends' own egress-return admission.
         let fixture = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
-        let live = [wire_ip(fixture.pod_ip)];
+        let live = [wire_ip(u32::from(fixture.pod_ip))];
 
         assert!(
             stale_pod_targets(&live, &live).is_empty(),

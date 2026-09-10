@@ -52,8 +52,9 @@ use beep_common::{
     backend_port_resolution, decap_forward_pod_admission, egress_return_admission,
     egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission, ipv4_mapped_v6,
     occupant_conflicts, resolve_backend_src_port, return_authorization, BackendPortDecision,
-    BackendPortResolution, DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome,
-    FlowDirection, FlowKey, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
+    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
+    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, ReturnAuthorization, TcpFlowKey,
+    VipBackend, VipKey,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -103,28 +104,10 @@ const TCP_CSUM: usize = L4_OFF + 16;
 const UDP_CSUM: usize = L4_OFF + 6;
 
 /// One static VIP:PORT -> backend mapping (fixture, populated once by the
-/// userspace loader). Same `VipKey` shape as `TARGET_PORTS` below, but a
-/// separate map -- the two never interact, just key on the same front tuple
-/// for the two different roles that need it (ingress backend selection here,
-/// backend target-port selection there).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct VipKey {
-    pub vip_ip: u32,
-    pub vip_port: u16,
-    pub proto: u8,
-    pub _pad: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct VipBackend {
-    /// Geneve remote for the forward leg -- the node hosting the chosen Pod.
-    pub backend_node_ip: u32,
-    /// Pod-identifier stamped as the forward-leg Geneve option.
-    pub pod_ip: u32,
-}
-
+/// userspace loader). Same `VipKey` (`beep_common`) shape as `TARGET_PORTS`
+/// below, but a separate map -- the two never interact, just key on the same
+/// front tuple for the two different roles that need it (ingress backend
+/// selection here, backend target-port selection there).
 #[map]
 static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
 
@@ -341,21 +324,10 @@ fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
 static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Host-specific runtime config the loader fills in after attach (an
-/// ifindex isn't known until then). Single entry.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Config {
-    pub geneve_ifindex: u32,
-    pub uplink_ifindex: u32,
-    /// `beep_common::uplink_l2_header_len`'s result for the uplink
-    /// iface -- 14 for a real Ethernet-framed NIC/veth, 0 for an L3-only
-    /// uplink (WireGuard or any other tun-style device with no L2 header).
-    /// `geneve0` is unaffected: it's always a real (Ethernet-framed) netdev
-    /// regardless of what the uplink is, so `geneve_ingress`'s parsing keeps
-    /// using the compile-time `ETH_HLEN` unconditionally.
-    pub uplink_l2_hlen: u32,
-}
-
+/// ifindex isn't known until then). Single entry, `Config` (`beep_common`).
+/// `geneve_ingress`'s parsing keeps using the compile-time `ETH_HLEN`
+/// unconditionally -- `geneve0` is always a real (Ethernet-framed) netdev
+/// regardless of what the uplink is.
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 
