@@ -26,11 +26,7 @@ spec:
         - operator: Exists
       containers:
         - name: servicelb-controller
-          # Registry decision is still OPEN (GHCR ruled out: IPv4-only pulls,
-          # incompatible with IPv6-only nodes; Docker Hub pending an
-          # IPv6-pull verification; otherwise self-host or a NAT64/DNS64
-          # gateway). Do not treat this as a real image reference.
-          image: PLACEHOLDER_IMAGE
+          image: docker.io/valerauko/beep-lb:latest
           securityContext:
             privileged: false
             capabilities:
