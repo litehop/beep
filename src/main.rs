@@ -25,13 +25,12 @@ use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context};
 use aya::{
-    include_bytes_aligned,
     maps::{HashMap as AyaHashMap, MapData},
     programs::TcAttachType,
-    Ebpf, EbpfLoader,
+    Ebpf,
 };
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, local_pod_ips, parse_fixture, populate_config,
+    attach_and_pin, bump_memlock_rlimit, load_ebpf, local_pod_ips, parse_fixture, populate_config,
     stale_pod_targets, Fixture, MAP_NAMES,
 };
 use beep_common::{wire_ip, wire_port, VipBackend, VipKey};
@@ -211,23 +210,8 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&pin_dir)
         .with_context(|| format!("creating pin dir {}", pin_dir.display()))?;
 
-    let mut loader = EbpfLoader::new();
-    for name in MAP_NAMES {
-        loader.map_pin_path(name, pin_dir.join(name));
-    }
-    // Only takes effect the FIRST time a pin path is created: a reused pin
-    // (loader restart against the same --pin-dir) opens the existing map via
-    // its live fd and this override is silently a no-op, which is the
-    // intended behavior -- sizing is decided once at initial provisioning,
-    // not resized on every restart (the declined-runtime-resize decision).
-    loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
-    loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
-    let mut ebpf = loader
-        .load(include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/beep-ebpf"
-        )))
-        .context("loading the beep-ebpf object")?;
+    let mut ebpf = load_ebpf(&pin_dir, fwd_pending_max_entries, flow_table_max_entries)
+        .context("loading beep-ebpf")?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures, node_ip)
