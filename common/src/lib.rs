@@ -1405,6 +1405,13 @@ mod tests {
             "an unmarked packet (the normal case for a genuine backend Pod reply) must still \
              go through hook 3's POD_TARGETS admission, not skip it"
         );
+        assert!(
+            !is_redirected_return_mark(0xdead),
+            "a nonzero mark that isn't this exact stamp must still go through hook 3's \
+             POD_TARGETS admission -- if this ever loosened to `mark != 0`, a genuine backend \
+             Pod reply carrying any incidental nonzero skb->mark would be waved through as if \
+             it were the redirected-back packet, skipping the REV_FLOW admission check it needs"
+        );
     }
 
     #[test]
