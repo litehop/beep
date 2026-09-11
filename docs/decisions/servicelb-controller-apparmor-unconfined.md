@@ -48,9 +48,11 @@ smallest change that matches a project this project already imitates
 
 ## Consequences
 
-- The controller container runs without AppArmor mediation on any node.
-  Its actual attack surface is unchanged: `hostNetwork: true` and
-  `CAP_BPF`/`CAP_NET_ADMIN` already grant kernel-level device access that
-  AppArmor's default profile only partially constrained.
+- The controller container runs without AppArmor mediation and with
+  `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON` — a set broadened by `CAP_PERFMON`
+  here, but still far short of `CAP_SYS_ADMIN`/`privileged`. With
+  `hostNetwork: true` and `CAP_BPF` already granting kernel-level access,
+  the incremental surface from unconfining AppArmor and adding `CAP_PERFMON`
+  is bounded.
 - A future scoped Localhost profile (option (b) in beep-26s) remains open
   if node provisioning grows the ability to ship one.

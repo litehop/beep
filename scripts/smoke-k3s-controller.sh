@@ -15,8 +15,8 @@
 # CONTROLLER-DEPLOY and MAP-PROGRAMMING now PASS for real. The round trip
 # itself still fails -- a distinct dataplane forwarding bug: the Geneve
 # decap reaches node-b's geneve0 (RX counter increments) but no return
-# traffic and no FLOW_TABLE entry ever appears on either node (see
-# ai/findings/ for the packet-capture evidence). This script's `run`
+# traffic and no FLOW_TABLE entry ever appears on either node. This
+# script's `run`
 # therefore still ends non-zero at ROUND-TRIP, but every step before
 # that -- cluster bring-up, geneve0, the kubeconfig Secret, the
 # DaemonSet/RBAC apply, the controller actually loading and pinning its
