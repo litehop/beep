@@ -165,3 +165,42 @@ bare-host loader never hit this because it runs as full, unrestricted
 root. Filed as beep-3kf, not fixed here: beep-26s's job was the AppArmor
 fix, not chasing a second, unrelated blocker in the same session.
 `beep-s5k`/`mayor-9gr0n` stay open pending beep-3kf.
+
+## 7. Update 2026-09-11: CAP_PERFMON confirmed fixed; NEW dataplane blocker one step later (beep-3kf)
+
+Adding `CAP_PERFMON` to `deploy/daemonset.yaml`'s `add:` list fixes this
+doc's section-6 blocker. Re-running `scripts/smoke-k3s-controller.sh` on
+the same `beep-node-a`/`beep-node-b` cluster: `BPF_PROG_LOAD` now
+succeeds, both pods log `all 3 hooks attached; watching
+Service/EndpointSlice/Node`, `bpftool net show` confirms all three tcx
+links (`uplink_ingress`/`geneve_ingress`/`uplink_egress_return`) on both
+nodes, `CONTROLLER-DEPLOY: PASS` (zero restarts), and `MAP-PROGRAMMING:
+PASS` -- `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS` all populated with the
+correct topology (`VipBackend.backend_node_ip`=node-b,
+`VipBackend.pod_ip`=10.42.1.7, matching the real EndpointSlice address).
+
+The round trip itself still does not go green: `curl` from the separate
+`beep-client` VM to the VIP times out. Live packet capture on both nodes'
+`eth0` during the attempt shows the client's SYN reaching node-a, being
+Geneve-encapsulated correctly (`vni 0x64`, 8-byte option, inner packet
+still addressed to the VIP, matching `VipBackend.pod_ip`'s doc'd role as a
+side-band identifier, not an inner-packet rewrite done by the ingress
+node) and arriving intact at node-b's `eth0`; `geneve0`'s RX counter on
+node-b increments (kernel-level Geneve decap into the `external`-mode
+device works). No SYN-ACK, no return Geneve packet, and no `FLOW_TABLE`
+entry ever appears on either node -- the flow never gets admitted or
+promoted. Ruled out as causes: the backend Pod itself (`curl` straight to
+its Pod IP from node-b succeeds), `CONFIG` map contents on node-b
+(`geneve_ifindex`/`uplink_ifindex` match `bpftool net show`'s real
+ifindices), `net.ipv4.ip_forward` (1), the `10.42.1.0/24 dev cni0` route,
+and AppArmor (`dmesg` shows no `DENIED` entries, `rp_filter` is loose-mode
+`2` everywhere, not strict). This narrows the drop to inside
+`geneve_ingress`'s own packet-rewrite/redirect logic, or an environment
+interaction (flannel/cni0) that beep's bare two-node fixture rigs
+(`smoke.sh`/`smoke-wg-2node.sh`/`smoke-eth-ingress-2node.sh`) can't
+surface, since none of them run a real CNI bridge alongside the tunnel.
+
+Not a capability/security issue (no AppArmor or permission-denied
+evidence anywhere in this pass) -- a distinct dataplane forwarding bug,
+out of scope for beep-3kf's surgical CAP_PERFMON fix. Filed as beep-v2c.
+`beep-s5k`/`mayor-9gr0n` stay open pending that bead.

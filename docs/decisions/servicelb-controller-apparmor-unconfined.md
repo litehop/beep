@@ -29,6 +29,12 @@ not a blanket `privileged: true`. Kubernetes 1.30+ honors the native
 deprecated `container.apparmor.security.beta.kubernetes.io/<container>:
 unconfined` pod annotation instead.
 
+`CAP_BPF`+`CAP_NET_ADMIN` alone gets past the AppArmor fix above but then
+fails `BPF_PROG_LOAD` itself: the verifier's pointer-arithmetic relaxations
+for a non-root load additionally gate on `perfmon_capable()` (CAP_PERFMON
+or CAP_SYS_ADMIN), which neither of those two capabilities grants. Add
+`CAP_PERFMON` to `add:` — still short of CAP_SYS_ADMIN or `privileged`.
+
 ## Rationale
 
 Authoring a custom Localhost AppArmor profile scoped to exactly the
