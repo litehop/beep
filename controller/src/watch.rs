@@ -304,6 +304,15 @@ impl WatchState {
         // decap (`try_geneve_decap_forward`) looks up TARGET_PORTS keyed on
         // whichever node the client actually dialed, which is any node in
         // the cluster, not necessarily this one.
+        // Startup ordering: `node_ips` is empty until the Node LIST (run
+        // concurrently with the Service/EndpointSlice watches in
+        // `run_controller_loop`'s `tokio::join!`) delivers its first event,
+        // so a reconcile fired from an early Service/EndpointSlice event can
+        // transiently program zero fronts for an already-known Service.
+        // Accepted: fail-CLOSED (dropped connections, never misrouted ones),
+        // and self-healing -- the Node LIST's own events each re-trigger a
+        // full reconcile, so the correct front set lands as soon as it
+        // catches up, with no restart or backoff needed.
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);

@@ -108,8 +108,16 @@ const UDP_CSUM: usize = L4_OFF + 6;
 /// below, but a separate map -- the two never interact, just key on the same
 /// front tuple for the two different roles that need it (ingress backend
 /// selection here, backend target-port selection there).
+///
+/// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
+/// userspace loader overrides it via `EbpfLoader::map_max_entries`
+/// (`src/lib.rs`'s `load_ebpf`), same pattern as `FWD_PENDING`/`FLOW_TABLE`.
+/// The controller's every-node-is-a-front keying (`ebpf-lb-dataplane.md`'s
+/// "Packet flow" step 1) makes this map's entry count nodes x Service ports,
+/// not just Service ports, so the old fixture-era 16 overflows at modest
+/// cluster scale.
 #[map]
-static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
+static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(4096, 0);
 
 /// Backend-local: which target port a decap'd, DNAT'd packet should land on
 /// for a given front (VIP:PORT:proto) -- keyed the same way as `VIP_MAP`
@@ -119,9 +127,13 @@ static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(16, 0);
 /// pod IP (`ebpf-lb-dataplane.md`'s settled wire-format decision), so the
 /// front tuple this map keys on -- still present on the packet's own
 /// untouched inner dst at decap time -- is what disambiguates instead.
-/// <20 entries per `ebpf-lb-dataplane.md`'s sizing table.
+///
+/// `max_entries` below is a load-time DEFAULT, not the enforced ceiling,
+/// same override path and same nodes x Service-ports sizing pressure as
+/// `VIP_MAP` above (every front_ip x Service-port pair -- `watch.rs`'s
+/// `desired()` -- inserts into both maps 1:1, so the two share one default).
 #[map]
-static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(32, 0);
+static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(4096, 0);
 
 /// Backend-local: which pod IPs are this node's own beep backend Pods,
 /// keyed on pod IP alone -- deliberately NOT on target port, unlike

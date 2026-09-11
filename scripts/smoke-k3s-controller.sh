@@ -159,7 +159,10 @@ for vm in "$VM_A" "$VM_B"; do
     # decapped forward packet before it ever reaches cni0 (confirmed live:
     # kprobe:ip_route_input_noref returns -EXDEV for the decapped packet,
     # even with rp_filter=2 on both all and geneve0). Only rp_filter=0
-    # bypasses this check.
+    # bypasses this check. The kernel takes max(all, interface), so the
+    # `all` companion is required too -- an interface-only 0 is fragile
+    # against a nonzero `all` (the siblings above all set both).
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
     sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   '
 done
