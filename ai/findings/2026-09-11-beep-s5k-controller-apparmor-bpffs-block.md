@@ -137,3 +137,31 @@ never inside a confined container, so they could never surface it. Once
 beep-26s is resolved, `scripts/smoke-k3s-controller.sh` should get past
 `CONTROLLER-DEPLOY` and continue on to the actual Service/EndpointSlice/
 round-trip assertions it already implements.
+
+## 6. Update 2026-09-11: AppArmor fix applied, NEW blocker one step later (beep-3kf)
+
+beep-26s's fix (`securityContext.appArmorProfile.type: Unconfined`)
+resolves this doc's blocker: re-running `scripts/smoke-k3s-controller.sh`
+on the same `beep-node-a`/`beep-node-b` cluster shows no more
+`creating pin dir` error and no AppArmor `DENIED` entries in `dmesg`. The
+controller still `CrashLoopBackOff`s, now one step later, during
+`BPF_PROG_LOAD`:
+
+```
+...
+R5 tried to add from different maps, paths or scalars, pointer
+arithmetic with it prohibited for !root
+verification time 358 usec
+...
+1: Permission denied (os error 13)
+```
+
+This matches the kernel's `CAP_BPF`/`CAP_PERFMON` split (5.8+): some
+verifier relaxations -- this pointer-arithmetic pattern (likely rustc's
+stack-init/memset codegen) among them -- additionally gate on
+`perfmon_capable()` (`CAP_PERFMON`), which `deploy/daemonset.yaml`'s
+`drop: ["ALL"], add: ["BPF", "NET_ADMIN"]` doesn't grant. `smoke.sh`'s
+bare-host loader never hit this because it runs as full, unrestricted
+root. Filed as beep-3kf, not fixed here: beep-26s's job was the AppArmor
+fix, not chasing a second, unrelated blocker in the same session.
+`beep-s5k`/`mayor-9gr0n` stay open pending beep-3kf.

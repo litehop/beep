@@ -16,7 +16,9 @@ Manifest skeleton for the beep servicelb controller.
   `CAP_BPF` + `CAP_NET_ADMIN` only (no `privileged: true`, no CRI socket
   mount), tolerates all taints so it runs on every node including
   control-plane nodes, and mounts the host's bpffs (`/sys/fs/bpf`) so pinned
-  programs/maps survive pod restarts.
+  programs/maps survive pod restarts. Requires `appArmorProfile: Unconfined`
+  to pin to bpffs under containerd's default AppArmor profile — see
+  `docs/decisions/servicelb-controller-apparmor-unconfined.md`.
 - `rbac.yaml` — `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` for
   the above.
 

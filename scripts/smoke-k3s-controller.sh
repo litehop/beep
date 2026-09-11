@@ -7,22 +7,18 @@
 # from LIVE watch events -- not hand-rolled fixture args like
 # scripts/smoke.sh / smoke-wg-2node.sh / smoke-eth-ingress-2node.sh.
 #
-# CURRENT STATUS (as of this gate's introduction): the controller DaemonSet
-# never gets past its own startup -- both pods crashloop on
-# `Error: creating pin dir /sys/fs/bpf/beep: Permission denied (os error 13)`
-# before loading a single eBPF program. Root cause (confirmed via a debug
-# pod carrying the same securityContext): containerd's default
-# `cri-containerd.apparmor.d` AppArmor profile denies ALL bpffs writes
-# (mkdir AND plain file create), even as root with CAP_BPF/CAP_NET_ADMIN
-# added -- Linux capabilities don't reach AppArmor's confinement layer.
-# Fixing this means loosening a privileged hostNetwork DaemonSet's AppArmor
-# confinement, a security-posture decision that needs explicit operator
-# sign-off, not something to bake into deploy/daemonset.yaml from an agent
-# session -- see ai/findings/ for the full evidence and the options. This
-# script's `run` therefore ends in a documented, non-zero
-# "CONTROLLER-DEPLOY: FAIL (known blocker)" rather than a false pass; every
-# step before that (cluster bring-up, geneve0, the kubeconfig Secret, the
-# DaemonSet/RBAC apply itself) is a genuine, asserted PASS.
+# CURRENT STATUS: the AppArmor/bpffs-pin blocker this gate originally
+# surfaced -- containerd's default `cri-containerd.apparmor.d` profile
+# denying all bpffs writes -- is fixed via `deploy/daemonset.yaml`'s
+# `appArmorProfile: Unconfined`. The controller DaemonSet still crashloops
+# one step later, now during BPF_PROG_LOAD, with the kernel verifier
+# rejecting a pointer-arithmetic pattern for a process lacking CAP_PERFMON
+# (`add: ["BPF", "NET_ADMIN"]` isn't sufficient) -- not this gate's own bug.
+# See ai/findings/ for the full evidence chain. This script's `run`
+# therefore ends in a documented, non-zero "CONTROLLER-DEPLOY: FAIL (known
+# blocker)" rather than a false pass; every step before that (cluster
+# bring-up, geneve0, the kubeconfig Secret, the DaemonSet/RBAC apply
+# itself) is a genuine, asserted PASS.
 #
 # TOPOLOGY: ingress VIP = node-a's own address, backend Pod pinned
 # (`nodeName`) to node-b -- a genuinely cross-node round trip: the backend
@@ -106,10 +102,10 @@ dump_evidence() {
     limactl shell "$vm" -- sudo dmesg 2>&1 | tail -30 || true
   done
   echo "---- controller pod describe (events) ----"
-  kube -n kube-system describe pods -l app.kubernetes.io/name=servicelb-controller 2>&1 || true
+  kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR" 2>&1 || true
   echo "---- controller pod logs (current + previous, i.e. pre-crash) ----"
-  kube -n kube-system logs -l app.kubernetes.io/name=servicelb-controller --all-containers --tail=100 2>&1 || true
-  kube -n kube-system logs -l app.kubernetes.io/name=servicelb-controller --all-containers --tail=100 --previous 2>&1 || true
+  kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 2>&1 || true
+  kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous 2>&1 || true
 }
 
 cleanup() {
@@ -170,6 +166,13 @@ controller_deploy_failed=0
 if ! kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s; then
   controller_deploy_failed=1
 fi
+# Read the pod selector back from the DaemonSet itself, rather than
+# hardcoding a copy of `deploy/daemonset.yaml`'s labels here: a hardcoded
+# literal that drifts from the manifest matches zero pods, leaving
+# `controller_deploy_failed` unchanged instead of failing -- a silent
+# no-op, not a caught error.
+CONTROLLER_SELECTOR=$(kube -n kube-system get daemonset servicelb-controller \
+  -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
 # `rollout status` alone is not sufficient evidence: a container with no
 # readiness/liveness probe (this one has neither) reports Ready as soon as
 # it *starts*, even if it exits non-zero moments later -- `rollout status`
@@ -178,14 +181,14 @@ fi
 # while diagnosing the AppArmor/bpffs blocker). Settle, then require zero
 # restarts.
 sleep 10
-restarts=$(kube -n kube-system get pods -l app.kubernetes.io/name=servicelb-controller \
+restarts=$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" \
   -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "")
 for c in $restarts; do
   [ "$c" = "0" ] || controller_deploy_failed=1
 done
 if [ "$controller_deploy_failed" -ne 0 ]; then
   echo "CONTROLLER-DEPLOY: FAIL (known blocker -- see this script's header)" >&2
-  kube -n kube-system get pods -l app.kubernetes.io/name=servicelb-controller -o wide >&2 || true
+  kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
   dump_evidence
   exit 1
 fi
