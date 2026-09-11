@@ -14,7 +14,8 @@
 # one step later, now during BPF_PROG_LOAD, with the kernel verifier
 # rejecting a pointer-arithmetic pattern for a process lacking CAP_PERFMON
 # (`add: ["BPF", "NET_ADMIN"]` isn't sufficient) -- not this gate's own bug.
-# See ai/findings/ for the full evidence chain. This script's `run`
+# See docs/decisions/servicelb-controller-apparmor-unconfined.md for the
+# AppArmor rationale. This script's `run`
 # therefore ends in a documented, non-zero "CONTROLLER-DEPLOY: FAIL (known
 # blocker)" rather than a false pass; every step before that (cluster
 # bring-up, geneve0, the kubeconfig Secret, the DaemonSet/RBAC apply
