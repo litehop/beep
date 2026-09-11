@@ -3,9 +3,9 @@
 #
 # Run this locally before any beep-ebpf PR merges. It is the one gate
 # that actually loads the compiled object into a live kernel verifier and
-# drives real packets through it -- CI's `ebpf-build` job only proves the
-# bpfel-unknown-none build COMPILES, not that the verifier ACCEPTS it at
-# load time (the exact risk `docs/design/ebpf-lb-dataplane.md`
+# drives real packets through it -- CI's fmt/lint-matrix/test-matrix jobs
+# only prove the bpfel-unknown-none build COMPILES, not that the verifier
+# ACCEPTS it at load time (the exact risk `docs/design/ebpf-lb-dataplane.md`
 # flags for "verifier rejection under churn/scale").
 #
 # What it does, on one already-provisioned Lima VM (default beep-smoke):

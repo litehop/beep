@@ -25,14 +25,15 @@ PR's body — the PR body is the durable git-history record. `bd prime`'s memory
 section is index-only (pull-on-demand via `bd recall <key>`) — see CLAUDE.md
 "Memory access pattern".
 
-**Quality gate.** The canonical gate is the 5 commands CI's `ebpf-build` job
-runs, byte-exact: (1) `cargo fmt --check` (2) `cargo clippy --tests -- -D
-warnings` (3) `cargo test -p beep-common` (4) `cd ebpf && cargo clippy
---release --target bpfel-unknown-none -Z build-std=core -- -D warnings`
-(5) `cargo build --release`. The loader and steps 2/4/5 are Linux-only; on
-macOS run the subset `cargo fmt --check` + `cargo test -p beep-common` and
-leave the rest to CI / a Lima VM. Required merge-queue checks: `ebpf-build`,
-`ebpf-memory-smoke` — both must be green before a PR merges.
+**Quality gate.** The canonical gate is the 5 commands CI's `fmt` /
+`lint-matrix` / `test-matrix` / `memory-smoke` jobs run, byte-exact: (1)
+`cargo fmt --check` (2) `cargo clippy --tests -- -D warnings` (3) `cargo test
+-p beep-common` (4) `cd ebpf && cargo clippy --release --target
+bpfel-unknown-none -Z build-std=core -- -D warnings` (5) `cargo build
+--release`. The loader and steps 2/4/5 are Linux-only; on macOS run the
+subset `cargo fmt --check` + `cargo test -p beep-common` and leave the rest
+to CI / a Lima VM. Required merge-queue checks: `test-gate`, `lint-gate`,
+`memory-smoke`, `fmt` — all four must be green before a PR merges.
 
 **REQUIRED before your first dispatch:** Read `ai/prompts/mayor-dispatch-template.md`
 in full — do not dispatch any worker until you have done this. It defines the worktree
@@ -126,8 +127,8 @@ as needed.
 
 **Mayor tick loop body — GitHub Merge Queue is active on this repo.** The
 main-branch ruleset (`22605658`) requires
-these status checks, enforced: `ebpf-build`, `ebpf-memory-smoke`. Queue
-config: MERGE method, all-green grouping, min 1 / max 5,
+these status checks, enforced: `test-gate`, `lint-gate`, `memory-smoke`,
+`fmt`. Queue config: MERGE method, all-green grouping, min 1 / max 5,
 `allow_auto_merge=true`. `strict_required_status_checks_policy` is deliberately
 `false`: the queue builds a synthetic merge commit against the latest base and
 tests THAT, so also requiring the PR branch itself to be current would only cost

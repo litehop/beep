@@ -173,7 +173,7 @@ beep's dataplane is eBPF that only builds and runs on Linux, so "the tests
 pass" means two different things depending on host.
 
 The **canonical 5-command quality gate** (from `.github/workflows/ci.yaml`'s
-`ebpf-build` job, byte-exact) is:
+`fmt`, `lint-matrix`, `test-matrix`, and `memory-smoke` jobs, byte-exact) is:
 
 1. `cargo fmt --check`
 2. `cargo clippy --tests -- -D warnings`
@@ -183,8 +183,8 @@ The **canonical 5-command quality gate** (from `.github/workflows/ci.yaml`'s
 
 Steps 2, 4, and 5 need a Linux toolchain and `bpf-linker`; on macOS only the
 **macOS-host subset** — `cargo fmt --check` and `cargo test -p beep-common`
-— runs. Workers on macOS run the subset locally and let CI's `ebpf-build`
-job enforce the full gate on the PR.
+— runs. Workers on macOS run the subset locally and let CI's `lint-gate` +
+`test-gate` + `memory-smoke` jobs enforce the full gate on the PR.
 
 For beads that touch the dataplane, the gate alone is not enough — it
 proves the eBPF program compiles, not that it loads and forwards packets.
@@ -204,9 +204,9 @@ Before merging, the mayor checks:
 - the diff matches the bead;
 - scope did not sprawl;
 - failure output remains actionable;
-- required checks are green — the merge queue enforces `ebpf-build` and
-  `ebpf-memory-smoke` on every PR to `litehop/beep`, so "CI is green" means
-  both of those, not just a subset;
+- required checks are green — the merge queue enforces `test-gate`,
+  `lint-gate`, `memory-smoke`, and `fmt` on every PR to `litehop/beep`, so
+  "CI is green" means all four, not just a subset;
 - bead state will be updated after merge.
 
 After merge, the mayor pulls main, closes the bead with a concrete reason,

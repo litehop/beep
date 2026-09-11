@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # CI assertion for scripts/sample-ebpf-memory.sh's
 # ebpf-map-memory.csv. Its own script (not inlined in
-# .github/workflows/test.yaml) so scripts/test-sample-ebpf-memory-logic.sh
+# .github/workflows/ci.yaml) so scripts/test-sample-ebpf-memory-logic.sh
 # can exercise the REAL assertion logic against constructed CSVs instead of a
 # copied-out fragment that could silently drift from what CI actually runs.
 #
 # Expects a CSV produced by a SINGLE `sample-ebpf-memory.sh once` call into a
-# fresh --out-dir (see .github/workflows/test.yaml's ebpf-memory-smoke job):
+# fresh --out-dir (see .github/workflows/ci.yaml's memory-smoke job):
 # every data row must belong to exactly one tick. Do not point this at a CSV
 # accumulated across multiple ticks/calls -- there is no per-tick boundary
 # marker in the CSV to isolate "the latest tick" from an older one, and a

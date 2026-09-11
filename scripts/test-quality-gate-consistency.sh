@@ -2,7 +2,8 @@
 # Asserts the canonical eBPF quality gate stays consistent across the places
 # it is enforced, so an edit to one never silently drifts from the others.
 #
-# Source of truth: .github/workflows/ci.yaml's ebpf-build job. By decision
+# Source of truth: .github/workflows/ci.yaml's fmt/lint-matrix/test-matrix/
+# memory-smoke jobs. By decision
 # (not a shared script) those five commands are copied in full into
 # .claude/settings.json's PreToolUse Bash hook and .githooks/pre-push, and
 # .claude/agents/worker.md carries the macOS-host subset (fmt + beep-common
@@ -22,7 +23,7 @@ SETTINGS=.claude/settings.json
 PREPUSH=.githooks/pre-push
 WORKER=.claude/agents/worker.md
 
-# The canonical 5 commands, in ci.yaml ebpf-build order.
+# The canonical 5 commands, in the order CI runs them across its jobs.
 C1='cargo fmt --check'
 C2='cargo clippy --tests -- -D warnings'
 C3='cargo test -p beep-common'

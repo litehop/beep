@@ -176,9 +176,10 @@ beads — the Lima VM protocol block>
 ```
 
 **Note on Shape 1's quality-gate commands below:** they are the canonical
-5-command gate from CI's `ebpf-build` job — the same gate
-`.claude/settings.json`'s `PreToolUse Bash` hook, `.githooks/pre-push`, and
-worker.md's Workflow step 5 all carry. On a macOS host only `cargo fmt
+5-command gate CI's `fmt` / `lint-matrix` / `test-matrix` / `memory-smoke`
+jobs run — the same gate `.claude/settings.json`'s `PreToolUse Bash` hook,
+`.githooks/pre-push`, and worker.md's Workflow step 5 all carry. On a macOS
+host only `cargo fmt
 --check` + `cargo test -p beep-common` run locally; CI enforces the full
 gate on the PR. Change it in all four places together —
 `scripts/test-quality-gate-consistency.sh` guards the drift.
@@ -217,7 +218,8 @@ git status --short              # must be clean
 ```
 
 Quality gate — mandatory, run in this exact order, paste output into return
-(byte-identical to `.githooks/pre-push` and CI's `ebpf-build` job):
+(byte-identical to `.githooks/pre-push` and CI's `fmt` / `lint-matrix` /
+`test-matrix` / `memory-smoke` jobs):
 ```bash
 cargo fmt --check
 cargo clippy --tests -- -D warnings
@@ -238,7 +240,7 @@ scripts/smoke.sh --vm <assigned VM, default beep-smoke>
 ```
 This is the one gate that actually loads the compiled object into a live
 kernel verifier and drives real packets through it — the host gate above
-only proves the build compiles. CI's `ebpf-memory-smoke` job re-runs an
+only proves the build compiles. CI's `memory-smoke` job re-runs an
 equivalent round trip on merge, so a worker skipping this locally still
 gets caught, just later and with less context.
 
@@ -336,14 +338,14 @@ net recommendation in 2–3 sentences with specific timing + dispatch shape.
 ## Shape 5 — Fix CI failure on a specific PR
 
 One PR has a failing check that isn't obviously irrelevant. Sections:
-the failing check name (`ebpf-build` or `ebpf-memory-smoke`) + log lines
-verbatim; 2–3 root-cause hypotheses; worktree at
+the failing check name (`test-gate`, `lint-gate`, `fmt`, or `memory-smoke`)
++ log lines verbatim; 2–3 root-cause hypotheses; worktree at
 `<WORKTREE_ROOT>/<branch-name>-fix` checking out the existing branch (not a
 new one); boundary block; investigation steps; pick the fix: (A) surgical /
 (B) medium / (C) skip + file follow-on bead (appropriate when stance allows
 a safe-out and the fix proves deeper than the bead's scope); verify locally
 (the Shape 1 quality gate, plus `scripts/smoke.sh` if the failure is in
-`ebpf-memory-smoke`); **push to the existing PR branch, not main**; return
+`memory-smoke`); **push to the existing PR branch, not main**; return
 under 300 words with root cause + fix chosen + verification. Diagnosis often
 surfaces deeper insight than the failure log shows — test the hypothesis
 before applying the fix.
@@ -469,7 +471,7 @@ martian-source-drop.
   touching `ebpf/`, `common/`'s shared conntrack/map types, or `src/`'s
   map-population logic. This is what actually loads the compiled object into
   a live kernel verifier — the host gate only proves it compiles.
-- **CI re-runs an equivalent round trip as `ebpf-memory-smoke` on merge**
+- **CI re-runs an equivalent round trip as `memory-smoke` on merge**
   (native on `ubuntu-latest`, no Lima/cross-build) as a backstop, so a worker
   who skips the local smoke step is still caught before landing on `main` —
   just later, and with a less specific failure than the local script gives.
@@ -588,8 +590,8 @@ martian-source-drop.
   `--admin`. If a check fails: read the log first. If it is a transient GitHub
   infra flake (e.g. `fatal: could not read Username`, checkout auth failure,
   runner timeout unrelated to the diff), rerun the specific job with
-  `gh run rerun <run-id> --failed` and wait for green. Only merge when both
-  required checks (`ebpf-build`, `ebpf-memory-smoke`) are green.
+  `gh run rerun <run-id> --failed` and wait for green. Only merge when all
+  required checks (`test-gate`, `lint-gate`, `memory-smoke`, `fmt`) are green.
 
 ## Pointers to canonical examples
 

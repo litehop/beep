@@ -34,7 +34,7 @@ Your invoker will pass the specific deliverable in the prompt. Ask if unclear.
 3. **Bead file-scope adherence.** Did the worker fix in the RIGHT place? Not "just where the bead said" if the real bug is a layer up.
    - See bd memory: `verify-bead-file-scope-before-dispatch`.
 4. **Shared-type / map-layout consistency (beep-common).** If the diff changes a conntrack key/value or any type crossing the kernel/user boundary, is it defined once in beep-common (not duplicated) so loader and eBPF stay byte-identical? A drifted layout silently corrupts the map. See CLAUDE.md "Conventions & Patterns".
-5. **eBPF map memory.** If the diff adds/resizes a map or changes max_entries/value size, does it stay under the ceiling ebpf-memory-smoke asserts (discovered map set must be exactly the known maps under the byte ceiling)? A new unbounded map is a finding.
+5. **eBPF map memory.** If the diff adds/resizes a map or changes max_entries/value size, does it stay under the ceiling memory-smoke asserts (discovered map set must be exactly the known maps under the byte ceiling)? A new unbounded map is a finding.
 6. **Packet-access safety.** If the diff reads packet fields via direct packet access, are the data/data_end bounds checks present and correct, and byte-order conversions right for the header field? Out-of-bounds or endianness slips are findings.
 7. **Test intent, not behavior.** Do the new/modified tests state WHY the behavior matters (what breaks for a user if it regresses), not just describe what the code does? A test that can't fail when business logic breaks is documentation, not a test.
    - See CLAUDE.md Rule 9, Rule 14.

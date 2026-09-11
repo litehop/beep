@@ -4,7 +4,8 @@ set -e
 # beep quality gate. The loader links Linux-only bpf(2)/netlink syscalls and
 # beep-ebpf cross-builds for bpfel-unknown-none, so the full 5-command gate
 # only runs on Linux; on macOS only fmt + the beep-common host tests run (CI's
-# ebpf-build job enforces the full gate on every PR). Keep these commands
+# fmt/lint-matrix/test-matrix/memory-smoke jobs enforce the full gate on
+# every PR). Keep these commands
 # byte-identical to settings.json's PreToolUse Bash hook and
 # .claude/agents/worker.md -- scripts/test-quality-gate-consistency.sh asserts
 # the three agree.
@@ -27,7 +28,8 @@ fi
 # goes unreviewed. See bd memory `surface-test-edits-for-review-not-block`.
 #
 # (u7s's sonobuoy --focus conformance gate is not ported -- beep has no
-# apiserver/e2e suite; CI's ebpf-build + ebpf-memory-smoke are the merge gate.)
+# apiserver/e2e suite; CI's test-gate/lint-gate/memory-smoke/fmt are the
+# merge gate.)
 
 ZERO_OID=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
