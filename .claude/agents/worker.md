@@ -111,7 +111,8 @@ cargo test -p beep-common 2>&1 | tail -30
 # fire mid-build.
 # clippy(loader), clippy(ebpf), and `cargo build --release` are Linux-only
 # (aya cross-build to bpfel-unknown-none) — do not run them on this macOS
-# host. CI's ebpf-build job enforces the full 5-command gate on the PR.
+# host. CI's fmt/lint-matrix/test-matrix/memory-smoke jobs enforce the full
+# 5-command gate on the PR.
 # For a bead that touches the dataplane (ebpf/, common/, or the loader's
 # map/attach code), also run scripts/smoke.sh against your assigned VM
 # before opening the PR:
