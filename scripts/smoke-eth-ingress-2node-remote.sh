@@ -82,9 +82,10 @@ setup_geneve() {
   ip link set "$GENEVE_IFACE" up
 }
 
-# Node-a only. Confirms eth0 is up before the loader binds its uplink hooks
-# to it -- a silent no-op attach to a down/missing device would otherwise
-# surface only much later as an inexplicable client timeout.
+# Runs on both nodes -- both bind eth0 as their uplink. Confirms eth0 is up
+# before the loader binds its uplink hooks to it -- a silent no-op attach to
+# a down/missing device would otherwise surface only much later as an
+# inexplicable client timeout.
 check_uplink() {
   local iface="$1"
   ip link show "$iface" 2>/dev/null | grep -q "state UP\|UNKNOWN" || {
