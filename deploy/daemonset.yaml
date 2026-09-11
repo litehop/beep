@@ -40,7 +40,11 @@ spec:
               type: Unconfined
             capabilities:
               drop: ["ALL"]
-              add: ["BPF", "NET_ADMIN"]
+              # CAP_PERFMON: the verifier's pointer-arithmetic relaxations
+              # for a non-root BPF_PROG_LOAD gate on perfmon_capable(), not
+              # just CAP_BPF -- without it the load is rejected outright.
+              # See docs/decisions/servicelb-controller-apparmor-unconfined.md.
+              add: ["BPF", "NET_ADMIN", "PERFMON"]
           env:
             # hostNetwork means status.hostIP is this node's own address --
             # exactly the value `--node-ip` needs (`ebpf-lb-dataplane.md`'s

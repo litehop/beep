@@ -29,6 +29,12 @@ not a blanket `privileged: true`. Kubernetes 1.30+ honors the native
 deprecated `container.apparmor.security.beta.kubernetes.io/<container>:
 unconfined` pod annotation instead.
 
+`CAP_BPF`+`CAP_NET_ADMIN` alone gets past the AppArmor fix above but then
+fails `BPF_PROG_LOAD` itself: the verifier's pointer-arithmetic relaxations
+for a non-root load additionally gate on `perfmon_capable()` (CAP_PERFMON
+or CAP_SYS_ADMIN), which neither of those two capabilities grants. Add
+`CAP_PERFMON` to `add:` — still short of CAP_SYS_ADMIN or `privileged`.
+
 ## Rationale
 
 Authoring a custom Localhost AppArmor profile scoped to exactly the
@@ -42,9 +48,11 @@ smallest change that matches a project this project already imitates
 
 ## Consequences
 
-- The controller container runs without AppArmor mediation on any node.
-  Its actual attack surface is unchanged: `hostNetwork: true` and
-  `CAP_BPF`/`CAP_NET_ADMIN` already grant kernel-level device access that
-  AppArmor's default profile only partially constrained.
+- The controller container runs without AppArmor mediation and with
+  `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON` — a set broadened by `CAP_PERFMON`
+  here, but still far short of `CAP_SYS_ADMIN`/`privileged`. With
+  `hostNetwork: true` and `CAP_BPF` already granting kernel-level access,
+  the incremental surface from unconfining AppArmor and adding `CAP_PERFMON`
+  is bounded.
 - A future scoped Localhost profile (option (b) in beep-26s) remains open
   if node provisioning grows the ability to ship one.

@@ -7,19 +7,20 @@
 # from LIVE watch events -- not hand-rolled fixture args like
 # scripts/smoke.sh / smoke-wg-2node.sh / smoke-eth-ingress-2node.sh.
 #
-# CURRENT STATUS: the AppArmor/bpffs-pin blocker this gate originally
-# surfaced -- containerd's default `cri-containerd.apparmor.d` profile
-# denying all bpffs writes -- is fixed via `deploy/daemonset.yaml`'s
-# `appArmorProfile: Unconfined`. The controller DaemonSet still crashloops
-# one step later, now during BPF_PROG_LOAD, with the kernel verifier
-# rejecting a pointer-arithmetic pattern for a process lacking CAP_PERFMON
-# (`add: ["BPF", "NET_ADMIN"]` isn't sufficient) -- not this gate's own bug.
-# See docs/decisions/servicelb-controller-apparmor-unconfined.md for the
-# AppArmor rationale. This script's `run`
-# therefore ends in a documented, non-zero "CONTROLLER-DEPLOY: FAIL (known
-# blocker)" rather than a false pass; every step before that (cluster
-# bring-up, geneve0, the kubeconfig Secret, the DaemonSet/RBAC apply
-# itself) is a genuine, asserted PASS.
+# CURRENT STATUS: the AppArmor/bpffs-pin blocker and the BPF_PROG_LOAD
+# verifier/CAP_PERFMON blocker this gate originally surfaced are both
+# fixed (`deploy/daemonset.yaml`'s `appArmorProfile: Unconfined` +
+# `add: ["BPF", "NET_ADMIN", "PERFMON"]`; see
+# docs/decisions/servicelb-controller-apparmor-unconfined.md).
+# CONTROLLER-DEPLOY and MAP-PROGRAMMING now PASS for real. The round trip
+# itself still fails -- a distinct dataplane forwarding bug: the Geneve
+# decap reaches node-b's geneve0 (RX counter increments) but no return
+# traffic and no FLOW_TABLE entry ever appears on either node. This
+# script's `run`
+# therefore still ends non-zero at ROUND-TRIP, but every step before
+# that -- cluster bring-up, geneve0, the kubeconfig Secret, the
+# DaemonSet/RBAC apply, the controller actually loading and pinning its
+# eBPF programs, and map programming -- is a genuine, asserted PASS.
 #
 # TOPOLOGY: ingress VIP = node-a's own address, backend Pod pinned
 # (`nodeName`) to node-b -- a genuinely cross-node round trip: the backend
@@ -188,7 +189,7 @@ for c in $restarts; do
   [ "$c" = "0" ] || controller_deploy_failed=1
 done
 if [ "$controller_deploy_failed" -ne 0 ]; then
-  echo "CONTROLLER-DEPLOY: FAIL (known blocker -- see this script's header)" >&2
+  echo "CONTROLLER-DEPLOY: FAIL (see pod status/logs below -- this step is expected to PASS, see this script's header)" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
   dump_evidence
   exit 1
