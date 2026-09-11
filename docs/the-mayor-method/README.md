@@ -183,8 +183,8 @@ The **canonical 5-command quality gate** (from `.github/workflows/ci.yaml`'s
 
 Steps 2, 4, and 5 need a Linux toolchain and `bpf-linker`; on macOS only the
 **macOS-host subset** — `cargo fmt --check` and `cargo test -p beep-common`
-— runs. Workers on macOS run the subset locally and let CI's `lint-gate` +
-`test-gate` + `memory-smoke` jobs enforce the full gate on the PR.
+— runs. Workers on macOS run the subset locally and let CI's `fmt` +
+`lint-gate` + `test-gate` + `memory-smoke` jobs enforce the full gate on the PR.
 
 For beads that touch the dataplane, the gate alone is not enough — it
 proves the eBPF program compiles, not that it loads and forwards packets.
