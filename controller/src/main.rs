@@ -166,8 +166,21 @@ async fn run_controller_loop(
             apply_reconcile(&state, &maps, &node);
         }
     };
-    let on_node = move |event: Value| {
-        state.lock().unwrap().apply_node_event(&event);
+    let on_node = {
+        let state = Arc::clone(&state);
+        let maps = Arc::clone(&maps);
+        move |event: Value| {
+            state.lock().unwrap().apply_node_event(&event);
+            apply_reconcile(&state, &maps, &node);
+        }
+    };
+    // Fires once the initial Node LIST has fully delivered -- flips
+    // `nodes_listed` so `desired` stops suppressing front programming, then
+    // immediately reconciles so a genuinely node-less cluster's correct
+    // (destructive) diff runs right away instead of waiting on the next
+    // event (`WatchState::desired`'s doc comment).
+    let on_nodes_listed = move || {
+        state.lock().unwrap().mark_nodes_listed();
         apply_reconcile(&state, &maps, &node);
     };
 
@@ -175,13 +188,14 @@ async fn run_controller_loop(
     // error (if any) wins here never matters at runtime -- `and` just gives
     // the whole function a single `Result` to return.
     let (services, endpoint_slices, nodes) = tokio::join!(
-        run_list_watch(&client, "/api/v1/services", on_service),
+        run_list_watch(&client, "/api/v1/services", on_service, || {}),
         run_list_watch(
             &client,
             "/apis/discovery.k8s.io/v1/endpointslices",
             on_endpoint_slice,
+            || {},
         ),
-        run_list_watch(&client, "/api/v1/nodes", on_node),
+        run_list_watch(&client, "/api/v1/nodes", on_node, on_nodes_listed),
     );
     services.and(endpoint_slices).and(nodes)
 }

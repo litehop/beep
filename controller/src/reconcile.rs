@@ -147,6 +147,14 @@ pub struct DesiredEntries {
     pub vip_map: HashMap<VipKey, VipBackend>,
     pub target_ports: HashMap<VipKey, u16>,
     pub pod_targets: HashSet<u32>,
+    /// Whether `vip_map`/`target_ports` were computed from a fully-known
+    /// node set. `WatchState::desired` (the only real producer of an
+    /// aggregate `DesiredEntries`) sets this to `false` while the initial
+    /// Node LIST hasn't completed yet, so `PinnedMaps::apply` knows an empty
+    /// `vip_map`/`target_ports` here means "node set not known yet", not
+    /// "no fronts should exist" -- diffing against the latter would delete
+    /// every already-programmed front that survived a controller restart.
+    pub fronts_known: bool,
 }
 
 fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> VipKey {
@@ -156,6 +164,40 @@ fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> VipKey {
         proto: port.protocol.as_ip_proto(),
         _pad: 0,
     }
+}
+
+/// POD_TARGETS is this node's own local serving-set, port-agnostic by
+/// design (`beep_common::egress_return_admission`'s doc comment) --
+/// membership must never depend on which front port an endpoint answers,
+/// only on whether THIS node hosts it and is ready to serve it. Deliberately
+/// independent of `ServiceView` (no `vip_ip`/`ports` input): unlike
+/// `VIP_MAP`/`TARGET_PORTS`, POD_TARGETS is EndpointSlice/local-node-derived,
+/// not front-derived, so `WatchState::desired` can (and must) call this even
+/// while the front set is still unknown (`nodes_listed == false`) -- see its
+/// call site's comment for the restart-blackhole this independence avoids.
+/// An endpoint is admitted if its pod_ip is in this node's pod_cidr OR it
+/// carries the hostNetwork signature (pod_ip == node_ip): in bare metal
+/// (no cloud LB, no BGP -- beep fronts the node's physical IP) a
+/// hostNetwork pod's IP IS the node IP, so without this a Service backed
+/// by a hostNetwork pod would be silently excluded here and every
+/// forward packet dropped at decap admission. Guarding which control-
+/// plane ports (6443/10250/2379/...) may be fronted this way is
+/// deliberately out of scope -- that's perimeter/firewall policy
+/// (ufw/NetworkPolicy), not the load balancer's job. Arbitrary out-of-
+/// cidr pod_ips that are also != node_ip are still rejected below.
+pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) -> HashSet<u32> {
+    let mut pod_targets = HashSet::new();
+    for slice in slices {
+        for ep in &slice.endpoints {
+            if ep.ready
+                && ep.node_ip == node.node_ip
+                && (node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip)
+            {
+                pod_targets.insert(wire_ip(u32::from(ep.pod_ip)));
+            }
+        }
+    }
+    pod_targets
 }
 
 /// Reconciles one Service against its EndpointSlices into the map entries
@@ -171,28 +213,7 @@ pub fn reconcile_service(
     let mut desired = DesiredEntries::default();
     let endpoints: Vec<&Endpoint> = slices.iter().flat_map(|s| s.endpoints.iter()).collect();
 
-    // POD_TARGETS is this node's own local serving-set, port-agnostic by
-    // design (`beep_common::egress_return_admission`'s doc comment) --
-    // membership must never depend on which front port an endpoint answers,
-    // only on whether THIS node hosts it and is ready to serve it. An
-    // endpoint is admitted if its pod_ip is in this node's pod_cidr OR it
-    // carries the hostNetwork signature (pod_ip == node_ip): in bare metal
-    // (no cloud LB, no BGP -- beep fronts the node's physical IP) a
-    // hostNetwork pod's IP IS the node IP, so without this a Service backed
-    // by a hostNetwork pod would be silently excluded here and every
-    // forward packet dropped at decap admission. Guarding which control-
-    // plane ports (6443/10250/2379/...) may be fronted this way is
-    // deliberately out of scope -- that's perimeter/firewall policy
-    // (ufw/NetworkPolicy), not the load balancer's job. Arbitrary out-of-
-    // cidr pod_ips that are also != node_ip are still rejected below.
-    for ep in &endpoints {
-        if ep.ready
-            && ep.node_ip == node.node_ip
-            && (node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip)
-        {
-            desired.pod_targets.insert(wire_ip(u32::from(ep.pod_ip)));
-        }
-    }
+    desired.pod_targets = pod_targets_for_node(slices, node);
 
     // VIP_MAP/TARGET_PORTS are NOT node-scoped (any node can be ingress for
     // any VIP, mirroring the loader's fixture population), so backend
