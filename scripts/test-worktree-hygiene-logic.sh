@@ -397,20 +397,14 @@ assert "without DRY_RUN, run_cmd executes the real command" \
   "$([ -e "$MARKER" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 6. STEP E -- findings-enforcement drift backstop. Only the two pure
-#    functions are covered here (bead-id extraction and staleness
-#    classification, which together fully capture the branching logic);
-#    step_e_stale_findings() itself isn't, since it calls live `bd show`
-#    against this repo's real, mutable bead state -- referencing a real
-#    bead ID here would make the test's outcome depend on that bead's
-#    status at whatever moment CI happens to run, silently flipping
-#    PASS/FAIL as unrelated bead lifecycle events occur elsewhere. This was
-#    instead verified manually against real live bd state during
-#    development (a scratch ai/findings/*.md staged against a genuinely
-#    closed bead, a genuinely open bead, and a nonexistent bead ID all
-#    produced the expected warn/silent split) -- the same "exercise the
-#    real thing, not a synthetic stand-in" principle this suite follows
-#    elsewhere, just not automatable here without a disposable bd database.
+# 6. STEP E -- findings-enforcement drift backstop. The pure functions
+#    (bead-id extraction and staleness classification, which together fully
+#    capture the branching logic) are covered directly here.
+#    step_e_stale_findings() itself is covered further below (6b) against a
+#    disposable sandbox repo with `bd` stubbed rather than live -- a real
+#    bead ID's status can change at any moment, which would make a test
+#    against LIVE bd state silently flip PASS/FAIL as unrelated bead
+#    lifecycle events occur elsewhere.
 # ---------------------------------------------------------------------------
 
 # Fixture suffixes below are intentionally 2 chars, one below the real
@@ -421,6 +415,14 @@ FINDING_CLOSED="$SANDBOX_ROOT/finding-closed.md"
 printf 'Bead: mayor-fx\n\nBody text.\n' > "$FINDING_CLOSED"
 assert "bead_id_from_finding extracts the bead id from a well-formed header" \
   "$([ "$(call bead_id_from_finding "$FINDING_CLOSED")" = "mayor-fx" ] && echo 1 || echo 0)"
+
+# Regression: the regex used to match only `mayor-*` (the u7s-monorepo
+# prefix this script was imported with), silently skipping every finding
+# using this project's own `beep-*` prefix -- making step E a no-op here.
+FINDING_BEEP="$SANDBOX_ROOT/finding-beep.md"
+printf 'Bead: beep-zz\n\nBody text.\n' > "$FINDING_BEEP"
+assert "bead_id_from_finding also extracts a beep-* bead id, not just mayor-* -- otherwise step E never fires on this project's own findings" \
+  "$([ "$(call bead_id_from_finding "$FINDING_BEEP")" = "beep-zz" ] && echo 1 || echo 0)"
 
 FINDING_NO_HEADER="$SANDBOX_ROOT/finding-no-header.md"
 printf 'Just prose, no bead reference.\n' > "$FINDING_NO_HEADER"
@@ -465,6 +467,46 @@ RC=0
 call is_stale_bead_status "in_progress" || RC=$?
 assert "is_stale_bead_status does NOT flag an in_progress bead" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 6b. STEP E end-to-end, `bd` stubbed (not live) so the outcome never
+#    depends on real bead lifecycle. Regression for two bugs observed
+#    together on the 2026-09-11 hygiene tick:
+#      (1) bead_id_from_finding's regex recognized only the mayor prefix,
+#          making this whole step a no-op for beep-* findings (fixed above
+#          at the unit level; here it must actually surface as a printed
+#          [hygiene] line end-to-end).
+#      (2) once a beep-* header DID match, an unmatched grep elsewhere in
+#          bead_id_from_finding exits non-zero, and under this script's
+#          `set -e -o pipefail` the caller's bare `bead_id=$(...)`
+#          assignment turned that into a silent whole-script abort with NO
+#          [hygiene] line at all -- even for headers that turn out NOT to be
+#          stale. step_e_stale_findings must also return non-zero itself
+#          exactly when it printed such a line, so main() can propagate a
+#          meaningful exit code instead of an unexplained one.
+# ---------------------------------------------------------------------------
+
+STUB_BD_CLOSED="$SANDBOX_ROOT/stub-bd-closed"
+mkdir -p "$STUB_BD_CLOSED"
+cat > "$STUB_BD_CLOSED/bd" <<'EOF'
+#!/usr/bin/env bash
+echo '[{"status":"closed"}]'
+EOF
+chmod +x "$STUB_BD_CLOSED/bd"
+
+E_REPO="$SANDBOX_ROOT/step-e-repo"
+new_sandbox "$E_REPO"
+mkdir -p "$E_REPO/ai/findings"
+printf 'Bead: beep-zz\n\nBody text.\n' > "$E_REPO/ai/findings/scratch-finding.md"
+git -C "$E_REPO" add -A
+git -C "$E_REPO" commit -q -m "seed finding"
+
+STALE_RC=0
+STALE_OUT=$(WORKTREE_HYGIENE_REPO_ROOT="$E_REPO" PATH="$STUB_BD_CLOSED:$PATH" call step_e_stale_findings) || STALE_RC=$?
+assert "step_e_stale_findings detects a beep-* Bead: header referencing a closed bead as stale (fails if the bead-ID regex still recognizes only the mayor prefix)" \
+  "$(printf '%s' "$STALE_OUT" | grep -qF '[hygiene] stale-finding: ai/findings/scratch-finding.md references beep-zz, which is closed' && echo 1 || echo 0)"
+assert "...and step_e_stale_findings itself exits non-zero when it printed that anomaly, so main() can't silently swallow it" \
+  "$([ "$STALE_RC" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 7. main()'s fail-safe refusal without --live-agents. STEP C/D are
@@ -557,6 +599,43 @@ assert "worktree-hygiene refuses to run when both --live-agents and --no-live-wo
   "$([ "$NLW_BOTH_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and the mutual-exclusion refusal names both flags on stderr, distinct from the missing-flag refusal message" \
   "$(printf '%s' "$NLW_BOTH_OUT" | grep -q -- 'mutually exclusive' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 9. Full end-to-end regression for the 2026-09-11 bug: a verifiably clean
+#    repo (no stray branches, valid --no-live-workers) that also has a
+#    beep-* Bead: header finding for a genuinely OPEN bead must exit 0.
+#    This is deliberately NOT the "no findings at all" case already covered
+#    by 8. above -- the crash this regresses against fired on ANY beep-*
+#    finding, stale or not, the instant bead_id_from_finding's regex
+#    matched nothing under the old mayor-prefix-only pattern (a `grep` with
+#    no match, non-zero under `pipefail`, tripping `set -e` via the bare
+#    `bead_id=$(...)` assignment with no [hygiene] line ever printed). A
+#    test using only a closed-bead fixture couldn't distinguish "correctly
+#    detected as stale" from "crashed before ever checking" -- both print
+#    nothing else and both used to exit non-zero for a different reason.
+# ---------------------------------------------------------------------------
+
+STUB_BD_OPEN="$SANDBOX_ROOT/stub-bd-open"
+mkdir -p "$STUB_BD_OPEN"
+cat > "$STUB_BD_OPEN/bd" <<'EOF'
+#!/usr/bin/env bash
+echo '[{"status":"open"}]'
+EOF
+chmod +x "$STUB_BD_OPEN/bd"
+
+CLEAN_E_REPO="$SANDBOX_ROOT/clean-with-open-finding-repo"
+new_sandbox "$CLEAN_E_REPO"
+mkdir -p "$CLEAN_E_REPO/ai/findings"
+printf 'Bead: beep-yy\n\nBody text.\n' > "$CLEAN_E_REPO/ai/findings/open-finding.md"
+git -C "$CLEAN_E_REPO" add -A
+git -C "$CLEAN_E_REPO" commit -q -m "seed finding"
+
+CLEAN_RC=0
+CLEAN_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$CLEAN_E_REPO" PATH="$STUB_BD_OPEN:$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers 2>&1) || CLEAN_RC=$?
+assert "worktree-hygiene exits 0 on a verifiably clean repo with a beep-* finding for a genuinely open bead -- fails if the spurious no-message exit 1 returns" \
+  "$([ "$CLEAN_RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...and no [hygiene] anomaly line is printed for a genuinely open bead (nothing to act on)" \
+  "$(! printf '%s' "$CLEAN_OUT" | grep -q '\[hygiene\]' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

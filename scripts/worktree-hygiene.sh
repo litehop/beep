@@ -45,12 +45,14 @@
 #   since the export's last commit, or pruned after closing.
 #
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
-# mayor to look at, surfaced via this script's own `set -e` (a `git
-# fetch`/`branch` failure aborts the run with git's exit code, which is
-# itself already non-zero). STEP E never contributes to the exit code -- it
-# only reports, it never mutates. A missing/empty --live-agents flag with no
-# --no-live-workers fallback (or passing both together) exits 2 before any
-# step runs (see main()).
+# mayor to look at: either a `git fetch`/`branch` failure in STEP B-D,
+# surfaced via this script's own `set -e` with git's own exit code, or STEP
+# E printing at least one `[hygiene] stale-finding: ...` line (tracked via
+# an explicit count, not left to fall out of `set -e` incidentally) -- a
+# non-zero exit is always accompanied by a message naming the anomaly, never
+# silent. A missing/empty --live-agents flag with no --no-live-workers
+# fallback (or passing both together) exits 2 before any step runs (see
+# main()).
 #
 # DRY_RUN=1 turns every destructive command (git branch -D/-d) into a
 # logged no-op via run_cmd() -- same idiom the sibling merge/dashboard
@@ -287,11 +289,22 @@ step_d_gone_upstream_branches() {
 # any trailing descriptive text (e.g. a parenthetical naming related beads)
 # -- the old whitespace-stripped whole-line slurp mangled such a header into
 # a compound string that would never match any live bd record, making this
-# step warn to delete a finding that's actually still open.
+# step warn to delete a finding that's actually still open. Matches both
+# `mayor-*` (the u7s-monorepo prefix this script was imported with) and
+# `beep-*` (this project's own prefix) -- a regex recognizing only the
+# mayor prefix silently skipped every beep-* finding, making this whole
+# step a no-op here.
+#
+# The final pipeline is guarded with `|| true`: under this script's
+# `set -euo pipefail`, an unmatched grep (no Bead: header, or one this
+# regex doesn't recognize) makes the pipeline itself exit non-zero, and the
+# caller's bare `bead_id=$(bead_id_from_finding ...)` assignment then trips
+# errexit and kills the whole run with no anomaly printed -- "no bead id
+# found" is an expected, non-error outcome here, not a script failure.
 bead_id_from_finding() {
   local f="$1" bead_line
   bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
-  printf '%s' "$bead_line" | grep -oE 'mayor-[a-z0-9.]+' | head -1
+  printf '%s' "$bead_line" | grep -oE '(mayor|beep)-[a-z0-9.]+' | head -1 || true
 }
 
 # True (exit 0) iff a bead in the given live-bd status is stale enough to
@@ -303,8 +316,12 @@ is_stale_bead_status() {
   [ "$status" = "closed" ] || [ -z "$status" ]
 }
 
+# Returns non-zero iff it printed at least one `[hygiene]` anomaly line --
+# the explicit anomaly count main() relies on for its own exit status, so a
+# clean tick (nothing stale) exits 0 and a reported anomaly is always
+# accompanied by the message explaining it, never a silent non-zero exit.
 step_e_stale_findings() {
-  local findings f bead_id status
+  local findings f bead_id status stale_count=0
   findings=$(git -C "$REPO_ROOT" ls-files 'ai/findings/*.md' | grep -v '^ai/findings/legacy/') || true
   [ -n "$findings" ] || return 0
 
@@ -314,6 +331,7 @@ step_e_stale_findings() {
     [ -n "$bead_id" ] || continue
     status=$(bd -C "$REPO_ROOT" show "$bead_id" --json 2>/dev/null | jq -r '.[0]?.status // empty') || true
     if is_stale_bead_status "$status"; then
+      stale_count=$(( stale_count + 1 ))
       if [ -z "$status" ]; then
         echo "[hygiene] stale-finding: $f references $bead_id, which bd has no live record of (pruned, or a bad reference) -- delete it, git history is the archive"
       else
@@ -321,6 +339,8 @@ step_e_stale_findings() {
       fi
     fi
   done <<< "$findings"
+
+  [ "$stale_count" -eq 0 ]
 }
 
 main() {
