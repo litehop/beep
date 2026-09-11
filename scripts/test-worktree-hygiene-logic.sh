@@ -543,7 +543,7 @@ assert "...proven by dry-run step output actually appearing, not just a bare exi
 # indistinguishable from "the caller forgot the flag", and only the
 # affirmative --no-live-workers flag above may waive the fail-safe.
 NLW_STILL_EMPTY_RC=0
-bash "$SCRIPT" --live-agents "" >/dev/null 2>&1 || NLW_STILL_EMPTY_RC=$?
+DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_REPO" PATH="$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --live-agents "" >/dev/null 2>&1 || NLW_STILL_EMPTY_RC=$?
 assert "worktree-hygiene still refuses to run on a bare empty --live-agents value now that --no-live-workers exists as the only valid zero-workers path" \
   "$([ "$NLW_STILL_EMPTY_RC" -eq 2 ] && echo 1 || echo 0)"
 
@@ -552,7 +552,7 @@ assert "worktree-hygiene still refuses to run on a bare empty --live-agents valu
 # set the caller meant, and silently picking one risks reaping a live
 # worker's branch if --live-agents was the intended (correct) flag.
 NLW_BOTH_RC=0
-NLW_BOTH_OUT=$(bash "$SCRIPT" --live-agents "someagent" --no-live-workers 2>&1) || NLW_BOTH_RC=$?
+NLW_BOTH_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_REPO" PATH="$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --live-agents "someagent" --no-live-workers 2>&1) || NLW_BOTH_RC=$?
 assert "worktree-hygiene refuses to run when both --live-agents and --no-live-workers are passed together" \
   "$([ "$NLW_BOTH_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and the mutual-exclusion refusal names both flags on stderr, distinct from the missing-flag refusal message" \
