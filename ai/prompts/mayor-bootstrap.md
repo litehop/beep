@@ -229,15 +229,19 @@ their own subagents.
 **Worktree hygiene loop body.** The mechanical body — `git worktree prune`
 and stale worker/non-worker branch cleanup — lives in
 `scripts/worktree-hygiene.sh`; the cron loop runs that script directly.
-Before running it, call `ListAgents`, extract the `worker/agent-*` ids of
-currently running subagents, and pass them as `--live-agents
-<comma-separated ids>` — the script REFUSES to run at all
-(non-destructively, exit 2) without this flag, since the destructive steps
-cannot tell a live worker's branch/worktree apart from a stale one on
+Before running it, call `ListAgents` and extract the `worker/agent-*` ids of
+currently running subagents. If any are running, pass them as
+`--live-agents <comma-separated ids>`; if none are running, pass
+`--no-live-workers` instead — do NOT fake a placeholder id (the old
+`--live-agents __none_live__` convention is deprecated), since that made
+every zero-worker tick exit non-zero even on a verifiably clean repo. The
+script REFUSES to run at all (non-destructively, exit 2) without EITHER
+flag, or if both are passed together, since the destructive steps cannot
+tell a live worker's branch/worktree apart from a stale one on
 dir-existence or merge-state alone. A worktree/branch whose agent-id is in
-that set is protected from every destructive step unconditionally,
-regardless of dir existence or merge state. See the script for the
-step-by-step implementation and its design rationale.
+the `--live-agents` set is protected from every destructive step
+unconditionally, regardless of dir existence or merge state. See the script
+for the step-by-step implementation and its design rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
 logs loudly instead of asking. Exit 0 means a clean tick; non-zero means an

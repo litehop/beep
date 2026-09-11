@@ -510,6 +510,55 @@ assert "...and no destructive-step log output appears at all for the whitespace-
   "$(! printf '%s' "$FAILSAFE_WS_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 8. main()'s --no-live-workers flag -- the affirmative alternative to
+#    --live-agents for the idle state, so a hygiene cron tick with zero
+#    running workers doesn't have to fake a placeholder --live-agents id
+#    just to get past the fail-safe guard above (which previously made
+#    every zero-worker tick exit non-zero even on a verifiably clean repo).
+# ---------------------------------------------------------------------------
+
+STUB_GH_EMPTY="$SANDBOX_ROOT/stub-gh-empty"
+mkdir -p "$STUB_GH_EMPTY"
+cat > "$STUB_GH_EMPTY/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$STUB_GH_EMPTY/gh"
+
+NLW_REPO="$SANDBOX_ROOT/no-live-workers-repo"
+new_sandbox "$NLW_REPO"
+printf 'line one\n' > "$NLW_REPO/file.txt"
+git -C "$NLW_REPO" add -A
+git -C "$NLW_REPO" commit -q -m initial
+
+NLW_RC=0
+NLW_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_REPO" PATH="$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers 2>&1) || NLW_RC=$?
+assert "worktree-hygiene --no-live-workers runs STEP B/C/D/E (not the fail-safe refusal) on a verifiably clean zero-worker tree, exiting 0 instead of crying wolf on every idle cron tick" \
+  "$([ "$NLW_RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...proven by dry-run step output actually appearing, not just a bare exit 0 that could equally mean 'refused before running anything'" \
+  "$(printf '%s' "$NLW_OUT" | grep -q -- '\[dry-run\] would run' && echo 1 || echo 0)"
+
+# A bare empty --live-agents value must still refuse even now that
+# --no-live-workers exists -- an omitted/empty --live-agents is
+# indistinguishable from "the caller forgot the flag", and only the
+# affirmative --no-live-workers flag above may waive the fail-safe.
+NLW_STILL_EMPTY_RC=0
+bash "$SCRIPT" --live-agents "" >/dev/null 2>&1 || NLW_STILL_EMPTY_RC=$?
+assert "worktree-hygiene still refuses to run on a bare empty --live-agents value now that --no-live-workers exists as the only valid zero-workers path" \
+  "$([ "$NLW_STILL_EMPTY_RC" -eq 2 ] && echo 1 || echo 0)"
+
+# Passing BOTH flags is a usage error, not "one wins" -- there is no way to
+# tell which of two contradictory affirmative claims about the live-agent
+# set the caller meant, and silently picking one risks reaping a live
+# worker's branch if --live-agents was the intended (correct) flag.
+NLW_BOTH_RC=0
+NLW_BOTH_OUT=$(bash "$SCRIPT" --live-agents "someagent" --no-live-workers 2>&1) || NLW_BOTH_RC=$?
+assert "worktree-hygiene refuses to run when both --live-agents and --no-live-workers are passed together" \
+  "$([ "$NLW_BOTH_RC" -eq 2 ] && echo 1 || echo 0)"
+assert "...and the mutual-exclusion refusal names both flags on stderr, distinct from the missing-flag refusal message" \
+  "$(printf '%s' "$NLW_BOTH_OUT" | grep -q -- 'mutually exclusive' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
