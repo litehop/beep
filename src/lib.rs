@@ -146,11 +146,13 @@ pub fn bump_memlock_rlimit() {
 /// build script), pinning each of `MAP_NAMES` under `pin_dir` so a loader
 /// restart reuses the existing map set instead of `Ebpf::load` creating an
 /// empty one (`MAP_NAMES`'s own doc comment). `fwd_pending_max_entries`/
-/// `flow_table_max_entries` size the two conntrack tables -- a load-time
-/// DaemonSet config knob, not a value baked into the eBPF object -- and only
-/// take effect the first time each pin path is created (a reused pin from a
-/// prior run opens the existing map via its live fd and silently ignores
-/// this override; see `EbpfLoader::map_max_entries`'s own semantics).
+/// `flow_table_max_entries`/`vip_map_max_entries`/`target_ports_max_entries`
+/// size the four maps whose entry count scales with cluster/Service state --
+/// a load-time DaemonSet config knob, not a value baked into the eBPF
+/// object -- and only take effect the first time each pin path is created (a
+/// reused pin from a prior run opens the existing map via its live fd and
+/// silently ignores this override; see `EbpfLoader::map_max_entries`'s own
+/// semantics).
 ///
 /// Shared by the `beep` loader binary and the controller binary (Phase 5's
 /// Service/EndpointSlice watcher) so both embed and load the exact same
@@ -160,6 +162,8 @@ pub fn load_ebpf(
     pin_dir: &Path,
     fwd_pending_max_entries: u32,
     flow_table_max_entries: u32,
+    vip_map_max_entries: u32,
+    target_ports_max_entries: u32,
 ) -> anyhow::Result<Ebpf> {
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
@@ -167,6 +171,8 @@ pub fn load_ebpf(
     }
     loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
     loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
+    loader.map_max_entries("VIP_MAP", vip_map_max_entries);
+    loader.map_max_entries("TARGET_PORTS", target_ports_max_entries);
     loader
         .load(include_bytes_aligned!(concat!(
             env!("OUT_DIR"),

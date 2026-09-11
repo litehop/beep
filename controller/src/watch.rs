@@ -297,6 +297,23 @@ impl WatchState {
     pub fn desired(&self, node: &NodeContext) -> DesiredEntries {
         let mut aggregate = DesiredEntries::default();
         let no_slices = HashMap::new();
+        // The front-IP model (ebpf-lb-dataplane.md's "Packet flow" step 1):
+        // every node's own address is a valid front for every Service, so
+        // VIP_MAP/TARGET_PORTS need one entry per KNOWN node address, not
+        // just this controller's own `node.node_ip` -- the backend node's
+        // decap (`try_geneve_decap_forward`) looks up TARGET_PORTS keyed on
+        // whichever node the client actually dialed, which is any node in
+        // the cluster, not necessarily this one.
+        // Startup ordering: `node_ips` is empty until the Node LIST (run
+        // concurrently with the Service/EndpointSlice watches in
+        // `run_controller_loop`'s `tokio::join!`) delivers its first event,
+        // so a reconcile fired from an early Service/EndpointSlice event can
+        // transiently program zero fronts for an already-known Service.
+        // Accepted: fail-CLOSED (dropped connections, never misrouted ones),
+        // and self-healing -- the Node LIST's own events each re-trigger a
+        // full reconcile, so the correct front set lands as soon as it
+        // catches up, with no restart or backoff needed.
+        let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -316,20 +333,17 @@ impl WatchState {
                 }
             }
 
-            let view = ServiceView {
-                vip_ip: node.node_ip,
-                ports: svc
-                    .ports
-                    .iter()
-                    .filter_map(|p| {
-                        Self::resolve_target_port(p, &slice_ports).map(|target_port| ServicePort {
-                            port: p.port,
-                            protocol: p.protocol,
-                            target_port,
-                        })
+            let ports: Vec<ServicePort> = svc
+                .ports
+                .iter()
+                .filter_map(|p| {
+                    Self::resolve_target_port(p, &slice_ports).map(|target_port| ServicePort {
+                        port: p.port,
+                        protocol: p.protocol,
+                        target_port,
                     })
-                    .collect(),
-            };
+                })
+                .collect();
 
             let endpoint_slices: Vec<EndpointSliceView> = slices
                 .values()
@@ -359,10 +373,16 @@ impl WatchState {
                 })
                 .collect();
 
-            let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
-            aggregate.vip_map.extend(desired.vip_map);
-            aggregate.target_ports.extend(desired.target_ports);
-            aggregate.pod_targets.extend(desired.pod_targets);
+            for front_ip in &front_ips {
+                let view = ServiceView {
+                    vip_ip: *front_ip,
+                    ports: ports.clone(),
+                };
+                let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
+                aggregate.vip_map.extend(desired.vip_map);
+                aggregate.target_ports.extend(desired.target_ports);
+                aggregate.pod_targets.extend(desired.pod_targets);
+            }
         }
         aggregate
     }
@@ -877,6 +897,67 @@ mod tests {
             desired.vip_map.is_empty(),
             "an endpoint on an unresolved node must not produce a VIP_MAP entry -- fabricating \
              a node_ip (e.g. 0.0.0.0) would misdirect the Geneve tunnel"
+        );
+    }
+
+    // The front-IP model means EVERY node's own address is a valid ingress
+    // for a Service (ebpf-lb-dataplane.md's "Packet flow" step 1) -- a
+    // client dialing the OTHER node's address must still resolve on the
+    // backend node's own TARGET_PORTS, or `try_geneve_decap_forward`'s
+    // lookup misses and silently drops every forwarded packet before a
+    // FLOW_TABLE entry is ever written -- this exact miss produced no
+    // SYN-ACK and no FLOW_TABLE entry despite a working Geneve decap.
+    #[test]
+    fn desired_covers_every_known_node_as_a_front_not_just_the_local_one() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-b"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.6"}]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-b", "conditions": {"ready": true}}],
+            },
+        }));
+
+        // Reconciling from node-b's own perspective (the backend node) --
+        // the ingress node in this flow is node-a, a DIFFERENT node.
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 6)));
+        let fronts: HashSet<[u8; 4]> = desired
+            .vip_map
+            .keys()
+            .map(|k| k.vip_ip.to_le_bytes())
+            .collect();
+        assert_eq!(
+            fronts,
+            HashSet::from([[10, 0, 0, 5], [10, 0, 0, 6]]),
+            "TARGET_PORTS/VIP_MAP must cover every known node's address as a front, not just \
+             this node's own -- otherwise the backend node can never decap a forward packet \
+             whose client dialed a DIFFERENT node's front IP"
         );
     }
 

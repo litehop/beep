@@ -16,10 +16,10 @@
 //! would silently drop every established flow on each DaemonSet rollout,
 //! eviction, or OOM kill. Real Service/EndpointSlice watching is Phase 5.
 //!
-//! `FWD_PENDING`/`FLOW_TABLE` sizes are a load-time DaemonSet config knob,
-//! not a value baked into the eBPF object (`beep-ebpf`'s admission-control
-//! doc comment) -- overridden here via `EbpfLoader::map_max_entries` before
-//! `load()`.
+//! `FWD_PENDING`/`FLOW_TABLE`/`VIP_MAP`/`TARGET_PORTS` sizes are a load-time
+//! DaemonSet config knob, not a value baked into the eBPF object
+//! (`beep-ebpf`'s admission-control doc comment) -- overridden here via
+//! `EbpfLoader::map_max_entries` before `load()`.
 
 use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
 
@@ -45,6 +45,15 @@ use clap::Parser;
 /// admission control keeps that role unreachable by a flood.
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
+/// `VIP_MAP`/`TARGET_PORTS` scale with nodes x Service ports under the
+/// every-node-is-a-front model (`beep-ebpf`'s doc comments on both maps), not
+/// a fixed Service count -- 4096 covers a realistic cluster (e.g. 100 nodes x
+/// 40 Service ports) with headroom, and stays well under
+/// `assert-ebpf-map-memory.sh`'s 4 MiB gross-regression ceiling alongside
+/// FWD_PENDING/FLOW_TABLE's existing footprint (verified via
+/// `scripts/sample-ebpf-memory.sh`).
+const DEFAULT_VIP_MAP_MAX_ENTRIES: u32 = 4096;
+const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -111,6 +120,15 @@ struct Args {
     /// since they now share one physical capacity pool.
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
+
+    /// `VIP_MAP` max_entries -- see `beep-ebpf`'s doc comment. A load-time
+    /// DaemonSet config knob, not a value baked into the eBPF object.
+    #[arg(long, default_value_t = DEFAULT_VIP_MAP_MAX_ENTRIES)]
+    vip_map_max_entries: u32,
+
+    /// `TARGET_PORTS` max_entries -- see `beep-ebpf`'s doc comment.
+    #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
+    target_ports_max_entries: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,6 +214,8 @@ fn main() -> anyhow::Result<()> {
         node_ip,
         fwd_pending_max_entries,
         flow_table_max_entries,
+        vip_map_max_entries,
+        target_ports_max_entries,
     } = Args::parse();
 
     for fixture in &fixtures {
@@ -210,8 +230,14 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&pin_dir)
         .with_context(|| format!("creating pin dir {}", pin_dir.display()))?;
 
-    let mut ebpf = load_ebpf(&pin_dir, fwd_pending_max_entries, flow_table_max_entries)
-        .context("loading beep-ebpf")?;
+    let mut ebpf = load_ebpf(
+        &pin_dir,
+        fwd_pending_max_entries,
+        flow_table_max_entries,
+        vip_map_max_entries,
+        target_ports_max_entries,
+    )
+    .context("loading beep-ebpf")?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures, node_ip)
