@@ -147,6 +147,14 @@ pub struct DesiredEntries {
     pub vip_map: HashMap<VipKey, VipBackend>,
     pub target_ports: HashMap<VipKey, u16>,
     pub pod_targets: HashSet<u32>,
+    /// Whether `vip_map`/`target_ports` were computed from a fully-known
+    /// node set. `WatchState::desired` (the only real producer of an
+    /// aggregate `DesiredEntries`) sets this to `false` while the initial
+    /// Node LIST hasn't completed yet, so `PinnedMaps::apply` knows an empty
+    /// `vip_map`/`target_ports` here means "node set not known yet", not
+    /// "no fronts should exist" -- diffing against the latter would delete
+    /// every already-programmed front that survived a controller restart.
+    pub fronts_known: bool,
 }
 
 fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> VipKey {

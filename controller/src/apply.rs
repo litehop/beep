@@ -55,23 +55,36 @@ impl PinnedMaps {
     /// for OTHER, unrelated Services in the same reconcile tick (PR #51
     /// review's HIGH finding -- a bare `?` chain here silently left every
     /// later Service unrouted with no attempt at all).
+    ///
+    /// Skips the VIP_MAP/TARGET_PORTS diff entirely while
+    /// `desired.fronts_known` is `false` (`DesiredEntries`'s doc comment):
+    /// diffing an empty `vip_map`/`target_ports` against these maps' actual
+    /// contents would delete every front, even ones a previous run already
+    /// programmed and pinned -- `desired.fronts_known == false` means "not
+    /// known yet", not "no fronts should exist".
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
-        let vip_map_result = apply_ops(
-            &mut self.vip_map,
-            &desired.vip_map,
-            reconcile::vip_backend_eq,
-            "VIP_MAP",
-            describe_vip_key,
-        )
-        .context("applying VIP_MAP");
-        let target_ports_result = apply_ops(
-            &mut self.target_ports,
-            &desired.target_ports,
-            |a: &u16, b: &u16| a == b,
-            "TARGET_PORTS",
-            describe_vip_key,
-        )
-        .context("applying TARGET_PORTS");
+        let (vip_map_result, target_ports_result) = if desired.fronts_known {
+            (
+                apply_ops(
+                    &mut self.vip_map,
+                    &desired.vip_map,
+                    reconcile::vip_backend_eq,
+                    "VIP_MAP",
+                    describe_vip_key,
+                )
+                .context("applying VIP_MAP"),
+                apply_ops(
+                    &mut self.target_ports,
+                    &desired.target_ports,
+                    |a: &u16, b: &u16| a == b,
+                    "TARGET_PORTS",
+                    describe_vip_key,
+                )
+                .context("applying TARGET_PORTS"),
+            )
+        } else {
+            (Ok(()), Ok(()))
+        };
         let pod_targets_result = apply_pod_targets(&mut self.pod_targets, &desired.pod_targets)
             .context("applying POD_TARGETS");
 

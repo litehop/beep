@@ -77,6 +77,12 @@ pub struct WatchState {
     // slice would silently drop every other slice's endpoints.
     slices: HashMap<ServiceKey, HashMap<String, RawEndpointSlice>>,
     node_ips: HashMap<String, Ipv4Addr>,
+    // Whether the initial Node LIST has completed at least once. `false`
+    // means `node_ips` is empty (or partial) purely because the LIST hasn't
+    // delivered its results yet, NOT because the cluster genuinely has no
+    // nodes -- `desired`'s doc comment on `front_ips` explains why that
+    // distinction matters.
+    nodes_listed: bool,
 }
 
 enum EventKind {
@@ -272,6 +278,15 @@ impl WatchState {
         }
     }
 
+    /// Signals that the initial Node LIST has fully delivered (called once
+    /// `run_list_watch`'s list phase for `/api/v1/nodes` returns, before it
+    /// starts watching) -- see `nodes_listed`'s doc comment for why this,
+    /// rather than `node_ips.is_empty()`, is what `desired` gates front
+    /// programming on.
+    pub fn mark_nodes_listed(&mut self) {
+        self.nodes_listed = true;
+    }
+
     /// Resolves a Service port's numeric target port against its
     /// EndpointSlices' `ports[]` by name -- or positionally when both sides
     /// have exactly one, unnamed port, the common single-port-Service case
@@ -295,7 +310,10 @@ impl WatchState {
     /// desired map state -- the controller writes all fronts from a single
     /// pass, not one dataplane write per Service.
     pub fn desired(&self, node: &NodeContext) -> DesiredEntries {
-        let mut aggregate = DesiredEntries::default();
+        let mut aggregate = DesiredEntries {
+            fronts_known: self.nodes_listed,
+            ..DesiredEntries::default()
+        };
         let no_slices = HashMap::new();
         // The front-IP model (ebpf-lb-dataplane.md's "Packet flow" step 1):
         // every node's own address is a valid front for every Service, so
@@ -306,14 +324,24 @@ impl WatchState {
         // the cluster, not necessarily this one.
         // Startup ordering: `node_ips` is empty until the Node LIST (run
         // concurrently with the Service/EndpointSlice watches in
-        // `run_controller_loop`'s `tokio::join!`) delivers its first event,
-        // so a reconcile fired from an early Service/EndpointSlice event can
-        // transiently program zero fronts for an already-known Service.
-        // Accepted: fail-CLOSED (dropped connections, never misrouted ones),
-        // and self-healing -- the Node LIST's own events each re-trigger a
-        // full reconcile, so the correct front set lands as soon as it
-        // catches up, with no restart or backoff needed.
+        // `run_controller_loop`'s `tokio::join!`) delivers its first event.
+        // On a FRESH start that's harmless fail-closed self-healing -- there
+        // is nothing programmed yet to lose, and the Node LIST's own events
+        // each re-trigger a reconcile, so the correct front set lands as
+        // soon as it catches up. On a RESTART it is not harmless:
+        // VIP_MAP/TARGET_PORTS pins survive the process exit, and
+        // `reconcile::diff` deletes any current entry missing from
+        // `desired` -- so reconciling with `node_ips` still empty (or
+        // partial) would wipe every already-programmed front. `nodes_listed`
+        // gates the whole front loop below on the initial Node LIST having
+        // actually completed, and `fronts_known` above carries that gate
+        // into `DesiredEntries` so `PinnedMaps::apply` knows to leave
+        // VIP_MAP/TARGET_PORTS untouched rather than diff them against an
+        // empty desired set while the node set isn't known yet.
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
+        if !self.nodes_listed {
+            return aggregate;
+        }
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -447,18 +475,22 @@ async fn list(client: &HyperApiClient, path: &str) -> anyhow::Result<(Vec<Value>
 /// Lists `resource_path` (e.g. `/api/v1/services`, no query string) once,
 /// then watches it from the list's `resourceVersion` forever, feeding every
 /// object (list items wrapped as a synthetic `ADDED`, so callers have one
-/// ingestion point) to `on_event`. On a watch failure, relists (fresh
-/// `resourceVersion`) if the failure was a 410 Gone, otherwise reconnects at
-/// the same `resourceVersion`; either way, backs off exponentially between
-/// attempts. In practice this never returns (there is no persistent proxy
-/// loop to hand control back to -- `ebpf-lb-dataplane.md`'s "Userspace
-/// control plane" section); the declared `Result` (rather than `!`) is
-/// solely so three of these compose cleanly under `tokio::join!`, which
-/// mishandles literally-`!`-typed branches.
+/// ingestion point) to `on_event`. Calls `on_list_complete` once every list
+/// item has been folded into `on_event` -- the Node watch's caller uses this
+/// to flip `WatchState::mark_nodes_listed`, so `desired` can tell "no nodes
+/// seen yet" apart from "genuinely no nodes" (that doc comment).
+/// On a watch failure, relists (fresh `resourceVersion`) if the failure was
+/// a 410 Gone, otherwise reconnects at the same `resourceVersion`; either
+/// way, backs off exponentially between attempts. In practice this never
+/// returns (there is no persistent proxy loop to hand control back to --
+/// `ebpf-lb-dataplane.md`'s "Userspace control plane" section); the declared
+/// `Result` (rather than `!`) is solely so three of these compose cleanly
+/// under `tokio::join!`, which mishandles literally-`!`-typed branches.
 pub async fn run_list_watch(
     client: &HyperApiClient,
     resource_path: &str,
     mut on_event: impl FnMut(Value),
+    mut on_list_complete: impl FnMut(),
 ) -> anyhow::Result<()> {
     let mut backoff = INITIAL_BACKOFF;
     let mut resource_version: Option<String> = None;
@@ -471,6 +503,7 @@ pub async fn run_list_watch(
                     }
                     resource_version = Some(rv);
                     backoff = INITIAL_BACKOFF;
+                    on_list_complete();
                 }
                 Err(e) => {
                     eprintln!("controller: list {resource_path} failed: {e:#}");
@@ -662,6 +695,7 @@ mod tests {
                 "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
             },
         }));
+        state.mark_nodes_listed();
         for (slice_name, pod_ip) in [
             ("svc-a-abcde", "10.244.0.20"),
             ("svc-a-fghij", "10.244.0.2"),
@@ -715,6 +749,7 @@ mod tests {
                 "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
             },
         }));
+        state.mark_nodes_listed();
         let slice_a = serde_json::json!({
             "type": "ADDED",
             "object": {
@@ -790,6 +825,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
+        state.mark_nodes_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert_eq!(
@@ -852,6 +888,7 @@ mod tests {
                 }],
             },
         }));
+        state.mark_nodes_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert_eq!(desired.target_ports.len(), 2);
@@ -943,6 +980,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-b", "conditions": {"ready": true}}],
             },
         }));
+        state.mark_nodes_listed();
 
         // Reconciling from node-b's own perspective (the backend node) --
         // the ingress node in this flow is node-a, a DIFFERENT node.
@@ -958,6 +996,149 @@ mod tests {
             "TARGET_PORTS/VIP_MAP must cover every known node's address as a front, not just \
              this node's own -- otherwise the backend node can never decap a forward packet \
              whose client dialed a DIFFERENT node's front IP"
+        );
+    }
+
+    // Regression for the restart race: VIP_MAP/TARGET_PORTS pins
+    // survive a controller restart, and `reconcile::diff` deletes any
+    // current entry missing from `desired`. If a reconcile fires before the
+    // initial Node LIST has ever completed (racing the Service watch in
+    // `run_controller_loop`'s `tokio::join!`), `desired` must NOT report an
+    // empty vip_map/target_ports as if there are truly no fronts -- doing so
+    // would make `PinnedMaps::apply` delete every already-programmed front
+    // and blackhole every Service on this node until the Node LIST catches
+    // up. `fronts_known` is how `desired` tells "not known yet" apart from
+    // "genuinely empty" (the next two tests cover that other side).
+    #[test]
+    fn desired_before_node_list_completes_reports_fronts_unknown_not_empty() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        // A Node event has already landed (the Node watch's own list races
+        // the Service watch), but the initial Node LIST as a whole has not
+        // completed -- mark_nodes_listed() deliberately not called. svc-a
+        // already has a ready backend, so this WOULD produce a front if
+        // programmed.
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(
+            !desired.fronts_known,
+            "fronts_known must be false before the Node LIST has ever completed, or \
+             PinnedMaps::apply would diff this pass's vip_map/target_ports against whatever \
+             fronts a previous controller run already pinned (bpffs pins survive a restart) \
+             and delete every one this pass doesn't also produce -- exactly the restart \
+             blackhole this bug reported"
+        );
+        assert!(
+            desired.vip_map.is_empty() && desired.target_ports.is_empty(),
+            "a pre-LIST reconcile must not program ANY front, even one whose backend is \
+             already fully known -- reverting the gate that skips this loop would leak this \
+             entry back into an aggregate the caller still can't safely diff against"
+        );
+    }
+
+    // The flip side of the previous test: once the Node LIST has genuinely
+    // completed and found zero nodes, `desired` must go back to reporting
+    // the correct (destructive) result -- proving the fix gates on the
+    // race window, not on emptiness itself. Disabling deletes outright
+    // instead of gating on `nodes_listed` would fail this.
+    #[test]
+    fn desired_after_node_list_completes_with_zero_nodes_still_reports_fronts_known() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        // The Node LIST completed and genuinely found zero Node objects.
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(
+            desired.fronts_known,
+            "fronts_known must be true once the Node LIST has actually completed, even with \
+             zero nodes -- otherwise a real no-node cluster could never prune a stale front, \
+             and this fix would have just disabled deletes outright instead of gating on the \
+             startup race"
+        );
+        assert!(
+            desired.vip_map.is_empty(),
+            "with genuinely zero known nodes there is no valid front, so vip_map must still \
+             be empty here"
+        );
+    }
+
+    // A normal, fully-caught-up reconcile (the common case, and every other
+    // test in this file) must be unaffected by the new gate -- it must not
+    // have narrowed to only cover the race window's opposite case.
+    #[test]
+    fn desired_with_a_known_node_set_reports_fronts_known_and_programs_them() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        state.mark_nodes_listed();
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(
+            desired.fronts_known,
+            "a normal, fully-caught-up reconcile must report fronts_known -- the gate must \
+             only suppress the pre-LIST race window, not every reconcile"
+        );
+        assert_eq!(
+            desired.vip_map.len(),
+            1,
+            "a normal populated reconcile must still program its front -- the fix must not \
+             have accidentally suppressed the common case along with the race window"
         );
     }
 
