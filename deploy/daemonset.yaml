@@ -32,12 +32,27 @@ spec:
             capabilities:
               drop: ["ALL"]
               add: ["BPF", "NET_ADMIN"]
+          env:
+            # hostNetwork means status.hostIP is this node's own address --
+            # exactly the value `--node-ip` needs (`ebpf-lb-dataplane.md`'s
+            # node-owned-address model: every node advertises its OWN
+            # address as the LB front for every Service it fronts).
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          args:
+            # 10.42.0.0/16 is k3s's own default --cluster-cidr (flannel);
+            # override for a cluster provisioned with a different pod CIDR.
+            - --pod-cidr=10.42.0.0/16
+            - --node-ip=$(NODE_IP)
+            - --kubeconfig=/etc/beep-controller/kubeconfig
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
-          # TODO(controller binary): map names, pin-dir path, and any other
-          # map-schema-dependent args/env are not wired here -- that lands
-          # with the controller binary itself, not this manifest skeleton.
+            - name: kubeconfig
+              mountPath: /etc/beep-controller
+              readOnly: true
       volumes:
         # bpffs must already be mounted at this path on the host (it is on
         # any kernel new enough to run this dataplane); pins under it survive
@@ -46,3 +61,11 @@ spec:
           hostPath:
             path: /sys/fs/bpf
             type: Directory
+        # beep-kubeconfig only parses an X.509 client-cert kubeconfig (no
+        # in-cluster ServiceAccount token support yet) -- this Secret must
+        # hold one with (at least) the RBAC this DaemonSet's ClusterRole
+        # grants (rbac.yaml). Provisioning it is left to the cluster
+        # operator/deploy tooling, not this manifest.
+        - name: kubeconfig
+          secret:
+            secretName: beep-controller-kubeconfig
