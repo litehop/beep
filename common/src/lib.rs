@@ -260,7 +260,7 @@ pub enum ForwardAdmission {
     MintPending,
 }
 
-/// `in_main`: result of an `FWD_MAIN.get(key)` lookup.
+/// `in_main`: result of a `FLOW_TABLE.get(key)` lookup.
 pub fn forward_admission(in_main: bool) -> ForwardAdmission {
     if in_main {
         ForwardAdmission::Established
@@ -283,7 +283,7 @@ pub enum ReturnAuthorization {
     Drop,
 }
 
-/// `in_main`/`in_pending`: results of `FWD_MAIN.get(key)`/`FWD_PENDING.get(key)`
+/// `in_main`/`in_pending`: results of `FLOW_TABLE.get(key)`/`FWD_PENDING.get(key)`
 /// lookups. Callers should short-circuit the PENDING lookup when `in_main`
 /// is already true (the established/happy-path case costs one lookup, not
 /// two).
@@ -300,24 +300,24 @@ pub fn return_authorization(in_main: bool, in_pending: bool) -> ReturnAuthorizat
 /// Uplink-egress return-path admission (`beep-ebpf`'s
 /// `try_uplink_egress_return`, hook 3): whether a packet leaving the node on
 /// the physical uplink is one of this node's own backend Pods replying to a
-/// client, checked BEFORE the ~37-byte REV_FLOW conntrack key is even built.
+/// client, checked BEFORE the ~38-byte FLOW_TABLE conntrack key is even built.
 /// This hook sees ALL uplink egress traffic, not just beep's, so most
 /// packets take the `NotBackendTraffic` branch and must never pay for a
-/// REV_FLOW lookup at all.
+/// FLOW_TABLE lookup at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressReturnAdmission {
     /// Source is not one of this node's backend Pods -- not beep's
     /// traffic, pass through untouched.
     NotBackendTraffic,
     /// Source IS one of this node's backend Pods -- proceed to the
-    /// REV_FLOW lookup.
+    /// FLOW_TABLE lookup.
     BackendTraffic,
 }
 
 /// `is_backend_pod`: `POD_TARGETS.get(src_ip)` membership on the packet's
 /// SOURCE ADDRESS ONLY -- deliberately not its port. `POD_TARGETS` is keyed
 /// on pod IP alone precisely so this stays true across a rolling update or a
-/// targetPort edit: a flow only ever earns a REV_FLOW entry because the
+/// targetPort edit: a flow only ever earns a FLOW_TABLE entry because the
 /// forward path already found its pod in this same map, so admitting on
 /// membership alone can never drop a live flow whose target port has since
 /// changed -- comparing the port too would couple this gate to a value that
@@ -332,11 +332,11 @@ pub fn egress_return_admission(is_backend_pod: bool) -> EgressReturnAdmission {
     }
 }
 
-/// Outcome of the REV_FLOW lookup for a packet already confirmed
+/// Outcome of the FLOW_TABLE lookup for a packet already confirmed
 /// `EgressReturnAdmission::BackendTraffic`. A miss here can no longer be
 /// treated as "not ours" the way `EgressReturnAdmission::NotBackendTraffic`
 /// is -- the source has already been positively identified as one of this
-/// node's own backend Pods, most likely evicted from the LRU REV_FLOW table
+/// node's own backend Pods, most likely evicted from the LRU FLOW_TABLE
 /// rather than genuinely unrelated. Letting an identified backend Pod's
 /// reply through unencapsulated would leak a pod-CIDR-sourced packet onto
 /// the underlay while still stalling the connection either way, so dropping
@@ -345,14 +345,14 @@ pub fn egress_return_admission(is_backend_pod: bool) -> EgressReturnAdmission {
 /// `TC_ACT_SHOT` via `unwrap_or`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressReturnOutcome {
-    /// No live REV_FLOW entry for this identified backend Pod's packet --
+    /// No live FLOW_TABLE entry for this identified backend Pod's packet --
     /// drop it rather than forward it raw onto the underlay.
     Drop,
-    /// A live REV_FLOW entry exists -- proceed with the un-DNAT + re-encap.
+    /// A live FLOW_TABLE entry exists -- proceed with the un-DNAT + re-encap.
     Forward,
 }
 
-/// `has_rev_flow_entry`: result of a `REV_FLOW.get(key)` lookup, for a
+/// `has_rev_flow_entry`: result of a `FLOW_TABLE.get(key)` lookup, for a
 /// packet the caller has already gated through
 /// `EgressReturnAdmission::BackendTraffic`.
 pub fn egress_return_outcome(has_rev_flow_entry: bool) -> EgressReturnOutcome {
