@@ -7,7 +7,8 @@ Manifest skeleton for the beep servicelb controller.
   `Dockerfile` and published by `.github/workflows/delivery.yaml`'s
   `image` job on every push to `main`.
 - **RBAC is scoped to exactly what the design calls for:** list/watch/get on
-  `Service` and `discovery.k8s.io/EndpointSlice`. Nothing broader.
+  `Service`, `discovery.k8s.io/EndpointSlice`, and `Node` (the last needed to
+  resolve an `EndpointSlice` endpoint's hosting-node IP). Nothing broader.
 
 ## Files
 
@@ -27,9 +28,10 @@ central controller can't program them), loads and pins the tc-bpf programs
 once, watches `Service`/`EndpointSlice`, writes maps on change, then idles —
 the kernel does the packet forwarding.
 
-## Out of scope here
+## Kubeconfig
 
-Container args/env that encode map names, pin-dir paths, or other
-map-schema-dependent wiring are left for the controller-binary work — baking
-them into this skeleton ahead of that would be guessing at a schema that
-isn't settled yet.
+`beep-kubeconfig` only parses an X.509 client-cert kubeconfig file (no
+in-cluster ServiceAccount token support yet), so `--kubeconfig` points at a
+Secret-mounted kubeconfig, not the ServiceAccount's own projected token.
+Provisioning that Secret (`beep-controller-kubeconfig` in `kube-system`) is
+left to the cluster operator/deploy tooling -- not this manifest.
