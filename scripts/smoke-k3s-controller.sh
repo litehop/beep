@@ -150,6 +150,17 @@ for vm in "$VM_A" "$VM_B"; do
   limactl shell "$vm" -- sudo bash -c '
     ip link show geneve0 >/dev/null 2>&1 || ip link add geneve0 type geneve external
     ip link set geneve0 up
+    # Same rp_filter workaround every other smoke harness applies
+    # (smoke-remote.sh/smoke-wg-2node-remote.sh/smoke-eth-ingress-2node-remote.sh):
+    # geneve0 carries no IP address, so fib_validate_source in the kernel
+    # never grants its loose-mode (2) exception for it -- an address-less
+    # input device falls through to the same reverse-path drop as strict
+    # mode regardless of the configured value, silently blackholing every
+    # decapped forward packet before it ever reaches cni0 (confirmed live:
+    # kprobe:ip_route_input_noref returns -EXDEV for the decapped packet,
+    # even with rp_filter=2 on both all and geneve0). Only rp_filter=0
+    # bypasses this check.
+    sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   '
 done
 
