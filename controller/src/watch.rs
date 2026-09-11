@@ -81,7 +81,10 @@ pub struct WatchState {
     // means `node_ips` is empty (or partial) purely because the LIST hasn't
     // delivered its results yet, NOT because the cluster genuinely has no
     // nodes -- `desired`'s doc comment on `front_ips` explains why that
-    // distinction matters.
+    // distinction matters. A one-way latch: `mark_nodes_listed` also fires
+    // on every 410-Gone relist (`run_list_watch`'s `on_list_complete`), not
+    // just the very first LIST, but setting an already-`true` bool to `true`
+    // again is a no-op, so that's harmless.
     nodes_listed: bool,
 }
 
@@ -333,15 +336,22 @@ impl WatchState {
         // `reconcile::diff` deletes any current entry missing from
         // `desired` -- so reconciling with `node_ips` still empty (or
         // partial) would wipe every already-programmed front. `nodes_listed`
-        // gates the whole front loop below on the initial Node LIST having
-        // actually completed, and `fronts_known` above carries that gate
-        // into `DesiredEntries` so `PinnedMaps::apply` knows to leave
-        // VIP_MAP/TARGET_PORTS untouched rather than diff them against an
-        // empty desired set while the node set isn't known yet.
+        // gates only the front_ip loop below (VIP_MAP/TARGET_PORTS) on the
+        // initial Node LIST having actually completed, and `fronts_known`
+        // above carries that gate into `DesiredEntries` so `PinnedMaps::apply`
+        // knows to leave VIP_MAP/TARGET_PORTS untouched rather than diff them
+        // against an empty desired set while the node set isn't known yet.
+        // POD_TARGETS must NOT be gated the same way: it's EndpointSlice/
+        // local-node-derived (`reconcile::pod_targets_for_node`), not
+        // front-derived, so it's still computed below even while
+        // `nodes_listed` is false. `apply_pod_targets` full-syncs
+        // unconditionally (no `fronts_known`-style guard, since POD_TARGETS
+        // never depended on the Node LIST) -- handing it an empty set here
+        // pre-LIST would wipe already-pinned POD_TARGETS entries and
+        // blackhole this node's backend Pods until the LIST completes, the
+        // same restart bug this gate exists to prevent, just for the other
+        // map.
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
-        if !self.nodes_listed {
-            return aggregate;
-        }
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -401,6 +411,13 @@ impl WatchState {
                 })
                 .collect();
 
+            aggregate
+                .pod_targets
+                .extend(reconcile::pod_targets_for_node(&endpoint_slices, node));
+
+            if !self.nodes_listed {
+                continue;
+            }
             for front_ip in &front_ips {
                 let view = ServiceView {
                     vip_ip: *front_ip,
@@ -409,7 +426,6 @@ impl WatchState {
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
                 aggregate.vip_map.extend(desired.vip_map);
                 aggregate.target_ports.extend(desired.target_ports);
-                aggregate.pod_targets.extend(desired.pod_targets);
             }
         }
         aggregate
@@ -1058,6 +1074,61 @@ mod tests {
             "a pre-LIST reconcile must not program ANY front, even one whose backend is \
              already fully known -- reverting the gate that skips this loop would leak this \
              entry back into an aggregate the caller still can't safely diff against"
+        );
+    }
+
+    // POD_TARGETS is EndpointSlice/local-node-derived, not Node-LIST-derived,
+    // so the `nodes_listed` gate above must NOT zero it out too. Unlike
+    // VIP_MAP/TARGET_PORTS, `apply_pod_targets` full-syncs POD_TARGETS
+    // unconditionally (no `fronts_known` check) -- if `desired` reported an
+    // empty pod_targets here, a controller restart would wipe the
+    // already-pinned entry for this node's own backend Pod before the Node
+    // LIST completes, and its decap path would blackhole until the LIST
+    // catches up. Broadening the whole-`DesiredEntries` early return that
+    // this test guards against would fail it.
+    #[test]
+    fn desired_before_node_list_completes_still_computes_pod_targets() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        // mark_nodes_listed() deliberately not called -- this is the
+        // pre-LIST restart window.
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(
+            !desired.fronts_known,
+            "fronts_known must still be false pre-LIST -- this test only guards pod_targets, \
+             it must not weaken the front-side gate PR #53 added"
+        );
+        assert!(
+            !desired.pod_targets.is_empty(),
+            "a controller restart must not blackhole backend-Pod decap by wiping POD_TARGETS \
+             before the Node LIST completes -- pod_targets is local-node/EndpointSlice-derived \
+             and must be computed even while fronts_known is false"
         );
     }
 
