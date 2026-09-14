@@ -26,6 +26,14 @@ use beep_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use clap::Parser;
 use serde_json::Value;
 
+// Heap-profiling build only: routes every allocation through dhat so a
+// SIGINT-triggered flush (see `main`) can attribute idle RSS to call sites.
+// Not present in the default build -- the shipped binary keeps the system
+// allocator.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
 /// See `src/main.rs`'s identical constants: `VIP_MAP`/`TARGET_PORTS` scale
@@ -207,6 +215,13 @@ async fn run_controller_loop(
 // it would never use.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Held for `main`'s whole body; its `Drop` (on return, below) writes
+    // dhat-heap.json. `run_controller_loop` never returns on its own, so a
+    // dhat-heap build races it against Ctrl-C instead of awaiting it
+    // directly -- that's the only way to reach this `Drop` at all.
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let args = Args::parse();
 
     bump_memlock_rlimit();
@@ -285,5 +300,17 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     eprintln!("all 3 hooks attached; watching Service/EndpointSlice/Node");
+
+    #[cfg(feature = "dhat-heap")]
+    {
+        tokio::select! {
+            result = run_controller_loop(client, state, maps, node) => result,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("controller: dhat-heap: SIGINT received, flushing dhat-heap.json");
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(feature = "dhat-heap"))]
     run_controller_loop(client, state, maps, node).await
 }
