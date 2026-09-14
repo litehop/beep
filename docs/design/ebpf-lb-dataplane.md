@@ -122,13 +122,13 @@ forward-write and return-read).
 
 | Component | Estimate (1 vCPU) | Basis |
 |---|---|---|
-| Userspace control-plane process | 3–5 MiB RSS | Rust async binary; idle after reconcile. |
+| Userspace control-plane process | ~6.9 MiB RSS | Rust async binary; idle after reconcile. Measured, not estimated — gated by CI's `memory-smoke` job (`scripts/memory-smoke-controller.sh`). |
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
 | Front-IP map (<100 Services × ≤2 protocols) | ~25 KiB | <200 entries. |
 | Endpoint map (<1000 endpoints) | ~128 KiB | Full map on every node. |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
-| **Total** | **~4–7 MiB** | Independent of vCPU count — maps are shared. |
+| **Total** | **~8–9 MiB** | Independent of vCPU count — maps are shared. |
 
 All maps pre-allocate their full ceiling — loxilb's "cannot start on 1GB
 node" failure mode (gate 2) — sized for u7s's envelope (<10 nodes/<100
