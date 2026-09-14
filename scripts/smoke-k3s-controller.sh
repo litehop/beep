@@ -7,20 +7,15 @@
 # from LIVE watch events -- not hand-rolled fixture args like
 # scripts/smoke.sh / smoke-wg-2node.sh / smoke-eth-ingress-2node.sh.
 #
-# CURRENT STATUS: the AppArmor/bpffs-pin blocker and the BPF_PROG_LOAD
-# verifier/CAP_PERFMON blocker this gate originally surfaced are both
-# fixed (`deploy/daemonset.yaml`'s `appArmorProfile: Unconfined` +
-# `add: ["BPF", "NET_ADMIN", "PERFMON"]`; see
-# docs/decisions/servicelb-controller-apparmor-unconfined.md).
-# CONTROLLER-DEPLOY and MAP-PROGRAMMING now PASS for real. The round trip
-# itself still fails -- a distinct dataplane forwarding bug: the Geneve
-# decap reaches node-b's geneve0 (RX counter increments) but no return
-# traffic and no FLOW_TABLE entry ever appears on either node. This
-# script's `run`
-# therefore still ends non-zero at ROUND-TRIP, but every step before
-# that -- cluster bring-up, geneve0, the kubeconfig Secret, the
-# DaemonSet/RBAC apply, the controller actually loading and pinning its
-# eBPF programs, and map programming -- is a genuine, asserted PASS.
+# STATUS: the AppArmor/bpffs-pin blocker, the BPF_PROG_LOAD
+# verifier/CAP_PERFMON blocker, and the cross-node return-path dataplane
+# bug this gate originally surfaced are all fixed (`deploy/daemonset.yaml`'s
+# `appArmorProfile: Unconfined` + `add: ["BPF", "NET_ADMIN", "PERFMON"]`;
+# see docs/decisions/servicelb-controller-apparmor-unconfined.md). Every
+# step -- cluster bring-up, geneve0, the kubeconfig Secret, the
+# DaemonSet/RBAC apply, the controller loading and pinning its eBPF
+# programs, map programming, the cross-node round trip, and FLOW_TABLE
+# promotion -- is a genuine, asserted PASS.
 #
 # TOPOLOGY: ingress VIP = node-a's own address, backend Pod pinned
 # (`nodeName`) to node-b -- a genuinely cross-node round trip: the backend
@@ -130,6 +125,12 @@ cleanup() {
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
+    limactl shell "$vm" -- sudo bash -c '
+      if [ -f /tmp/beep-k3s-controller-rpfilter-all.saved ]; then
+        sysctl -w net.ipv4.conf.all.rp_filter="$(cat /tmp/beep-k3s-controller-rpfilter-all.saved)" >/dev/null 2>&1 || true
+        rm -f /tmp/beep-k3s-controller-rpfilter-all.saved
+      fi
+    ' >/dev/null 2>&1 || true
   done
 }
 trap cleanup EXIT
@@ -172,6 +173,14 @@ for vm in "$VM_A" "$VM_B"; do
     # bypasses this check. The kernel takes max(all, interface), so the
     # `all` companion is required too -- an interface-only 0 is fragile
     # against a nonzero `all` (the siblings above all set both).
+    # Saved (all only -- geneve0 itself is deleted in cleanup, so its
+    # own value never persists to restore) and restored on exit, same
+    # as smoke-remote.sh/smoke-wg-2node-remote.sh/
+    # smoke-eth-ingress-2node-remote.sh, so this rig never leaves the
+    # VM'"'"'s global rp_filter permanently weakened.
+    if [ ! -f /tmp/beep-k3s-controller-rpfilter-all.saved ]; then
+      sysctl -n net.ipv4.conf.all.rp_filter > /tmp/beep-k3s-controller-rpfilter-all.saved
+    fi
     sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
     sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   '
