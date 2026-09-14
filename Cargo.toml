@@ -20,6 +20,19 @@ debug = 2
 codegen-units = 1
 strip = false
 
+# Size win for the host binaries (beep, beep-controller): resource-starved
+# clusters care about image/disk size, not just idle RSS. lto and panic
+# can't be scoped per-package (Cargo forbids overriding them in
+# [profile.release.package.*]), so this also reaches beep-ebpf's build, but
+# its own package override above still wins for codegen-units/strip/debug.
+# panic = "abort" is safe: no crate in this workspace uses catch_unwind, and
+# a DaemonSet pod restart on panic is an acceptable outcome.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
 [dependencies]
 aya = { version = "0.14", default-features = false }
 anyhow = "1"
