@@ -155,6 +155,19 @@ pub struct DesiredEntries {
     /// "no fronts should exist" -- diffing against the latter would delete
     /// every already-programmed front that survived a controller restart.
     pub fronts_known: bool,
+    /// Whether `pod_targets` was computed with THIS node's own address
+    /// already resolvable in `WatchState::desired`'s endpoint->node_ip
+    /// lookup (`pod_targets_for_node` can only admit an endpoint whose
+    /// resolved `node_ip` equals `NodeContext::node_ip`). `false` means
+    /// "this node's own Node LIST/watch entry hasn't landed yet", not
+    /// "this node hosts no backends" -- in a multi-node cluster, whichever
+    /// position THIS node's own entry lands at in the startup Node LIST is
+    /// unrelated to every OTHER node's position, so gating this on the
+    /// full list (`fronts_known`) would still let an already-pinned local
+    /// backend get wiped while unrelated nodes are still being listed.
+    /// `PinnedMaps::apply` skips the destructive POD_TARGETS full-sync
+    /// while this is `false`.
+    pub pod_targets_known: bool,
 }
 
 fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> VipKey {
