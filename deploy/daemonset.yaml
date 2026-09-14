@@ -21,12 +21,36 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       # Runs on every node, including control-plane nodes: the dataplane
       # this controller programs must be present wherever Service traffic
-      # can land, not just on worker nodes.
+      # can land, not just on worker nodes. CriticalAddonsOnly and the
+      # control-plane role taint are two DIFFERENT taints some clusters
+      # apply to capacity-constrained control-plane nodes -- tolerating
+      # only one won't get this pod scheduled there. (DaemonSet pods get
+      # the standard not-ready/unreachable/pressure tolerations injected
+      # automatically, so those don't need to be listed here.)
       tolerations:
-        - operator: Exists
+        - key: CriticalAddonsOnly
+          operator: Exists
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: servicelb-controller
           image: docker.io/valerauko/beep-lb:latest
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              # No cpu limit: this is a mostly-idle watch loop and a cpu
+              # limit would only add throttling risk for no benefit.
+              # Memory limit must clear the ~31 MiB transient peak from aya
+              # parsing /sys/kernel/btf/vmlinux in load_ebpf (measured with
+              # dhat) with headroom, or the controller OOMKills on every
+              # startup -- steady-state RSS afterward is ~7 MiB.
+              memory: 96Mi
           securityContext:
             privileged: false
             # containerd's default cri-containerd.apparmor.d profile denies
