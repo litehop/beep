@@ -18,13 +18,15 @@
 # scripts/smoke-remote.sh's own smoke-veth0/geneve0/`/sys/fs/bpf/beep-smoke`
 # fixture run earlier in the same job -- no real traffic needs to flow
 # through them here, only a verifier-accept attach, so no veth pair/netns/
-# rp_filter dance is needed either. `ip link add` retries for up to a
-# minute: k3s's own flannel CNI bringing up cni0/flannel.1 and scheduling
-# coredns was observed leaving the host's rtnl busy enough to fail this
-# exact call with EBUSY on a real GitHub-hosted runner, well after /readyz
-# already reported the API server itself healthy (ci.yaml's install step
-# additionally waits for coredns Running before this script runs at all --
-# this retry is defense in depth, not the primary fix).
+# rp_filter dance is needed either. That earlier fixture's own `geneve0`
+# stays up for the rest of the job (nothing calls `smoke-remote.sh
+# cleanup`), and an "external"-mode geneve device with no explicit
+# `dstport` binds the UDP 6081 default -- a SECOND such device in the same
+# netns collides on that same port with a real, deterministic (not
+# transient) EBUSY, confirmed live. `dstport 6082` sidesteps it; `ip link
+# add` still retries a short while as defense in depth against any
+# genuinely transient rtnl contention, but that is no longer the expected
+# failure mode here.
 #
 # RSS ceilings/sampling: see scripts/controller-rss.sh (shared with
 # scripts/smoke-k3s-controller.sh's own real-2-node data point).
@@ -93,7 +95,7 @@ ip_link_add_retry() { # ip_link_add_retry <ip link add args...> -- retries on a 
 echo "==> [1/6] creating a dedicated dummy uplink + geneve device for beep-controller's own tc-bpf attach"
 ip_link_add_retry "$UPLINK_IFACE" type dummy
 ip link set "$UPLINK_IFACE" up
-ip_link_add_retry "$GENEVE_IFACE" type geneve external
+ip_link_add_retry "$GENEVE_IFACE" type geneve external dstport 6082
 ip link set "$GENEVE_IFACE" up
 
 echo "==> [2/6] resolving this single node's identity from the live k3s apiserver"
