@@ -24,10 +24,10 @@
 # against the real binary. The ".*" below skips over those inline tags.
 # Validate any focus-regex change with --dry-run first.
 #
-# Requires the kube-proxy/flannel coexistence gap closed and the
-# cross-node return-path dataplane bug fixed for a genuine green run --
-# check kube-proxy/status-IP overlap before attributing a red run to a
-# beep dataplane regression.
+# The kube-proxy/flannel coexistence gap and the cross-node return-path
+# dataplane bug that once blocked a genuine green run here are both
+# fixed -- check kube-proxy/status-IP overlap before attributing a red
+# run to a beep dataplane regression.
 #
 # Usage: scripts/e2e-lb-k3s.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
 #          [--vm-client <client-vm>] [--focus <ginkgo-focus-regex>]
