@@ -52,9 +52,9 @@ impl PinnedMaps {
     /// syscalls (`reconcile::diff`'s doc comment). Runs all three maps'
     /// diffs to completion before propagating any error: a capacity failure
     /// on VIP_MAP must never suppress the TARGET_PORTS/POD_TARGETS writes
-    /// for OTHER, unrelated Services in the same reconcile tick (PR #51
-    /// review's HIGH finding -- a bare `?` chain here silently left every
-    /// later Service unrouted with no attempt at all).
+    /// for OTHER, unrelated Services in the same reconcile tick -- a bare
+    /// `?` chain here previously left every later Service unrouted with no
+    /// attempt at all.
     ///
     /// Skips the VIP_MAP/TARGET_PORTS diff entirely while
     /// `desired.fronts_known` is `false` (`DesiredEntries`'s doc comment):
@@ -216,10 +216,10 @@ mod tests {
 
     #[test]
     fn apply_diff_ops_continues_past_a_write_failure_so_later_entries_still_get_applied() {
-        // Regression for PR #51 review's HIGH finding: the old code used a
-        // bare `?` per op, so ONE VIP_MAP capacity failure aborted every
-        // LATER Service's write in the same reconcile -- those Services went
-        // silently unrouted with no attempt made and no error naming them.
+        // Regression test: the old code used a bare `?` per op, so ONE
+        // VIP_MAP capacity failure aborted every LATER Service's write in
+        // the same reconcile -- those Services went silently unrouted with
+        // no attempt made and no error naming them.
         let ops = vec![
             MapOp::Upsert(1u32, 10u8),
             MapOp::Upsert(2u32, 20u8), // simulated capacity failure

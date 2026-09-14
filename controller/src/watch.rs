@@ -1136,7 +1136,8 @@ mod tests {
         assert!(
             !desired.fronts_known,
             "fronts_known must still be false pre-LIST -- this test only guards pod_targets, \
-             it must not weaken the front-side gate PR #53 added"
+             it must not weaken the fronts_known gate that keeps VIP_MAP/TARGET_PORTS \
+             untouched until the Node LIST completes"
         );
         assert!(
             !desired.pod_targets.is_empty(),
