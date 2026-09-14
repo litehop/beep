@@ -126,6 +126,10 @@ jobs:
   # natively on ubuntu-latest (no Lima/cross-build), then asserts the discovered
   # map set is EXACTLY the 7 known maps (catches partial-discovery regressions a
   # byte-sum-only check would miss) under a gross-regression bytes_memlock ceiling.
+  # Also runs the real beep-controller binary against a real single-node k3s
+  # apiserver on this same runner and gates its userspace RSS
+  # (scripts/memory-smoke-controller.sh) -- the tokio/hyper/rustls/watch-loop
+  # weight the eBPF-map-memory check above never measures.
   memory-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -164,8 +168,8 @@ jobs:
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y netcat-openbsd
 
-      - name: Build beep-ebpf + beep
-        run: cargo build --release
+      - name: Build beep-ebpf + beep + beep-controller
+        run: cargo build --release -p beep -p beep-controller
 
       - name: Run smoke fixture (loads real programs, drives one round trip, samples eBPF map memory + loader RSS)
         run: |
@@ -180,3 +184,24 @@ jobs:
 
       - name: Assert the discovered map set is exactly the 7 known maps, under the gross-regression byte ceiling
         run: bash scripts/assert-ebpf-map-memory.sh /tmp/beep-ebpf-memory-assert/ebpf-map-memory.csv
+
+      # get.k3s.io's own installer (systemd unit + start), same source ci.yaml
+      # already trusts nowhere else -- scripts/k3s-up.sh uses the identical
+      # install path for the Lima gate. servicelb/traefik/metrics-server/
+      # local-storage disabled: beep replaces servicelb, the rest are unused
+      # weight this single-node, no-real-workload cluster doesn't need.
+      - name: Install single-node k3s (for the beep-controller RSS gate)
+        run: |
+          set -euo pipefail
+          curl -sfL https://get.k3s.io -o /tmp/k3s-install.sh
+          chmod +x /tmp/k3s-install.sh
+          sudo INSTALL_K3S_EXEC="server --disable=traefik,servicelb,metrics-server,local-storage" /tmp/k3s-install.sh
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get --raw=/readyz >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "FAIL: k3s server did not become ready" >&2
+          exit 1
+
+      - name: Run beep-controller against k3s and gate its userspace RSS
+        run: sudo bash scripts/memory-smoke-controller.sh run
