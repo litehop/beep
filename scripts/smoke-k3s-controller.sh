@@ -33,6 +33,22 @@
 # rig could only prove the forward leg). Driving the client from a
 # genuinely separate VM sidesteps that blocker entirely.
 #
+# CONTROLLER RSS: ebpf-lb-dataplane.md budgets the userspace control-plane
+# process at 3-5 MiB RSS, but that figure was never measured against the
+# ACTUAL beep-controller binary -- only against the standalone beep loader
+# (scripts/sample-ebpf-memory.sh, driven by scripts/smoke-remote.sh's CI
+# job), which carries none of beep-controller's tokio/hyper/rustls/watch-loop
+# weight. Measured directly on a live Linux run (Lima aarch64, beep-controller
+# built from source, watching a real single-node k3s apiserver): ~6.8 MiB
+# (6948 kB) idle baseline right after the initial Service/EndpointSlice/Node
+# LIST+watch settle, ~7.0 MiB (7004 kB) after reconciling 6 Services and 5
+# backend Pods (a ~56 kB delta) -- modestly above the doc's 3-5 MiB line, not
+# a wild overshoot, and consistent with this being a real async k8s client
+# rather than the bare reconcile logic the doc's estimate assumed. The two
+# ceilings below (CONTROLLER_RSS_BASELINE_CEILING_KB/CONTROLLER_RSS_GROWTH_
+# CEILING_KB) are generous multiples of that measured baseline/delta, not the
+# doc's unvalidated estimate.
+#
 # KUBECONFIG: beep-kubeconfig (controller/src/main.rs's --kubeconfig) only
 # parses an X.509 client-cert kubeconfig -- no in-cluster ServiceAccount
 # token support yet. This gate extracts k3s's own admin kubeconfig
@@ -71,6 +87,8 @@ DEPLOY_NAME="whoami"
 VIP_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
 KUBECONFIG_SECRET="beep-controller-kubeconfig"
+CONTROLLER_RSS_BASELINE_CEILING_KB=16384
+CONTROLLER_RSS_GROWTH_CEILING_KB=4096
 
 for tool in limactl jq; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
@@ -88,6 +106,14 @@ map_entry_count() { # map_entry_count <vm> <map-name> -- entries in a pinned map
   local vm="$1" name="$2" json
   json=$(limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>/dev/null) || { echo ""; return; }
   jq 'length' <<<"$json" 2>/dev/null || echo ""
+}
+
+controller_rss() { # controller_rss <vm> -- beep-controller process RSS in kB on that node, "" if not found
+  local vm="$1" pid rss
+  pid=$(limactl shell "$vm" -- pgrep -f beep-controller 2>/dev/null | head -1) || true
+  [ -z "$pid" ] && { echo ""; return; }
+  rss=$(limactl shell "$vm" -- ps -o rss= -p "$pid" 2>/dev/null | tr -d '[:space:]') || true
+  echo "$rss"
 }
 
 dump_evidence() {
@@ -124,7 +150,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> [1/9] bringing up the k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
+echo "==> [1/11] bringing up the k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
 "$SCRIPT_DIR/k3s-up.sh" --vm-a "$VM_A" --vm-b "$VM_B"
 if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
   limactl start "$VM_CLIENT"
@@ -145,7 +171,7 @@ kube get node "$NODE_A_K8S" "$NODE_B_K8S" >/dev/null || {
 }
 echo "CLUSTER-UP: PASS ($VM_A=$IP_A/$NODE_A_K8S ingress, $VM_B=$IP_B/$NODE_B_K8S backend, client=$VM_CLIENT/$IP_CLIENT)"
 
-echo "==> [2/9] creating geneve0 on both nodes (external mode -- beep sets the tunnel key itself)"
+echo "==> [2/11] creating geneve0 on both nodes (external mode -- beep sets the tunnel key itself)"
 for vm in "$VM_A" "$VM_B"; do
   limactl shell "$vm" -- sudo bash -c '
     ip link show geneve0 >/dev/null 2>&1 || ip link add geneve0 type geneve external
@@ -167,7 +193,7 @@ for vm in "$VM_A" "$VM_B"; do
   '
 done
 
-echo "==> [3/9] provisioning the controller's kubeconfig Secret from $VM_A's own admin kubeconfig (see this script's header)"
+echo "==> [3/11] provisioning the controller's kubeconfig Secret from $VM_A's own admin kubeconfig (see this script's header)"
 limactl shell "$VM_A" -- sudo bash -c "
   sed 's#server: https://127.0.0.1:6443#server: https://${IP_A}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-controller-kubeconfig
   k3s kubectl create secret generic $KUBECONFIG_SECRET -n kube-system \
@@ -175,7 +201,7 @@ limactl shell "$VM_A" -- sudo bash -c "
   rm -f /tmp/beep-controller-kubeconfig
 "
 
-echo "==> [4/9] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
+echo "==> [4/11] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
 kube apply -f - < "$REPO_ROOT/deploy/rbac.yaml"
 kube apply -f - < "$REPO_ROOT/deploy/daemonset.yaml"
 controller_deploy_failed=0
@@ -210,7 +236,24 @@ if [ "$controller_deploy_failed" -ne 0 ]; then
 fi
 echo "CONTROLLER-DEPLOY: PASS (servicelb-controller Running on both nodes, zero restarts after a 10s settle)"
 
-echo "==> [5/9] creating the real Service + backend Deployment (Pod pinned to $NODE_B_K8S)"
+echo "==> [5/11] sampling beep-controller RSS baseline (post-deploy, before any Service/EndpointSlice reconcile load)"
+rss_a_baseline=$(controller_rss "$VM_A")
+rss_b_baseline=$(controller_rss "$VM_B")
+[ -n "$rss_a_baseline" ] && [ -n "$rss_b_baseline" ] || {
+  echo "FAIL: could not resolve beep-controller RSS on $VM_A ('$rss_a_baseline') or $VM_B ('$rss_b_baseline')" >&2
+  dump_evidence
+  exit 1
+}
+for rss in "$rss_a_baseline" "$rss_b_baseline"; do
+  [ "$rss" -le "$CONTROLLER_RSS_BASELINE_CEILING_KB" ] || {
+    echo "FAIL: beep-controller baseline RSS ${rss} kB exceeds the ${CONTROLLER_RSS_BASELINE_CEILING_KB} kB ceiling (see this script's header comment for the measured baseline this ceiling is set against)" >&2
+    dump_evidence
+    exit 1
+  }
+done
+echo "CONTROLLER-RSS-BASELINE: PASS ($VM_A=${rss_a_baseline}kB $VM_B=${rss_b_baseline}kB, ceiling ${CONTROLLER_RSS_BASELINE_CEILING_KB}kB)"
+
+echo "==> [6/11] creating the real Service + backend Deployment (Pod pinned to $NODE_B_K8S)"
 kube create namespace "$NAMESPACE" --dry-run=client -o yaml | kube apply -f -
 cat <<EOF | kube apply -f -
 apiVersion: apps/v1
@@ -247,7 +290,7 @@ spec:
       protocol: TCP
 EOF
 
-echo "==> [6/9] waiting for the Deployment, EndpointSlice, and status.loadBalancer.ingress"
+echo "==> [7/11] waiting for the Deployment, EndpointSlice, and status.loadBalancer.ingress"
 kube -n "$NAMESPACE" rollout status deployment/"$DEPLOY_NAME" --timeout=60s || {
   echo "FAIL: backend Deployment never became Ready" >&2
   kube -n "$NAMESPACE" describe pods >&2 || true
@@ -286,7 +329,7 @@ case "$ingress_ips" in
 esac
 echo "SERVICE STATUS: PASS (status.loadBalancer.ingress = $ingress_ips)"
 
-echo "==> [7/9] confirming the dataplane maps are programmed"
+echo "==> [8/11] confirming the dataplane maps are programmed"
 vip_a=$(map_entry_count "$VM_A" VIP_MAP)
 vip_b=$(map_entry_count "$VM_B" VIP_MAP)
 pod_targets_b=$(map_entry_count "$VM_B" POD_TARGETS)
@@ -299,7 +342,26 @@ pod_targets_b=$(map_entry_count "$VM_B" POD_TARGETS)
 }
 echo "MAP-PROGRAMMING: PASS (VIP_MAP: $VM_A=$vip_a $VM_B=$vip_b entries, $VM_B POD_TARGETS=$pod_targets_b entries)"
 
-echo "==> [8/9] driving client ($VM_CLIENT, $IP_CLIENT) -> VIP $IP_A:$VIP_PORT -> cross-node backend on $VM_B"
+echo "==> [9/11] sampling beep-controller RSS after real reconcile load and asserting growth stays bounded"
+rss_a_peak=$(controller_rss "$VM_A")
+rss_b_peak=$(controller_rss "$VM_B")
+[ -n "$rss_a_peak" ] && [ -n "$rss_b_peak" ] || {
+  echo "FAIL: could not resolve beep-controller RSS on $VM_A ('$rss_a_peak') or $VM_B ('$rss_b_peak')" >&2
+  dump_evidence
+  exit 1
+}
+delta_a=$(( rss_a_peak - rss_a_baseline ))
+delta_b=$(( rss_b_peak - rss_b_baseline ))
+for delta in "$delta_a" "$delta_b"; do
+  [ "$delta" -le "$CONTROLLER_RSS_GROWTH_CEILING_KB" ] || {
+    echo "FAIL: beep-controller RSS grew by ${delta} kB reconciling one Service+backend Pod, exceeding the ${CONTROLLER_RSS_GROWTH_CEILING_KB} kB growth ceiling -- an unbounded per-Service/per-endpoint retained allocation would show up here first" >&2
+    dump_evidence
+    exit 1
+  }
+done
+echo "CONTROLLER-RSS-PEAK: PASS ($VM_A=${rss_a_peak}kB (delta ${delta_a}kB) $VM_B=${rss_b_peak}kB (delta ${delta_b}kB), growth ceiling ${CONTROLLER_RSS_GROWTH_CEILING_KB}kB)"
+
+echo "==> [10/11] driving client ($VM_CLIENT, $IP_CLIENT) -> VIP $IP_A:$VIP_PORT -> cross-node backend on $VM_B"
 set +e
 CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${VIP_PORT}/" 2>&1)"
 CLIENT_RC=$?
@@ -317,7 +379,7 @@ if ! grep -q "RemoteAddr: ${IP_CLIENT}:" <<<"$CLIENT_BODY"; then
 fi
 echo "ROUND-TRIP: PASS (symmetric return; whoami's RemoteAddr confirms the real client IP $IP_CLIENT reached the pod un-SNAT'd)"
 
-echo "==> [9/9] confirming a conntrack/FLOW_TABLE entry exists for the flow"
+echo "==> [11/11] confirming a conntrack/FLOW_TABLE entry exists for the flow"
 flow_a=$(map_entry_count "$VM_A" FLOW_TABLE)
 [ -n "$flow_a" ] && [ "$flow_a" -ge 1 ] || {
   echo "FAIL: $VM_A's FLOW_TABLE has no entries ($flow_a) after a completed round trip" >&2
