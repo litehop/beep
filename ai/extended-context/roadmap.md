@@ -86,18 +86,16 @@ not be treated as a v0.x blocker.
 
 ## Versioning trajectory
 
-Cut **v0.1.0** once the u7s-testable bar and the docs gap above are closed.
-Mechanics, once decided: add semver image tags in
-`.github/workflows/delivery.yaml` (today it only pushes `:latest`/`:sha`),
-pin `deploy/daemonset.yaml` to `:v0.1.0` instead of `:latest`, and git-tag
-the release. The eventual repo split (`mayor-aie31.4`) for an independent
-release cadence is out of scope for v0.1.0.
+**Ratified 2026-09-14**: v0.1.0 = single-backend-per-Service delivery is
+sufficient for u7s's first integration; multi-endpoint LB (`beep-5lw`) is a
+fast-follow, not a v0.1.0 blocker. The controller ships single-endpoint
+today by design (deferred from `mayor-9gr0n`). Full scheme and scope in
+`docs/decisions/versioning.md`.
 
-## Open (operator to ratify)
-
-- **Does v0.1.0 require multi-endpoint LB (`beep-5lw`), or is
-  single-backend-per-Service sufficient for u7s's first integration?** The
-  controller ships single-endpoint today by design (deferred from
-  `mayor-9gr0n`); `beep-5lw` is the open feature bead for real N-endpoint
-  selection. No versioning ADR exists yet -- write one once this is
-  ratified, since it determines what v0.1.0 actually promises.
+`.github/workflows/delivery.yaml` now publishes
+`docker.io/valerauko/beep-lb:<tag>` on any `v*` git tag push, alongside its
+existing `:latest`/`:sha` branch-push tags. Still open, and owned by the
+operator per the ADR's cut procedure: push the `v0.1.0` tag itself, then
+pin `deploy/daemonset.yaml` to `:v0.1.0` instead of `:latest`. The eventual
+repo split (`mayor-aie31.4`) for an independent release cadence stays out
+of scope for v0.1.0.

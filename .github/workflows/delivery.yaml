@@ -3,6 +3,7 @@ name: Delivery
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       push:
@@ -75,6 +76,26 @@ jobs:
           username: valerauko
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # A branch push tags :latest + :sha, unchanged. A `v*` tag push (the
+      # release cut procedure in docs/decisions/versioning.md) tags the
+      # version instead of :latest, so a historical tag never clobbers
+      # :latest with an older commit's image.
+      - name: Determine image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            extra="docker.io/valerauko/beep-lb:${{ github.ref_name }}"
+          else
+            extra="docker.io/valerauko/beep-lb:latest"
+          fi
+          {
+            echo "list<<EOF"
+            echo "docker.io/valerauko/beep-lb:${{ github.sha }}"
+            echo "$extra"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # No QEMU needed: the Dockerfile only COPYs a prebuilt binary per
       # platform, it never RUNs anything for the foreign arch. A manual
       # dispatch defaults to a dry-run build of both arches (push: false);
@@ -84,6 +105,4 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' || inputs.push }}
-          tags: |
-            docker.io/valerauko/beep-lb:latest
-            docker.io/valerauko/beep-lb:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.list }}
