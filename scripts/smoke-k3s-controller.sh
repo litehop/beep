@@ -125,6 +125,12 @@ cleanup() {
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
+    limactl shell "$vm" -- sudo bash -c '
+      if [ -f /tmp/beep-k3s-controller-rpfilter-all.saved ]; then
+        sysctl -w net.ipv4.conf.all.rp_filter="$(cat /tmp/beep-k3s-controller-rpfilter-all.saved)" >/dev/null 2>&1 || true
+        rm -f /tmp/beep-k3s-controller-rpfilter-all.saved
+      fi
+    ' >/dev/null 2>&1 || true
   done
 }
 trap cleanup EXIT
@@ -167,6 +173,14 @@ for vm in "$VM_A" "$VM_B"; do
     # bypasses this check. The kernel takes max(all, interface), so the
     # `all` companion is required too -- an interface-only 0 is fragile
     # against a nonzero `all` (the siblings above all set both).
+    # Saved (all only -- geneve0 itself is deleted in cleanup, so its
+    # own value never persists to restore) and restored on exit, same
+    # as smoke-remote.sh/smoke-wg-2node-remote.sh/
+    # smoke-eth-ingress-2node-remote.sh, so this rig never leaves the
+    # VM'"'"'s global rp_filter permanently weakened.
+    if [ ! -f /tmp/beep-k3s-controller-rpfilter-all.saved ]; then
+      sysctl -n net.ipv4.conf.all.rp_filter > /tmp/beep-k3s-controller-rpfilter-all.saved
+    fi
     sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
     sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   '
