@@ -13,12 +13,15 @@
 # still exercises the SAME reconcile path a real cluster would.
 #
 # The eBPF hooks this binary attaches (uplink_ingress/geneve_ingress/
-# uplink_egress_return) are given a dedicated veth pair + geneve device
-# (ctrl-veth0/ctrl-veth1/ctrl-geneve0) and pin dir, entirely disjoint from
+# uplink_egress_return) are given a dedicated dummy uplink + geneve device
+# (ctrl-uplink0/ctrl-geneve0) and pin dir, entirely disjoint from
 # scripts/smoke-remote.sh's own smoke-veth0/geneve0/`/sys/fs/bpf/beep-smoke`
 # fixture run earlier in the same job -- no real traffic needs to flow
-# through them here, only a verifier-accept attach, so no netns/rp_filter
-# dance is needed either.
+# through them here, only a verifier-accept attach, so no veth pair/netns/
+# rp_filter dance is needed either. `ip link add` retries a few times: k3s's
+# own flannel CNI is still creating/renaming devices for coredns right after
+# the cluster reports Ready, and was observed racing this exact call with a
+# transient EBUSY on a real GitHub-hosted runner.
 #
 # RSS ceilings/sampling: see scripts/controller-rss.sh (shared with
 # scripts/smoke-k3s-controller.sh's own real-2-node data point).
@@ -32,8 +35,7 @@ NAMESPACE="beep-controller-memory-smoke"
 DEPLOY_NAME="whoami"
 SERVICE_NAME="whoami"
 PIN_DIR="/sys/fs/bpf/beep-controller-smoke"
-UPLINK_IFACE="ctrl-veth0"
-UPLINK_PEER="ctrl-veth1"
+UPLINK_IFACE="ctrl-uplink0"
 GENEVE_IFACE="ctrl-geneve0"
 LOG="/tmp/beep-controller-memory-smoke.log"
 
@@ -73,11 +75,19 @@ done
 
 cleanup >/dev/null 2>&1 || true
 
-echo "==> [1/6] creating a dedicated veth pair + geneve device for beep-controller's own tc-bpf attach"
-ip link add "$UPLINK_IFACE" type veth peer name "$UPLINK_PEER"
+ip_link_add_retry() { # ip_link_add_retry <ip link add args...> -- retries a few times on a transient EBUSY (see this script's header)
+  local i
+  for i in 1 2 3 4 5; do
+    ip link add "$@" 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+echo "==> [1/6] creating a dedicated dummy uplink + geneve device for beep-controller's own tc-bpf attach"
+ip_link_add_retry "$UPLINK_IFACE" type dummy
 ip link set "$UPLINK_IFACE" up
-ip link set "$UPLINK_PEER" up
-ip link add "$GENEVE_IFACE" type geneve external
+ip_link_add_retry "$GENEVE_IFACE" type geneve external
 ip link set "$GENEVE_IFACE" up
 
 echo "==> [2/6] resolving this single node's identity from the live k3s apiserver"
