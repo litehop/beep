@@ -192,9 +192,14 @@ limactl shell "$VM_CLIENT" -- env K8S_VER="$K8S_VER" bash -c '
     echo "cache hit: $CACHE_DIR"
     exit 0
   fi
-  echo "cache miss: downloading kubernetes-test-linux-arm64.tar.gz for $K8S_VER"
+  case "$(uname -m)" in
+    arm64|aarch64) K8S_ARCH="arm64" ;;
+    x86_64) K8S_ARCH="amd64" ;;
+    *) echo "FAIL: unsupported arch $(uname -m)" >&2; exit 1 ;;
+  esac
+  echo "cache miss: downloading kubernetes-test-linux-${K8S_ARCH}.tar.gz for $K8S_VER"
   mkdir -p "$CACHE_DIR"
-  curl -sfL "https://dl.k8s.io/${K8S_VER}/kubernetes-test-linux-arm64.tar.gz" \
+  curl -sfL "https://dl.k8s.io/${K8S_VER}/kubernetes-test-linux-${K8S_ARCH}.tar.gz" \
     | tar -xz -C "$CACHE_DIR" --strip-components=3 kubernetes/test/bin/e2e.test kubernetes/test/bin/ginkgo
   chmod +x "$CACHE_DIR/e2e.test" "$CACHE_DIR/ginkgo"
 '
