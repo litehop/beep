@@ -180,7 +180,7 @@ if [ "$controller_deploy_failed" -ne 0 ]; then
 fi
 echo "CONTROLLER-DEPLOY: PASS (servicelb-controller Running on both nodes, zero restarts after a 10s settle)"
 
-echo "==> [5/7] resolving the live k3s minor on $VM_A and caching e2e.test+ginkgo on $VM_CLIENT"
+echo "==> [5/7] resolving the live k3s minor on $VM_A and caching e2e.test+ginkgo+kubectl on $VM_CLIENT"
 K3S_VER="$(limactl shell "$VM_A" -- sudo k3s --version | awk '/^k3s version/{print $3}')"
 [ -n "$K3S_VER" ] || { echo "FAIL: could not resolve $VM_A's k3s version" >&2; exit 1; }
 K8S_VER="${K3S_VER%%+*}" # k3s's version string is built directly on this exact upstream k8s release
@@ -188,7 +188,7 @@ echo "k3s=$K3S_VER -> kubernetes=$K8S_VER"
 limactl shell "$VM_CLIENT" -- env K8S_VER="$K8S_VER" bash -c '
   set -euo pipefail
   CACHE_DIR="$HOME/.cache/e2e-lb-k3s/$K8S_VER"
-  if [ -x "$CACHE_DIR/e2e.test" ] && [ -x "$CACHE_DIR/ginkgo" ]; then
+  if [ -x "$CACHE_DIR/e2e.test" ] && [ -x "$CACHE_DIR/ginkgo" ] && [ -x "$CACHE_DIR/kubectl" ]; then
     echo "cache hit: $CACHE_DIR"
     exit 0
   fi
@@ -202,6 +202,11 @@ limactl shell "$VM_CLIENT" -- env K8S_VER="$K8S_VER" bash -c '
   curl -sfL "https://dl.k8s.io/${K8S_VER}/kubernetes-test-linux-${K8S_ARCH}.tar.gz" \
     | tar -xz -C "$CACHE_DIR" --strip-components=3 kubernetes/test/bin/e2e.test kubernetes/test/bin/ginkgo
   chmod +x "$CACHE_DIR/e2e.test" "$CACHE_DIR/ginkgo"
+  # framework.RunKubectl/e2ekubectl.RunHostCmd exec a literal "kubectl" from
+  # pods (specs 2 and 5) -- ginkgo/e2e.test alone cannot serve those calls.
+  echo "cache miss: downloading standalone kubectl for $K8S_VER/$K8S_ARCH"
+  curl -sfL "https://dl.k8s.io/${K8S_VER}/bin/linux/${K8S_ARCH}/kubectl" -o "$CACHE_DIR/kubectl"
+  chmod +x "$CACHE_DIR/kubectl"
 '
 
 echo "==> [6/7] running e2e.test on $VM_CLIENT (--provider=local, ginkgo-timeout=$GINKGO_TIMEOUT, wall-timeout=$WALL_TIMEOUT, dry-run=$DRY_RUN)"
@@ -216,6 +221,7 @@ limactl shell "$VM_CLIENT" -- env \
   bash -c '
     set -euo pipefail
     CACHE_DIR="$HOME/.cache/e2e-lb-k3s/$K8S_VER"
+    export PATH="$CACHE_DIR:$PATH" # e2e.test exec()s a literal "kubectl" for specs 2 and 5
     timeout "$WALL_TIMEOUT" "$CACHE_DIR/e2e.test" \
       --kubeconfig="$KUBECONFIG_PATH" \
       --provider=local \
