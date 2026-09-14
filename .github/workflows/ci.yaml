@@ -197,10 +197,21 @@ jobs:
           chmod +x /tmp/k3s-install.sh
           sudo INSTALL_K3S_EXEC="server --disable=traefik,servicelb,metrics-server,local-storage" /tmp/k3s-install.sh
           for i in $(seq 1 30); do
-            sudo k3s kubectl get --raw=/readyz >/dev/null 2>&1 && exit 0
+            sudo k3s kubectl get --raw=/readyz >/dev/null 2>&1 && break
             sleep 2
           done
-          echo "FAIL: k3s server did not become ready" >&2
+          # /readyz alone only means the API server answers -- flannel CNI is
+          # still bringing up cni0/flannel.1 and scheduling coredns for a
+          # while after that, and was observed leaving the host's rtnl busy
+          # enough to fail an unrelated `ip link add` moments later. Waiting
+          # for coredns Running is a real signal that this churn has settled.
+          for i in $(seq 1 60); do
+            phase=$(sudo k3s kubectl -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            [ "$phase" = "Running" ] && exit 0
+            sleep 2
+          done
+          echo "FAIL: k3s server/coredns did not settle in time" >&2
+          sudo k3s kubectl get pods -A >&2 || true
           exit 1
 
       - name: Run beep-controller against k3s and gate its userspace RSS

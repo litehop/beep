@@ -18,10 +18,13 @@
 # scripts/smoke-remote.sh's own smoke-veth0/geneve0/`/sys/fs/bpf/beep-smoke`
 # fixture run earlier in the same job -- no real traffic needs to flow
 # through them here, only a verifier-accept attach, so no veth pair/netns/
-# rp_filter dance is needed either. `ip link add` retries a few times: k3s's
-# own flannel CNI is still creating/renaming devices for coredns right after
-# the cluster reports Ready, and was observed racing this exact call with a
-# transient EBUSY on a real GitHub-hosted runner.
+# rp_filter dance is needed either. `ip link add` retries for up to a
+# minute: k3s's own flannel CNI bringing up cni0/flannel.1 and scheduling
+# coredns was observed leaving the host's rtnl busy enough to fail this
+# exact call with EBUSY on a real GitHub-hosted runner, well after /readyz
+# already reported the API server itself healthy (ci.yaml's install step
+# additionally waits for coredns Running before this script runs at all --
+# this retry is defense in depth, not the primary fix).
 #
 # RSS ceilings/sampling: see scripts/controller-rss.sh (shared with
 # scripts/smoke-k3s-controller.sh's own real-2-node data point).
@@ -75,12 +78,15 @@ done
 
 cleanup >/dev/null 2>&1 || true
 
-ip_link_add_retry() { # ip_link_add_retry <ip link add args...> -- retries a few times on a transient EBUSY (see this script's header)
+ip_link_add_retry() { # ip_link_add_retry <ip link add args...> -- retries on a transient EBUSY (see this script's header) for up to a minute, dumping kernel-side evidence if it never clears
   local i
-  for i in 1 2 3 4 5; do
+  for i in $(seq 1 30); do
     ip link add "$@" 2>&1 && return 0
-    sleep 1
+    sleep 2
   done
+  echo "FAIL: \`ip link add $*\` stayed busy for 60s" >&2
+  ip link show >&2 || true
+  journalctl -k --since "-2 minutes" >&2 || true
   return 1
 }
 
