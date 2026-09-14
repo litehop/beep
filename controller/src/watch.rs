@@ -313,8 +313,14 @@ impl WatchState {
     /// desired map state -- the controller writes all fronts from a single
     /// pass, not one dataplane write per Service.
     pub fn desired(&self, node: &NodeContext) -> DesiredEntries {
+        // See `pod_targets_known`'s doc comment: this node's own entry can
+        // land at any position in the startup Node LIST independent of
+        // every OTHER node's position, so it's tracked separately from
+        // `nodes_listed` (the whole-list latch `fronts_known` reuses).
+        let self_node_known = self.node_ips.values().any(|&ip| ip == node.node_ip);
         let mut aggregate = DesiredEntries {
             fronts_known: self.nodes_listed,
+            pod_targets_known: self_node_known,
             ..DesiredEntries::default()
         };
         let no_slices = HashMap::new();
@@ -341,16 +347,19 @@ impl WatchState {
         // above carries that gate into `DesiredEntries` so `PinnedMaps::apply`
         // knows to leave VIP_MAP/TARGET_PORTS untouched rather than diff them
         // against an empty desired set while the node set isn't known yet.
-        // POD_TARGETS must NOT be gated the same way: it's EndpointSlice/
-        // local-node-derived (`reconcile::pod_targets_for_node`), not
-        // front-derived, so it's still computed below even while
-        // `nodes_listed` is false. `apply_pod_targets` full-syncs
-        // unconditionally (no `fronts_known`-style guard, since POD_TARGETS
-        // never depended on the Node LIST) -- handing it an empty set here
-        // pre-LIST would wipe already-pinned POD_TARGETS entries and
-        // blackhole this node's backend Pods until the LIST completes, the
-        // same restart bug this gate exists to prevent, just for the other
-        // map.
+        // POD_TARGETS must NOT be gated on the FULL Node LIST the same way:
+        // it's EndpointSlice/local-node-derived (`reconcile::
+        // pod_targets_for_node`), not front-derived, so it's still computed
+        // below even while `nodes_listed` is false. It is still gated, just
+        // on the narrower `pod_targets_known`/`self_node_known` above --
+        // `pod_targets_for_node` can only match an endpoint once THIS
+        // node's own address has resolved, and `PinnedMaps::apply` skips
+        // the destructive POD_TARGETS full-sync until then, or a restart
+        // (pins survive process exit) would wipe an already-pinned local
+        // backend for as long as this node's own Node LIST/watch entry
+        // takes to land -- the same restart bug `fronts_known` exists to
+        // prevent, just keyed on this node's own entry instead of the
+        // whole list.
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
@@ -1078,14 +1087,19 @@ mod tests {
     }
 
     // POD_TARGETS is EndpointSlice/local-node-derived, not Node-LIST-derived,
-    // so the `nodes_listed` gate above must NOT zero it out too. Unlike
-    // VIP_MAP/TARGET_PORTS, `apply_pod_targets` full-syncs POD_TARGETS
-    // unconditionally (no `fronts_known` check) -- if `desired` reported an
-    // empty pod_targets here, a controller restart would wipe the
-    // already-pinned entry for this node's own backend Pod before the Node
-    // LIST completes, and its decap path would blackhole until the LIST
-    // catches up. Broadening the whole-`DesiredEntries` early return that
-    // this test guards against would fail it.
+    // so the `nodes_listed` gate above must NOT zero it out too. THIS node's
+    // own entry ("node-a", matching `node.node_ip` below) has already
+    // landed, so `pod_targets_known` is true here even though the whole
+    // list hasn't completed -- if `desired` reported an empty pod_targets
+    // (or `pod_targets_known == false`) in this scenario, a controller
+    // restart would wipe the already-pinned entry for this node's own
+    // backend Pod before the Node LIST completes, and its decap path would
+    // blackhole until the LIST catches up. Broadening the whole-
+    // `DesiredEntries` early return that this test guards against would
+    // fail it. The companion bug -- THIS node's own entry landing LATE,
+    // unrelated to whether the list as a whole is done -- is covered by
+    // `desired_with_a_not_yet_resolved_local_node_reports_pod_targets_unknown_not_empty`
+    // below.
     #[test]
     fn desired_before_node_list_completes_still_computes_pod_targets() {
         let mut state = WatchState::default();
@@ -1129,6 +1143,75 @@ mod tests {
             "a controller restart must not blackhole backend-Pod decap by wiping POD_TARGETS \
              before the Node LIST completes -- pod_targets is local-node/EndpointSlice-derived \
              and must be computed even while fronts_known is false"
+        );
+        assert!(
+            desired.pod_targets_known,
+            "this node's own address (node-a, 10.0.0.5) has already resolved, so \
+             pod_targets_known must be true even though the whole Node LIST hasn't completed \
+             -- it must not piggyback on fronts_known's whole-list gate"
+        );
+    }
+
+    // Regression: in a multi-node cluster, THIS node's own Node LIST/watch
+    // entry can land AFTER some OTHER node's, independent of whether the
+    // list as a whole has completed. `pod_targets_for_node` only admits an
+    // endpoint whose resolved node_ip equals THIS node's own, so while that
+    // one specific resolution is missing, a pod that genuinely IS hosted
+    // here computes an empty pod_targets -- gating the destructive
+    // POD_TARGETS full-sync on `fronts_known`/`nodes_listed` (the whole-list
+    // latch) would NOT catch this, since a remote node landing late never
+    // flips those. Without `pod_targets_known` this backend's decap
+    // blackholes for as long as ITS OWN node happens to sort after another
+    // node in the LIST response -- self-healing once that event lands, but
+    // a real transient outage until then.
+    #[test]
+    fn desired_with_a_not_yet_resolved_local_node_reports_pod_targets_unknown_not_empty() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        // node-b (a DIFFERENT, remote node) has already landed in the
+        // startup Node LIST; THIS node ("node-a", 10.0.0.5 below) has not
+        // -- its own entry is ordered later in the same LIST response.
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-b"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.6"}]},
+            },
+        }));
+        // The backend pod is hosted on THIS node (node-a), not node-b.
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(
+            !desired.pod_targets_known,
+            "node-a's own Node LIST/watch entry hasn't landed yet (only node-b's has) -- \
+             pod_targets_known must be false so PinnedMaps::apply skips the destructive \
+             POD_TARGETS full-sync, or a controller restart would blackhole this backend \
+             pod's decap for as long as node-a's own entry sorts after other nodes' in the \
+             startup LIST"
+        );
+        assert!(
+            desired.pod_targets.is_empty(),
+            "the endpoint's node_ip can't resolve to node-a yet, so pod_targets_for_node \
+             correctly can't include it either -- pod_targets_known (not pod_targets) is what \
+             must carry the 'not known yet' distinction through to PinnedMaps::apply"
         );
     }
 

@@ -61,7 +61,11 @@ impl PinnedMaps {
     /// diffing an empty `vip_map`/`target_ports` against these maps' actual
     /// contents would delete every front, even ones a previous run already
     /// programmed and pinned -- `desired.fronts_known == false` means "not
-    /// known yet", not "no fronts should exist".
+    /// known yet", not "no fronts should exist". Skips the POD_TARGETS
+    /// full-sync the same way while `desired.pod_targets_known` is `false`
+    /// -- same reasoning, keyed on this node's own Node LIST/watch entry
+    /// instead of the whole list (`DesiredEntries::pod_targets_known`'s doc
+    /// comment).
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
         let (vip_map_result, target_ports_result) = if desired.fronts_known {
             (
@@ -85,8 +89,12 @@ impl PinnedMaps {
         } else {
             (Ok(()), Ok(()))
         };
-        let pod_targets_result = apply_pod_targets(&mut self.pod_targets, &desired.pod_targets)
-            .context("applying POD_TARGETS");
+        let pod_targets_result = if desired.pod_targets_known {
+            apply_pod_targets(&mut self.pod_targets, &desired.pod_targets)
+                .context("applying POD_TARGETS")
+        } else {
+            Ok(())
+        };
 
         vip_map_result?;
         target_ports_result?;
