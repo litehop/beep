@@ -317,6 +317,12 @@ impl WatchState {
         // land at any position in the startup Node LIST independent of
         // every OTHER node's position, so it's tracked separately from
         // `nodes_listed` (the whole-list latch `fronts_known` reuses).
+        // Unlike `nodes_listed`, this is recomputed fresh on every call, not
+        // latched: if THIS node's own Node object is later deleted mid-run,
+        // `self_node_known` flips back to false and the POD_TARGETS
+        // full-sync FREEZES (stops updating) rather than wiping -- worse
+        // than staying current, but self-healing on relist and strictly
+        // better than the pre-fix full-wipe.
         let self_node_known = self.node_ips.values().any(|&ip| ip == node.node_ip);
         let mut aggregate = DesiredEntries {
             fronts_known: self.nodes_listed,
@@ -1136,7 +1142,8 @@ mod tests {
         assert!(
             !desired.fronts_known,
             "fronts_known must still be false pre-LIST -- this test only guards pod_targets, \
-             it must not weaken the front-side gate PR #53 added"
+             it must not weaken the fronts_known gate that keeps VIP_MAP/TARGET_PORTS \
+             untouched until the Node LIST completes"
         );
         assert!(
             !desired.pod_targets.is_empty(),
