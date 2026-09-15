@@ -5,18 +5,31 @@
 # klipper-lb can't race beep for type=LoadBalancer Services; flannel
 # (default VXLAN CNI) and kube-proxy are left stock.
 #
-# Usage: scripts/k3s-up.sh [--vm-a <server-vm>] [--vm-b <agent-vm>]
+# Usage: scripts/k3s-up.sh [--vm-a <server-vm>] [--vm-b <agent-vm>] [--proxy-mode <iptables|ipvs>]
 set -euo pipefail
 
 VM_A="beep-node-a"
 VM_B="beep-node-b"
+PROXY_MODE="iptables"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
     --vm-b) VM_B="$2"; shift 2 ;;
+    --proxy-mode) PROXY_MODE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+# kube-proxy's IPVS backend needs ip_vs/ip_vs_rr/nf_conntrack present on both
+# nodes -- lima/beep-k3s.yaml's Ubuntu image has them, but this script
+# doesn't modprobe them; caller's responsibility.
+KUBE_PROXY_ARG=""
+if [ "$PROXY_MODE" = "ipvs" ]; then
+  KUBE_PROXY_ARG=" --kube-proxy-arg=proxy-mode=ipvs"
+elif [ "$PROXY_MODE" != "iptables" ]; then
+  echo "FAIL: unknown --proxy-mode '$PROXY_MODE' (want iptables or ipvs)" >&2
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIMA_YAML="$SCRIPT_DIR/../lima/beep-k3s.yaml"
@@ -36,8 +49,8 @@ eth0_ip() { # eth0_ip <vm> -- this VM's underlay address, used as k3s node-ip / 
 IP_A="$(eth0_ip "$VM_A")"
 [ -n "$IP_A" ] || { echo "FAIL: could not resolve $VM_A's eth0 address" >&2; exit 1; }
 
-echo "==> [2/4] installing k3s server on $VM_A (node-ip=$IP_A, --disable=servicelb,traefik)"
-limactl shell "$VM_A" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --disable=servicelb,traefik --node-ip=$IP_A --write-kubeconfig-mode=644' sh -"
+echo "==> [2/4] installing k3s server on $VM_A (node-ip=$IP_A, --disable=servicelb,traefik, proxy-mode=$PROXY_MODE)"
+limactl shell "$VM_A" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --disable=servicelb,traefik --node-ip=$IP_A --write-kubeconfig-mode=644$KUBE_PROXY_ARG' sh -"
 
 echo "==> waiting for $VM_A's k3s server to be ready"
 limactl shell "$VM_A" -- sudo bash -c '
@@ -52,8 +65,8 @@ limactl shell "$VM_A" -- sudo bash -c '
 TOKEN="$(limactl shell "$VM_A" -- sudo cat /var/lib/rancher/k3s/server/node-token)"
 [ -n "$TOKEN" ] || { echo "FAIL: could not read $VM_A's k3s node-token" >&2; exit 1; }
 
-echo "==> [3/4] installing k3s agent on $VM_B (joining https://$IP_A:6443)"
-limactl shell "$VM_B" -- sudo bash -c "curl -sfL https://get.k3s.io | K3S_URL='https://$IP_A:6443' K3S_TOKEN='$TOKEN' sh -"
+echo "==> [3/4] installing k3s agent on $VM_B (joining https://$IP_A:6443, proxy-mode=$PROXY_MODE)"
+limactl shell "$VM_B" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='agent$KUBE_PROXY_ARG' K3S_URL='https://$IP_A:6443' K3S_TOKEN='$TOKEN' sh -"
 
 echo "==> [4/4] waiting for both nodes to report Ready"
 limactl shell "$VM_A" -- sudo bash -c '
