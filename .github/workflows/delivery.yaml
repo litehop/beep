@@ -30,7 +30,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # fetch-depth: 0 pulls full history + all tags, needed by "Determine
+      # image tags" below to find the highest existing v* tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       # beep-controller's build.rs cross-builds beep-ebpf via aya-build,
       # which needs nightly + rust-src regardless of the host build's own
@@ -78,10 +82,14 @@ jobs:
           username: valerauko
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # A branch push tags :latest + :sha, unchanged. A `v*` tag push (the
-      # release cut procedure in docs/decisions/versioning.md) tags the
-      # version instead of :latest, so a historical tag never clobbers
-      # :latest with an older commit's image.
+      # A `v*` tag push (the release cut procedure in
+      # docs/decisions/versioning.md) tags the release version, plus
+      # :latest -- but only if this tag is the highest semver `v*` tag, so a
+      # backport tag (e.g. v0.1.1 cut after v0.2.0 exists) never regresses
+      # :latest to an older line. A branch push (main) tags :sha only: no
+      # mutable tip-of-main tag, since daemonset.yaml and the e2e rig both
+      # want either an exact commit or the latest release, never "whatever
+      # main happened to be last".
       - name: Determine image tags
         id: tags
         run: |
@@ -94,14 +102,17 @@ jobs:
               v*) ;;
               *) echo "error: tag '${{ github.ref_name }}' does not start with 'v'" >&2; exit 1 ;;
             esac
-            extra="docker.io/valerauko/beep-lb:${{ github.ref_name }}"
+            list="docker.io/valerauko/beep-lb:${{ github.ref_name }}"
+            highest=$(git tag --list 'v*' | sort -V | tail -1)
+            if [ "${{ github.ref_name }}" = "$highest" ]; then
+              list="$(printf '%s\n%s' "$list" "docker.io/valerauko/beep-lb:latest")"
+            fi
           else
-            extra="docker.io/valerauko/beep-lb:latest"
+            list="docker.io/valerauko/beep-lb:${{ github.sha }}"
           fi
           {
             echo "list<<EOF"
-            echo "docker.io/valerauko/beep-lb:${{ github.sha }}"
-            echo "$extra"
+            echo "$list"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -115,3 +126,37 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' || inputs.push }}
           tags: ${{ steps.tags.outputs.list }}
+
+  # Auto-creates the GitHub Release for a `v*` tag ref, so this step can't
+  # be silently skipped (as it was for v0.1.0). Only runs after `image`
+  # publishes successfully; the release-create call is idempotent, so a
+  # manual workflow_dispatch retry against an existing tag is safe too.
+  release:
+    needs: image
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Idempotent: a re-run (e.g. this job re-triggered after an earlier
+      # unrelated failure) must not hard-fail just because the Release
+      # already exists.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists, skipping"
+            exit 0
+          fi
+          notes="docs/release-notes/$tag.md"
+          if [ -f "$notes" ]; then
+            gh release create "$tag" --title "$tag" --notes-file "$notes"
+          else
+            gh release create "$tag" --title "$tag" --generate-notes
+          fi
