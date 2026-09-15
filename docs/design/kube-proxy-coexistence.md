@@ -20,8 +20,10 @@ north-south `LoadBalancer` VIP:port traffic. There is no double-processing
 between the two (`docs/decisions/servicelb-ebpf-geneve-dataplane.md:46`).
 `geneve0` (Geneve/UDP 6081, beep's tunnel device) and `flannel.1`
 (VXLAN/UDP 8472, flannel's) are separate devices with no shared routes —
-beep's Geneve tunnel never touches flannel's pod routing
-(`docs/decisions/servicelb-ebpf-geneve-dataplane.md:50`,
+beep's Geneve tunnel never touches flannel's vxlan device (`flannel.1`).
+The one intended contact point: a backend node's decap hands its DNAT'd
+packet to flannel's pod-CIDR routing for the last hop
+(`docs/decisions/servicelb-ebpf-geneve-dataplane.md:50-53`,
 `docs/design/ebpf-lb-dataplane.md:63`).
 
 ## Why IPVS mode is unsupported
@@ -44,9 +46,10 @@ that list as a Service VIP to bind onto its own `kube-ipvs0`, including
 the *other* nodes' addresses it now sees via that shared status field. The
 result is a reciprocal duplicate-IP conflict: each node ends up binding
 every other node's real IP as a local NOARP address on a flat L2 network,
-which breaks node-to-node connectivity — reproduced 5 times live, with one
-node's VM crashing outright. The iptables baseline passed both before and
-after this test; only IPVS mode exhibits the conflict.
+which breaks node-to-node connectivity — reproduced consistently in live
+IPVS-mode testing, with node-to-node connectivity breaking and, on some
+runs, a node becoming unresponsive. The iptables baseline passed both
+before and after this testing; only IPVS mode exhibits the conflict.
 
 ## Deployment requirements
 
@@ -69,20 +72,40 @@ after this test; only IPVS mode exhibits the conflict.
 
 ## Verifying this (agent-facing)
 
+**Supported (iptables) path** — the green controller-driven round trip:
+
 ```bash
-scripts/k3s-up.sh --proxy-mode iptables   # or --proxy-mode ipvs to reproduce the failure
+scripts/k3s-up.sh --proxy-mode iptables   # default; flag can be omitted
 scripts/smoke-k3s-controller.sh
 ```
 
 `k3s-up.sh --proxy-mode` (default `iptables`) passes
 `--kube-proxy-arg=proxy-mode=<mode>` to the k3s server and agent install. A
-green run under `iptables` shows `smoke-k3s-controller.sh`'s full sequence
-passing: cluster bring-up, the controller loading and pinning its eBPF
-programs, VIP map programming from watch events, and a genuine cross-node
-client round trip. Rerunning the same rig with `--proxy-mode ipvs`
-reproduces the duplicate-IP node-to-node breakage described above instead
-of a clean round trip — that is the expected (failing) outcome for that
-mode, not a rig bug.
+green run shows `smoke-k3s-controller.sh`'s full sequence passing: cluster
+bring-up, the controller loading and pinning its eBPF programs, VIP map
+programming from watch events, and a genuine cross-node client round trip.
+
+**Unsupported (IPVS) observation** — do not chain
+`scripts/smoke-k3s-controller.sh` onto this: it re-invokes `k3s-up.sh`
+without `--proxy-mode`, which reinstalls k3s in its default iptables mode
+and silently resets the cluster before any assertion runs, so following
+the iptables recipe above with `--proxy-mode ipvs` substituted does not
+exercise the failure. Instead bring the cluster up in IPVS mode and
+observe the incompatibility directly:
+
+```bash
+scripts/k3s-up.sh --proxy-mode ipvs
+```
+
+With the controller/DaemonSet running against this cluster, the
+incompatibility is visible without a separate round-trip assertion: the
+controller publishes every node's own IP into
+`status.loadBalancer.ingress[]`, each node's kube-proxy binds the *other*
+nodes' IPs onto its local `kube-ipvs0`, and node-to-node connectivity
+breaks as a result — the control-plane tunnel between nodes resets, and a
+node can become unresponsive. That breakage is the incompatibility itself,
+not a rig bug, and it is why no clean LB round trip can be observed under
+IPVS mode.
 
 ## Verifying this (human-facing)
 
