@@ -33,10 +33,15 @@ pullable over IPv6.
 (`beep-5lw`); real-fleet/production-network fidelity (`beep-903`); the
 eventual repo split for an independent release cadence (`mayor-aie31.4`).
 
-**Cut procedure** (operator step, not performed by this ADR): push git tag
-`v0.1.0` → `delivery.yaml`'s tag trigger publishes
-`docker.io/valerauko/beep-lb:v0.1.0` → pin `deploy/daemonset.yaml`'s image
-to `:v0.1.0` → create the GitHub release from the tag.
+**Cut procedure**: push git tag `v0.1.0` → `delivery.yaml` publishes
+`docker.io/valerauko/beep-lb:v0.1.0` (plus `:latest`, if it's the highest
+`v*` tag) and auto-creates the GitHub release.
+
+**`deploy/daemonset.yaml` stays on `:latest`**: a release-tag pin is
+temporally impossible — the pin commit lands after the immutable tag, so
+the tagged commit never carries its own pin. `:latest` now equals the
+newest release; override to a version or sha via a local kustomize patch
+(`deploy/README.md`).
 
 ## Rationale
 
@@ -47,13 +52,10 @@ from outside: its own tags never include a plain, un-suffixed
 at u7s's scale.
 
 Adopted from u7s's `release-tarball.yaml`: its `push: tags: ['v*']` trigger,
-and its concurrency comment that a partially-uploaded release is worse than
-a slow one (`cancel-in-progress: false` for tag-triggered runs, added to
-`delivery.yaml`). Not adopted: its tarball + `install.sh` distribution
-(beep ships a container image, not a binary); its prerelease-suffix
-detection (beep has no snapshot/rc cadence yet); its single-workflow
-`gh release create` (beep pins `deploy/daemonset.yaml` between publish
-and release, kept separate and manual).
+its "partial upload is worse than slow" concurrency comment, and its
+single-workflow `gh release create`. Not adopted: tarball + `install.sh`
+distribution (beep ships a container image); prerelease-suffix detection
+(no snapshot/rc cadence yet).
 
 ## Consequences
 

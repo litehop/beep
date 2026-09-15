@@ -5,7 +5,10 @@ Manifest skeleton for the beep servicelb controller.
 - `daemonset.yaml` points at `docker.io/valerauko/beep-lb:latest`, a
   dual-arch (linux/amd64 + linux/arm64) image built by the root
   `Dockerfile` and published by `.github/workflows/delivery.yaml`'s
-  `image` job on every push to `main`.
+  `image` job. `:latest` tracks the newest `v*` release tag (see
+  `docs/decisions/versioning.md`); a push to `main` alone only publishes
+  a `:<sha>` image. To run a specific version or commit, override the
+  image with a local `kustomize` patch rather than editing this manifest.
 - **RBAC is scoped to exactly what the design calls for:** list/watch/get on
   `Service`, `discovery.k8s.io/EndpointSlice`, and `Node` (the last needed to
   resolve an `EndpointSlice` endpoint's hosting-node IP). Nothing broader.
