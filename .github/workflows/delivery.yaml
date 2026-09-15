@@ -133,7 +133,7 @@ jobs:
   # manual workflow_dispatch retry against an existing tag is safe too.
   release:
     needs: image
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.push)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
