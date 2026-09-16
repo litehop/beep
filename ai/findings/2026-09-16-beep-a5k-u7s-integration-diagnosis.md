@@ -28,14 +28,29 @@ address-less device like `geneve0`, and only `0` avoids the drop. This is a
 tight, mechanism-level match for the exact symptom u7s observed (decap
 succeeds, `FLOW_TABLE` populates, packet never reaches `cni0`/veth).
 
-A second, independently real but non-explanatory gap: `deploy/daemonset.yaml`
-also never creates the `geneve0` device itself (the controller crashes at
-startup without it -- u7s's own round-5 notes hit this and worked around it
-by hand) and pins `--pod-cidr=10.42.0.0/16` (k3s's default) while u7s ships
-`10.244.0.0/16` (flannel's default, confirmed in `scripts/install.sh:902`).
-u7s's tester corrected both by hand in every round, so neither explains the
-observed failure -- but both are real out-of-the-box breakage for anyone who
-deploys the manifest as-is, and belong in the same fix.
+A second, independently real but non-explanatory gap, and the more likely
+FIRST thing an unmodified `deploy/daemonset.yaml` breaks on: it never creates
+the `geneve0` device itself (the controller crashes at startup without it --
+u7s's own round-5 notes hit this and worked around it by hand) and pins
+`--pod-cidr=10.42.0.0/16` (k3s's default) while u7s ships `10.244.0.0/16`
+(flannel's default, confirmed in `scripts/install.sh:902`). The pod-CIDR
+default is not just a misconfiguration -- `controller/src/reconcile.rs:191-214`
+has a real, code-confirmed anti-spoof admission gate keyed on it
+(`pod_targets_for_node`) that **silently** drops every non-hostNetwork
+endpoint outside the configured CIDR, with zero logging
+(`controller/src/main.rs:119-124`'s `apply_reconcile` only logs on an apply
+*error*, never a rejected endpoint -- filed separately as `beep-1d4`). u7s's
+tester corrected both the CIDR and the `geneve0` device by hand in every
+*tested* round, so neither explains round 4/5's specific failure -- but both
+are real out-of-the-box breakage for anyone deploying the manifest as-is,
+and are distinguishable from the `rp_filter` mechanism by one live signal:
+this gate drops the packet before `FLOW_TABLE` ever gets a reverse-flow
+entry (`TC_ACT_SHOT` at `ebpf/src/main.rs:634-636`, upstream of the
+`FLOW_TABLE` insert at `:790-793`), whereas the `rp_filter` drop happens
+*after* `FLOW_TABLE` is already populated. Round 4/5's own evidence shows
+`FLOW_TABLE` populated -- ruling this mechanism OUT for round 4/5, but the
+pod-CIDR/`geneve0` gap remains the higher-priority fix for Phase 2 to
+exercise first, since it is what an operator would actually hit on day one.
 
 ## (a) Exact observed u7s-side failure
 
@@ -92,31 +107,72 @@ Evidence:
   `net.ipv4.conf.all.rp_filter=0` + `net.ipv4.conf.geneve0.rp_filter=0` and
   assert delivery succeeds with no other change.
 
-### 2. Pod-CIDR mismatch (`10.42.0.0/16` manifest default vs u7s's `10.244.0.0/16`) -- CONFIRMED as a real gap, KILLED as the explanation for the observed failure
+### 2. Pod-CIDR mismatch, silently rejected by a real code-level admission gate (`10.42.0.0/16` manifest default vs u7s's `10.244.0.0/16`) -- CONFIRMED as a real, code-verified silent-failure mechanism; KILLED as the explanation for round 4/5's specific observed failure
 
-Evidence:
-- `deploy/daemonset.yaml:82-84`: `--pod-cidr=10.42.0.0/16` (k3s default),
-  comment says "override for a cluster provisioned with a different pod
-  CIDR" -- but `deploy/README.md` never tells an operator to actually do
-  this; there's no kustomize overlay shipped for it.
-- u7s `scripts/install.sh:899-902`: `POD_CLUSTER_CIDR="10.244.0.0/16"`
-  (flannel's own default), used unconditionally by the real bring-up path.
-- **Kill**: `mayor-re973` round 5 explicitly deployed beep with
-  `--pod-cidr=10.244.0.0/16` (u7s's real, correct CIDR, "verified against
-  the turnkey diff in mayor-0v60z") and the identical decap->veth failure
-  still reproduced. A misclassified pod-CIDR would show up as `VIP_MAP`
-  resolving wrong or `try_geneve_decap_forward`'s `POD_TARGETS` membership
-  check dropping the packet outright (`TC_ACT_SHOT`) -- not as a
-  correctly-decapped packet with a correct `FLOW_TABLE` entry that
-  disappears one hop later. This hypothesis does not fit the observed
-  symptom once the CIDR is corrected, which it was.
-- Disposition: real bug, ship a fix (kustomize overlay or make
-  `--pod-cidr` operator-required with no baked-in default), but not the
-  cause of round 4/5's failure.
-- Confirm-step: deploy the unmodified manifest (no override) against a
-  10.244.0.0/16 cluster and assert `VIP_MAP`/`TARGET_PORTS` misprogram
-  (distinguish from hypothesis 1 by checking whether the packet is dropped
-  at decap, `TC_ACT_SHOT`, vs. silently vanishing after a successful decap).
+This mechanism is more precise than "misconfiguration" -- it is an actual
+anti-spoof gate in the controller, and it fails **silently by design minus
+one missing log line**, not as a side effect.
+
+Mechanism, read from source (not inferred):
+- `controller/src/reconcile.rs:191-214` (`pod_targets_for_node`, feeds
+  `POD_TARGETS`): an `EndpointSlice` endpoint is admitted as one of THIS
+  node's own backends only if `node.pod_cidr.contains(ep.pod_ip) ||
+  ep.pod_ip == ep.node_ip` (hostNetwork escape hatch) **and**
+  `ep.node_ip == node.node_ip`. Doc comment at `:70-88`: "An arbitrary
+  `pod_ip` that is neither in `pod_cidr` nor equal to `node_ip` is still
+  rejected -- anti-spoof for a value another (untrusted) component wrote."
+  This is deliberate, correct security design, not a bug in itself.
+- Crucially, this gate governs **`POD_TARGETS` only** -- the ingress-side
+  `VIP_MAP`/`TARGET_PORTS` backend-selection loop
+  (`reconcile.rs:235-267`) has **no `pod_cidr` filter at all**: it picks
+  the lowest-IP `ready` endpoint across every node/slice regardless of
+  CIDR membership. So a pod-CIDR mismatch does **not** empty `VIP_MAP` (an
+  ingress node still resolves a front to *some* real backend pod IP and
+  encaps toward it) -- it empties **`POD_TARGETS`** on the node that's
+  supposed to actually host that pod, which is checked at decap time.
+- `common/src/lib.rs:400-419` (`decap_forward_pod_admission`): `is_local_pod
+  == false` -> `DecapForwardPodAdmission::Drop`.
+  `ebpf/src/main.rs:633-636`: a `Drop` returns `Some(TC_ACT_SHOT)` --
+  **before** the `FLOW_TABLE` reverse-flow insert at `:790-793`. So a
+  pod-CIDR-mismatch drop leaves `FLOW_TABLE` **empty** -- a different,
+  earlier, distinguishable signature than hypothesis 1's drop (which
+  happens *after* `FLOW_TABLE` is written).
+- Silence: `controller/src/main.rs:119-124` (`apply_reconcile`) only
+  `eprintln!`s on a map-apply *error*; `reconcile_service`/
+  `pod_targets_for_node` are pure functions with no logging at all. A
+  100%-rejected `EndpointSlice` produces zero output anywhere. Filed as
+  `beep-1d4` (fail-loud gap; the admission logic itself is correct and
+  not touched by that bead).
+- `deploy/daemonset.yaml:82-84`: `--pod-cidr=10.42.0.0/16` (k3s default) is
+  the *only* value an unmodified manifest ever passes; `deploy/README.md`
+  never tells an operator to override it, and no kustomize overlay ships
+  one. u7s `scripts/install.sh:899-902`: `POD_CLUSTER_CIDR="10.244.0.0/16"`
+  -- confirmed disjoint from the manifest default.
+- **Kill (for round 4/5 specifically)**: `mayor-re973` round 5 explicitly
+  deployed beep with `--pod-cidr=10.244.0.0/16` (u7s's real CIDR, "verified
+  against the turnkey diff in mayor-0v60z") -- i.e. (a) the value passed
+  equals (b) the real cluster CIDR -- and round 5's own `bpftool` dump
+  showed `VIP_MAP` resolving to a real backend AND `FLOW_TABLE` getting 3
+  populated entries after 3 client attempts, i.e. (c) `POD_TARGETS`/
+  `FLOW_TABLE` were **not** empty. Per the mechanism above, an admission
+  rejection would have left `FLOW_TABLE` at 0 entries, not 3 -- this
+  directly rules the gate OUT as the cause of round 4/5's specific
+  zero-response symptom, since it demonstrably let the packet through to
+  the DNAT+insert step.
+- Disposition: real, code-confirmed silent-failure mechanism that WILL bite
+  any operator who deploys the unmodified manifest against u7s without a
+  manual `--pod-cidr` override (which every *tested* round in the bd
+  history applied by hand) -- likely the actual first blocker for any
+  attempt that didn't know to override it, and worth fixing/observability
+  regardless of hypothesis 1's fix. Not the cause of the specific
+  round 4/5 zero-response evidence on record.
+- Confirm-step: deploy the **unmodified** manifest (no `--pod-cidr`
+  override) against u7s's real `10.244.0.0/16` cluster and dump
+  `POD_TARGETS`/`FLOW_TABLE` via `bpftool map dump` on the backend node
+  after a client attempt -- expect `POD_TARGETS` to lack the real pod IP
+  and `FLOW_TABLE` to stay at 0 entries (distinguishing signature from
+  hypothesis 1, where `FLOW_TABLE` populates but `cni0`/veth still sees
+  nothing).
 
 ### 3. Rootless/caps (u7s's runtime privileges block eBPF attach) -- KILLED
 
@@ -192,29 +248,41 @@ rounds built beep from source on Lima VMs rather than pulling images).
    that KCM disables `-service-lb-controller` (u7s expects an external LB).
 3. Build beep from this worktree's current `HEAD` (or the latest tagged
    release once cut) on `beep-smoke` (aarch64, native).
-4. Deploy beep with the **documented-but-currently-missing** fixes applied
-   by hand (this is what Phase-2 needs to confirm actually closes the gap):
+4. Apply a backend `Deployment` (nginx or similar) + a `type=LoadBalancer`
+   `Service` selecting it, scheduled by u7s.
+5. **First pass -- deploy the manifest exactly as-shipped** (no
+   `--pod-cidr` override, so it stays at the default `10.42.0.0/16` against
+   u7s's real `10.244.0.0/16`), skip the `geneve0`/`rp_filter` steps too.
+   Attempt a client `curl`, then `bpftool map dump` `POD_TARGETS` and
+   `FLOW_TABLE` on the backend node. Expected per hypothesis 2:
+   `POD_TARGETS` lacks the real pod IP, `FLOW_TABLE` stays at 0 entries --
+   confirms/kills hypothesis 2 as the day-one blocker.
+6. **Second pass -- apply the documented-but-currently-missing fixes** (this
+   is what Phase-2 needs to confirm actually closes the gap):
+   - `deploy/daemonset.yaml` via kustomize patch: `--pod-cidr=10.244.0.0/16`.
    - `ip link add geneve0 type geneve external && ip link set geneve0 up`
      before the controller starts.
-   - `sysctl -w net.ipv4.conf.all.rp_filter=0` and
-     `sysctl -w net.ipv4.conf.geneve0.rp_filter=0` (both -- kernel takes
-     `max`).
-   - `deploy/daemonset.yaml` via kustomize patch: `--pod-cidr=10.244.0.0/16`.
    - Real `deploy/rbac.yaml` ClusterRole + a genuinely least-privilege
      X.509 client-cert kubeconfig Secret (not an admin cert) -- closes
      hypothesis 5 in the same pass.
-5. Apply a backend `Deployment` (nginx or similar) + a `type=LoadBalancer`
-   `Service` selecting it, scheduled by u7s.
-6. Assert: `curl` to the assigned `status.loadBalancer.ingress` address from
-   outside the pod netns returns `200 OK`; inspect the backend's own request
-   log (or an `httpbin`-style echo) to assert the **real client IP** was
-   delivered, not a NAT'd/node address -- matching the bar
+   - Leave `rp_filter` at its default (2) for this pass. Attempt a client
+     `curl`, dump `POD_TARGETS`/`FLOW_TABLE` again. Expected per
+     hypothesis 1: `POD_TARGETS` now has the real pod IP, `FLOW_TABLE`
+     populates (non-zero), but the client still gets zero response and
+     the backend pod's own veth capture shows nothing -- isolates
+     hypothesis 1 as the *remaining* gap once hypothesis 2 is fixed.
+7. **Third pass -- add the `rp_filter` fix**: `sysctl -w
+   net.ipv4.conf.all.rp_filter=0` and `sysctl -w
+   net.ipv4.conf.geneve0.rp_filter=0` (both -- kernel takes `max`), no
+   other change. Assert: `curl` to the assigned
+   `status.loadBalancer.ingress` address from outside the pod netns
+   returns `200 OK`; inspect the backend's own request log (or an
+   `httpbin`-style echo) to assert the **real client IP** was delivered,
+   not a NAT'd/node address -- matching the bar
    `ai/extended-context/roadmap.md:52-54` already sets for beep's own
-   k3s/flannel e2e.
-7. Negative control (optional, strengthens the confirm): repeat step 5-6
-   once with `rp_filter` left at its default (2) and no other change, and
-   assert the exact same zero-response failure u7s observed -- directly
-   proving hypothesis 1 is sufficient and necessary, not just correlated.
+   k3s/flannel e2e. Going from zero-response (pass 6) to `200 OK` (pass 7)
+   with only the `rp_filter` sysctl changed directly proves hypothesis 1
+   is sufficient and necessary, not just correlated.
 
 Cross-node is not exercised on single-node `beep-smoke` (front == backend
 node), but per `ai/extended-context/roadmap.md`'s own "single-node AND
