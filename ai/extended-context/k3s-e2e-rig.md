@@ -122,6 +122,24 @@ single-node k3s cluster with no Lima VM at all -- it runs directly on the
 GitHub-hosted runner, exercising the reconcile path without a dataplane
 round trip.
 
+## Bidirectional cross-node coverage
+
+```bash
+scripts/e2e-lb-bidirectional-k3s.sh [--vm-a beep-node-a] [--vm-b beep-node-b] \
+  [--vm-client beep-client]
+```
+
+`smoke-k3s-controller.sh` and `e2e-lb-k3s.sh`'s specs only ever pin the
+backend Pod to `beep-node-b` (the k3s agent) and dial in via `beep-node-a`
+(the k3s server) -- one direction. This script proves the reverse
+orientation too, in one cluster bring-up: two Services on distinct VIP
+ports, one backend pinned to node-a dialed via node-b's address, the other
+pinned to node-b dialed via node-a's address. Both assert the round trip
+succeeds and the backend's own `RemoteAddr` still shows the real client
+IP (beep never source-NATs the forward leg) -- catching a Geneve
+encap/decap or return-path bug that only manifests in one ingress/backend
+orientation.
+
 ## Driving the rig as an agent
 
 `limactl` is the only tool that mutates VM/cluster state --
@@ -153,8 +171,9 @@ path.
 ## Related
 
 - `scripts/k3s-up.sh`, `scripts/e2e-lb-k3s.sh`,
-  `scripts/smoke-k3s-controller.sh`, `scripts/memory-smoke-controller.sh`,
-  `scripts/controller-rss.sh` -- the scripts this doc describes.
+  `scripts/smoke-k3s-controller.sh`, `scripts/e2e-lb-bidirectional-k3s.sh`,
+  `scripts/memory-smoke-controller.sh`, `scripts/controller-rss.sh` -- the
+  scripts this doc describes.
 - `lima/beep-k3s.yaml` -- the VM profile `k3s-up.sh` provisions from.
 - `deploy/rbac.yaml`, `deploy/daemonset.yaml` -- the controller manifests
   both e2e scripts deploy.
