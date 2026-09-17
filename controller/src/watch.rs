@@ -1165,6 +1165,64 @@ mod tests {
         );
     }
 
+    // `desired`'s `.rejected.extend(reconcile::rejected_endpoints_for_node(...))`
+    // line is the production wiring that makes the pod-CIDR WARN in
+    // `apply_reconcile` fire at all -- `rejected_endpoints_for_node` itself is
+    // unit-tested in reconcile.rs, but nothing here exercised the aggregation
+    // through `WatchState`. Reverting just that `.extend` line would pass
+    // every other test in this file while silently re-breaking the WARN a
+    // misconfigured `--pod-cidr` depends on to be diagnosable at all, instead
+    // of surfacing as no traffic delivered and nothing in any log naming why.
+    #[test]
+    fn desired_surfaces_a_rejected_out_of_cidr_endpoint_from_watch_state() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        // 192.168.1.9 is outside the 10.244.0.0/16 pod_cidr `node()` sets up
+        // below, and not equal to the node_ip, so it's neither cidr-admitted
+        // nor the hostNetwork signature.
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["192.168.1.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(
+            desired.rejected,
+            vec![reconcile::RejectedEndpoint {
+                pod_ip: Ipv4Addr::new(192, 168, 1, 9),
+                reason: "pod_ip is outside the configured --pod-cidr and is not this node's \
+                         own address (hostNetwork)",
+            }],
+            "WatchState::desired must surface a pod-CIDR-rejected endpoint through its own \
+             `.rejected.extend(...)` wiring, not just through the pure rejected_endpoints_for_node \
+             fn it calls -- a revert of that one aggregation line would leave every other test \
+             green while silently re-breaking the WARN a misconfigured --pod-cidr needs to be \
+             diagnosable at all"
+        );
+    }
+
     // Regression: in a multi-node cluster, THIS node's own Node LIST/watch
     // entry can land AFTER some OTHER node's, independent of whether the
     // list as a whole has completed. `pod_targets_for_node` only admits an
