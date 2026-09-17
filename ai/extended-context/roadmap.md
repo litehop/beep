@@ -83,15 +83,6 @@ not be treated as a v0.x blocker.
 - `beep-39n` -- DaemonSet memory request/limit sized to clear the measured
   ~31 MiB BTF-parse peak, plus control-plane tolerations, so beep schedules
   on resource-starved and control-plane nodes.
-- A u7s-facing "how to test beep on a VM rig" doc for humans and agents.
-  **Gap, not covered**: `ai/extended-context/vm-operations.md` documents the
-  Lima pool and the single-node dataplane smoke path (`scripts/smoke.sh`)
-  well, but says nothing about the k3s-controller e2e rig
-  (`scripts/k3s-up.sh`, `scripts/e2e-lb-k3s.sh`,
-  `scripts/smoke-k3s-controller.sh`) that the e2e status above actually
-  exercises -- that path's only documentation today is the scripts' own
-  header comments. Extending `vm-operations.md` (or a sibling doc) to cover
-  the k3s rig is unclaimed work.
 
 ## Versioning trajectory
 

@@ -10,14 +10,13 @@ each — 2 on Linode, 1 behind a home NAT router, 3 on Scaleway (IPv6-only,
 no IPv4 at all), mesh-connected via Tailscale. Priorities: memory footprint
 (hard ceiling), then correctness (cross-node routing, source-IP
 preservation, IPv4-less egress), then NetworkPolicy depth (near-zero —
-`kube-network-policies` already covers this per
-`docs/decisions/network-policy-engine.md`, regardless of CNI choice).
+`kube-network-policies` already covers this, regardless of CNI choice).
 
 ## Recommendation
 
 | Layer | Pick | Why |
 |---|---|---|
-| CNI | **Flannel**, bundled default | Lightest verified footprint (~50–80MB), no forced kube-proxy replacement. See `docs/decisions/flannel-for-cni.md`. |
+| CNI | **Flannel**, bundled default | Lightest verified footprint (~50–80MB), no forced kube-proxy replacement. |
 | Egress (Scaleway IPv4-less nodes) | **Jool + CoreDNS `dns64`**, host-level on Linode only | Measured negligible footprint; pure static routing, no CNI cooperation needed. |
 | Mesh | **Tailscale** (stays) | Beats surveyed alternatives on no-exposed-IP + low footprint + route-carrying simultaneously, at zero added infra. |
 | Ingress/L7 | **Traefik** (stays) | ~45MiB observed in production; not replaced by any alternative. |

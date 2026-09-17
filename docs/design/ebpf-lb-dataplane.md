@@ -6,7 +6,7 @@ kind: initiative-state
 # u7s eBPF LB dataplane — mechanism
 
 Phase-1 datapath mechanism for the ServiceLB dataplane (`bd show
-mayor-2et9d`, supersedes `mayor-fhfro`/`mayor-mma08`); implements
+mayor-2et9d`, supersedes `mayor-fhfro`); implements
 `docs/decisions/servicelb-ebpf-geneve-dataplane.md` (this dataplane IS the
 ServiceLB), `servicelb-symmetric-geneve-return.md` (symmetric, not DSR),
 and `ebpf-toolchain-aya.md` (`aya`). Service-level semantics from `bd show
@@ -41,8 +41,7 @@ merged one. Node-local traffic (a same-node proxy dialing the node's own
 front IP) never crosses the uplink qdisc; it needs its own, kernel-forced
 `lo` attach point. Separate hooks are also cheaper — each tc program
 runs only on its own device's traffic, and maps stay shared by name
-regardless of hook count. Deferred until the L7 tier is scoped
-(`mayor-s82zr`).
+regardless of hook count. Deferred until the L7 tier is scoped.
 
 ## Packet flow
 
@@ -152,7 +151,7 @@ flow state.
    continuously monitorable** (`ebpf-toolchain-aya.md`), not assumed
    stable.
 
-## Settled wire-format decisions (mayor-gjbov, 2026-09-03)
+## Settled wire-format decisions (2026-09-03)
 
 - **Geneve option encoding**: raw pod IP for the pod identifier; raw
   `FRONT_IP:FRONT_PORT` for the front-IP echo. Compact alternatives cost
@@ -168,6 +167,5 @@ flow state.
 
 ## References
 
-`bd show mayor-0gpqp`/`mayor-fhfro`/`mayor-mma08`; `cni-svclb-landscape.md`;
-`docs/decisions/flannel-for-cni.md`; `kubernetes-retired/blixt`; RFC 9000;
-`draft-ietf-quic-load-balancers-21`; `crates/scheduler`/`kubeconfig`.
+`bd show mayor-0gpqp`/`mayor-fhfro`; `cni-svclb-landscape.md`;
+`kubernetes-retired/blixt`; RFC 9000; `draft-ietf-quic-load-balancers-21`.

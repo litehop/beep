@@ -53,6 +53,6 @@ large to accept.
   `pod_ip` against its own local serving-set (`bd show mayor-tavxy`) —
   a lagging ingress node's stale pin is bounded only if the backend
   node rejects it.
-- TCP eviction on endpoint removal is left open (`bd show mayor-dksf5`):
+- TCP eviction on endpoint removal is left open (`bd show mayor-aie31.21`):
   without it, a pinned flow hangs until the client's retransmit timeout
   rather than getting a prompt RST.
