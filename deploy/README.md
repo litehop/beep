@@ -33,6 +33,25 @@ central controller can't program them), loads and pins the tc-bpf programs
 once, watches `Service`/`EndpointSlice`, writes maps on change, then idles —
 the kernel does the packet forwarding.
 
+Node self-prep is part of that same startup, not a separate step this
+manifest or its operator needs to provide: the controller creates `geneve0`
+(an address-less, external-mode Geneve device) if it doesn't already exist,
+and disables the reverse-path filter on `all` and `geneve0`
+(`net.ipv4.conf.{all,geneve0}.rp_filter=0`).
+
+**rp_filter=0 is a deliberate, operator-decided tradeoff (2026-09-17), not
+an oversight.** beep preserves the client's real source IP across the
+Geneve tunnel — the entire point of this LB — so the decapped packet's
+source address is the external client, never reachable back out an
+address-less `geneve0`; the kernel's reverse-path filter drops it by
+construction regardless of strict/loose mode. Cilium and Katran run the
+same way, for the same reason; Calico only avoids it because it's a
+routing-based LB with symmetric BGP returns, not an eBPF-redirect one. The
+cost is real: this weakens anti-spoof protection node-wide (`all`), not
+just on `geneve0`. REVISIT if that turns out to matter for your threat
+model — the escape hatch is a routing-based/policy-routing decap
+alternative that preserves symmetric RPF at a real datapath cost.
+
 ## Kubeconfig
 
 `beep-kubeconfig` only parses an X.509 client-cert kubeconfig file (no
