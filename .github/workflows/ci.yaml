@@ -217,7 +217,7 @@ jobs:
       - name: Run beep-controller against k3s and gate its userspace RSS
         run: sudo bash scripts/memory-smoke-controller.sh run
 
-  # Coverage for Dockerfile's iproute2 addition (beep-o1b/#75): the two
+  # Coverage for Dockerfile's iproute2 addition: the two
   # jobs above run the raw beep-controller binary directly on the runner,
   # never the SHIPPED image, so a missing/broken `ip` on PATH inside it, or
   # a break in node self-prep when run from that image, had zero CI
