@@ -21,7 +21,7 @@ use beep::{
 };
 use beep_controller::{
     apply::PinnedMaps,
-    reconcile::{Ipv4Cidr, NodeContext},
+    reconcile::{DesiredEntries, Ipv4Cidr, NodeContext},
     status::ensure_node_ingress,
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -121,9 +121,34 @@ fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
 
 fn apply_reconcile(state: &Mutex<WatchState>, maps: &Mutex<PinnedMaps>, node: &NodeContext) {
     let desired = state.lock().unwrap().desired(node);
+    warn_on_rejected_endpoints(&desired, node);
     if let Err(e) = maps.lock().unwrap().apply(&desired) {
         eprintln!("controller: applying reconciled maps failed: {e:#}");
     }
+}
+
+/// A rejected endpoint is nearly always a misconfigured `--pod-cidr` (every
+/// endpoint on every node gets rejected the same way), not a one-off bad
+/// actor -- see `RejectedEndpoint`'s doc comment. Without this, that
+/// misconfiguration empties `POD_TARGETS` and drops every forward packet at
+/// decap admission with nothing in any log naming why.
+fn warn_on_rejected_endpoints(desired: &DesiredEntries, node: &NodeContext) {
+    if desired.rejected.is_empty() {
+        return;
+    }
+    let pod_ips: Vec<String> = desired
+        .rejected
+        .iter()
+        .map(|r| r.pod_ip.to_string())
+        .collect();
+    eprintln!(
+        "controller: WARN {} endpoint(s) rejected from POD_TARGETS: pod_ip [{}] outside \
+         configured pod_cidr {} -- double check --pod-cidr matches this cluster's real pod \
+         network (deploy/README.md's pod-cidr gotcha)",
+        desired.rejected.len(),
+        pod_ips.join(", "),
+        node.pod_cidr
+    );
 }
 
 /// Re-asserts this node's own address in `status.loadBalancer.ingress` for

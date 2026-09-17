@@ -429,6 +429,12 @@ impl WatchState {
             aggregate
                 .pod_targets
                 .extend(reconcile::pod_targets_for_node(&endpoint_slices, node));
+            aggregate
+                .rejected
+                .extend(reconcile::rejected_endpoints_for_node(
+                    &endpoint_slices,
+                    node,
+                ));
 
             if !self.nodes_listed {
                 continue;
