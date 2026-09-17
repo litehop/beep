@@ -92,6 +92,16 @@ struct Args {
     #[arg(long = "pod-cidr", value_parser = parse_ipv4_cidr)]
     pod_cidr: Ipv4Cidr,
 
+    /// Cluster Service CIDR / ClusterIP range (e.g. `10.96.0.0/12`).
+    /// Optional: only enforced when given. Every `--fixture` vip_ip is
+    /// rejected at startup if it falls inside this range: tc runs before
+    /// netfilter on ingress (`docs/design/kube-proxy-coexistence.md`), so a
+    /// VIP inside the Service CIDR would let beep's classifier shadow that
+    /// ClusterIP Service's east-west traffic instead of falling through to
+    /// kube-proxy.
+    #[arg(long = "service-cidr", value_parser = parse_ipv4_cidr)]
+    service_cidr: Option<Ipv4Cidr>,
+
     /// This node's own address -- the value a `--fixture`'s
     /// `backend_node_ip` names when THIS node is the one hosting that
     /// fixture's pod. Interim stand-in for real node identity (the eventual
@@ -164,17 +174,19 @@ impl std::fmt::Display for Ipv4Cidr {
 }
 
 fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
+    // Shared by --pod-cidr and --service-cidr's value_parser, so this
+    // message can't name either flag specifically.
     let (network, prefix_len) = s
         .split_once('/')
         .ok_or_else(|| format!("expected network_ip/prefix_len, got `{s}`"))?;
     let network: Ipv4Addr = network
         .parse()
-        .map_err(|e| format!("pod_cidr network `{network}`: {e}"))?;
+        .map_err(|e| format!("cidr network `{network}`: {e}"))?;
     let prefix_len: u8 = prefix_len
         .parse()
-        .map_err(|e| format!("pod_cidr prefix_len `{prefix_len}`: {e}"))?;
+        .map_err(|e| format!("cidr prefix_len `{prefix_len}`: {e}"))?;
     if prefix_len > 32 {
-        return Err(format!("pod_cidr prefix_len `{prefix_len}` must be 0..=32"));
+        return Err(format!("cidr prefix_len `{prefix_len}` must be 0..=32"));
     }
     // Mask off host bits so Display/error text always shows the canonical
     // network address (e.g. `10.244.0.0/16`, not `10.244.1.7/16`); `contains`
@@ -204,6 +216,25 @@ fn vip_outside_pod_cidr(vip: Ipv4Addr, pod_cidr: Ipv4Cidr) -> Result<(), String>
     }
 }
 
+/// tc runs before netfilter on ingress
+/// (`docs/design/kube-proxy-coexistence.md`), so a VIP inside the Service
+/// CIDR is not disjoint from ClusterIP space by construction, only by
+/// configuration -- beep's classifier would shadow that ClusterIP Service's
+/// east-west traffic instead of letting it fall through to kube-proxy's
+/// chains. Rejecting at startup is the only way to guarantee the two stay
+/// disjoint.
+fn vip_outside_service_cidr(vip: Ipv4Addr, service_cidr: Ipv4Cidr) -> Result<(), String> {
+    if service_cidr.contains(vip) {
+        Err(format!(
+            "vip_ip `{vip}` falls inside Service CIDR `{service_cidr}`: beep's classifier \
+             would shadow that ClusterIP Service's east-west traffic instead of falling \
+             through to kube-proxy"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let Args {
         uplink_iface,
@@ -211,6 +242,7 @@ fn main() -> anyhow::Result<()> {
         pin_dir,
         fixtures,
         pod_cidr,
+        service_cidr,
         node_ip,
         fwd_pending_max_entries,
         flow_table_max_entries,
@@ -220,6 +252,9 @@ fn main() -> anyhow::Result<()> {
 
     for fixture in &fixtures {
         vip_outside_pod_cidr(fixture.vip_ip, pod_cidr).map_err(|e| anyhow!(e))?;
+        if let Some(service_cidr) = service_cidr {
+            vip_outside_service_cidr(fixture.vip_ip, service_cidr).map_err(|e| anyhow!(e))?;
+        }
     }
 
     bump_memlock_rlimit();
@@ -535,6 +570,63 @@ mod tests {
             pod_cidr.to_string(),
             "10.244.0.0/16",
             "the stored network address must be masked to its canonical form at parse time"
+        );
+    }
+
+    // `vip_outside_service_cidr` mirrors `vip_outside_pod_cidr` above: same
+    // boundary math (`Ipv4Cidr::contains`), same rejection shape, guarding
+    // against beep's classifier shadowing a ClusterIP Service instead of
+    // the flow-key collision the pod-CIDR guard prevents.
+    #[test]
+    fn vip_inside_service_cidr_is_rejected() {
+        let service_cidr = parse_ipv4_cidr("10.96.0.0/12").unwrap();
+        let vip = Ipv4Addr::new(10, 96, 5, 9);
+
+        let err = vip_outside_service_cidr(vip, service_cidr)
+            .expect_err("a VIP inside the Service CIDR must be rejected, or beep's classifier can shadow a ClusterIP Service");
+        assert!(
+            err.contains("10.96.5.9") && err.contains("10.96.0.0/12"),
+            "rejection must name both the offending VIP and the Service CIDR so an operator can fix the config: got `{err}`"
+        );
+    }
+
+    #[test]
+    fn vip_outside_service_cidr_is_accepted() {
+        let service_cidr = parse_ipv4_cidr("10.96.0.0/12").unwrap();
+        // Matches scripts/smoke-remote.sh's RFC 5737 VIP, deliberately
+        // disjoint from the Service range -- this is the legitimate-config
+        // path that must keep loading.
+        let vip = Ipv4Addr::new(203, 0, 113, 1);
+
+        assert!(
+            vip_outside_service_cidr(vip, service_cidr).is_ok(),
+            "a VIP outside the Service CIDR is a legitimate config and must not be rejected"
+        );
+    }
+
+    #[test]
+    fn vip_at_service_cidr_network_or_broadcast_address_is_rejected() {
+        let service_cidr = parse_ipv4_cidr("10.96.0.0/12").unwrap();
+        assert!(
+            vip_outside_service_cidr(Ipv4Addr::new(10, 96, 0, 0), service_cidr).is_err(),
+            "the Service CIDR's network address is still inside the block and must be rejected"
+        );
+        assert!(
+            vip_outside_service_cidr(Ipv4Addr::new(10, 111, 255, 255), service_cidr).is_err(),
+            "the Service CIDR's broadcast address is still inside the block and must be rejected"
+        );
+    }
+
+    #[test]
+    fn vip_one_address_outside_service_cidr_boundary_is_accepted() {
+        let service_cidr = parse_ipv4_cidr("10.96.0.0/12").unwrap();
+        assert!(
+            vip_outside_service_cidr(Ipv4Addr::new(10, 95, 255, 255), service_cidr).is_ok(),
+            "one address below the Service CIDR's network address must be accepted"
+        );
+        assert!(
+            vip_outside_service_cidr(Ipv4Addr::new(10, 112, 0, 0), service_cidr).is_ok(),
+            "one address above the Service CIDR's broadcast address must be accepted"
         );
     }
 
