@@ -62,13 +62,18 @@ before and after this testing; only IPVS mode exhibits the conflict.
 - The LB VIP / front-IP range MUST be disjoint from the **pod CIDR** — a
   hostNetwork Pod's IP equals its node's IP (front-IP space), so a VIP
   inside the pod CIDR can byte-collide a forward and reverse flow key.
-  This is **enforced at loader startup**: `vip_outside_pod_cidr`
-  (`src/main.rs:195`) rejects a `--pod-cidr` that contains any configured
-  VIP.
+  This is **enforced at startup by the standalone `beep` loader's
+  `--fixture` path**: `vip_outside_pod_cidr` (`src/main.rs:195`) rejects a
+  `--pod-cidr` that contains any configured VIP. The shipped
+  `beep-controller` DaemonSet binary does not call this guard — its VIP is
+  always the node's own physical address, disjoint from the pod CIDR by
+  construction, so the check doesn't apply there.
 - The VIP range MUST also be disjoint from the **Service CIDR**
-  (ClusterIP range). This is **not yet enforced** by the loader — it is
-  the operator's responsibility to keep the two ranges apart when sizing
-  the cluster.
+  (ClusterIP range), or beep's classifier can shadow a ClusterIP Service's
+  east-west traffic instead of falling through to kube-proxy. Same scope
+  as above: the standalone loader enforces this when `--service-cidr` is
+  given (`vip_outside_service_cidr`, `src/main.rs`); it's optional and, like
+  `--pod-cidr`, not called by `beep-controller`.
 
 ## Verifying this (agent-facing)
 
