@@ -208,6 +208,23 @@ fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> VipKey {
     }
 }
 
+/// The CIDR/hostNetwork admission disjunct shared by `pod_targets_for_node`
+/// and `rejected_endpoints_for_node`: an endpoint is admitted if its pod_ip
+/// is in this node's pod_cidr OR it carries the hostNetwork signature
+/// (pod_ip == node_ip). In bare metal (no cloud LB, no BGP -- beep fronts
+/// the node's physical IP) a hostNetwork pod's IP IS the node IP, so
+/// without the second disjunct a Service backed by a hostNetwork pod would
+/// be silently excluded and every forward packet dropped at decap
+/// admission. Guarding which control-plane ports (6443/10250/2379/...) may
+/// be fronted this way is deliberately out of scope -- that's
+/// perimeter/firewall policy (ufw/NetworkPolicy), not the load balancer's
+/// job. Extracted to one predicate both callers share, so a future change
+/// to this condition can't silently drift between the admit path and its
+/// negated, observational complement below.
+fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
+    node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip
+}
+
 /// POD_TARGETS is this node's own local serving-set, port-agnostic by
 /// design (`beep_common::egress_return_admission`'s doc comment) --
 /// membership must never depend on which front port an endpoint answers,
@@ -217,24 +234,14 @@ fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> VipKey {
 /// not front-derived, so `WatchState::desired` can (and must) call this even
 /// while the front set is still unknown (`nodes_listed == false`) -- see its
 /// call site's comment for the restart-blackhole this independence avoids.
-/// An endpoint is admitted if its pod_ip is in this node's pod_cidr OR it
-/// carries the hostNetwork signature (pod_ip == node_ip): in bare metal
-/// (no cloud LB, no BGP -- beep fronts the node's physical IP) a
-/// hostNetwork pod's IP IS the node IP, so without this a Service backed
-/// by a hostNetwork pod would be silently excluded here and every
-/// forward packet dropped at decap admission. Guarding which control-
-/// plane ports (6443/10250/2379/...) may be fronted this way is
-/// deliberately out of scope -- that's perimeter/firewall policy
-/// (ufw/NetworkPolicy), not the load balancer's job. Arbitrary out-of-
-/// cidr pod_ips that are also != node_ip are still rejected below.
+/// See `is_admitted` for the CIDR/hostNetwork admission check itself.
+/// Arbitrary out-of-cidr pod_ips that are also != node_ip are still
+/// rejected below.
 pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) -> HashSet<u32> {
     let mut pod_targets = HashSet::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready
-                && ep.node_ip == node.node_ip
-                && (node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip)
-            {
+            if ep.ready && ep.node_ip == node.node_ip && is_admitted(ep, node) {
                 pod_targets.insert(wire_ip(u32::from(ep.pod_ip)));
             }
         }
@@ -243,11 +250,7 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
 }
 
 /// The observational complement of `pod_targets_for_node`: every ready,
-/// this-node-hosted endpoint that admission check excluded, paired with why.
-/// Deliberately duplicates that function's condition (negated) rather than
-/// refactoring it to share a helper -- `pod_targets_for_node`'s admission
-/// logic is settled anti-spoof behavior that must not shift as a side
-/// effect of adding observability around it.
+/// this-node-hosted endpoint that `is_admitted` excluded, paired with why.
 pub fn rejected_endpoints_for_node(
     slices: &[EndpointSliceView],
     node: &NodeContext,
@@ -255,10 +258,7 @@ pub fn rejected_endpoints_for_node(
     let mut rejected = Vec::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready
-                && ep.node_ip == node.node_ip
-                && !(node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip)
-            {
+            if ep.ready && ep.node_ip == node.node_ip && !is_admitted(ep, node) {
                 rejected.push(RejectedEndpoint {
                     pod_ip: ep.pod_ip,
                     reason: "pod_ip is outside the configured --pod-cidr and is not this \
