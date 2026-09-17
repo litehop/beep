@@ -205,6 +205,68 @@ pub fn iface_index(name: &str) -> anyhow::Result<u32> {
     Ok(ifindex)
 }
 
+/// Creates `iface` as an external-mode ("collect metadata") Geneve device
+/// and brings it up, if it doesn't already exist -- idempotent so a restart
+/// against a node that already has it (or a test fixture that pre-creates
+/// it) is a no-op. The shipped DaemonSet has no other node-prep step, and a
+/// missing `geneve0` used to crash-loop it at `populate_config`'s ifindex
+/// resolution ("resolving ifindex for geneve0 / No such device").
+///
+/// Shells out to `ip` (iproute2, added to the runtime image in `Dockerfile`)
+/// rather than emitting a raw `RTM_NEWLINK` netlink message directly: this
+/// workspace has no netlink crate dependency (minimal-deps stance), and
+/// hand-rolling the GENEVE collect-metadata link-info attributes over a raw
+/// `AF_NETLINK` socket is a lot of unsafe FFI for a one-shot node-prep step.
+pub fn ensure_geneve_iface(iface: &str) -> anyhow::Result<()> {
+    if iface_index(iface).is_err() {
+        let out = std::process::Command::new("ip")
+            .args(["link", "add", iface, "type", "geneve", "external"])
+            .output()
+            .with_context(|| format!("running `ip link add {iface} type geneve external`"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "`ip link add {iface} type geneve external` exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    let out = std::process::Command::new("ip")
+        .args(["link", "set", iface, "up"])
+        .output()
+        .with_context(|| format!("running `ip link set {iface} up`"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "`ip link set {iface} up` exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Disables the kernel reverse-path filter on `all` and on `iface` (the
+/// Geneve device) -- effective RPF is `max(conf.all.rp_filter,
+/// conf.<iface>.rp_filter)` (see `ip-sysctl.rst`), so both writes are
+/// required or the `all` exception alone is moot.
+///
+/// DELIBERATE, operator-decided tradeoff (2026-09-17), not an oversight: to
+/// preserve the client's real source IP across the tunnel -- the entire
+/// point of this LB -- the decapped inner packet's source address is the
+/// external client, never reachable back out an address-less `geneve0`;
+/// strict or loose RPF drops it by construction (Cilium and Katran run the
+/// same way, for the same reason). This weakens anti-spoof protection
+/// node-wide (`all`), not just on `geneve0`. REVISIT if that turns out to
+/// matter -- the escape hatch is a routing-based/policy-routing decap
+/// alternative that preserves symmetric RPF at a real datapath cost.
+pub fn disable_rp_filter(iface: &str) -> anyhow::Result<()> {
+    for dev in ["all", iface] {
+        let path = format!("/proc/sys/net/ipv4/conf/{dev}/rp_filter");
+        std::fs::write(&path, b"0").with_context(|| format!("writing 0 to {path}"))?;
+    }
+    Ok(())
+}
+
 /// Resolves the Geneve device's ifindex (unknown until this host's `ip link`
 /// state is inspected, so it can't be a compile-time constant in the eBPF
 /// program), the uplink's L2 header length (a WireGuard/tun uplink has no

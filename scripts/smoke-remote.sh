@@ -148,15 +148,15 @@ ip netns exec smoke-client ip link set smoke-veth1 up
 ip netns exec smoke-client ip link set lo up
 ip addr add "${POD_IP}/32" dev lo
 
-# Empirically required for this fixture (kfree_skb tracepoint pinpointed
-# `ip_rcv_finish_core`, reason IP_RPFILTER): the forward-decap program
-# re-delivers the DNAT'd packet locally via `lo` (the pod_ip alias above)
-# while it physically arrived on geneve0 -- Linux's loose (2) reverse-path
-# filter still drops that mismatch for a source reachable only via a
-# different device (smoke-veth0). A real deployment routes the decap'd
-# packet to an actual Pod veth instead of a loopback alias and does not
-# appear to need this (PR #1557's real 2-node run never touched rp_filter);
-# saved/restored so this harness never leaves the VM's global rp_filter
+# Required here AND on a real deployment (empirically confirmed against a
+# single-node k3s cluster): the decapped inner packet's source is the
+# external client, never reachable back out an address-less `geneve0`, so
+# the kernel's reverse-path filter drops it by construction -- this
+# fixture's `ip_rcv_finish_core`/IP_RPFILTER kfree_skb just makes that same
+# drop visible locally via the `lo` (pod_ip alias) re-delivery. The shipped
+# DaemonSet now sets this itself at startup (`beep::disable_rp_filter`,
+# `deploy/README.md`'s REVISIT note); this harness still saves/restores it
+# around its own run so it never leaves the VM's global rp_filter
 # permanently weakened.
 if [ ! -f "$RPFILTER_SAVE_FILE" ]; then
   sysctl -n net.ipv4.conf.all.rp_filter > "$RPFILTER_SAVE_FILE"

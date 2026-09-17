@@ -68,6 +68,12 @@ spec:
               # for a non-root BPF_PROG_LOAD gate on perfmon_capable(), not
               # just CAP_BPF -- without it the load is rejected outright.
               # See docs/decisions/servicelb-controller-apparmor-unconfined.md.
+              # CAP_NET_ADMIN also covers the two node-prep steps this
+              # controller does at startup, before attaching anything:
+              # creating `geneve0` (`beep::ensure_geneve_iface`) and
+              # disabling its reverse-path filter (`beep::disable_rp_filter`
+              # -- see its doc comment for why rp_filter=0 is deliberate,
+              # not optional).
               add: ["BPF", "NET_ADMIN", "PERFMON"]
           env:
             # hostNetwork means status.hostIP is this node's own address --

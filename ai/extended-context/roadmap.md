@@ -45,13 +45,22 @@ IPv6-only-registry constraint. `deploy/daemonset.yaml` pulls `:latest`.
 
 ## Near-term goal -- "testable by u7s"
 
-Two bars gate beep being usable from the u7s monorepo it was extracted from,
-and both are essentially MET:
+Two bars gate beep being usable from the u7s monorepo it was extracted from.
+The dataplane itself is proven; the shipped deploy artifact had gaps that
+blocked u7s from reaching that dataplane at all (`beep-a5k`'s diagnosis, PR
+#74):
 
 - **Consumable**: an image u7s can pull. Met -- Docker Hub, IPv6-reachable.
 - **Functional**: real LoadBalancer delivery, single-node AND cross-node,
-  with the real client IP preserved. Met -- proven on the k3s-on-Lima rig
-  per the e2e status above.
+  with the real client IP preserved. Met at the dataplane level -- proven
+  on the k3s-on-Lima rig per the e2e status above -- but the as-shipped
+  `deploy/daemonset.yaml` couldn't reach that dataplane on a fresh node: it
+  never created `geneve0` (immediate CrashLoop) and never disabled the
+  reverse-path filter on it (packets decap correctly but the backend Pod
+  sees zero of them, `FLOW_TABLE` notwithstanding). `beep-o1b` fixed both by
+  making the controller self-prep at startup; a third gap (pod-CIDR
+  hardcoded to `10.42.0.0/16` in the manifest) is tracked separately in
+  `beep-1d4`.
 
 u7s tests beep by standing up the same kind of local VM rig beep itself
 uses (Lima + k3s), not a real cloud fleet. So the remaining requirement is
