@@ -259,6 +259,22 @@ jobs:
       - name: Assert `ip` (iproute2) is present on PATH inside the built image
         run: docker run --rm --entrypoint sh beep-controller:ci-smoke -c 'command -v ip && ip -V'
 
+      - name: DEBUG diagnose the sudo/ip/apparmor environment
+        run: |
+          uname -a
+          sudo -n true && echo "sudo: passwordless OK"
+          sudo aa-status 2>&1 | head -40 || echo "aa-status: $?"
+          echo "---- bare sudo ip link add ----"
+          sudo ip link add diag-test0 type dummy
+          echo "exit=$?"
+          ip link show diag-test0 || echo "diag-test0 missing"
+          sudo ip link del diag-test0 || true
+          echo "---- sudo bash -c wrapped ----"
+          sudo bash -c 'ip link add diag-test1 type dummy'
+          echo "exit=$?"
+          ip link show diag-test1 || echo "diag-test1 missing"
+          sudo ip link del diag-test1 || true
+
       # --network host: matches deploy/daemonset.yaml's hostNetwork: true,
       # and (practically) means geneve0/rp_filter land in the runner's own
       # netns/procfs, so they're inspectable after the container exits
