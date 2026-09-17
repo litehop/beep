@@ -412,6 +412,7 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     }
 }
 
+#[inline(always)]
 fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i32> {
     // No Ethernet header at all on an L3-only uplink -- there's no EtherType
     // field to check; the IP-version nibble below is this path's only gate.
@@ -982,6 +983,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     }
 }
 
+#[inline(always)]
 fn try_uplink_egress_return_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i32> {
     if L2_HLEN == ETH_HLEN && load_direct::<u16>(ctx, 12)? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
