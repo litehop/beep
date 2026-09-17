@@ -259,22 +259,6 @@ jobs:
       - name: Assert `ip` (iproute2) is present on PATH inside the built image
         run: docker run --rm --entrypoint sh beep-controller:ci-smoke -c 'command -v ip && ip -V'
 
-      - name: DEBUG diagnose the sudo/ip/apparmor environment
-        run: |
-          uname -a
-          sudo -n true && echo "sudo: passwordless OK"
-          sudo aa-status 2>&1 | head -40 || echo "aa-status: $?"
-          echo "---- bare sudo ip link add ----"
-          sudo ip link add diag-test0 type dummy
-          echo "exit=$?"
-          ip link show diag-test0 || echo "diag-test0 missing"
-          sudo ip link del diag-test0 || true
-          echo "---- sudo bash -c wrapped ----"
-          sudo bash -c 'ip link add diag-test1 type dummy'
-          echo "exit=$?"
-          ip link show diag-test1 || echo "diag-test1 missing"
-          sudo ip link del diag-test1 || true
-
       # --network host: matches deploy/daemonset.yaml's hostNetwork: true,
       # and (practically) means geneve0/rp_filter land in the runner's own
       # netns/procfs, so they're inspectable after the container exits
@@ -288,15 +272,14 @@ jobs:
       #
       # Capabilities + AppArmor mirror deploy/daemonset.yaml's
       # securityContext exactly (docs/decisions/servicelb-controller-
-      # apparmor-unconfined.md), not a CI-only workaround: --privileged
-      # alone hits "Error: Attribute failed policy validation" on this
-      # runner image's AppArmor/Docker combination, and the DaemonSet never
-      # runs privileged anyway.
+      # apparmor-unconfined.md). Device names must stay <=15 bytes
+      # (IFNAMSIZ) or `ip link add` fails the kernel's own netlink
+      # attribute validation on IFLA_IFNAME.
       - name: Run beep-controller from the built image and assert node self-prep (geneve0 + rp_filter=0)
         run: |
           set -euo pipefail
-          UPLINK=ci-smoke-uplink0
-          GENEVE=ci-smoke-geneve0
+          UPLINK=smoke-uplink0
+          GENEVE=smoke-geneve0
           echo "==> creating dummy uplink $UPLINK"
           sudo ip link add "$UPLINK" type dummy
           sudo ip link set "$UPLINK" up
@@ -329,5 +312,5 @@ jobs:
         if: always()
         run: |
           docker rm -f beep-node-prep-smoke >/dev/null 2>&1 || true
-          sudo ip link del ci-smoke-geneve0 >/dev/null 2>&1 || true
-          sudo ip link del ci-smoke-uplink0 >/dev/null 2>&1 || true
+          sudo ip link del smoke-geneve0 >/dev/null 2>&1 || true
+          sudo ip link del smoke-uplink0 >/dev/null 2>&1 || true
