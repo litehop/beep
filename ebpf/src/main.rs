@@ -50,11 +50,12 @@ use aya_ebpf::{
 };
 use beep_common::{
     backend_port_resolution, decap_forward_pod_admission, egress_return_admission,
-    egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission, ipv4_mapped_v6,
-    is_redirected_return_mark, occupant_conflicts, resolve_backend_src_port, return_authorization,
-    BackendPortDecision, BackendPortResolution, Config, DecapForwardPodAdmission,
-    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission,
-    ReturnAuthorization, TcpFlowKey, VipBackend, VipKey, REDIRECTED_RETURN_MARK,
+    egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission,
+    fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts,
+    resolve_backend_src_port, return_authorization, BackendPortDecision, BackendPortResolution,
+    Config, DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection,
+    FlowKey, ForwardAdmission, FwdPendingPin, ReturnAuthorization, TcpFlowKey, VipBackend, VipKey,
+    REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -478,12 +479,12 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i
         // A PENDING lookup is an RCU read that already refreshes this
         // entry's LRU recency, so once minted the backend choice never
         // needs rewriting -- a write takes the bucket's raw_spinlock and can
-        // run the LRU shrink path, unlike a read. Existence alone is enough
-        // to skip it: the backend picked on this flow's first packet is the
-        // one affinity should keep, not whatever VIP_MAP would pick if
-        // re-run on a later pre-promotion packet.
-        if unsafe { FWD_PENDING.get(flow_key) }.is_none() {
-            FWD_PENDING.insert(flow_key, backend, 0).ok()?;
+        // run the LRU shrink path, unlike a read.
+        match fwd_pending_affinity_pin(unsafe { FWD_PENDING.get(flow_key) }.copied(), backend) {
+            FwdPendingPin::Insert(candidate) => {
+                FWD_PENDING.insert(flow_key, candidate, 0).ok()?;
+            }
+            FwdPendingPin::Keep => {}
         }
     }
 

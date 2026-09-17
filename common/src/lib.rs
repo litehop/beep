@@ -214,7 +214,7 @@ pub struct VipKey {
 /// `VIP_MAP`/`FWD_PENDING` value: the backend identity a `VipKey` resolves
 /// to.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VipBackend {
     /// Geneve remote for the forward leg -- the node hosting the chosen Pod.
     pub backend_node_ip: u32,
@@ -266,6 +266,35 @@ pub fn forward_admission(in_main: bool) -> ForwardAdmission {
         ForwardAdmission::Established
     } else {
         ForwardAdmission::MintPending
+    }
+}
+
+/// FWD_PENDING affinity-pin decision (`beep-ebpf`'s
+/// `try_uplink_ingress_headers`, inside the `ForwardAdmission::MintPending`
+/// branch). `VIP_MAP` is re-resolved on every pre-promotion packet, so
+/// without this guard a later packet of the same not-yet-promoted flow could
+/// silently re-pin a different backend before promotion copies the PENDING
+/// value into FLOW_TABLE -- once a flow is established, that would mean
+/// mid-connection packets landing on a different backend than the one that
+/// answered its first packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FwdPendingPin {
+    /// No PENDING entry yet -- pin `candidate`, the backend just resolved
+    /// for this (first) packet of the flow.
+    Insert(VipBackend),
+    /// Already pinned by an earlier packet -- leave it untouched.
+    Keep,
+}
+
+/// `existing`: result of a `FWD_PENDING.get(flow_key)` lookup. `candidate`:
+/// the backend `VIP_MAP` resolved for the current packet.
+pub fn fwd_pending_affinity_pin(
+    existing: Option<VipBackend>,
+    candidate: VipBackend,
+) -> FwdPendingPin {
+    match existing {
+        Some(_) => FwdPendingPin::Keep,
+        None => FwdPendingPin::Insert(candidate),
     }
 }
 
@@ -1212,6 +1241,42 @@ mod tests {
         // can therefore never populate MAIN by construction, not just by
         // convention.
         assert_eq!(forward_admission(false), ForwardAdmission::MintPending);
+    }
+
+    #[test]
+    fn fwd_pending_pin_absent_uses_and_inserts_the_candidate() {
+        // A flow's first packet has no existing pin, so the freshly-resolved
+        // backend becomes the one this flow sticks to for the rest of its
+        // pre-promotion life.
+        let candidate = VipBackend {
+            backend_node_ip: 1,
+            pod_ip: 100,
+        };
+        assert_eq!(
+            fwd_pending_affinity_pin(None, candidate),
+            FwdPendingPin::Insert(candidate)
+        );
+    }
+
+    #[test]
+    fn fwd_pending_pin_present_keeps_the_pinned_backend_not_the_candidate() {
+        // A regression that overwrites an existing pin with the newly
+        // re-resolved candidate would let an established connection's
+        // mid-stream packets land on a different backend than the one that
+        // answered its first packet, silently breaking session affinity.
+        let pinned = VipBackend {
+            backend_node_ip: 1,
+            pod_ip: 100,
+        };
+        let candidate = VipBackend {
+            backend_node_ip: 2,
+            pod_ip: 200,
+        };
+        assert_eq!(
+            fwd_pending_affinity_pin(Some(pinned), candidate),
+            FwdPendingPin::Keep,
+            "an existing pin must never be overwritten by a later packet's re-resolved backend"
+        );
     }
 
     #[test]
