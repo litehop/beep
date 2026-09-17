@@ -14,7 +14,15 @@
 # store from the CA cert embedded in the mounted kubeconfig/ServiceAccount
 # token, not the OS trust store. The DaemonSet grants CAP_BPF/CAP_NET_ADMIN
 # at the pod level (deploy/daemonset.yaml).
+#
+# iproute2 provides `ip`, which `beep::ensure_geneve_iface` shells out to at
+# startup to create the node's `geneve0` device -- the workspace has no
+# netlink crate to emit the RTM_NEWLINK message directly (minimal-deps
+# stance; see that function's doc comment).
 FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG TARGETARCH
 

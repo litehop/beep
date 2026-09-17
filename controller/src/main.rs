@@ -15,7 +15,10 @@ use std::{
 
 use anyhow::Context;
 use aya::programs::TcAttachType;
-use beep::{attach_and_pin, bump_memlock_rlimit, load_ebpf, populate_config};
+use beep::{
+    attach_and_pin, bump_memlock_rlimit, disable_rp_filter, ensure_geneve_iface, load_ebpf,
+    populate_config,
+};
 use beep_controller::{
     apply::PinnedMaps,
     reconcile::{Ipv4Cidr, NodeContext},
@@ -239,6 +242,12 @@ async fn main() -> anyhow::Result<()> {
         args.target_ports_max_entries,
     )
     .context("loading beep-ebpf")?;
+
+    // Node self-prep: the shipped DaemonSet has no initContainer and no
+    // other prerequisite step, so this is the only place `geneve0` gets
+    // created and the RPF exception gets applied on a fresh node.
+    ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
+    disable_rp_filter(&args.geneve_iface).context("disabling reverse-path filter")?;
 
     populate_config(&mut ebpf, &args.geneve_iface, &args.uplink_iface)
         .context("populating CONFIG map")?;
