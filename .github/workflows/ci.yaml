@@ -216,3 +216,91 @@ jobs:
 
       - name: Run beep-controller against k3s and gate its userspace RSS
         run: sudo bash scripts/memory-smoke-controller.sh run
+
+  # Coverage for Dockerfile's iproute2 addition (beep-o1b/#75): the two
+  # jobs above run the raw beep-controller binary directly on the runner,
+  # never the SHIPPED image, so a missing/broken `ip` on PATH inside it, or
+  # a break in node self-prep when run from that image, had zero CI
+  # coverage. Builds the same runtime image delivery.yaml ships (native
+  # amd64, no cross-build needed since this runner IS that platform), then
+  # `docker run`s it to assert `ip` is present and that beep-controller
+  # creates `geneve0` and disables its reverse-path filter end-to-end --
+  # exactly the two node-prep steps deploy/daemonset.yaml's hostNetwork pod
+  # relies on this image providing.
+  container-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: bpf-linker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build beep-controller and stage it where the Dockerfile expects it
+        run: |
+          set -euo pipefail
+          cargo build --release -p beep-controller
+          mkdir -p dist/linux/amd64
+          cp target/release/beep-controller dist/linux/amd64/beep-controller
+
+      - name: Build the runtime image
+        run: docker build -t beep-controller:ci-smoke .
+
+      - name: Assert `ip` (iproute2) is present on PATH inside the built image
+        run: docker run --rm --entrypoint sh beep-controller:ci-smoke -c 'command -v ip && ip -V'
+
+      # --network host: matches deploy/daemonset.yaml's hostNetwork: true,
+      # and (practically) means geneve0/rp_filter land in the runner's own
+      # netns/procfs, so they're inspectable after the container exits
+      # instead of being torn down with its private netns. A dedicated
+      # dummy uplink device (never the runner's real NIC) is the same
+      # precaution scripts/memory-smoke-controller.sh takes for its own
+      # ctrl-uplink0 fixture. --kubeconfig points nowhere on purpose: node
+      # self-prep runs before beep-controller ever reads it, so a fast,
+      # loud failure there (after self-prep already ran) is fine -- this
+      # job only asserts on self-prep's side effects, not a full k8s watch.
+      - name: Run beep-controller from the built image and assert node self-prep (geneve0 + rp_filter=0)
+        run: |
+          set -euo pipefail
+          UPLINK=ci-smoke-uplink0
+          GENEVE=ci-smoke-geneve0
+          sudo ip link add "$UPLINK" type dummy
+          sudo ip link set "$UPLINK" up
+
+          docker run -d --name beep-node-prep-smoke \
+            --privileged --network host \
+            -v /sys/fs/bpf:/sys/fs/bpf \
+            beep-controller:ci-smoke \
+            --uplink-iface "$UPLINK" --geneve-iface "$GENEVE" \
+            --pin-dir /sys/fs/bpf/beep-ci-smoke \
+            --pod-cidr 10.244.0.0/16 --node-ip 10.0.0.5 \
+            --kubeconfig /nonexistent-kubeconfig
+
+          timeout 30 docker wait beep-node-prep-smoke >/dev/null || true
+          echo "---- beep-node-prep-smoke container logs ----"
+          docker logs beep-node-prep-smoke || true
+
+          ip link show "$GENEVE" || { echo "FAIL: $GENEVE was never created by ensure_geneve_iface" >&2; exit 1; }
+          all_rpf=$(cat /proc/sys/net/ipv4/conf/all/rp_filter)
+          geneve_rpf=$(cat "/proc/sys/net/ipv4/conf/$GENEVE/rp_filter")
+          echo "rp_filter: all=$all_rpf $GENEVE=$geneve_rpf"
+          [ "$all_rpf" = "0" ] || { echo "FAIL: conf.all.rp_filter=$all_rpf, want 0" >&2; exit 1; }
+          [ "$geneve_rpf" = "0" ] || { echo "FAIL: conf.$GENEVE.rp_filter=$geneve_rpf, want 0" >&2; exit 1; }
+          echo "CONTAINER NODE-PREP SMOKE: PASS"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f beep-node-prep-smoke >/dev/null 2>&1 || true
+          sudo ip link del ci-smoke-geneve0 >/dev/null 2>&1 || true
+          sudo ip link del ci-smoke-uplink0 >/dev/null 2>&1 || true
