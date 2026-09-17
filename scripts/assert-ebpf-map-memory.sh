@@ -33,7 +33,10 @@ set -euo pipefail
 csv="${1:?usage: $0 <ebpf-map-memory.csv>}"
 [ -f "$csv" ] || { echo "FAIL: $csv not found" >&2; exit 1; }
 
-mapfile -t names < <(awk -F, 'NR>1 {print $3}' "$csv")
+names=()
+while IFS= read -r name; do
+  names+=("$name")
+done < <(awk -F, 'NR>1 {print $3}' "$csv")
 total=$(awk -F, 'NR>1 { sum += $6 } END { print sum+0 }' "$csv")
 echo "discovered maps (${#names[@]}): ${names[*]:-none}"
 echo "total bytes_memlock: $total"
