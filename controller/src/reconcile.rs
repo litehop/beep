@@ -67,6 +67,15 @@ impl Ipv4Cidr {
     }
 }
 
+// So a caller (`main.rs`'s `apply_reconcile`) can name the misconfigured
+// `--pod-cidr` value in its WARN without reaching into this type's private
+// fields.
+impl std::fmt::Display for Ipv4Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
 /// This node's own identity for reconciling a `Service`. `node_ip` is the
 /// value the loader's `--node-ip` already gates `POD_TARGETS` scoping on
 /// (`src/main.rs`'s `local_pod_ips`: `backend_node_ip == node_ip`); `pod_cidr`
@@ -138,6 +147,22 @@ pub struct EndpointSliceView {
     pub endpoints: Vec<Endpoint>,
 }
 
+/// A ready endpoint hosted on THIS node (`ep.node_ip == node.node_ip`) that
+/// `pod_targets_for_node`'s admission check excluded from `POD_TARGETS`
+/// because its `pod_ip` matched neither `pod_cidr` nor the hostNetwork
+/// signature. The rejection itself is correct anti-spoof behavior (see
+/// `pod_targets_for_node`'s doc comment) -- this type exists purely so a
+/// caller can log what got rejected instead of the dataplane going quietly
+/// backend-less. A misconfigured `--pod-cidr` (e.g. left at a different
+/// CNI's default) rejects every endpoint on every node this way, which
+/// previously surfaced as no traffic delivered and nothing in any log
+/// naming why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedEndpoint {
+    pub pod_ip: Ipv4Addr,
+    pub reason: &'static str,
+}
+
 /// Desired `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS` contents for one Service,
 /// keyed exactly like the maps themselves so `diff` can compare this against
 /// a previous reconcile's output (or the maps' actual current contents) with
@@ -147,6 +172,10 @@ pub struct DesiredEntries {
     pub vip_map: HashMap<VipKey, VipBackend>,
     pub target_ports: HashMap<VipKey, u16>,
     pub pod_targets: HashSet<u32>,
+    /// Endpoints excluded from `pod_targets` by the pod-CIDR admission
+    /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
+    /// nothing here changes `pod_targets` itself.
+    pub rejected: Vec<RejectedEndpoint>,
     /// Whether `vip_map`/`target_ports` were computed from a fully-known
     /// node set. `WatchState::desired` (the only real producer of an
     /// aggregate `DesiredEntries`) sets this to `false` while the initial
@@ -213,6 +242,34 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     pod_targets
 }
 
+/// The observational complement of `pod_targets_for_node`: every ready,
+/// this-node-hosted endpoint that admission check excluded, paired with why.
+/// Deliberately duplicates that function's condition (negated) rather than
+/// refactoring it to share a helper -- `pod_targets_for_node`'s admission
+/// logic is settled anti-spoof behavior that must not shift as a side
+/// effect of adding observability around it.
+pub fn rejected_endpoints_for_node(
+    slices: &[EndpointSliceView],
+    node: &NodeContext,
+) -> Vec<RejectedEndpoint> {
+    let mut rejected = Vec::new();
+    for slice in slices {
+        for ep in &slice.endpoints {
+            if ep.ready
+                && ep.node_ip == node.node_ip
+                && !(node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip)
+            {
+                rejected.push(RejectedEndpoint {
+                    pod_ip: ep.pod_ip,
+                    reason: "pod_ip is outside the configured --pod-cidr and is not this \
+                             node's own address (hostNetwork)",
+                });
+            }
+        }
+    }
+    rejected
+}
+
 /// Reconciles one Service against its EndpointSlices into the map entries
 /// this node's dataplane needs. Pure: same inputs always produce the same
 /// `DesiredEntries`, so a caller (Phase B's watch handler) can call this on
@@ -227,6 +284,7 @@ pub fn reconcile_service(
     let endpoints: Vec<&Endpoint> = slices.iter().flat_map(|s| s.endpoints.iter()).collect();
 
     desired.pod_targets = pod_targets_for_node(slices, node);
+    desired.rejected = rejected_endpoints_for_node(slices, node);
 
     // VIP_MAP/TARGET_PORTS are NOT node-scoped (any node can be ingress for
     // any VIP, mirroring the loader's fixture population), so backend
@@ -671,6 +729,19 @@ mod tests {
             "an out-of-cidr pod_ip that also isn't the hostNetwork signature (pod_ip == \
              node_ip) must not be admitted into POD_TARGETS -- node_ip alone is a claim an \
              untrusted EndpointSlice entry can't be trusted on without this cross-check"
+        );
+        assert_eq!(
+            desired.rejected,
+            vec![RejectedEndpoint {
+                pod_ip: implausible_pod,
+                reason: "pod_ip is outside the configured --pod-cidr and is not this node's \
+                         own address (hostNetwork)",
+            }],
+            "the exclusion above is correct anti-spoof, but it must not go back to being \
+             SILENT: a misconfigured --pod-cidr rejecting every endpoint on every node with \
+             nothing naming why cost a prior operator multiple sessions to diagnose \
+             (a day-one baffling outage, not an edge case) -- reconcile_service's return must \
+             name the offending pod_ip so the caller can log it"
         );
     }
 

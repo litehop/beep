@@ -25,25 +25,25 @@ Manifest skeleton for the beep servicelb controller.
 ## Required per-cluster configuration & gotchas
 
 Read this before deploying to any cluster other than the k3s-on-Lima dev rig
-this manifest's defaults target. Two of these are silent — get them right
+this manifest's defaults target. One of these is silent — get them right
 the first time, then confirm with "Verify your deployment" below.
 
-1. **`--pod-cidr` MUST match your cluster's real pod CIDR — SILENT if
-   wrong. This is the day-one gotcha.** `daemonset.yaml` defaults to k3s's
-   own flannel CIDR, `10.42.0.0/16` (`deploy/daemonset.yaml:90`). If your
-   cluster's actual pod network differs (e.g. Calico's `10.244.0.0/16`),
-   every backend Pod is rejected by the controller's admission gate: an
-   `EndpointSlice` endpoint is only admitted if its `pod_ip` falls inside
-   `--pod-cidr`, or equals its hosting node's own IP, the hostNetwork case
-   (`controller/src/reconcile.rs:191-214`). The result: `POD_TARGETS` ends
-   up empty on every node, so the dataplane has no backend to deliver
-   to — **and nothing logs it.** No error, no warning, just no traffic.
-   Fix by overriding `--pod-cidr` via a local kustomize patch (never edit
-   this manifest directly) to your cluster's real pod CIDR
+1. **`--pod-cidr` MUST match your cluster's real pod CIDR — this is the
+   day-one gotcha.** `daemonset.yaml` defaults to k3s's own flannel CIDR,
+   `10.42.0.0/16` (`deploy/daemonset.yaml:96`). If your cluster's actual pod
+   network differs (e.g. Calico's `10.244.0.0/16`), every backend Pod is
+   rejected by the controller's admission gate: an `EndpointSlice` endpoint
+   is only admitted if its `pod_ip` falls inside `--pod-cidr`, or equals its
+   hosting node's own IP, the hostNetwork case
+   (`controller/src/reconcile.rs:211-243`). The result: `POD_TARGETS` ends
+   up empty on every node, so the dataplane has no backend to deliver to.
+   The controller logs a `controller: WARN N endpoint(s) rejected from
+   POD_TARGETS: ...` on every reconcile while this is wrong — watch
+   `kubectl logs` for it, since a `Running` Pod status alone proves
+   nothing. Fix by overriding `--pod-cidr` via a local kustomize patch
+   (never edit this manifest directly) to your cluster's real pod CIDR
    (`kubectl cluster-info dump | grep -i cluster-cidr`, or your CNI's own
-   config). A future change will make this fail loud instead of silent;
-   until then, verify the fix yourself with "Verify your deployment"
-   below.
+   config), then confirm with "Verify your deployment" below.
 
 2. **The VIP/front-IP range MUST be disjoint from the pod CIDR — LOUD if
    wrong, but hard to hit in a real cluster.** Under beep's
@@ -176,8 +176,9 @@ kubectl create secret generic beep-controller-kubeconfig -n kube-system \
 
 Applying `deploy/rbac.yaml` and `deploy/daemonset.yaml` (with your own
 `--pod-cidr` override) leaves every controller Pod `Running` even when
-gotcha #1 above is silently misconfigured -- a healthy Pod status proves
-nothing about actual delivery. Confirm the real thing:
+gotcha #1 above is misconfigured -- a healthy Pod status proves nothing
+about actual delivery, and the WARN log is easy to miss across a fleet of
+`Running` pods. Confirm the real thing:
 
 1. Apply a `type=LoadBalancer` Service plus a backend that echoes the
    client's address, e.g. `traefik/whoami`:

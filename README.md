@@ -14,6 +14,10 @@ For now, you supply the loader with static VIP:PORT -> backend-node/PodIP:Target
 
 `beep-ebpf` is this crate's no_std sibling — the actual dataplane program. This loader links Linux-only syscalls (`bpf(2)`, netlink), so it only builds and runs on Linux.
 
+## Deploying to Kubernetes
+
+To run beep on a real Kubernetes cluster as a DaemonSet, rather than standalone with `--fixture`, see the setup guide in `deploy/README.md`. Read its "Required per-cluster configuration & gotchas" section before deploying to any cluster other than the dev rig, and use "Verify your deployment" to confirm the install worked.
+
 ## Building
 
 You need a `nightly` toolchain with the `rust-src` component, and `bpf-linker` on your `PATH`. Install `bpf-linker` with `cargo install bpf-linker`, or grab a prebuilt release from https://github.com/aya-rs/bpf-linker/releases.

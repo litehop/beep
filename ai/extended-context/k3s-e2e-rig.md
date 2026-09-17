@@ -77,19 +77,19 @@ GitHub-hosted runners can't host this 3-VM rig.
 **What PASS looks like.** The last full run (bead beep-lbs) recorded 4/7
 PASS: 2 specs failed on a since-fixed harness gap (`beep-client` had no
 standalone `kubectl` on `PATH`, blocking the two specs that `exec` into a
-pod -- fixed by beep-bol, now on `main`), so a current run is expected to
-land **6/7**. The remaining, expected failure is spec 1 (`... should work
-for type=LoadBalancer`): its own log shows beep correctly delivered the
-client's real, unmasqueraded IP, but the spec's cloud-provider heuristic
-derives a `/16` from the node's internal address and calls any client IP
-inside that `/16` "not preserved" -- which only holds when the node's
-internal subnet is disjoint from the client's, true on a real cloud VPC but
-false on Lima, where `k3s-up.sh` puts node-a, node-b, and `beep-client` on
-the same flat `192.168.104.0/24` subnet nested inside that `/16`. Treat a
-spec-1 FAIL alone as this known Lima-topology artifact, not a beep
-regression; a FAIL on any other spec is a real signal -- both scripts print
-`dump_evidence()`'s bpftool/`ip -s link`/controller-log dump automatically
-on failure.
+pod -- fixed by beep-bol, now on `main`), so a current run lands **6/7**,
+the observed result (beep-bol, PR #60). The remaining failure is spec 1
+(`... should work for type=LoadBalancer`): its own log shows beep
+correctly delivered the client's real, unmasqueraded IP, but the spec's
+cloud-provider heuristic derives a `/16` from the node's internal address
+and calls any client IP inside that `/16` "not preserved" -- which only
+holds when the node's internal subnet is disjoint from the client's, true on
+a real cloud VPC but false on Lima, where `k3s-up.sh` puts node-a, node-b,
+and `beep-client` on the same flat `192.168.104.0/24` subnet nested inside
+that `/16`. Treat a spec-1 FAIL alone as this known Lima-topology artifact,
+not a beep regression; a FAIL on any other spec is a real signal -- both
+scripts print `dump_evidence()`'s bpftool/`ip -s link`/controller-log dump
+automatically on failure.
 
 `--dry-run` validates the focus-list without running anything live (`Will
 run 7 of 7579 specs`); use it after touching `FOCUS` before spending the
