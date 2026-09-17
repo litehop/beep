@@ -269,6 +269,12 @@ jobs:
       # self-prep runs before beep-controller ever reads it, so a fast,
       # loud failure there (after self-prep already ran) is fine -- this
       # job only asserts on self-prep's side effects, not a full k8s watch.
+      # --security-opt apparmor=unconfined: ubuntu-latest's AppArmor 4.x
+      # rejects Docker's bundled docker-default profile outright ("Attribute
+      # failed policy validation") even under --privileged, which is
+      # supposed to skip confinement on its own but doesn't here -- a known
+      # Docker/AppArmor incompatibility on this runner image, not something
+      # this job's own privilege set controls.
       - name: Run beep-controller from the built image and assert node self-prep (geneve0 + rp_filter=0)
         run: |
           set -euo pipefail
@@ -278,7 +284,7 @@ jobs:
           sudo ip link set "$UPLINK" up
 
           docker run -d --name beep-node-prep-smoke \
-            --privileged --network host \
+            --privileged --network host --security-opt apparmor=unconfined \
             -v /sys/fs/bpf:/sys/fs/bpf \
             beep-controller:ci-smoke \
             --uplink-iface "$UPLINK" --geneve-iface "$GENEVE" \
