@@ -89,6 +89,18 @@ jobs:
         working-directory: ebpf
         run: cargo clippy --release --target bpfel-unknown-none -Z build-std=core -- -D warnings
 
+      # controller/Cargo.toml's dhat-heap feature is opt-in so the shipped
+      # binary never links dhat's profiling allocator; this catches a future
+      # edit accidentally making dhat a default/normal dependency.
+      - if: matrix.component == 'beep-controller'
+        name: Guard the default beep-controller build excludes dhat-heap
+        run: |
+          set -euo pipefail
+          if cargo tree -p beep-controller -e normal | grep -q dhat; then
+            echo "FAIL: default beep-controller build pulls in dhat (dhat-heap must stay opt-in)" >&2
+            exit 1
+          fi
+
   lint-gate:
     if: ${{ always() }}
     needs: lint-matrix
