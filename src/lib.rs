@@ -219,22 +219,28 @@ pub fn iface_index(name: &str) -> anyhow::Result<u32> {
 /// `AF_NETLINK` socket is a lot of unsafe FFI for a one-shot node-prep step.
 pub fn ensure_geneve_iface(iface: &str) -> anyhow::Result<()> {
     if iface_index(iface).is_err() {
-        let status = std::process::Command::new("ip")
+        let out = std::process::Command::new("ip")
             .args(["link", "add", iface, "type", "geneve", "external"])
-            .status()
+            .output()
             .with_context(|| format!("running `ip link add {iface} type geneve external`"))?;
-        if !status.success() {
+        if !out.status.success() {
             return Err(anyhow!(
-                "`ip link add {iface} type geneve external` exited with {status}"
+                "`ip link add {iface} type geneve external` exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
             ));
         }
     }
-    let status = std::process::Command::new("ip")
+    let out = std::process::Command::new("ip")
         .args(["link", "set", iface, "up"])
-        .status()
+        .output()
         .with_context(|| format!("running `ip link set {iface} up`"))?;
-    if !status.success() {
-        return Err(anyhow!("`ip link set {iface} up` exited with {status}"));
+    if !out.status.success() {
+        return Err(anyhow!(
+            "`ip link set {iface} up` exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(())
 }
@@ -252,8 +258,7 @@ pub fn ensure_geneve_iface(iface: &str) -> anyhow::Result<()> {
 /// same way, for the same reason). This weakens anti-spoof protection
 /// node-wide (`all`), not just on `geneve0`. REVISIT if that turns out to
 /// matter -- the escape hatch is a routing-based/policy-routing decap
-/// alternative that preserves symmetric RPF at a real datapath cost (see
-/// the PR that landed this function for the design tradeoffs considered).
+/// alternative that preserves symmetric RPF at a real datapath cost.
 pub fn disable_rp_filter(iface: &str) -> anyhow::Result<()> {
     for dev in ["all", iface] {
         let path = format!("/proc/sys/net/ipv4/conf/{dev}/rp_filter");

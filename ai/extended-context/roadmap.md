@@ -47,8 +47,8 @@ IPv6-only-registry constraint. `deploy/daemonset.yaml` pulls `:latest`.
 
 Two bars gate beep being usable from the u7s monorepo it was extracted from.
 The dataplane itself is proven; the shipped deploy artifact had gaps that
-blocked u7s from reaching that dataplane at all (`beep-a5k`'s diagnosis,
-`ai/findings/2026-09-16-beep-a5k-u7s-integration-diagnosis.md`):
+blocked u7s from reaching that dataplane at all (`beep-a5k`'s diagnosis, PR
+#74):
 
 - **Consumable**: an image u7s can pull. Met -- Docker Hub, IPv6-reachable.
 - **Functional**: real LoadBalancer delivery, single-node AND cross-node,
