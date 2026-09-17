@@ -271,10 +271,15 @@ jobs:
       # job only asserts on self-prep's side effects, not a full k8s watch.
       #
       # Capabilities + AppArmor mirror deploy/daemonset.yaml's
-      # securityContext exactly (docs/decisions/servicelb-controller-
-      # apparmor-unconfined.md). Device names must stay <=15 bytes
-      # (IFNAMSIZ) or `ip link add` fails the kernel's own netlink
-      # attribute validation on IFLA_IFNAME.
+      # securityContext (docs/decisions/servicelb-controller-apparmor-
+      # unconfined.md). systempaths=unconfined is docker-CLI-specific and
+      # NOT part of that securityContext: dockerd (unlike the containerd/CRI
+      # path the real DaemonSet runs under) always bind-mounts /proc/sys
+      # read-only regardless of capabilities or --network host, which
+      # breaks disable_rp_filter's fs::write -- this only unmasks that
+      # docker-CLI default, it grants no extra capability. Device names
+      # must stay <=15 bytes (IFNAMSIZ) or `ip link add` fails the kernel's
+      # own netlink attribute validation on IFLA_IFNAME.
       - name: Run beep-controller from the built image and assert node self-prep (geneve0 + rp_filter=0)
         run: |
           set -euo pipefail
@@ -288,7 +293,7 @@ jobs:
           docker run -d --name beep-node-prep-smoke \
             --network host \
             --cap-drop=ALL --cap-add=NET_ADMIN --cap-add=BPF --cap-add=PERFMON \
-            --security-opt apparmor=unconfined \
+            --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
             -v /sys/fs/bpf:/sys/fs/bpf \
             beep-controller:ci-smoke \
             --uplink-iface "$UPLINK" --geneve-iface "$GENEVE" \
