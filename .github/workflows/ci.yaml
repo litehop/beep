@@ -134,6 +134,49 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+  # delivery.yaml cross-compiles beep-controller for aarch64-gnu (in addition
+  # to the host amd64 target) via cargo-zigbuild, but test-matrix/lint-matrix
+  # above only ever build the host target -- so an arch-specific compile
+  # break (rare: arch-specific code, pointer width) would pass PR CI and
+  # only surface at release time. Same cross-build technique as
+  # delivery.yaml; a debug build is enough to catch a compile break, no
+  # need to run the resulting binary.
+  controller-cross-aarch64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # beep-controller's build.rs cross-builds beep-ebpf via aya-build,
+      # which needs nightly + rust-src regardless of the host build's own
+      # target; aarch64-unknown-linux-gnu is beep-controller's own target.
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Same hash-verified prebuilt-binary install as delivery.yaml's
+      # bpf-linker + cargo-zigbuild step.
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: bpf-linker,cargo-zigbuild
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # cargo-zigbuild shells out to `zig cc` as its cross-linker.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Cross-compile beep-controller for aarch64-gnu
+        run: cargo +nightly zigbuild -p beep-controller --target aarch64-unknown-linux-gnu.2.36
+
   # Loads the real programs and drives one client->VIP->backend round trip
   # natively on ubuntu-latest (no Lima/cross-build), then asserts the discovered
   # map set is EXACTLY the 7 known maps (catches partial-discovery regressions a
