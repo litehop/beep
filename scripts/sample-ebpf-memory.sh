@@ -94,22 +94,22 @@ ensure_csv_headers() {
 }
 
 # Unions map_ids across every pinned prog, deduping via the `seen`
-# associative array (local to this call, so dedup never leaks across
+# comma-delimited string (local to this call, so dedup never leaks across
 # ticks). A pin-dir with no *-prog files yet (loader not started) or a
 # bpftool call that fails mid-loop (prog unpinned between glob and query)
 # simply yields fewer rows for this tick -- not an error.
 sample_maps() {
   local ts="$1" pin_dir="$2"
   local prog json map_json id name type max_entries memlock
-  local -A seen=()
+  local seen=","
   for prog in "$pin_dir"/*-prog; do
     [ -e "$prog" ] || continue
     json="$(bpftool prog show pinned "$prog" --json 2>/dev/null)" || continue
     [ -z "$json" ] && continue
     while IFS= read -r id; do
       [ -z "$id" ] && continue
-      [ -n "${seen[$id]:-}" ] && continue
-      seen[$id]=1
+      case "$seen" in *",${id},"*) continue ;; esac
+      seen="${seen}${id},"
       map_json="$(bpftool map show id "$id" --json 2>/dev/null)" || continue
       [ -z "$map_json" ] && continue
       name="$(jq -r '.name // ""' <<<"$map_json")"
