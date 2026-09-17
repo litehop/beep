@@ -269,22 +269,27 @@ jobs:
       # self-prep runs before beep-controller ever reads it, so a fast,
       # loud failure there (after self-prep already ran) is fine -- this
       # job only asserts on self-prep's side effects, not a full k8s watch.
-      # --security-opt apparmor=unconfined: ubuntu-latest's AppArmor 4.x
-      # rejects Docker's bundled docker-default profile outright ("Attribute
-      # failed policy validation") even under --privileged, which is
-      # supposed to skip confinement on its own but doesn't here -- a known
-      # Docker/AppArmor incompatibility on this runner image, not something
-      # this job's own privilege set controls.
+      #
+      # Capabilities + AppArmor mirror deploy/daemonset.yaml's
+      # securityContext exactly (docs/decisions/servicelb-controller-
+      # apparmor-unconfined.md), not a CI-only workaround: --privileged
+      # alone hits "Error: Attribute failed policy validation" on this
+      # runner image's AppArmor/Docker combination, and the DaemonSet never
+      # runs privileged anyway.
       - name: Run beep-controller from the built image and assert node self-prep (geneve0 + rp_filter=0)
         run: |
           set -euo pipefail
           UPLINK=ci-smoke-uplink0
           GENEVE=ci-smoke-geneve0
+          echo "==> creating dummy uplink $UPLINK"
           sudo ip link add "$UPLINK" type dummy
           sudo ip link set "$UPLINK" up
 
+          echo "==> starting beep-node-prep-smoke"
           docker run -d --name beep-node-prep-smoke \
-            --privileged --network host --security-opt apparmor=unconfined \
+            --network host \
+            --cap-drop=ALL --cap-add=NET_ADMIN --cap-add=BPF --cap-add=PERFMON \
+            --security-opt apparmor=unconfined \
             -v /sys/fs/bpf:/sys/fs/bpf \
             beep-controller:ci-smoke \
             --uplink-iface "$UPLINK" --geneve-iface "$GENEVE" \
