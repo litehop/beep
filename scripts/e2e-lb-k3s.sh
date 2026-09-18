@@ -63,6 +63,8 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=k3s-common.sh
+. "$SCRIPT_DIR/k3s-common.sh"
 JUNIT_DIR="${JUNIT_DIR:-$REPO_ROOT/temp/e2e-lb-k3s-junit}"
 
 PIN_DIR="/sys/fs/bpf/beep"
@@ -105,9 +107,7 @@ cleanup() {
   # so their generated Namespaces are named loadbalancers-<random>/esipp-<random>.
   kube get ns -o name 2>/dev/null | grep -E '^namespace/(loadbalancers|esipp)-' | sed 's#^namespace/##' \
     | while read -r ns; do kube delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true; done || true
-  kube delete -f - --ignore-not-found < "$REPO_ROOT/deploy/daemonset.yaml" >/dev/null 2>&1 || true
-  kube delete -f - --ignore-not-found < "$REPO_ROOT/deploy/rbac.yaml" >/dev/null 2>&1 || true
-  kube delete secret "$KUBECONFIG_SECRET" -n kube-system --ignore-not-found >/dev/null 2>&1 || true
+  k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   limactl shell "$VM_CLIENT" -- rm -f "$CLIENT_KUBECONFIG" "$CLIENT_JUNIT" >/dev/null 2>&1 || true
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
@@ -117,10 +117,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> [1/7] bringing up the k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
-"$SCRIPT_DIR/k3s-up.sh" --vm-a "$VM_A" --vm-b "$VM_B"
-if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
-  limactl start "$VM_CLIENT"
-fi
+k3s_bring_up_cluster "$VM_A" "$VM_B" "$VM_CLIENT"
 
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"
@@ -145,34 +142,13 @@ for vm in "$VM_A" "$VM_B"; do
 done
 
 echo "==> [3/7] provisioning kubeconfigs (controller Secret on $VM_A, e2e client copy on $VM_CLIENT)"
-limactl shell "$VM_A" -- sudo bash -c "
-  sed 's#server: https://127.0.0.1:6443#server: https://${IP_A}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-controller-kubeconfig
-  k3s kubectl create secret generic $KUBECONFIG_SECRET -n kube-system \
-    --from-file=kubeconfig=/tmp/beep-controller-kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -
-"
+k3s_provision_kubeconfig_secret "$VM_A" "$IP_A" "$KUBECONFIG_SECRET" 0
 limactl shell "$VM_A" -- sudo cat /tmp/beep-controller-kubeconfig \
   | limactl shell "$VM_CLIENT" -- tee "$CLIENT_KUBECONFIG" >/dev/null
 limactl shell "$VM_A" -- sudo rm -f /tmp/beep-controller-kubeconfig
 
 echo "==> [4/7] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
-kube apply -f - < "$REPO_ROOT/deploy/rbac.yaml"
-kube apply -f - < "$REPO_ROOT/deploy/daemonset.yaml"
-controller_deploy_failed=0
-if ! kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s; then
-  controller_deploy_failed=1
-fi
-CONTROLLER_SELECTOR=$(kube -n kube-system get daemonset servicelb-controller \
-  -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
-# rollout status alone can observe a container that starts fine but then
-# CrashLoopBackOffs moments later (no readiness/liveness probe here) --
-# settle, then require zero restarts, same as smoke-k3s-controller.sh.
-sleep 10
-restarts=$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" \
-  -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "")
-for c in $restarts; do
-  [ "$c" = "0" ] || controller_deploy_failed=1
-done
-if [ "$controller_deploy_failed" -ne 0 ]; then
+if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
   echo "CONTROLLER-DEPLOY: FAIL" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
   dump_evidence
