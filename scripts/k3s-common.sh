@@ -14,9 +14,9 @@ eth0_ip() { # eth0_ip <vm> -- this VM's real underlay address
   limactl shell "$1" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1"
 }
 
-k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> -- brings up the k3s server/agent pair (scripts/k3s-up.sh) and starts the client VM if it isn't already running
-  local vm_a="$1" vm_b="$2" vm_client="$3"
-  "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b"
+k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy-mode] -- brings up the k3s server/agent pair (scripts/k3s-up.sh) and starts the client VM if it isn't already running; proxy-mode forwards to k3s-up.sh --proxy-mode (default iptables, matching k3s-up.sh's own default) so a caller can drive an IPVS-mode cluster without k3s-up.sh's own default silently resetting it back to iptables on the next invocation
+  local vm_a="$1" vm_b="$2" vm_client="$3" proxy_mode="${4:-iptables}"
+  "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b" --proxy-mode "$proxy_mode"
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm_client}[[:space:]]+Running"; then
     limactl start "$vm_client"
   fi
