@@ -34,9 +34,36 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIMA_YAML="$SCRIPT_DIR/../lima/beep-k3s.yaml"
 
+command -v jq >/dev/null || { echo "FAIL: jq not found on PATH" >&2; exit 1; }
+
+# beep-node-a/beep-node-b are shared, by name, with the lighter smoke-wg-2node
+# rig (lima/beep.yaml, 1CPU/2GiB) -- an already-provisioned directory under
+# these names doesn't prove it was provisioned from THIS profile
+# (lima/beep-k3s.yaml, 2CPU/4GiB). Resuming a wrong-shaped VM silently would
+# make the controller e2e flaky/underpowered instead of failing loud.
+REQUIRED_CPUS="$(grep -E '^cpus:' "$LIMA_YAML" | awk '{print $2}')"
+REQUIRED_MEMORY="$(grep -E '^memory:' "$LIMA_YAML" | awk '{print $2}' | tr -d '"')"
+[ -n "$REQUIRED_CPUS" ] && [ -n "$REQUIRED_MEMORY" ] || {
+  echo "FAIL: could not read cpus/memory from $LIMA_YAML" >&2
+  exit 1
+}
+
+assert_vm_shape() { # assert_vm_shape <vm> -- fails loud if a VM already provisioned under this name has different cpus/memory than lima/beep-k3s.yaml wants (e.g. it's still shaped for the lighter smoke-wg-2node rig), instead of silently resuming it
+  local vm="$1" info actual_cpus actual_memory
+  info="$(limactl list --json 2>/dev/null | jq -c "select(.name == \"$vm\")")"
+  [ -n "$info" ] || { echo "FAIL: $vm has a lima instance directory but 'limactl list' doesn't know about it" >&2; exit 1; }
+  actual_cpus="$(jq -r '.config.cpus' <<<"$info")"
+  actual_memory="$(jq -r '.config.memory' <<<"$info")"
+  if [ "$actual_cpus" != "$REQUIRED_CPUS" ] || [ "$actual_memory" != "$REQUIRED_MEMORY" ]; then
+    echo "FAIL: $vm is already provisioned at cpus=$actual_cpus memory=$actual_memory, but this k3s rig (lima/beep-k3s.yaml) needs cpus=$REQUIRED_CPUS memory=$REQUIRED_MEMORY -- looks like the lighter smoke-wg-2node profile (lima/beep.yaml) is still provisioned under this VM name. Delete it first: limactl delete -f $vm" >&2
+    exit 1
+  fi
+}
+
 echo "==> [1/4] bringing up $VM_A and $VM_B (lima/beep-k3s.yaml)"
 for vm in "$VM_A" "$VM_B"; do
   if [ -d "${HOME}/.lima/${vm}" ]; then
+    assert_vm_shape "$vm"
     limactl start "$vm" >/dev/null
   else
     limactl start --tty=false --name="$vm" "$LIMA_YAML"
