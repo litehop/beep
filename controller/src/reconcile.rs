@@ -179,17 +179,19 @@ pub struct DesiredEntries {
     /// kernel itself converts host<->network internally, never a raw wire
     /// byte load (`beep-ebpf`'s module doc). Same source as `lb_front_map`/
     /// `target_ports`'s per-Service front-IP loop (`WatchState::desired`'s
-    /// `front_ips`) -- gated on `fronts_known` below for the identical
-    /// restart-wipe reason, NOT the narrower `pod_targets_known` the
+    /// `front_ips`), NOT the narrower `pod_targets_known` the
     /// pre-existing `try_geneve_decap_forward` admission check (POD_TARGETS)
     /// alone used to bound: `node_allow`'s content is the WHOLE known-node
     /// set (like `lb_front_map`/`target_ports`), not this node's own entry alone
-    /// (like `pod_targets`), so gating its destructive full-sync on
-    /// `pod_targets_known` would let a restart's partially-caught-up
-    /// `node_ips` wipe already-pinned peer entries the same way `fronts_known`
-    /// exists to prevent for `lb_front_map`/`target_ports` -- narrowing this gate
-    /// trades that correctness property for a shorter cold-start Geneve
-    /// blackout window, and is not done here.
+    /// (like `pod_targets`), so a restart's partially-caught-up `node_ips`
+    /// must never DELETE already-pinned peer entries before the full Node
+    /// LIST (`fronts_known` below) is known-complete. `PinnedMaps::
+    /// apply_node_allow` still upserts this set every tick
+    /// regardless of `fronts_known` -- only the delete half of its sync is
+    /// latched on `fronts_known` having been seen true once this process --
+    /// so already-discovered peers get admitted without waiting for the
+    /// full list, without reopening the restart-wipe window `fronts_known`
+    /// exists to prevent.
     pub node_allow: HashSet<u32>,
     /// Endpoints excluded from `pod_targets` by the pod-CIDR admission
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
@@ -199,11 +201,12 @@ pub struct DesiredEntries {
     /// fully-known node set. `WatchState::desired` (the only real producer
     /// of an aggregate `DesiredEntries`) sets this to `false` while the
     /// initial Node LIST hasn't completed yet, so `PinnedMaps::apply` knows
-    /// an empty `lb_front_map`/`target_ports`/`node_allow` here means "node set
-    /// not known yet", not "no fronts/peers should exist" -- diffing
-    /// against the latter would delete every already-programmed front (or,
-    /// for `node_allow`, drop every peer's Geneve traffic) that survived a
-    /// controller restart.
+    /// an empty `lb_front_map`/`target_ports` here means "node set not known
+    /// yet", not "no fronts should exist" -- diffing against the latter
+    /// would delete every already-programmed front that survived a
+    /// controller restart. `node_allow` is upserted every tick regardless
+    /// (`node_allow` field's doc comment); this flag only latches ON the
+    /// destructive half of ITS sync once true, never back off.
     pub fronts_known: bool,
     /// Whether `pod_targets` was computed with THIS node's own address
     /// already resolvable in `WatchState::desired`'s endpoint->node_ip
