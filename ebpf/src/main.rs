@@ -303,6 +303,21 @@ pub struct PortMemoValue {
 /// dual-role one, whereas 16384 costs only ~64 KiB more than the 8192+8192
 /// pair it replaces and gives back the full combined capacity as one
 /// flexible pool -- strictly dominates 8192 for both node shapes.
+///
+/// `scripts/flow-table-burst-char.sh` empirically bounds the dual-role
+/// eviction risk two paragraphs up: on a simulated dual-role node with 8
+/// pre-established forward entries, a geometric burst of concurrent
+/// reverse-role flows left all 8 intact through 32768 (this table at
+/// ~16300-16370/16384 entries) but had evicted every one of them by
+/// 65536, reproduced across three trials. Read as an order-of-magnitude
+/// operational limit -- tens of thousands of concurrent reverse-role
+/// flows, not low thousands -- not a precise boundary: the harness's
+/// 90-second wall-clock cap stops sweeping at the first geometric
+/// doubling step (512, 1024, ...) that shows an eviction, so the true
+/// threshold is only bounded to (32768, 65536], and at that scale its
+/// ephemeral-port-keyed burst generator collides against itself (65536
+/// send attempts yielded ~16300 distinct entries, not 65536) -- "burst
+/// size" above means send attempts, not a guaranteed distinct-flow count.
 #[map]
 static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries(16384, 0);
 
