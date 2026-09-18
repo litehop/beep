@@ -30,11 +30,12 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-pub const MAP_NAMES: [&str; 6] = [
+pub const MAP_NAMES: [&str; 7] = [
     "CONFIG",
     "VIP_MAP",
     "TARGET_PORTS",
     "POD_TARGETS",
+    "NODE_ALLOW",
     "FWD_PENDING",
     "FLOW_TABLE",
 ];

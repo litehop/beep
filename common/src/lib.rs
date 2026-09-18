@@ -449,6 +449,41 @@ pub fn decap_forward_pod_admission(is_local_pod: bool) -> DecapForwardPodAdmissi
     }
 }
 
+/// Outer Geneve tunnel-source attestation, checked first in both
+/// `geneve_ingress` branches (`try_geneve_decap_forward`/`_return`) --
+/// before either function's own admission gate above ever runs. With
+/// `rp_filter=0` node-wide (`docs/decisions/geneve-rp-filter-disable.md`),
+/// the kernel backstop that would otherwise drop an outer packet with a
+/// spoofed source is gone; `tkey.remote_ipv4` (the outer source, as decap'd
+/// by `bpf_skb_get_tunnel_key`) is the only remaining thing to check it
+/// against. A miss here is dropped, not passed through as unrelated traffic
+/// the way `EgressReturnAdmission::NotBackendTraffic` is -- unlike that
+/// hook, `geneve_ingress` sees only beep's own Geneve VNIs, so an unknown
+/// outer source is never legitimate non-beep traffic, only a spoof or a
+/// not-yet-converged peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerNodeAdmission {
+    /// `tkey.remote_ipv4` is not a member of this node's current
+    /// `NODE_ALLOW` -- drop rather than decap+deliver traffic whose outer
+    /// tunnel source cannot be attested.
+    Drop,
+    /// `tkey.remote_ipv4` is a known peer -- proceed with the decap.
+    Continue,
+}
+
+/// `is_known_peer`: `NODE_ALLOW.get(tkey.remote_ipv4)` membership. Same
+/// existence-only shape as `decap_forward_pod_admission`'s `is_local_pod`
+/// above -- membership alone is checked, never a second field, so a peer
+/// node's address staying in the cluster's Node set is sufficient regardless
+/// of which VNI (forward or return) the packet arrived on.
+pub fn peer_node_admission(is_known_peer: bool) -> PeerNodeAdmission {
+    if is_known_peer {
+        PeerNodeAdmission::Continue
+    } else {
+        PeerNodeAdmission::Drop
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -1507,5 +1542,30 @@ mod tests {
             decap_forward_pod_admission(true),
             DecapForwardPodAdmission::Deliver
         );
+    }
+
+    #[test]
+    fn peer_node_admission_drops_an_outer_source_absent_from_node_allow() {
+        // This is the security property this gate exists for: with
+        // rp_filter=0 node-wide, any host that can reach a node's Geneve UDP
+        // port can send a packet with a spoofed outer source. If this ever
+        // reverts to `Continue`, an attacker's chosen outer source is
+        // trusted verbatim again -- both a client-IP-spoofing primitive and,
+        // via the stamped `ingress_node_ip` echo, a reflection/amplification
+        // primitive against any third-party IP.
+        assert_eq!(
+            peer_node_admission(false),
+            PeerNodeAdmission::Drop,
+            "an outer tunnel source with no NODE_ALLOW entry must be dropped, never decap'd -- \
+             it cannot be attested as a genuine cluster peer"
+        );
+    }
+
+    #[test]
+    fn peer_node_admission_continues_a_known_peer() {
+        // The happy path this bead must not regress: a genuine cluster
+        // peer's Geneve traffic keeps decapping, not dropped just because
+        // the attestation gate now exists.
+        assert_eq!(peer_node_admission(true), PeerNodeAdmission::Continue);
     }
 }

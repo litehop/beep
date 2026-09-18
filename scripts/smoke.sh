@@ -21,7 +21,11 @@
 #      explicitly, plus an independent `bpftool prog list` confirmation);
 #   4. drives two client -> VIP -> backend TCP round trips through the real
 #      Geneve encap/decap dataplane -- two Service ports on the SAME backend
-#      Pod -- and asserts each lands on its own distinct target port.
+#      Pod -- and asserts each lands on its own distinct target port;
+#   5. removes this fixture's own peer-node entry from NODE_ALLOW and
+#      asserts a further round trip through the same VIP is DROPPED --
+#      proves geneve_ingress's outer-tunnel-source attestation gate actually
+#      rejects an unattested source rather than merely compiling.
 #
 # Exits non-zero on any failure. Always tears down its own fixture
 # (`smoke-remote.sh cleanup`) on exit, success or failure.

@@ -52,10 +52,10 @@ use beep_common::{
     backend_port_resolution, decap_forward_pod_admission, egress_return_admission,
     egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission,
     fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts,
-    resolve_backend_src_port, return_authorization, BackendPortDecision, BackendPortResolution,
-    Config, DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection,
-    FlowKey, ForwardAdmission, FwdPendingPin, ReturnAuthorization, TcpFlowKey, VipBackend, VipKey,
-    REDIRECTED_RETURN_MARK,
+    peer_node_admission, resolve_backend_src_port, return_authorization, BackendPortDecision,
+    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
+    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, FwdPendingPin,
+    PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, VipBackend, VipKey, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -159,6 +159,28 @@ static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(4096, 0);
 /// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
 #[map]
 static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
+
+/// Peer-node attestation for the outer Geneve tunnel source
+/// (`beep_common::peer_node_admission`'s doc comment for the threat this
+/// closes). Keyed on `tkey.remote_ipv4` -- the outer source
+/// `bpf_skb_get_tunnel_key` decap'd, in ITS host-native byte-order
+/// convention (module doc), deliberately NOT `POD_TARGETS`' raw-wire-token
+/// convention, since the two maps key on values read through different
+/// paths (a kernel helper vs. a raw packet load). Populated by the
+/// controller's Node watch (every known node's address, including this
+/// node's own -- a node that is both ingress and backend for the same flow
+/// legitimately sees its own address as the outer source) or, in fixture/
+/// smoke mode with no controller, by the loader seeding `--node-ip` alone.
+/// Same `HashMap<u32, u8>` shape and bare-existence-marker value as
+/// `POD_TARGETS` above; sized an order of magnitude smaller (cluster node
+/// count, not Service count). v1 constraint: one IP per node (the single
+/// address `node_ips`/`front_ips` in `controller/src/watch.rs` records) --
+/// a multi-homed or NAT'd node whose actual Geneve outer-source address
+/// differs from that recorded address is dropped by this admission check.
+/// Symmetric single-IP-per-node addressing is the deployment beep v1
+/// targets; admitting every address a Node reports is tracked separately.
+#[map]
+static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 
 /// Ingress-side forward-flow ADMISSION tier, written at stamp time (step
 /// 2): every new flow mints here, and ONLY here (`try_uplink_ingress`, on a
@@ -618,6 +640,19 @@ pub fn geneve_ingress(ctx: TcContext) -> i32 {
 /// routing, which is flannel's job from here, not ours.
 #[inline(always)]
 fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32> {
+    // Peer-node attestation, checked before anything else this hook does
+    // (`beep_common::peer_node_admission`'s doc comment): with rp_filter=0
+    // node-wide, the outer tunnel source is the only thing standing between
+    // a spoofed decap-forward and delivery. NODE_ALLOW is empty until the
+    // controller's Node LIST fully completes (`reconcile::DesiredEntries::
+    // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
+    // than the pre-existing POD_TARGETS check below alone required; accepted
+    // as the cost of not reintroducing a restart-wipe risk on this map.
+    let is_known_peer = unsafe { NODE_ALLOW.get(tkey.__bindgen_anon_1.remote_ipv4) }.is_some();
+    if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
+        return Some(TC_ACT_SHOT);
+    }
+
     if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
     }
@@ -851,7 +886,15 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 /// forward entry is stale or spoofed), then un-DNAT src back to the VIP and
 /// let normal routing carry it out to the client.
 #[inline(always)]
-fn try_geneve_decap_return(ctx: &TcContext, _tkey: &bpf_tunnel_key) -> Option<i32> {
+fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32> {
+    // Same peer-node attestation as `try_geneve_decap_forward` above -- this
+    // branch used to take `tkey` unused, relying entirely on the FLOW_TABLE
+    // reverse-key match with no outer-source check of its own.
+    let is_known_peer = unsafe { NODE_ALLOW.get(tkey.__bindgen_anon_1.remote_ipv4) }.is_some();
+    if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
+        return Some(TC_ACT_SHOT);
+    }
+
     if ctx.load::<u16>(12).ok()? != ETH_P_IPV4 {
         return Some(TC_ACT_OK);
     }

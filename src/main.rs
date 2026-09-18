@@ -276,7 +276,7 @@ fn main() -> anyhow::Result<()> {
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures, node_ip)
-        .context("populating VIP_MAP/TARGET_PORTS/POD_TARGETS fixture")?;
+        .context("populating VIP_MAP/TARGET_PORTS/POD_TARGETS/NODE_ALLOW fixture")?;
 
     let hooks: [(&str, &str, TcAttachType); 3] = [
         (
@@ -443,6 +443,28 @@ fn populate_fixtures(
         for pod_ip in &local_ips {
             pod_targets.insert(pod_ip, 1u8, 0)?;
         }
+    }
+
+    {
+        // Fixture/smoke mode has no controller-driven Node watch to seed
+        // this from (`beep_common::peer_node_admission`'s doc comment): the
+        // only peer this loader can attest to is its own `--node-ip`, which
+        // is also the outer Geneve source `geneve_ingress` sees for a
+        // single-node fixture's self-loop decap (this node is both ingress
+        // and backend for its own fixture). A real deployment's controller
+        // keeps NODE_ALLOW's real peer set converged instead.
+        let mut node_allow: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+            ebpf.map_mut("NODE_ALLOW")
+                .ok_or_else(|| anyhow!("no map named `NODE_ALLOW` in the eBPF object"))?,
+        )?;
+        let node_ip_native = u32::from(node_ip);
+        let existing_ips: Vec<u32> = node_allow.keys().collect::<Result<_, _>>()?;
+        for existing in existing_ips {
+            if existing != node_ip_native {
+                node_allow.remove(&existing)?;
+            }
+        }
+        node_allow.insert(node_ip_native, 1u8, 0)?;
     }
 
     Ok(())
