@@ -42,6 +42,8 @@ FLOOD_BACKEND_NODE_IP="203.0.113.250"
 PIN_DIR="/sys/fs/bpf/beep-smoke"
 BIN="/tmp/beep-smoke"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=verifier-accept-check.sh
+. "$SCRIPT_DIR/verifier-accept-check.sh"
 MEMORY_SCRIPT="$SCRIPT_DIR/sample-ebpf-memory.sh"
 MEMORY_OUT_DIR="/tmp/beep-ebpf-memory"
 LOADER_LOG="/tmp/beep-smoke-loader.log"
@@ -223,18 +225,10 @@ wait_for_attach "$LOADER_LOG"
 # exiting before the check below ever runs -- silently skipping the FAIL
 # diagnostic on exactly the failure this check exists to report.
 loaded=$(bpftool prog list | grep -cE 'name (uplink_ingress|geneve_ingress|uplink_egress_return)' || true)
-[ "$loaded" -eq 3 ] || {
-  echo "FAIL: expected 3 sched_cls programs loaded, bpftool sees $loaded" >&2
-  exit 1
-}
-echo "VERIFIER-ACCEPT: PASS"
-cat "$LOADER_LOG"
-
-echo "==> sampling eBPF map memory + loader RSS (before round trip)"
-# A monitoring gap (e.g. jq missing on this node) must never fail the
-# VERIFIER-ACCEPT/ROUND-TRIP fixture it's observing -- same contract
-# sample-ebpf-memory.sh's own header documents for its per-tick sampling.
-bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
+# verifier_accept_check (scripts/verifier-accept-check.sh) dumps the loader
+# log + samples eBPF map memory BEFORE deciding pass/fail, so a kernel-truth
+# divergence caught below still gets both diagnostics instead of losing them.
+verifier_accept_check "$loaded" "$LOADER_LOG" "$MEMORY_SCRIPT" "$PIN_DIR" "$MEMORY_OUT_DIR" || exit 1
 
 echo "==> starting backend responders on ${POD_IP}:${TARGET_PORT} and ${POD_IP}:${TARGET_PORT2}"
 # Distinct bodies, not just "both connections succeed": the bug this
