@@ -194,8 +194,8 @@ start_backend_responder() {
 # this rig needs beyond smoke-wg-2node-remote.sh's set, since the ingress
 # leg under test here is eth0, not wg0.
 dump_evidence() {
-  echo "== bpftool map dump: VIP_MAP =="
-  bpftool map dump pinned "$PIN_DIR/VIP_MAP" 2>&1 || true
+  echo "== bpftool map dump: LB_FRONT_MAP =="
+  bpftool map dump pinned "$PIN_DIR/LB_FRONT_MAP" 2>&1 || true
   echo "== bpftool map dump: FWD_PENDING =="
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
   echo "== bpftool map dump: FLOW_TABLE =="

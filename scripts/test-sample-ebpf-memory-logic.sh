@@ -10,7 +10,7 @@
 # Covers the failure modes PR #1568's review flagged as untested:
 #
 #   1. map-id union/dedup — a map pinned by two different progs (a real
-#      shape: VIP_MAP/CONFIG are referenced by more than one hook) must
+#      shape: LB_FRONT_MAP/CONFIG are referenced by more than one hook) must
 #      appear exactly once in the tick's CSV rows, not once per prog.
 #   2. skip-on-broken-prog-pin — one prog whose pin is broken (unpinned
 #      between glob and query, or a bpftool bug) must not abort the whole
@@ -94,7 +94,7 @@ case "$1 $2 $3" in
     ;;
   "map show id")
     case "$4" in
-      10) echo '{"name":"VIP_MAP","type":"hash","max_entries":16,"bytes_memlock":4096}' ;;
+      10) echo '{"name":"LB_FRONT_MAP","type":"hash","max_entries":16,"bytes_memlock":4096}' ;;
       11) echo '{"name":"CONFIG","type":"array","max_entries":1,"bytes_memlock":512}' ;;
       12) echo '{"name":"TARGET_PORTS","type":"hash","max_entries":32,"bytes_memlock":8192}' ;;
       *) exit 1 ;;
@@ -211,7 +211,7 @@ assert_eq "loader-rss.csv also writes its header exactly once across two once ca
 GOOD_CSV="$TMPDIR_TEST/good.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,LB_FRONT_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
   echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
@@ -231,7 +231,7 @@ assert_true "a correct single-tick CSV with all 8 known maps passes assert-ebpf-
 DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,LB_FRONT_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
   echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
@@ -261,7 +261,7 @@ fi
 LEGACY_8_THEN_7_CSV="$TMPDIR_TEST/legacy-8-then-7.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,VIP_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,LB_FRONT_MAP,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
   echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
@@ -269,7 +269,7 @@ LEGACY_8_THEN_7_CSV="$TMPDIR_TEST/legacy-8-then-7.csv"
   echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,196,EGRESS_DROPS,percpu_array,1,512"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
-  echo "2026-09-05T00:00:01Z,189,VIP_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:01Z,189,LB_FRONT_MAP,hash,16,4096"
   echo "2026-09-05T00:00:01Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:01Z,191,FLOW_TABLE,hash,16384,1966976"
   echo "2026-09-05T00:00:01Z,192,TARGET_PORTS,hash,32,4096"

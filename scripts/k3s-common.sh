@@ -71,11 +71,11 @@ k3s_teardown_controller() { # k3s_teardown_controller <repo-root> <secret-name> 
   kube delete secret "$secret_name" -n kube-system --ignore-not-found >/dev/null 2>&1 || true
 }
 
-k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of VIP_MAP/TARGET_PORTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR
+k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR
   local vm_a="$1" vm_b="$2" pin_dir="$3"
   for vm in "$vm_a" "$vm_b"; do
     echo "---- $vm evidence ----"
-    for m in VIP_MAP TARGET_PORTS POD_TARGETS FLOW_TABLE; do
+    for m in LB_FRONT_MAP TARGET_PORTS POD_TARGETS FLOW_TABLE; do
       echo "== bpftool map dump: $m =="
       limactl shell "$vm" -- sudo bpftool map dump pinned "$pin_dir/$m" 2>&1 || true
     done

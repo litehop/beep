@@ -208,8 +208,8 @@ start_backend_responder() {
 # geneve0/wg0 set, since the client's SYN now transits this node's eth0 (as
 # a genuine IP forward into wg0) rather than being self-originated here.
 dump_evidence() {
-  echo "== bpftool map dump: VIP_MAP =="
-  bpftool map dump pinned "$PIN_DIR/VIP_MAP" 2>&1 || true
+  echo "== bpftool map dump: LB_FRONT_MAP =="
+  bpftool map dump pinned "$PIN_DIR/LB_FRONT_MAP" 2>&1 || true
   echo "== bpftool map dump: FWD_PENDING =="
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
   echo "== bpftool map dump: FLOW_TABLE =="
