@@ -47,20 +47,26 @@
 # still verified by inspection, not exercised end-to-end); tracked as a
 # known gap, not a bug this bead fixes.
 #
-# Usage: scripts/smoke-k3s-controller.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
+# Usage: scripts/smoke-k3s-controller.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>] [--proxy-mode <iptables|ipvs>]
 # Defaults: beep-node-a (ingress, k3s server), beep-node-b (backend Pod,
 # k3s agent), beep-client (client). All three must be on the same Lima
 # network (scripts/k3s-up.sh's beep-k3s.yaml profile for the first two).
+# --proxy-mode forwards to scripts/k3s-up.sh (default iptables) -- without
+# this passthrough, this script's own k3s-up.sh invocation always defaults
+# back to iptables, silently resetting a cluster an earlier `k3s-up.sh
+# --proxy-mode ipvs` run had put into IPVS mode.
 set -euo pipefail
 
 VM_A="beep-node-a"
 VM_B="beep-node-b"
 VM_CLIENT="beep-client"
+PROXY_MODE="iptables"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
     --vm-b) VM_B="$2"; shift 2 ;;
     --vm-client) VM_CLIENT="$2"; shift 2 ;;
+    --proxy-mode) PROXY_MODE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -107,8 +113,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> [1/11] bringing up the k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
-k3s_bring_up_cluster "$VM_A" "$VM_B" "$VM_CLIENT"
+echo "==> [1/11] bringing up the k3s cluster ($VM_A server, $VM_B agent, proxy-mode=$PROXY_MODE) and $VM_CLIENT"
+k3s_bring_up_cluster "$VM_A" "$VM_B" "$VM_CLIENT" "$PROXY_MODE"
 
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"

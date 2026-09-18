@@ -90,16 +90,12 @@ green run shows `smoke-k3s-controller.sh`'s full sequence passing: cluster
 bring-up, the controller loading and pinning its eBPF programs, VIP map
 programming from watch events, and a genuine cross-node client round trip.
 
-**Unsupported (IPVS) observation** — do not chain
-`scripts/smoke-k3s-controller.sh` onto this: it re-invokes `k3s-up.sh`
-without `--proxy-mode`, which reinstalls k3s in its default iptables mode
-and silently resets the cluster before any assertion runs, so following
-the iptables recipe above with `--proxy-mode ipvs` substituted does not
-exercise the failure. Instead bring the cluster up in IPVS mode and
-observe the incompatibility directly:
+**Unsupported (IPVS) observation** — `smoke-k3s-controller.sh` forwards
+`--proxy-mode` to `k3s-up.sh`, so the single-command form below drives the
+cluster in IPVS mode without a silent reset back to iptables:
 
 ```bash
-scripts/k3s-up.sh --proxy-mode ipvs
+scripts/smoke-k3s-controller.sh --proxy-mode ipvs
 ```
 
 With the controller/DaemonSet running against this cluster, the
