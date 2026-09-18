@@ -83,39 +83,13 @@ for tool in limactl jq; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
 
-kube() { # kube <args...> -- runs k3s kubectl as root on $VM_A (the only node with a local apiserver)
-  limactl shell "$VM_A" -- sudo k3s kubectl "$@"
-}
-
-eth0_ip() { # eth0_ip <vm> -- this VM's real underlay address
-  limactl shell "$1" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1"
-}
-
 map_entry_count() { # map_entry_count <vm> <map-name> -- entries in a pinned map, "" if the pin is missing/unreadable
   local vm="$1" name="$2" json
   json=$(limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>/dev/null) || { echo ""; return; }
   jq 'length' <<<"$json" 2>/dev/null || echo ""
 }
 
-dump_evidence() {
-  for vm in "$VM_A" "$VM_B"; do
-    echo "---- $vm evidence ----"
-    for m in VIP_MAP TARGET_PORTS POD_TARGETS FLOW_TABLE; do
-      echo "== bpftool map dump: $m =="
-      limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$m" 2>&1 || true
-    done
-    echo "== ip -s link (eth0, geneve0) =="
-    limactl shell "$vm" -- ip -s link show eth0 2>&1 || true
-    limactl shell "$vm" -- ip -s link show geneve0 2>&1 || true
-    echo "== dmesg (tail) =="
-    limactl shell "$vm" -- sudo dmesg 2>&1 | tail -30 || true
-  done
-  echo "---- controller pod describe (events) ----"
-  kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR" 2>&1 || true
-  echo "---- controller pod logs (current + previous, i.e. pre-crash) ----"
-  kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 2>&1 || true
-  kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous 2>&1 || true
-}
+dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
