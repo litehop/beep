@@ -1,5 +1,5 @@
 //! Applies a `reconcile::DesiredEntries` to the dataplane's pinned
-//! `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS` maps. Opens them from their bpffs
+//! `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` maps. Opens them from their bpffs
 //! pins (`beep::attach_and_pin`'s loader already created them at load time)
 //! rather than holding an `Ebpf` handle, so this process never touches
 //! `FWD_PENDING`/`FLOW_TABLE` -- the kernel-written conntrack tables must
@@ -18,13 +18,14 @@ use beep_common::{VipBackend, VipKey};
 
 use crate::reconcile::{self, DesiredEntries, MapOp};
 
-/// The three controller-written maps, opened once from their pins and kept
+/// The four controller-written maps, opened once from their pins and kept
 /// open across every reconcile tick (avoids a `MapData::from_pin` syscall
 /// round trip per event).
 pub struct PinnedMaps {
     vip_map: AyaHashMap<MapData, VipKey, VipBackend>,
     target_ports: AyaHashMap<MapData, VipKey, u16>,
     pod_targets: AyaHashMap<MapData, u32, u8>,
+    node_allow: AyaHashMap<MapData, u32, u8>,
 }
 
 fn open_hash_map<K: aya::Pod, V: aya::Pod>(
@@ -44,30 +45,31 @@ impl PinnedMaps {
             vip_map: open_hash_map(pin_dir, "VIP_MAP")?,
             target_ports: open_hash_map(pin_dir, "TARGET_PORTS")?,
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
+            node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
         })
     }
 
     /// Diffs each map's live contents against `desired` and applies the
     /// minimal set of writes/deletes -- an unchanged reconcile costs no
-    /// syscalls (`reconcile::diff`'s doc comment). Runs all three maps'
+    /// syscalls (`reconcile::diff`'s doc comment). Runs all four maps'
     /// diffs to completion before propagating any error: a capacity failure
-    /// on VIP_MAP must never suppress the TARGET_PORTS/POD_TARGETS writes
-    /// for OTHER, unrelated Services in the same reconcile tick -- a bare
-    /// `?` chain here previously left every later Service unrouted with no
-    /// attempt at all.
+    /// on VIP_MAP must never suppress the TARGET_PORTS/POD_TARGETS/
+    /// NODE_ALLOW writes for OTHER, unrelated Services in the same
+    /// reconcile tick -- a bare `?` chain here previously left every later
+    /// Service unrouted with no attempt at all.
     ///
-    /// Skips the VIP_MAP/TARGET_PORTS diff entirely while
+    /// Skips the VIP_MAP/TARGET_PORTS/NODE_ALLOW diffs entirely while
     /// `desired.fronts_known` is `false` (`DesiredEntries`'s doc comment):
-    /// diffing an empty `vip_map`/`target_ports` against these maps' actual
-    /// contents would delete every front, even ones a previous run already
-    /// programmed and pinned -- `desired.fronts_known == false` means "not
-    /// known yet", not "no fronts should exist". Skips the POD_TARGETS
-    /// full-sync the same way while `desired.pod_targets_known` is `false`
-    /// -- same reasoning, keyed on this node's own Node LIST/watch entry
-    /// instead of the whole list (`DesiredEntries::pod_targets_known`'s doc
-    /// comment).
+    /// diffing an empty `vip_map`/`target_ports`/`node_allow` against these
+    /// maps' actual contents would delete every front (or every attested
+    /// peer), even ones a previous run already programmed and pinned --
+    /// `desired.fronts_known == false` means "not known yet", not "no
+    /// fronts/peers should exist". Skips the POD_TARGETS full-sync the same
+    /// way while `desired.pod_targets_known` is `false` -- same reasoning,
+    /// keyed on this node's own Node LIST/watch entry instead of the whole
+    /// list (`DesiredEntries::pod_targets_known`'s doc comment).
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
-        let (vip_map_result, target_ports_result) = if desired.fronts_known {
+        let (vip_map_result, target_ports_result, node_allow_result) = if desired.fronts_known {
             (
                 apply_ops(
                     &mut self.vip_map,
@@ -85,9 +87,11 @@ impl PinnedMaps {
                     describe_vip_key,
                 )
                 .context("applying TARGET_PORTS"),
+                apply_node_allow(&mut self.node_allow, &desired.node_allow)
+                    .context("applying NODE_ALLOW"),
             )
         } else {
-            (Ok(()), Ok(()))
+            (Ok(()), Ok(()), Ok(()))
         };
         let pod_targets_result = if desired.pod_targets_known {
             apply_pod_targets(&mut self.pod_targets, &desired.pod_targets)
@@ -98,6 +102,7 @@ impl PinnedMaps {
 
         vip_map_result?;
         target_ports_result?;
+        node_allow_result?;
         pod_targets_result?;
         Ok(())
     }
@@ -206,6 +211,44 @@ fn apply_pod_targets(
     }
     if failed > 0 {
         anyhow::bail!("{failed} write(s) to `POD_TARGETS` failed -- see per-entry errors above");
+    }
+    Ok(())
+}
+
+/// `NODE_ALLOW`'s peer-attestation full-sync -- same set-shaped,
+/// prune-then-insert pattern as `apply_pod_targets` above, reusing the same
+/// generic `beep::stale_pod_targets` set diff. Unlike `POD_TARGETS`, this
+/// map's keys are host-native (`DesiredEntries::node_allow`'s doc comment),
+/// so logging uses `Ipv4Addr::from` directly rather than `POD_TARGETS`'s
+/// `u32::from_be` unwrap.
+fn apply_node_allow(
+    map: &mut AyaHashMap<MapData, u32, u8>,
+    desired: &HashSet<u32>,
+) -> anyhow::Result<()> {
+    let existing: Vec<u32> = map.keys().collect::<Result<_, _>>()?;
+    let live: Vec<u32> = desired.iter().copied().collect();
+    let mut failed = 0;
+    for stale in beep::stale_pod_targets(&existing, &live) {
+        if let Err(e) = map.remove(&stale) {
+            failed += 1;
+            eprintln!(
+                "controller: NODE_ALLOW delete for peer {} failed: {e:#}",
+                Ipv4Addr::from(stale)
+            );
+        }
+    }
+    for ip in &live {
+        if let Err(e) = map.insert(ip, 1u8, 0) {
+            failed += 1;
+            eprintln!(
+                "controller: NODE_ALLOW upsert for peer {} failed (entry left unrouted -- map \
+                 may be at capacity): {e:#}",
+                Ipv4Addr::from(*ip)
+            );
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} write(s) to `NODE_ALLOW` failed -- see per-entry errors above");
     }
     Ok(())
 }

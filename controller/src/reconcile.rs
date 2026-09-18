@@ -163,26 +163,38 @@ pub struct RejectedEndpoint {
     pub reason: &'static str,
 }
 
-/// Desired `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS` contents for one Service,
-/// keyed exactly like the maps themselves so `diff` can compare this against
-/// a previous reconcile's output (or the maps' actual current contents) with
-/// no extra translation.
+/// Desired `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` contents for
+/// one Service, keyed exactly like the maps themselves so `diff` can compare
+/// this against a previous reconcile's output (or the maps' actual current
+/// contents) with no extra translation.
 #[derive(Default)]
 pub struct DesiredEntries {
     pub vip_map: HashMap<VipKey, VipBackend>,
     pub target_ports: HashMap<VipKey, u16>,
     pub pod_targets: HashSet<u32>,
+    /// Desired `NODE_ALLOW` contents: every known node's address, host-
+    /// native (not `wire_ip`) -- the same convention `VipBackend::
+    /// backend_node_ip` uses, since `beep-ebpf`'s `geneve_ingress` checks
+    /// this set against `tkey.remote_ipv4`, a kernel-tunnel-key field the
+    /// kernel itself converts host<->network internally, never a raw wire
+    /// byte load (`beep-ebpf`'s module doc). Same source as `vip_map`/
+    /// `target_ports`'s per-Service front-IP loop (`WatchState::desired`'s
+    /// `front_ips`) -- gated on `fronts_known` below for the identical
+    /// restart-wipe reason.
+    pub node_allow: HashSet<u32>,
     /// Endpoints excluded from `pod_targets` by the pod-CIDR admission
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
     /// nothing here changes `pod_targets` itself.
     pub rejected: Vec<RejectedEndpoint>,
-    /// Whether `vip_map`/`target_ports` were computed from a fully-known
-    /// node set. `WatchState::desired` (the only real producer of an
-    /// aggregate `DesiredEntries`) sets this to `false` while the initial
-    /// Node LIST hasn't completed yet, so `PinnedMaps::apply` knows an empty
-    /// `vip_map`/`target_ports` here means "node set not known yet", not
-    /// "no fronts should exist" -- diffing against the latter would delete
-    /// every already-programmed front that survived a controller restart.
+    /// Whether `vip_map`/`target_ports`/`node_allow` were computed from a
+    /// fully-known node set. `WatchState::desired` (the only real producer
+    /// of an aggregate `DesiredEntries`) sets this to `false` while the
+    /// initial Node LIST hasn't completed yet, so `PinnedMaps::apply` knows
+    /// an empty `vip_map`/`target_ports`/`node_allow` here means "node set
+    /// not known yet", not "no fronts/peers should exist" -- diffing
+    /// against the latter would delete every already-programmed front (or,
+    /// for `node_allow`, drop every peer's Geneve traffic) that survived a
+    /// controller restart.
     pub fronts_known: bool,
     /// Whether `pod_targets` was computed with THIS node's own address
     /// already resolvable in `WatchState::desired`'s endpoint->node_ip
