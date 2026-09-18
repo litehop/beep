@@ -331,7 +331,7 @@ pub struct PortMemoValue {
 /// pre-established forward entries, a geometric burst of concurrent
 /// reverse-role flows left all 8 intact through 32768 (this table at
 /// ~16300-16370/16384 entries) but had evicted every one of them by
-/// 65536, reproduced across three trials. Read as an order-of-magnitude
+/// 65536, reproduced across four trials. Read as an order-of-magnitude
 /// operational limit -- tens of thousands of concurrent reverse-role
 /// flows, not low thousands -- not a precise boundary: the harness's
 /// 90-second wall-clock cap stops sweeping at the first geometric
