@@ -374,32 +374,31 @@ jobs:
       # --network host: matches deploy/daemonset.yaml's hostNetwork: true,
       # and (practically) means geneve0/rp_filter land in the runner's own
       # netns/procfs, so they're inspectable after the container exits
-      # instead of being torn down with its private netns. A dedicated
-      # dummy uplink device (never the runner's real NIC) is the same
-      # precaution scripts/memory-smoke-controller.sh takes for its own
-      # ctrl-uplink0 fixture. --kubeconfig points nowhere on purpose: node
-      # self-prep runs before beep-controller ever reads it, so a fast,
-      # loud failure there (after self-prep already ran) is fine -- this
-      # job only asserts on self-prep's side effects, not a full k8s watch.
+      # instead of being torn down with its private netns. `--node-prep`
+      # (docs/decisions/servicelb-rp-filter-init-container.md) is exactly
+      # what deploy/daemonset.yaml's privileged initContainer runs -- it
+      # exits on its own once done, so this job only asserts on its side
+      # effects, not a full k8s watch.
       #
-      # Capabilities + AppArmor mirror deploy/daemonset.yaml's
-      # securityContext (docs/decisions/servicelb-controller-apparmor-
-      # unconfined.md). systempaths=unconfined is docker-CLI-specific and
-      # NOT part of that securityContext: dockerd (unlike the containerd/CRI
-      # path the real DaemonSet runs under) always bind-mounts /proc/sys
-      # read-only regardless of capabilities or --network host, which
-      # breaks disable_rp_filter's fs::write -- this only unmasks that
-      # docker-CLI default, it grants no extra capability. Device names
-      # must stay <=15 bytes (IFNAMSIZ) or `ip link add` fails the kernel's
-      # own netlink attribute validation on IFLA_IFNAME.
+      # Capabilities + AppArmor mirror deploy/daemonset.yaml's main
+      # container securityContext (docs/decisions/servicelb-controller-
+      # apparmor-unconfined.md), not the real initContainer's `privileged:
+      # true` -- this job's point is confirming the SHIPPED IMAGE's
+      # `--node-prep` still works given SOME elevated access, not exercising
+      # the initContainer's own privilege requirement end-to-end (that needs
+      # a real containerd CRI pod; scripts/smoke-k3s-controller.sh covers
+      # it). systempaths=unconfined is docker-CLI-specific and NOT part of
+      # that securityContext: dockerd (unlike the containerd/CRI path the
+      # real DaemonSet runs under) always bind-mounts /proc/sys read-only
+      # regardless of capabilities or --network host, which breaks
+      # disable_rp_filter's fs::write -- this only unmasks that docker-CLI
+      # default, it grants no extra capability. Device names must stay <=15
+      # bytes (IFNAMSIZ) or `ip link add` fails the kernel's own netlink
+      # attribute validation on IFLA_IFNAME.
       - name: Run beep-controller from the built image and assert node self-prep (geneve0 + rp_filter=0)
         run: |
           set -euo pipefail
-          UPLINK=smoke-uplink0
           GENEVE=smoke-geneve0
-          echo "==> creating dummy uplink $UPLINK"
-          sudo ip link add "$UPLINK" type dummy
-          sudo ip link set "$UPLINK" up
 
           echo "==> starting beep-node-prep-smoke"
           docker run -d --name beep-node-prep-smoke \
@@ -408,10 +407,7 @@ jobs:
             --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
             -v /sys/fs/bpf:/sys/fs/bpf \
             beep-controller:ci-smoke \
-            --uplink-iface "$UPLINK" --geneve-iface "$GENEVE" \
-            --pin-dir /sys/fs/bpf/beep-ci-smoke \
-            --pod-cidr 10.244.0.0/16 --node-ip 10.0.0.5 \
-            --kubeconfig /nonexistent-kubeconfig
+            --geneve-iface "$GENEVE" --node-prep
 
           timeout 30 docker wait beep-node-prep-smoke >/dev/null || true
           echo "---- beep-node-prep-smoke container logs ----"
@@ -430,4 +426,3 @@ jobs:
         run: |
           docker rm -f beep-node-prep-smoke >/dev/null 2>&1 || true
           sudo ip link del smoke-geneve0 >/dev/null 2>&1 || true
-          sudo ip link del smoke-uplink0 >/dev/null 2>&1 || true

@@ -77,12 +77,16 @@ the first time, then confirm with "Verify your deployment" below.
 ## Files
 
 - `daemonset.yaml` — one controller pod per node (`hostNetwork: true`),
-  `CAP_BPF` + `CAP_NET_ADMIN` only (no `privileged: true`, no CRI socket
-  mount), tolerates all taints so it runs on every node including
-  control-plane nodes, and mounts the host's bpffs (`/sys/fs/bpf`) so pinned
-  programs/maps survive pod restarts. Requires `appArmorProfile: Unconfined`
-  to pin to bpffs under containerd's default AppArmor profile — see
-  `docs/decisions/servicelb-controller-apparmor-unconfined.md`.
+  tolerates all taints so it runs on every node including control-plane
+  nodes, and mounts the host's bpffs (`/sys/fs/bpf`) so pinned programs/maps
+  survive pod restarts. The main container runs `CAP_BPF` + `CAP_NET_ADMIN`
+  only (no `privileged: true`, no CRI socket mount) and requires
+  `appArmorProfile: Unconfined` to pin to bpffs under containerd's default
+  AppArmor profile — see
+  `docs/decisions/servicelb-controller-apparmor-unconfined.md`. A separate,
+  privileged `node-prep` initContainer runs first for the one step that
+  needs it (disabling `rp_filter`) — see
+  `docs/decisions/servicelb-rp-filter-init-container.md`.
 - `rbac.yaml` — `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` for
   the above.
 
@@ -95,10 +99,12 @@ once, watches `Service`/`EndpointSlice`, writes maps on change, then idles —
 the kernel does the packet forwarding.
 
 Node self-prep is part of that same startup, not a separate step this
-manifest or its operator needs to provide: the controller creates `geneve0`
-(an address-less, external-mode Geneve device) if it doesn't already exist,
-and disables the reverse-path filter on `all` and `geneve0`
-(`net.ipv4.conf.{all,geneve0}.rp_filter=0`).
+manifest or its operator needs to provide: `geneve0` (an address-less,
+external-mode Geneve device) is created if it doesn't already exist, and the
+reverse-path filter is disabled on `all` and `geneve0`
+(`net.ipv4.conf.{all,geneve0}.rp_filter=0`). The `rp_filter` write runs in
+the privileged `node-prep` initContainer, not the main container — see
+`docs/decisions/servicelb-rp-filter-init-container.md` for why.
 
 This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the

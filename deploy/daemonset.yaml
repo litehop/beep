@@ -36,6 +36,21 @@ spec:
         - key: node-role.kubernetes.io/master
           operator: Exists
           effect: NoSchedule
+      initContainers:
+        # Privileged ONLY here, at startup, and only for this one step:
+        # containerd's default readonlyPaths mask /proc/sys off for a
+        # non-privileged container regardless of capabilities/AppArmor, so
+        # the rp_filter write below has to happen somewhere unmasked before
+        # the main (non-privileged) container starts. Runs in the pod's
+        # hostNetwork (spec.hostNetwork above), so it prepares the NODE, not
+        # a throwaway netns. See
+        # docs/decisions/servicelb-rp-filter-init-container.md.
+        - name: node-prep
+          image: docker.io/valerauko/beep-lb:latest
+          securityContext:
+            privileged: true
+          args:
+            - --node-prep
       containers:
         - name: servicelb-controller
           image: docker.io/valerauko/beep-lb:latest
@@ -68,12 +83,14 @@ spec:
               # for a non-root BPF_PROG_LOAD gate on perfmon_capable(), not
               # just CAP_BPF -- without it the load is rejected outright.
               # See docs/decisions/servicelb-controller-apparmor-unconfined.md.
-              # CAP_NET_ADMIN also covers the two node-prep steps this
-              # controller does at startup, before attaching anything:
-              # creating `geneve0` (`beep::ensure_geneve_iface`) and
-              # disabling its reverse-path filter (`beep::disable_rp_filter`
-              # -- see its doc comment for why rp_filter=0 is deliberate,
-              # not optional).
+              # CAP_NET_ADMIN also covers this container's own remaining
+              # node-prep step at startup, before attaching anything:
+              # creating `geneve0` (`beep::ensure_geneve_iface`) if the
+              # initContainer above hasn't already. Disabling its
+              # reverse-path filter (`beep::disable_rp_filter` -- see its
+              # doc comment for why rp_filter=0 is deliberate, not
+              # optional) now runs ONLY in that privileged initContainer;
+              # see its comment above for why.
               add: ["BPF", "NET_ADMIN", "PERFMON"]
           env:
             # hostNetwork means status.hostIP is this node's own address --

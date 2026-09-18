@@ -68,22 +68,34 @@ struct Args {
     #[arg(long, default_value = "/sys/fs/bpf/beep")]
     pin_dir: PathBuf,
 
+    /// Runs ONLY node self-prep -- create `geneve0`, then write
+    /// `rp_filter=0` on `all` and `geneve0` -- and exits. This is the
+    /// entrypoint the privileged initContainer runs: containerd's default
+    /// readonlyPaths mask `/proc/sys` off for the non-privileged main
+    /// container, so that write has to happen somewhere privileged before
+    /// the main container starts
+    /// (`docs/decisions/servicelb-rp-filter-init-container.md`). Makes
+    /// `pod_cidr`/`node_ip`/`kubeconfig` below optional, since this mode
+    /// never reaches the code that needs them.
+    #[arg(long)]
+    node_prep: bool,
+
     /// Cluster pod CIDR (e.g. `10.244.0.0/16`) -- scopes `POD_TARGETS`
     /// membership to endpoints whose pod_ip actually falls inside it
     /// (`reconcile::NodeContext`'s doc comment).
-    #[arg(long = "pod-cidr", value_parser = parse_ipv4_cidr)]
-    pod_cidr: Ipv4Cidr,
+    #[arg(long = "pod-cidr", value_parser = parse_ipv4_cidr, required_unless_present = "node_prep")]
+    pod_cidr: Option<Ipv4Cidr>,
 
     /// This node's own address: the LB front IP every `type=LoadBalancer`
     /// Service resolves to on this node (the node-owned-address model,
     /// `ebpf-lb-dataplane.md`), and the value `POD_TARGETS` scopes local
     /// backend membership against.
-    #[arg(long = "node-ip")]
-    node_ip: Ipv4Addr,
+    #[arg(long = "node-ip", required_unless_present = "node_prep")]
+    node_ip: Option<Ipv4Addr>,
 
     /// Path to a kubeconfig with credentials for this DaemonSet's watch.
-    #[arg(long)]
-    kubeconfig: String,
+    #[arg(long, required_unless_present = "node_prep")]
+    kubeconfig: Option<String>,
 
     /// `FWD_PENDING` max_entries (see `beep-ebpf`'s doc comment); a
     /// load-time DaemonSet config knob, not baked into the eBPF object.
@@ -252,6 +264,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    if args.node_prep {
+        ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
+        disable_rp_filter(&args.geneve_iface).context("disabling reverse-path filter")?;
+        return Ok(());
+    }
+
     bump_memlock_rlimit();
     // Pin dir must exist before `load_ebpf`: a fresh pin path's
     // `create_pinned_by_name` calls `bpf_obj_pin` on a miss, which fails if
@@ -268,11 +286,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("loading beep-ebpf")?;
 
-    // Node self-prep: the shipped DaemonSet has no initContainer and no
-    // other prerequisite step, so this is the only place `geneve0` gets
-    // created and the RPF exception gets applied on a fresh node.
+    // The privileged initContainer's `--node-prep` run already created
+    // `geneve0` and disabled its RPF exception before this container
+    // started (`docs/decisions/servicelb-rp-filter-init-container.md`).
+    // Re-running the idempotent iface check here is a no-op in that case,
+    // and a clear error instead of a silent skip if it somehow didn't run.
     ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
-    disable_rp_filter(&args.geneve_iface).context("disabling reverse-path filter")?;
 
     populate_config(&mut ebpf, &args.geneve_iface, &args.uplink_iface)
         .context("populating CONFIG map")?;
@@ -315,7 +334,11 @@ async fn main() -> anyhow::Result<()> {
         libc::malloc_trim(0);
     }
 
-    let creds = parse_kubeconfig(&args.kubeconfig).context("parsing kubeconfig")?;
+    let kubeconfig = args
+        .kubeconfig
+        .as_deref()
+        .expect("clap requires --kubeconfig unless --node-prep, which already returned above");
+    let creds = parse_kubeconfig(kubeconfig).context("parsing kubeconfig")?;
     let connector =
         build_tls_connector(&creds).context("building TLS connector from kubeconfig")?;
     let client = Arc::new(HyperApiClient {
@@ -325,8 +348,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let node = NodeContext {
-        node_ip: args.node_ip,
-        pod_cidr: args.pod_cidr,
+        node_ip: args
+            .node_ip
+            .expect("clap requires --node-ip unless --node-prep, which already returned above"),
+        pod_cidr: args
+            .pod_cidr
+            .expect("clap requires --pod-cidr unless --node-prep, which already returned above"),
     };
     let state = Arc::new(Mutex::new(WatchState::default()));
     let maps = Arc::new(Mutex::new(
@@ -347,4 +374,34 @@ async fn main() -> anyhow::Result<()> {
     }
     #[cfg(not(feature = "dhat-heap"))]
     run_controller_loop(client, state, maps, node).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The privileged initContainer invokes this binary as `beep-controller
+    // --node-prep` alone -- no --pod-cidr/--node-ip/--kubeconfig, none of
+    // which node-prep needs or has available at that point in the pod's
+    // startup. If `required_unless_present` ever regresses back to plain
+    // `required`, the initContainer's exec fails clap's arg validation and
+    // the DaemonSet crash-loops again, just on a different error than the
+    // original EROFS.
+    #[test]
+    fn node_prep_flag_alone_is_a_valid_invocation() {
+        Args::try_parse_from(["beep-controller", "--node-prep"])
+            .expect("--node-prep must not require --pod-cidr/--node-ip/--kubeconfig");
+    }
+
+    // The other side of the same guarantee: outside --node-prep mode, the
+    // three watch/reconcile args are still mandatory. If `required_unless_present`
+    // were ever loosened into unconditional non-required, this would start
+    // the real controller with a garbage default pod_cidr/node_ip instead of
+    // failing fast at argument parsing.
+    #[test]
+    fn watch_mode_still_requires_pod_cidr_node_ip_and_kubeconfig() {
+        Args::try_parse_from(["beep-controller"]).expect_err(
+            "pod-cidr/node-ip/kubeconfig must stay required when --node-prep is absent",
+        );
+    }
 }
