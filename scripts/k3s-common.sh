@@ -38,6 +38,18 @@ k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root
   kube apply -f - < "$repo_root/deploy/rbac.yaml"
   if [ -n "$image" ]; then
     sed "s#docker.io/valerauko/beep-lb:latest#${image}#" "$repo_root/deploy/daemonset.yaml" | kube apply -f -
+    # If deploy/daemonset.yaml's hardcoded image line ever drifts from this
+    # sed's match pattern, the sed silently no-ops and the rig deploys
+    # whatever :latest resolves to -- recreating the exact stale-image
+    # regression this image override exists to prevent. Read the deployed
+    # DaemonSet's image back (same pattern as CONTROLLER_SELECTOR below)
+    # and fail loud if it isn't the override we asked for.
+    deployed_image=$(kube -n kube-system get daemonset servicelb-controller \
+      -o jsonpath='{.spec.template.spec.containers[0].image}')
+    [ "$deployed_image" = "$image" ] || {
+      echo "FAIL: image override did not apply -- deployed image is '$deployed_image', expected '$image' (deploy/daemonset.yaml's hardcoded image line may have drifted from k3s_deploy_controller_daemonset's sed pattern)" >&2
+      return 1
+    }
   else
     kube apply -f - < "$repo_root/deploy/daemonset.yaml"
   fi

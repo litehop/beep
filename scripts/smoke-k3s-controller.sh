@@ -95,12 +95,21 @@ VIP_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
 KUBECONFIG_SECRET="beep-controller-kubeconfig"
 IMAGE_TMPDIR=""
+IMAGE=""
 
 for tool in limactl jq docker cargo-zigbuild; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
 rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
   echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
+  exit 1
+}
+# build.rs/aya-build cross-builds beep-ebpf via `-Z build-std=core`, which
+# needs rust-src regardless of the host target -- a nightly toolchain
+# without it passes the check above but fails later with an obscure
+# zigbuild/build.rs error.
+rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src (installed)' || {
+  echo "FAIL: rust-src component not installed for nightly (rustup component add rust-src --toolchain nightly)" >&2
   exit 1
 }
 
@@ -116,6 +125,10 @@ cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
+  # The tarball above is trap-cleaned, but the locally built+tagged image
+  # itself isn't -- without this, every run of a different commit leaves
+  # its sha-tagged image on the host indefinitely.
+  [ -n "$IMAGE" ] && docker rmi "$IMAGE" >/dev/null 2>&1 || true
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
