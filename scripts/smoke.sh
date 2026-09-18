@@ -55,6 +55,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BEEP_DIR="$REPO_ROOT"
 REMOTE_SCRIPT="$SCRIPT_DIR/smoke-remote.sh"
 MEMORY_SCRIPT="$SCRIPT_DIR/sample-ebpf-memory.sh"
+VERIFIER_CHECK_SCRIPT="$SCRIPT_DIR/verifier-accept-check.sh"
 
 for tool in cargo-zigbuild limactl; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
@@ -77,7 +78,8 @@ BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
 limactl copy "$BIN" "$VM":/tmp/beep-smoke
 limactl copy "$REMOTE_SCRIPT" "$VM":/tmp/smoke-remote.sh
 limactl copy "$MEMORY_SCRIPT" "$VM":/tmp/sample-ebpf-memory.sh
-limactl shell "$VM" -- bash -c 'chmod +x /tmp/beep-smoke /tmp/smoke-remote.sh /tmp/sample-ebpf-memory.sh'
+limactl copy "$VERIFIER_CHECK_SCRIPT" "$VM":/tmp/verifier-accept-check.sh
+limactl shell "$VM" -- bash -c 'chmod +x /tmp/beep-smoke /tmp/smoke-remote.sh /tmp/sample-ebpf-memory.sh /tmp/verifier-accept-check.sh'
 
 cleanup() {
   limactl shell "$VM" -- sudo bash /tmp/smoke-remote.sh cleanup || true
