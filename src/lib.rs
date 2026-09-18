@@ -32,7 +32,7 @@ const IPPROTO_UDP: u8 = 17;
 // drops that map's state on every restart with no build-time signal.
 pub const MAP_NAMES: [&str; 7] = [
     "CONFIG",
-    "VIP_MAP",
+    "LB_FRONT_MAP",
     "TARGET_PORTS",
     "POD_TARGETS",
     "NODE_ALLOW",
@@ -101,7 +101,7 @@ pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
 }
 
 /// Wire-form pod_ips of fixtures THIS node itself backs (`backend_node_ip
-/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `VIP_MAP`/
+/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `LB_FRONT_MAP`/
 /// `TARGET_PORTS` which every node populates identically from the full
 /// fixture set since any node can be ingress for any VIP.
 pub fn local_pod_ips(fixtures: &[Fixture], node_ip: Ipv4Addr) -> Vec<u32> {
@@ -147,7 +147,7 @@ pub fn bump_memlock_rlimit() {
 /// build script), pinning each of `MAP_NAMES` under `pin_dir` so a loader
 /// restart reuses the existing map set instead of `Ebpf::load` creating an
 /// empty one (`MAP_NAMES`'s own doc comment). `fwd_pending_max_entries`/
-/// `flow_table_max_entries`/`vip_map_max_entries`/`target_ports_max_entries`
+/// `flow_table_max_entries`/`lb_front_map_max_entries`/`target_ports_max_entries`
 /// size the four maps whose entry count scales with cluster/Service state --
 /// a load-time DaemonSet config knob, not a value baked into the eBPF
 /// object -- and only take effect the first time each pin path is created (a
@@ -163,7 +163,7 @@ pub fn load_ebpf(
     pin_dir: &Path,
     fwd_pending_max_entries: u32,
     flow_table_max_entries: u32,
-    vip_map_max_entries: u32,
+    lb_front_map_max_entries: u32,
     target_ports_max_entries: u32,
 ) -> anyhow::Result<Ebpf> {
     let mut loader = EbpfLoader::new();
@@ -172,7 +172,7 @@ pub fn load_ebpf(
     }
     loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
     loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
-    loader.map_max_entries("VIP_MAP", vip_map_max_entries);
+    loader.map_max_entries("LB_FRONT_MAP", lb_front_map_max_entries);
     loader.map_max_entries("TARGET_PORTS", target_ports_max_entries);
     loader
         .load(include_bytes_aligned!(concat!(

@@ -1,5 +1,5 @@
 //! Applies a `reconcile::DesiredEntries` to the dataplane's pinned
-//! `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` maps. Opens them from their bpffs
+//! `LB_FRONT_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` maps. Opens them from their bpffs
 //! pins (`beep::attach_and_pin`'s loader already created them at load time)
 //! rather than holding an `Ebpf` handle, so this process never touches
 //! `FWD_PENDING`/`FLOW_TABLE` -- the kernel-written conntrack tables must
@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep_common::{VipBackend, VipKey};
+use beep_common::{LbFrontBackend, LbFrontKey};
 
 use crate::reconcile::{self, DesiredEntries, MapOp};
 
@@ -22,8 +22,8 @@ use crate::reconcile::{self, DesiredEntries, MapOp};
 /// open across every reconcile tick (avoids a `MapData::from_pin` syscall
 /// round trip per event).
 pub struct PinnedMaps {
-    vip_map: AyaHashMap<MapData, VipKey, VipBackend>,
-    target_ports: AyaHashMap<MapData, VipKey, u16>,
+    lb_front_map: AyaHashMap<MapData, LbFrontKey, LbFrontBackend>,
+    target_ports: AyaHashMap<MapData, LbFrontKey, u16>,
     pod_targets: AyaHashMap<MapData, u32, u8>,
     node_allow: AyaHashMap<MapData, u32, u8>,
 }
@@ -42,7 +42,7 @@ fn open_hash_map<K: aya::Pod, V: aya::Pod>(
 impl PinnedMaps {
     pub fn open(pin_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
-            vip_map: open_hash_map(pin_dir, "VIP_MAP")?,
+            lb_front_map: open_hash_map(pin_dir, "LB_FRONT_MAP")?,
             target_ports: open_hash_map(pin_dir, "TARGET_PORTS")?,
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
             node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
@@ -53,14 +53,14 @@ impl PinnedMaps {
     /// minimal set of writes/deletes -- an unchanged reconcile costs no
     /// syscalls (`reconcile::diff`'s doc comment). Runs all four maps'
     /// diffs to completion before propagating any error: a capacity failure
-    /// on VIP_MAP must never suppress the TARGET_PORTS/POD_TARGETS/
+    /// on LB_FRONT_MAP must never suppress the TARGET_PORTS/POD_TARGETS/
     /// NODE_ALLOW writes for OTHER, unrelated Services in the same
     /// reconcile tick -- a bare `?` chain here previously left every later
     /// Service unrouted with no attempt at all.
     ///
-    /// Skips the VIP_MAP/TARGET_PORTS/NODE_ALLOW diffs entirely while
+    /// Skips the LB_FRONT_MAP/TARGET_PORTS/NODE_ALLOW diffs entirely while
     /// `desired.fronts_known` is `false` (`DesiredEntries`'s doc comment):
-    /// diffing an empty `vip_map`/`target_ports`/`node_allow` against these
+    /// diffing an empty `lb_front_map`/`target_ports`/`node_allow` against these
     /// maps' actual contents would delete every front (or every attested
     /// peer), even ones a previous run already programmed and pinned --
     /// `desired.fronts_known == false` means "not known yet", not "no
@@ -69,22 +69,23 @@ impl PinnedMaps {
     /// keyed on this node's own Node LIST/watch entry instead of the whole
     /// list (`DesiredEntries::pod_targets_known`'s doc comment).
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
-        let (vip_map_result, target_ports_result, node_allow_result) = if desired.fronts_known {
+        let (lb_front_map_result, target_ports_result, node_allow_result) = if desired.fronts_known
+        {
             (
                 apply_ops(
-                    &mut self.vip_map,
-                    &desired.vip_map,
-                    reconcile::vip_backend_eq,
-                    "VIP_MAP",
-                    describe_vip_key,
+                    &mut self.lb_front_map,
+                    &desired.lb_front_map,
+                    reconcile::lb_front_backend_eq,
+                    "LB_FRONT_MAP",
+                    describe_lb_front_key,
                 )
-                .context("applying VIP_MAP"),
+                .context("applying LB_FRONT_MAP"),
                 apply_ops(
                     &mut self.target_ports,
                     &desired.target_ports,
                     |a: &u16, b: &u16| a == b,
                     "TARGET_PORTS",
-                    describe_vip_key,
+                    describe_lb_front_key,
                 )
                 .context("applying TARGET_PORTS"),
                 apply_node_allow(&mut self.node_allow, &desired.node_allow)
@@ -100,7 +101,7 @@ impl PinnedMaps {
             Ok(())
         };
 
-        vip_map_result?;
+        lb_front_map_result?;
         target_ports_result?;
         node_allow_result?;
         pod_targets_result?;
@@ -108,7 +109,7 @@ impl PinnedMaps {
     }
 }
 
-fn describe_vip_key(key: &VipKey) -> String {
+fn describe_lb_front_key(key: &LbFrontKey) -> String {
     format!(
         "{}:{}/proto={}",
         Ipv4Addr::from(u32::from_be(key.vip_ip)),
@@ -178,7 +179,7 @@ where
     Ok(())
 }
 
-/// `POD_TARGETS` isn't map-shaped like `VIP_MAP`/`TARGET_PORTS`
+/// `POD_TARGETS` isn't map-shaped like `LB_FRONT_MAP`/`TARGET_PORTS`
 /// (`reconcile::DesiredEntries::pod_targets` is a set, not a map), so it's a
 /// full membership sync -- same prune-then-insert pattern as the loader's
 /// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
@@ -260,7 +261,7 @@ mod tests {
     #[test]
     fn apply_diff_ops_continues_past_a_write_failure_so_later_entries_still_get_applied() {
         // Regression test: the old code used a bare `?` per op, so ONE
-        // VIP_MAP capacity failure aborted every LATER Service's write in
+        // LB_FRONT_MAP capacity failure aborted every LATER Service's write in
         // the same reconcile -- those Services went silently unrouted with
         // no attempt made and no error naming them.
         let ops = vec![
@@ -292,7 +293,7 @@ mod tests {
             attempted,
             vec![1, 2, 3, 4],
             "a write failure on entry 2 must not skip attempting entries 3/4 -- that's exactly \
-             how a VIP_MAP overflow silently left later Services unrouted"
+             how a LB_FRONT_MAP overflow silently left later Services unrouted"
         );
         assert_eq!(
             failed, 1,

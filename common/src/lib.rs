@@ -195,27 +195,27 @@ pub fn wire_port(port: u16) -> u16 {
     port.to_be()
 }
 
-/// Loader-populated VIP:PORT(+proto) front-tuple key -- shared by
-/// `beep-ebpf`'s `VIP_MAP` and `TARGET_PORTS`, which key on the same front
-/// tuple for two different roles (ingress backend selection, backend
+/// Loader-populated LB-front-IP:PORT(+proto) front-tuple key -- shared by
+/// `beep-ebpf`'s `LB_FRONT_MAP` and `TARGET_PORTS`, which key on the same
+/// front tuple for two different roles (ingress backend selection, backend
 /// target-port selection). `#[repr(C)]`, byte-identical on both sides of the
 /// kernel boundary is the whole point: aya's userspace `HashMap<K, V>`
 /// requires `K: Pod`, and the kernel's `BPF_MAP_TYPE_HASH` hashes/compares
 /// this struct's raw bytes.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VipKey {
+pub struct LbFrontKey {
     pub vip_ip: u32,
     pub vip_port: u16,
     pub proto: u8,
     pub _pad: u8,
 }
 
-/// `VIP_MAP`/`FWD_PENDING` value: the backend identity a `VipKey` resolves
-/// to.
+/// `LB_FRONT_MAP`/`FWD_PENDING` value: the backend identity a `LbFrontKey`
+/// resolves to.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VipBackend {
+pub struct LbFrontBackend {
     /// Geneve remote for the forward leg -- the node hosting the chosen Pod.
     pub backend_node_ip: u32,
     /// Pod-identifier stamped as the forward-leg Geneve option.
@@ -238,9 +238,9 @@ pub struct Config {
 }
 
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for VipKey {}
+unsafe impl aya::Pod for LbFrontKey {}
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for VipBackend {}
+unsafe impl aya::Pod for LbFrontBackend {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Config {}
 
@@ -271,7 +271,7 @@ pub fn forward_admission(in_main: bool) -> ForwardAdmission {
 
 /// FWD_PENDING affinity-pin decision (`beep-ebpf`'s
 /// `try_uplink_ingress_headers`, inside the `ForwardAdmission::MintPending`
-/// branch). `VIP_MAP` is re-resolved on every pre-promotion packet, so
+/// branch). `LB_FRONT_MAP` is re-resolved on every pre-promotion packet, so
 /// without this guard a later packet of the same not-yet-promoted flow could
 /// silently re-pin a different backend before promotion copies the PENDING
 /// value into FLOW_TABLE -- once a flow is established, that would mean
@@ -281,16 +281,16 @@ pub fn forward_admission(in_main: bool) -> ForwardAdmission {
 pub enum FwdPendingPin {
     /// No PENDING entry yet -- pin `candidate`, the backend just resolved
     /// for this (first) packet of the flow.
-    Insert(VipBackend),
+    Insert(LbFrontBackend),
     /// Already pinned by an earlier packet -- leave it untouched.
     Keep,
 }
 
 /// `existing`: result of a `FWD_PENDING.get(flow_key)` lookup. `candidate`:
-/// the backend `VIP_MAP` resolved for the current packet.
+/// the backend `LB_FRONT_MAP` resolved for the current packet.
 pub fn fwd_pending_affinity_pin(
-    existing: Option<VipBackend>,
-    candidate: VipBackend,
+    existing: Option<LbFrontBackend>,
+    candidate: LbFrontBackend,
 ) -> FwdPendingPin {
     match existing {
         Some(_) => FwdPendingPin::Keep,
@@ -1283,7 +1283,7 @@ mod tests {
         // A flow's first packet has no existing pin, so the freshly-resolved
         // backend becomes the one this flow sticks to for the rest of its
         // pre-promotion life.
-        let candidate = VipBackend {
+        let candidate = LbFrontBackend {
             backend_node_ip: 1,
             pod_ip: 100,
         };
@@ -1299,11 +1299,11 @@ mod tests {
         // re-resolved candidate would let an established connection's
         // mid-stream packets land on a different backend than the one that
         // answered its first packet, silently breaking session affinity.
-        let pinned = VipBackend {
+        let pinned = LbFrontBackend {
             backend_node_ip: 1,
             pod_ip: 100,
         };
-        let candidate = VipBackend {
+        let candidate = LbFrontBackend {
             backend_node_ip: 2,
             pod_ip: 200,
         };

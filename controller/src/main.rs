@@ -3,7 +3,7 @@
 //! Loads, attaches, and pins the three tc-bpf classifiers via the `beep`
 //! lib (the same load/attach/pin invariants the standalone loader uses),
 //! sets `CONFIG`, then watches `Service`(type=LoadBalancer)/`EndpointSlice`/
-//! `Node` and programs `VIP_MAP`/`TARGET_PORTS`/`POD_TARGETS` on every
+//! `Node` and programs `LB_FRONT_MAP`/`TARGET_PORTS`/`POD_TARGETS` on every
 //! change. No persistent proxy loop -- the kernel forwards packets; this
 //! process idles between watch events.
 
@@ -39,10 +39,10 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
-/// See `src/main.rs`'s identical constants: `VIP_MAP`/`TARGET_PORTS` scale
+/// See `src/main.rs`'s identical constants: `LB_FRONT_MAP`/`TARGET_PORTS` scale
 /// with nodes x Service ports under the every-node-is-a-front model, not a
 /// fixed Service count.
-const DEFAULT_VIP_MAP_MAX_ENTRIES: u32 = 4096;
+const DEFAULT_LB_FRONT_MAP_MAX_ENTRIES: u32 = 4096;
 const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
 
 #[derive(Parser, Debug)]
@@ -94,9 +94,9 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
 
-    /// `VIP_MAP` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_VIP_MAP_MAX_ENTRIES)]
-    vip_map_max_entries: u32,
+    /// `LB_FRONT_MAP` max_entries (see `beep-ebpf`'s doc comment).
+    #[arg(long, default_value_t = DEFAULT_LB_FRONT_MAP_MAX_ENTRIES)]
+    lb_front_map_max_entries: u32,
 
     /// `TARGET_PORTS` max_entries (see `beep-ebpf`'s doc comment).
     #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         &args.pin_dir,
         args.fwd_pending_max_entries,
         args.flow_table_max_entries,
-        args.vip_map_max_entries,
+        args.lb_front_map_max_entries,
         args.target_ports_max_entries,
     )
     .context("loading beep-ebpf")?;

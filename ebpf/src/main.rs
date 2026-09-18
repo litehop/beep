@@ -6,7 +6,7 @@
 //! the beep eBPF dataplane
 //! (`docs/design/ebpf-lb-dataplane.md`'s "Packet flow" and
 //! "Conntrack & affinity" sections, `docs/decisions/servicelb-symmetric-geneve-return.md`).
-//! IPv4 only, one static VIP:PORT -> backend-node/PodIP:TargetPort mapping
+//! IPv4 only, one static LB-front-IP:PORT -> backend-node/PodIP:TargetPort mapping
 //! populated by the userspace loader at startup -- real Service/EndpointSlice
 //! watching is Phase 5. Flow-affinity keys are IPv6-primary (`beep_common`)
 //! so the same map shape covers real IPv6 flows once packet parsing grows
@@ -54,8 +54,8 @@ use beep_common::{
     fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts,
     peer_node_admission, resolve_backend_src_port, return_authorization, BackendPortDecision,
     BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
-    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, FwdPendingPin,
-    PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, VipBackend, VipKey, REDIRECTED_RETURN_MARK,
+    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, FwdPendingPin, LbFrontBackend,
+    LbFrontKey, PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -76,9 +76,9 @@ const GENEVE_OPT_CLASS: u16 = 0xffffu16.to_be();
 /// needs to pick a target port (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`
 /// wire-format settlement: "raw pod IP for the pod identifier").
 const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
-/// Return-leg option: raw `VIP_IP:VIP_PORT` echo (6 bytes + 2 padding),
-/// captured by the backend before it DNATs and echoed back so the ingress
-/// can un-DNAT without its own state lookup racing the encap.
+/// Return-leg option: raw `LB_FRONT_IP:LB_FRONT_PORT` echo (6 bytes + 2
+/// padding), captured by the backend before it DNATs and echoed back so the
+/// ingress can un-DNAT without its own state lookup racing the encap.
 const GENEVE_OPT_TYPE_VIP_ECHO: u8 = 0x02;
 
 const ETH_HLEN: usize = 14;
@@ -104,11 +104,11 @@ const L4_DPORT: usize = L4_OFF + 2;
 const TCP_CSUM: usize = L4_OFF + 16;
 const UDP_CSUM: usize = L4_OFF + 6;
 
-/// One static VIP:PORT -> backend mapping (fixture, populated once by the
-/// userspace loader). Same `VipKey` (`beep_common`) shape as `TARGET_PORTS`
-/// below, but a separate map -- the two never interact, just key on the same
-/// front tuple for the two different roles that need it (ingress backend
-/// selection here, backend target-port selection there).
+/// One static LB-front-IP:PORT -> backend mapping (fixture, populated once
+/// by the userspace loader). Same `LbFrontKey` (`beep_common`) shape as
+/// `TARGET_PORTS` below, but a separate map -- the two never interact, just
+/// key on the same front tuple for the two different roles that need it
+/// (ingress backend selection here, backend target-port selection there).
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
 /// userspace loader overrides it via `EbpfLoader::map_max_entries`
@@ -118,23 +118,23 @@ const UDP_CSUM: usize = L4_OFF + 6;
 /// not just Service ports, so the old fixture-era 16 overflows at modest
 /// cluster scale.
 #[map]
-static VIP_MAP: HashMap<VipKey, VipBackend> = HashMap::with_max_entries(4096, 0);
+static LB_FRONT_MAP: HashMap<LbFrontKey, LbFrontBackend> = HashMap::with_max_entries(4096, 0);
 
 /// Backend-local: which target port a decap'd, DNAT'd packet should land on
-/// for a given front (VIP:PORT:proto) -- keyed the same way as `VIP_MAP`
-/// above, deliberately NOT on pod IP alone. A pod IP alone cannot
-/// disambiguate a multi-port Service, a pod backing two Services, or TCP/UDP
-/// on different ports; the forward Geneve option only ever carries the raw
-/// pod IP (`ebpf-lb-dataplane.md`'s settled wire-format decision), so the
-/// front tuple this map keys on -- still present on the packet's own
+/// for a given front (LB front IP:PORT:proto) -- keyed the same way as
+/// `LB_FRONT_MAP` above, deliberately NOT on pod IP alone. A pod IP alone
+/// cannot disambiguate a multi-port Service, a pod backing two Services, or
+/// TCP/UDP on different ports; the forward Geneve option only ever carries
+/// the raw pod IP (`ebpf-lb-dataplane.md`'s settled wire-format decision), so
+/// the front tuple this map keys on -- still present on the packet's own
 /// untouched inner dst at decap time -- is what disambiguates instead.
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling,
 /// same override path and same nodes x Service-ports sizing pressure as
-/// `VIP_MAP` above (every front_ip x Service-port pair -- `watch.rs`'s
+/// `LB_FRONT_MAP` above (every front_ip x Service-port pair -- `watch.rs`'s
 /// `desired()` -- inserts into both maps 1:1, so the two share one default).
 #[map]
-static TARGET_PORTS: HashMap<VipKey, u16> = HashMap::with_max_entries(4096, 0);
+static TARGET_PORTS: HashMap<LbFrontKey, u16> = HashMap::with_max_entries(4096, 0);
 
 /// Backend-local: which pod IPs are this node's own beep backend Pods,
 /// keyed on pod IP alone -- deliberately NOT on target port, unlike
@@ -206,7 +206,7 @@ static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 /// (`src/main.rs`'s `--fwd-pending-max-entries`), so sizing is a DaemonSet
 /// config knob, not a value baked into this object.
 ///
-/// Value type is `VipBackend`, the full backend identity
+/// Value type is `LbFrontBackend`, the full backend identity
 /// (`backend_node_ip` + `pod_ip`), not just the node IP: aie31.21 pins this
 /// as the per-flow affinity target, so this bead's admission logic already
 /// carries the shape aie31.21 needs -- no map-shape change once
@@ -234,7 +234,7 @@ static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 /// and evicting (the doc's core requirement over a naive `HashMap`), just
 /// with one shared table instead of per-CPU shards.
 #[map]
-static FWD_PENDING: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_entries(2048, 0);
+static FWD_PENDING: LruHashMap<TcpFlowKey, LbFrontBackend> = LruHashMap::with_max_entries(2048, 0);
 
 /// Union of the three roles `FLOW_TABLE` stores, discriminated by the
 /// `FlowDirection` tag in its key. `forward` is the promoted,
@@ -248,7 +248,7 @@ static FWD_PENDING: LruHashMap<TcpFlowKey, VipBackend> = LruHashMap::with_max_en
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union FlowValue {
-    pub forward: VipBackend,
+    pub forward: LbFrontBackend,
     pub reverse: RevFlowValue,
     pub port_memo: PortMemoValue,
 }
@@ -350,7 +350,7 @@ static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries
 /// several call sites, no downside to forcing inlining, and it sidesteps
 /// this toolchain's non-inlined-BPF-to-BPF-call miscompile risk outright.
 #[inline(always)]
-fn flow_table_get_forward(key: FlowKey) -> Option<VipBackend> {
+fn flow_table_get_forward(key: FlowKey) -> Option<LbFrontBackend> {
     unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.forward })
 }
 
@@ -417,7 +417,7 @@ fn load_direct<T: Copy>(ctx: &TcContext, offset: usize) -> Option<T> {
 }
 
 /// Hook 1: ingress classifier on the physical uplink, every node (forward
-/// leg). Classifies VIP:PORT traffic, stamps Geneve metadata, redirects to
+/// leg). Classifies LB-front-IP:PORT traffic, stamps Geneve metadata, redirects to
 /// `geneve0`. Everything else passes through untouched -- this hook sees
 /// all uplink traffic, not just beep's.
 #[classifier]
@@ -482,13 +482,13 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i
 
     let dst_ip: u32 = load_direct(ctx, ip_dst)?;
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
-    let key = VipKey {
+    let key = LbFrontKey {
         vip_ip: dst_ip,
         vip_port: dst_port,
         proto,
         _pad: 0,
     };
-    let backend = *unsafe { VIP_MAP.get(key) }?;
+    let backend = *unsafe { LB_FRONT_MAP.get(key) }?;
 
     let src_ip: u32 = load_direct(ctx, ip_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
@@ -632,7 +632,7 @@ pub fn geneve_ingress(ctx: TcContext) -> i32 {
 /// Backend role (step 4): gate the Geneve option's stamped pod_ip on
 /// POD_TARGETS membership -- this node, not a possibly-lagging ingress, is
 /// the authoritative consistency point for whether that pod is still one of
-/// its own -- read `VIP_IP:VIP_PORT` off the still-untouched inner dst
+/// its own -- read `LB_FRONT_IP:LB_FRONT_PORT` off the still-untouched inner dst
 /// BEFORE rewriting anything, record the reverse-flow entry, DNAT dst to
 /// `PodIP:TargetPort` (src untouched -- the Pod must see the real client IP
 /// at L3), then hand the packet to the normal receive path: `TC_ACT_OK` on
@@ -696,7 +696,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // Geneve option's pod IP: the pod IP alone can't tell 80->8080 apart from
     // 443->8443 on the same pod (`TARGET_PORTS`' doc comment).
     let target_port = *unsafe {
-        TARGET_PORTS.get(VipKey {
+        TARGET_PORTS.get(LbFrontKey {
             vip_ip,
             vip_port,
             proto,
@@ -881,7 +881,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 }
 
 /// Ingress role (step 7): read `CLIENT_IP:SRC_PORT` off the inner dst and
-/// `VIP_IP:VIP_PORT` off the Geneve echo, confirm this return answers a flow
+/// `LB_FRONT_IP:LB_FRONT_PORT` off the Geneve echo, confirm this return answers a flow
 /// this node actually forwarded (drop otherwise -- an echo with no matching
 /// forward entry is stale or spoofed), then un-DNAT src back to the VIP and
 /// let normal routing carry it out to the client.
