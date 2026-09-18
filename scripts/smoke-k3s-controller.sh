@@ -69,6 +69,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=controller-rss.sh
 . "$SCRIPT_DIR/controller-rss.sh"
+# shellcheck source=k3s-common.sh
+. "$SCRIPT_DIR/k3s-common.sh"
 
 NAMESPACE="beep-controller-e2e"
 SERVICE_NAME="whoami"
@@ -117,11 +119,7 @@ dump_evidence() {
 
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  # `-f -` (stdin), not a host path: `kube` runs kubectl on $VM_A, which has
-  # no access to this script's own (host-side) $REPO_ROOT.
-  kube delete -f - --ignore-not-found < "$REPO_ROOT/deploy/daemonset.yaml" >/dev/null 2>&1 || true
-  kube delete -f - --ignore-not-found < "$REPO_ROOT/deploy/rbac.yaml" >/dev/null 2>&1 || true
-  kube delete secret "$KUBECONFIG_SECRET" -n kube-system --ignore-not-found >/dev/null 2>&1 || true
+  k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
@@ -136,10 +134,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> [1/11] bringing up the k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
-"$SCRIPT_DIR/k3s-up.sh" --vm-a "$VM_A" --vm-b "$VM_B"
-if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
-  limactl start "$VM_CLIENT"
-fi
+k3s_bring_up_cluster "$VM_A" "$VM_B" "$VM_CLIENT"
 
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"
@@ -187,41 +182,10 @@ for vm in "$VM_A" "$VM_B"; do
 done
 
 echo "==> [3/11] provisioning the controller's kubeconfig Secret from $VM_A's own admin kubeconfig (see this script's header)"
-limactl shell "$VM_A" -- sudo bash -c "
-  sed 's#server: https://127.0.0.1:6443#server: https://${IP_A}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-controller-kubeconfig
-  k3s kubectl create secret generic $KUBECONFIG_SECRET -n kube-system \
-    --from-file=kubeconfig=/tmp/beep-controller-kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -
-  rm -f /tmp/beep-controller-kubeconfig
-"
+k3s_provision_kubeconfig_secret "$VM_A" "$IP_A" "$KUBECONFIG_SECRET" 1
 
 echo "==> [4/11] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
-kube apply -f - < "$REPO_ROOT/deploy/rbac.yaml"
-kube apply -f - < "$REPO_ROOT/deploy/daemonset.yaml"
-controller_deploy_failed=0
-if ! kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s; then
-  controller_deploy_failed=1
-fi
-# Read the pod selector back from the DaemonSet itself, rather than
-# hardcoding a copy of `deploy/daemonset.yaml`'s labels here: a hardcoded
-# literal that drifts from the manifest matches zero pods, leaving
-# `controller_deploy_failed` unchanged instead of failing -- a silent
-# no-op, not a caught error.
-CONTROLLER_SELECTOR=$(kube -n kube-system get daemonset servicelb-controller \
-  -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
-# `rollout status` alone is not sufficient evidence: a container with no
-# readiness/liveness probe (this one has neither) reports Ready as soon as
-# it *starts*, even if it exits non-zero moments later -- `rollout status`
-# can observe that brief window and report success just before the pod
-# enters CrashLoopBackOff (confirmed: this exact false-positive happened
-# while diagnosing the AppArmor/bpffs blocker). Settle, then require zero
-# restarts.
-sleep 10
-restarts=$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" \
-  -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "")
-for c in $restarts; do
-  [ "$c" = "0" ] || controller_deploy_failed=1
-done
-if [ "$controller_deploy_failed" -ne 0 ]; then
+if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
   echo "CONTROLLER-DEPLOY: FAIL (see pod status/logs below -- this step is expected to PASS, see this script's header)" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
   dump_evidence
