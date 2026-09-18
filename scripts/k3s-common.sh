@@ -36,12 +36,27 @@ k3s_provision_kubeconfig_secret() { # k3s_provision_kubeconfig_secret <vm-a> <ip
 k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
   local repo_root="$1" image="${2:-}"
   kube apply -f - < "$repo_root/deploy/rbac.yaml"
+  controller_deploy_failed=0
   if [ -n "$image" ]; then
     sed "s#docker.io/valerauko/beep-lb:latest#${image}#" "$repo_root/deploy/daemonset.yaml" | kube apply -f -
+    # If deploy/daemonset.yaml's hardcoded image line ever drifts from this
+    # sed's match pattern, the sed silently no-ops and the rig deploys
+    # whatever :latest resolves to -- recreating the exact stale-image
+    # regression this image override exists to prevent. Read the deployed
+    # DaemonSet's image back (same pattern as CONTROLLER_SELECTOR below)
+    # and fail loud if it isn't the override we asked for. Fold into
+    # controller_deploy_failed rather than returning early: an early return
+    # here would skip the CONTROLLER_SELECTOR assignment below, and the
+    # caller's FAIL branch (dump_evidence) reads that under `set -u`.
+    deployed_image=$(kube -n kube-system get daemonset servicelb-controller \
+      -o jsonpath='{.spec.template.spec.containers[0].image}')
+    if [ "$deployed_image" != "$image" ]; then
+      echo "FAIL: image override did not apply -- deployed image is '$deployed_image', expected '$image' (deploy/daemonset.yaml's hardcoded image line may have drifted from k3s_deploy_controller_daemonset's sed pattern)" >&2
+      controller_deploy_failed=1
+    fi
   else
     kube apply -f - < "$repo_root/deploy/daemonset.yaml"
   fi
-  controller_deploy_failed=0
   if ! kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s; then
     controller_deploy_failed=1
   fi
