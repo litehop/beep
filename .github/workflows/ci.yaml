@@ -147,6 +147,36 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+  # Pure host bash tests (no VM, no cargo build, no eBPF) for the Rule-14
+  # regression tests scripts/test-*-logic.sh document -- before this job
+  # existed, none of them ran anywhere in CI or a git hook, so a fix's own
+  # regression test could never actually catch that regression's return.
+  # Loops the glob (not a hardcoded name list) so a future scripts/test-*
+  # -logic.sh is picked up automatically.
+  shell-logic-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run every scripts/test-*-logic.sh
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in scripts/test-*-logic.sh; do
+            echo "::group::$f"
+            if bash "$f"; then
+              echo "PASS: $f"
+            else
+              echo "FAIL: $f"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
   # delivery.yaml cross-compiles beep-controller for aarch64-gnu (in addition
   # to the host amd64 target) via cargo-zigbuild, but test-matrix/lint-matrix
   # above only ever build the host target -- so an arch-specific compile
