@@ -271,6 +271,17 @@ jobs:
       - name: Build beep-ebpf + beep + beep-controller
         run: cargo build --release -p beep -p beep-controller
 
+      # Guards build.rs's post-link DWARF strip (mayor-aie31.19) from a
+      # silent future revert -- a fresh checkout's target/ has exactly one
+      # build.rs invocation, so exactly one OUT_DIR/beep-ebpf to find.
+      - name: Assert the embedded eBPF object stays DWARF-stripped
+        run: |
+          set -euo pipefail
+          objects=$(find target/release/build -path '*/out/beep-ebpf')
+          count=$(printf '%s\n' "$objects" | grep -c .)
+          [ "$count" -eq 1 ] || { echo "FAIL: expected exactly 1 embedded beep-ebpf object, found $count: $objects" >&2; exit 1; }
+          bash scripts/assert-ebpf-object-stripped.sh "$objects"
+
       - name: Run smoke fixture (loads real programs, drives one round trip, samples eBPF map memory + loader RSS)
         run: |
           sudo install -m 0755 target/release/beep /tmp/beep-smoke
