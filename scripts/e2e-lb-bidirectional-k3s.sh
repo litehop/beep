@@ -12,7 +12,7 @@
 # agent) are not guaranteed symmetric just because the same eBPF program is
 # loaded on both. Reuses scripts/k3s-up.sh's bring-up and
 # deploy/{rbac,daemonset}.yaml, same as smoke-k3s-controller.sh -- does not
-# re-assert RSS/FLOW_TABLE/VIP_MAP population already covered there.
+# re-assert RSS/FLOW_TABLE/LB_FRONT_MAP population already covered there.
 #
 # Each direction uses a distinct VIP port (80 vs 8081): a type=LoadBalancer
 # Service's status.loadBalancer.ingress lists ALL node IPs regardless of

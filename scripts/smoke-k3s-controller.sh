@@ -256,17 +256,17 @@ esac
 echo "SERVICE STATUS: PASS (status.loadBalancer.ingress = $ingress_ips)"
 
 echo "==> [8/11] confirming the dataplane maps are programmed"
-vip_a=$(map_entry_count "$VM_A" VIP_MAP)
-vip_b=$(map_entry_count "$VM_B" VIP_MAP)
+vip_a=$(map_entry_count "$VM_A" LB_FRONT_MAP)
+vip_b=$(map_entry_count "$VM_B" LB_FRONT_MAP)
 pod_targets_b=$(map_entry_count "$VM_B" POD_TARGETS)
-[ -n "$vip_a" ] && [ "$vip_a" -ge 1 ] || { echo "FAIL: $VM_A's VIP_MAP has no entries ($vip_a)" >&2; dump_evidence; exit 1; }
-[ -n "$vip_b" ] && [ "$vip_b" -ge 1 ] || { echo "FAIL: $VM_B's VIP_MAP has no entries ($vip_b)" >&2; dump_evidence; exit 1; }
+[ -n "$vip_a" ] && [ "$vip_a" -ge 1 ] || { echo "FAIL: $VM_A's LB_FRONT_MAP has no entries ($vip_a)" >&2; dump_evidence; exit 1; }
+[ -n "$vip_b" ] && [ "$vip_b" -ge 1 ] || { echo "FAIL: $VM_B's LB_FRONT_MAP has no entries ($vip_b)" >&2; dump_evidence; exit 1; }
 [ -n "$pod_targets_b" ] && [ "$pod_targets_b" -ge 1 ] || {
   echo "FAIL: $VM_B's POD_TARGETS has no entries ($pod_targets_b) -- the backend Pod it hosts was never admitted" >&2
   dump_evidence
   exit 1
 }
-echo "MAP-PROGRAMMING: PASS (VIP_MAP: $VM_A=$vip_a $VM_B=$vip_b entries, $VM_B POD_TARGETS=$pod_targets_b entries)"
+echo "MAP-PROGRAMMING: PASS (LB_FRONT_MAP: $VM_A=$vip_a $VM_B=$vip_b entries, $VM_B POD_TARGETS=$pod_targets_b entries)"
 
 echo "==> [9/11] sampling beep-controller RSS after real reconcile load and asserting growth stays bounded"
 rss_a_peak=$(controller_rss limactl shell "$VM_A" --)

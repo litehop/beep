@@ -16,7 +16,7 @@
 //! would silently drop every established flow on each DaemonSet rollout,
 //! eviction, or OOM kill. Real Service/EndpointSlice watching is Phase 5.
 //!
-//! `FWD_PENDING`/`FLOW_TABLE`/`VIP_MAP`/`TARGET_PORTS` sizes are a load-time
+//! `FWD_PENDING`/`FLOW_TABLE`/`LB_FRONT_MAP`/`TARGET_PORTS` sizes are a load-time
 //! DaemonSet config knob, not a value baked into the eBPF object
 //! (`beep-ebpf`'s admission-control doc comment) -- overridden here via
 //! `EbpfLoader::map_max_entries` before `load()`.
@@ -33,7 +33,7 @@ use beep::{
     attach_and_pin, bump_memlock_rlimit, load_ebpf, local_pod_ips, parse_fixture, populate_config,
     stale_pod_targets, Fixture, MAP_NAMES,
 };
-use beep_common::{wire_ip, wire_port, VipBackend, VipKey};
+use beep_common::{wire_ip, wire_port, LbFrontBackend, LbFrontKey};
 use clap::Parser;
 
 /// Defaults from the admission-control sizing derivation
@@ -45,14 +45,14 @@ use clap::Parser;
 /// admission control keeps that role unreachable by a flood.
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
-/// `VIP_MAP`/`TARGET_PORTS` scale with nodes x Service ports under the
+/// `LB_FRONT_MAP`/`TARGET_PORTS` scale with nodes x Service ports under the
 /// every-node-is-a-front model (`beep-ebpf`'s doc comments on both maps), not
 /// a fixed Service count -- 4096 covers a realistic cluster (e.g. 100 nodes x
 /// 40 Service ports) with headroom, and stays well under
 /// `assert-ebpf-map-memory.sh`'s 4 MiB gross-regression ceiling alongside
 /// FWD_PENDING/FLOW_TABLE's existing footprint (verified via
 /// `scripts/sample-ebpf-memory.sh`).
-const DEFAULT_VIP_MAP_MAX_ENTRIES: u32 = 4096;
+const DEFAULT_LB_FRONT_MAP_MAX_ENTRIES: u32 = 4096;
 const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
 
 #[derive(Parser, Debug)]
@@ -76,7 +76,7 @@ struct Args {
     /// One VIP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
     /// to cover one Pod behind more than one Service port (a plain multi-port
     /// Service, or one Pod backing two distinct Services) -- each repetition
-    /// becomes its own `VIP_MAP`/`TARGET_PORTS` entry. VIP address is this
+    /// becomes its own `LB_FRONT_MAP`/`TARGET_PORTS` entry. VIP address is this
     /// node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
     /// Format: `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`
     /// (`proto` is `tcp` or `udp`).
@@ -109,7 +109,7 @@ struct Args {
     /// per-node EndpointSlice watch): scopes `POD_TARGETS`, the LOCAL
     /// backend-membership map the decap and egress-return admission gates
     /// check, to fixtures whose `backend_node_ip` matches this address.
-    /// `VIP_MAP`/`TARGET_PORTS` (the forwarding tables) stay unfiltered --
+    /// `LB_FRONT_MAP`/`TARGET_PORTS` (the forwarding tables) stay unfiltered --
     /// any node can be ingress for any VIP, so they need every fixture
     /// regardless of which node hosts the backend.
     #[arg(long = "node-ip")]
@@ -131,10 +131,10 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
 
-    /// `VIP_MAP` max_entries -- see `beep-ebpf`'s doc comment. A load-time
+    /// `LB_FRONT_MAP` max_entries -- see `beep-ebpf`'s doc comment. A load-time
     /// DaemonSet config knob, not a value baked into the eBPF object.
-    #[arg(long, default_value_t = DEFAULT_VIP_MAP_MAX_ENTRIES)]
-    vip_map_max_entries: u32,
+    #[arg(long, default_value_t = DEFAULT_LB_FRONT_MAP_MAX_ENTRIES)]
+    lb_front_map_max_entries: u32,
 
     /// `TARGET_PORTS` max_entries -- see `beep-ebpf`'s doc comment.
     #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
@@ -246,7 +246,7 @@ fn main() -> anyhow::Result<()> {
         node_ip,
         fwd_pending_max_entries,
         flow_table_max_entries,
-        vip_map_max_entries,
+        lb_front_map_max_entries,
         target_ports_max_entries,
     } = Args::parse();
 
@@ -269,14 +269,14 @@ fn main() -> anyhow::Result<()> {
         &pin_dir,
         fwd_pending_max_entries,
         flow_table_max_entries,
-        vip_map_max_entries,
+        lb_front_map_max_entries,
         target_ports_max_entries,
     )
     .context("loading beep-ebpf")?;
 
     populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures, node_ip)
-        .context("populating VIP_MAP/TARGET_PORTS/POD_TARGETS/NODE_ALLOW fixture")?;
+        .context("populating LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/NODE_ALLOW fixture")?;
 
     let hooks: [(&str, &str, TcAttachType); 3] = [
         (
@@ -356,12 +356,13 @@ fn main() -> anyhow::Result<()> {
 /// (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`'s node-owned-address
 /// model).
 ///
-/// `TARGET_PORTS` is keyed on the same (VIP:PORT:proto) front as `VIP_MAP`,
-/// not on pod IP alone: one `--fixture` per Service port, even when several
-/// share a backend Pod IP, so a multi-port Service resolves each port to its
-/// own target port instead of the last-written one silently winning.
-fn fixture_key(fixture: &Fixture) -> VipKey {
-    VipKey {
+/// `TARGET_PORTS` is keyed on the same (VIP:PORT:proto) front as
+/// `LB_FRONT_MAP`, not on pod IP alone: one `--fixture` per Service port,
+/// even when several share a backend Pod IP, so a multi-port Service
+/// resolves each port to its own target port instead of the last-written
+/// one silently winning.
+fn fixture_key(fixture: &Fixture) -> LbFrontKey {
+    LbFrontKey {
         vip_ip: wire_ip(u32::from(fixture.vip_ip)),
         vip_port: wire_port(fixture.vip_port),
         proto: fixture.proto.as_ip_proto(),
@@ -375,14 +376,14 @@ fn populate_fixtures(
     node_ip: Ipv4Addr,
 ) -> anyhow::Result<()> {
     {
-        let mut vip_map: AyaHashMap<_, VipKey, VipBackend> = AyaHashMap::try_from(
-            ebpf.map_mut("VIP_MAP")
-                .ok_or_else(|| anyhow!("no map named `VIP_MAP` in the eBPF object"))?,
+        let mut lb_front_map: AyaHashMap<_, LbFrontKey, LbFrontBackend> = AyaHashMap::try_from(
+            ebpf.map_mut("LB_FRONT_MAP")
+                .ok_or_else(|| anyhow!("no map named `LB_FRONT_MAP` in the eBPF object"))?,
         )?;
         for fixture in fixtures {
-            vip_map.insert(
+            lb_front_map.insert(
                 fixture_key(fixture),
-                VipBackend {
+                LbFrontBackend {
                     // bpf_tunnel_key.remote_ipv4 is the one field the kernel
                     // itself converts host<->network internally on set/get --
                     // confirmed empirically (a wire-token value here came out
@@ -398,7 +399,7 @@ fn populate_fixtures(
     }
 
     {
-        let mut target_ports: AyaHashMap<_, VipKey, u16> = AyaHashMap::try_from(
+        let mut target_ports: AyaHashMap<_, LbFrontKey, u16> = AyaHashMap::try_from(
             ebpf.map_mut("TARGET_PORTS")
                 .ok_or_else(|| anyhow!("no map named `TARGET_PORTS` in the eBPF object"))?,
         )?;
@@ -414,7 +415,7 @@ fn populate_fixtures(
         // that a pod is one of THIS node's own backends, deliberately not
         // which port it's replying from. Two fixtures sharing a pod IP (a
         // multi-port Service) collapse to one entry here on purpose:
-        // membership doesn't need per-port granularity. Unlike VIP_MAP/
+        // membership doesn't need per-port granularity. Unlike LB_FRONT_MAP/
         // TARGET_PORTS above, this map is scoped to `node_ip` via
         // `local_pod_ips`: any node can be ingress for any VIP, but only
         // the node actually running a pod may claim it as a local backend --
@@ -676,7 +677,7 @@ mod tests {
 
         // Simulates `TARGET_PORTS`: keyed on the front tuple, exactly like
         // `populate_fixtures`/`try_geneve_decap_forward`.
-        let mut target_ports: HashMap<VipKey, u16> = HashMap::new();
+        let mut target_ports: HashMap<LbFrontKey, u16> = HashMap::new();
         for f in &fixtures {
             target_ports.insert(fixture_key(f), wire_port(f.target_port));
         }

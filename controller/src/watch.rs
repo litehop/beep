@@ -191,7 +191,7 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
 }
 
 /// Parses a `Node` object's first `InternalIP` address -- the value
-/// `VipBackend.backend_node_ip` needs as the Geneve tunnel remote for a pod
+/// `LbFrontBackend.backend_node_ip` needs as the Geneve tunnel remote for a pod
 /// hosted on this node (`reconcile::Endpoint.node_ip`'s doc comment).
 fn parse_node_internal_ip(obj: &Value) -> Option<Ipv4Addr> {
     obj["status"]["addresses"]
@@ -332,7 +332,7 @@ impl WatchState {
         let no_slices = HashMap::new();
         // The front-IP model (ebpf-lb-dataplane.md's "Packet flow" step 1):
         // every node's own address is a valid front for every Service, so
-        // VIP_MAP/TARGET_PORTS need one entry per KNOWN node address, not
+        // LB_FRONT_MAP/TARGET_PORTS need one entry per KNOWN node address, not
         // just this controller's own `node.node_ip` -- the backend node's
         // decap (`try_geneve_decap_forward`) looks up TARGET_PORTS keyed on
         // whichever node the client actually dialed, which is any node in
@@ -344,14 +344,14 @@ impl WatchState {
         // is nothing programmed yet to lose, and the Node LIST's own events
         // each re-trigger a reconcile, so the correct front set lands as
         // soon as it catches up. On a RESTART it is not harmless:
-        // VIP_MAP/TARGET_PORTS pins survive the process exit, and
+        // LB_FRONT_MAP/TARGET_PORTS pins survive the process exit, and
         // `reconcile::diff` deletes any current entry missing from
         // `desired` -- so reconciling with `node_ips` still empty (or
         // partial) would wipe every already-programmed front. `nodes_listed`
-        // gates only the front_ip loop below (VIP_MAP/TARGET_PORTS) on the
+        // gates only the front_ip loop below (LB_FRONT_MAP/TARGET_PORTS) on the
         // initial Node LIST having actually completed, and `fronts_known`
         // above carries that gate into `DesiredEntries` so `PinnedMaps::apply`
-        // knows to leave VIP_MAP/TARGET_PORTS untouched rather than diff them
+        // knows to leave LB_FRONT_MAP/TARGET_PORTS untouched rather than diff them
         // against an empty desired set while the node set isn't known yet.
         // POD_TARGETS must NOT be gated on the FULL Node LIST the same way:
         // it's EndpointSlice/local-node-derived (`reconcile::
@@ -368,7 +368,7 @@ impl WatchState {
         // whole list.
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
         // NODE_ALLOW's peer set is the same front_ips this loop feeds
-        // VIP_MAP/TARGET_PORTS from -- host-native (`u32::from`, not
+        // LB_FRONT_MAP/TARGET_PORTS from -- host-native (`u32::from`, not
         // `wire_ip`), matching `tkey.remote_ipv4`'s convention
         // (`DesiredEntries::node_allow`'s doc comment). `PinnedMaps::apply`
         // gates this on `fronts_known` (set above) for the identical
@@ -452,7 +452,7 @@ impl WatchState {
                     ports: ports.clone(),
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
-                aggregate.vip_map.extend(desired.vip_map);
+                aggregate.lb_front_map.extend(desired.lb_front_map);
                 aggregate.target_ports.extend(desired.target_ports);
             }
         }
@@ -593,7 +593,7 @@ mod tests {
     }
 
     // A watch that skipped type=LoadBalancer filtering would program
-    // VIP_MAP for a ClusterIP Service too -- exposing a Service never meant
+    // LB_FRONT_MAP for a ClusterIP Service too -- exposing a Service never meant
     // to accept external traffic.
     #[test]
     fn cluster_ip_service_is_not_tracked() {
@@ -763,7 +763,11 @@ mod tests {
         }
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
-        let (_, backend) = desired.vip_map.iter().next().expect("one front expected");
+        let (_, backend) = desired
+            .lb_front_map
+            .iter()
+            .next()
+            .expect("one front expected");
         assert_eq!(
             backend.pod_ip.to_le_bytes(),
             [10, 244, 0, 2],
@@ -827,7 +831,11 @@ mod tests {
         }));
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
-        let (_, backend) = desired.vip_map.iter().next().expect("one front expected");
+        let (_, backend) = desired
+            .lb_front_map
+            .iter()
+            .next()
+            .expect("one front expected");
         assert_eq!(
             backend.pod_ip.to_le_bytes(),
             [10, 244, 0, 9],
@@ -839,7 +847,7 @@ mod tests {
     // A single-port Service and its EndpointSlice both omit the port name
     // (legal when there is exactly one port) -- target-port resolution must
     // still succeed positionally, or every unnamed single-port Service
-    // (the common case) would silently get zero VIP_MAP entries.
+    // (the common case) would silently get zero LB_FRONT_MAP entries.
     #[test]
     fn unnamed_single_port_resolves_positionally() {
         let mut state = WatchState::default();
@@ -873,7 +881,7 @@ mod tests {
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert_eq!(
-            desired.vip_map.len(),
+            desired.lb_front_map.len(),
             1,
             "an unnamed single Service port must still resolve against the sole unnamed \
              EndpointSlice port, not get silently dropped for lack of a name to match"
@@ -975,8 +983,8 @@ mod tests {
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert!(
-            desired.vip_map.is_empty(),
-            "an endpoint on an unresolved node must not produce a VIP_MAP entry -- fabricating \
+            desired.lb_front_map.is_empty(),
+            "an endpoint on an unresolved node must not produce a LB_FRONT_MAP entry -- fabricating \
              a node_ip (e.g. 0.0.0.0) would misdirect the Geneve tunnel"
         );
     }
@@ -1030,25 +1038,25 @@ mod tests {
         // the ingress node in this flow is node-a, a DIFFERENT node.
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 6)));
         let fronts: HashSet<[u8; 4]> = desired
-            .vip_map
+            .lb_front_map
             .keys()
             .map(|k| k.vip_ip.to_le_bytes())
             .collect();
         assert_eq!(
             fronts,
             HashSet::from([[10, 0, 0, 5], [10, 0, 0, 6]]),
-            "TARGET_PORTS/VIP_MAP must cover every known node's address as a front, not just \
+            "TARGET_PORTS/LB_FRONT_MAP must cover every known node's address as a front, not just \
              this node's own -- otherwise the backend node can never decap a forward packet \
              whose client dialed a DIFFERENT node's front IP"
         );
     }
 
-    // Regression for the restart race: VIP_MAP/TARGET_PORTS pins
+    // Regression for the restart race: LB_FRONT_MAP/TARGET_PORTS pins
     // survive a controller restart, and `reconcile::diff` deletes any
     // current entry missing from `desired`. If a reconcile fires before the
     // initial Node LIST has ever completed (racing the Service watch in
     // `run_controller_loop`'s `tokio::join!`), `desired` must NOT report an
-    // empty vip_map/target_ports as if there are truly no fronts -- doing so
+    // empty lb_front_map/target_ports as if there are truly no fronts -- doing so
     // would make `PinnedMaps::apply` delete every already-programmed front
     // and blackhole every Service on this node until the Node LIST catches
     // up. `fronts_known` is how `desired` tells "not known yet" apart from
@@ -1092,13 +1100,13 @@ mod tests {
         assert!(
             !desired.fronts_known,
             "fronts_known must be false before the Node LIST has ever completed, or \
-             PinnedMaps::apply would diff this pass's vip_map/target_ports against whatever \
+             PinnedMaps::apply would diff this pass's lb_front_map/target_ports against whatever \
              fronts a previous controller run already pinned (bpffs pins survive a restart) \
              and delete every one this pass doesn't also produce -- exactly the restart \
              blackhole this bug reported"
         );
         assert!(
-            desired.vip_map.is_empty() && desired.target_ports.is_empty(),
+            desired.lb_front_map.is_empty() && desired.target_ports.is_empty(),
             "a pre-LIST reconcile must not program ANY front, even one whose backend is \
              already fully known -- reverting the gate that skips this loop would leak this \
              entry back into an aggregate the caller still can't safely diff against"
@@ -1155,7 +1163,7 @@ mod tests {
         assert!(
             !desired.fronts_known,
             "fronts_known must still be false pre-LIST -- this test only guards pod_targets, \
-             it must not weaken the fronts_known gate that keeps VIP_MAP/TARGET_PORTS \
+             it must not weaken the fronts_known gate that keeps LB_FRONT_MAP/TARGET_PORTS \
              untouched until the Node LIST completes"
         );
         assert!(
@@ -1320,8 +1328,8 @@ mod tests {
              startup race"
         );
         assert!(
-            desired.vip_map.is_empty(),
-            "with genuinely zero known nodes there is no valid front, so vip_map must still \
+            desired.lb_front_map.is_empty(),
+            "with genuinely zero known nodes there is no valid front, so lb_front_map must still \
              be empty here"
         );
     }
@@ -1367,7 +1375,7 @@ mod tests {
              only suppress the pre-LIST race window, not every reconcile"
         );
         assert_eq!(
-            desired.vip_map.len(),
+            desired.lb_front_map.len(),
             1,
             "a normal populated reconcile must still program its front -- the fix must not \
              have accidentally suppressed the common case along with the race window"
