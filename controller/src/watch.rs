@@ -370,9 +370,11 @@ impl WatchState {
         // NODE_ALLOW's peer set is the same front_ips this loop feeds
         // LB_FRONT_MAP/TARGET_PORTS from -- host-native (`u32::from`, not
         // `wire_ip`), matching `tkey.remote_ipv4`'s convention
-        // (`DesiredEntries::node_allow`'s doc comment). `PinnedMaps::apply`
-        // gates this on `fronts_known` (set above) for the identical
-        // restart-wipe reason `front_ips` itself is gated for.
+        // (`DesiredEntries::node_allow`'s doc comment). Unlike LB_FRONT_MAP/
+        // TARGET_PORTS, `PinnedMaps::apply_node_allow` upserts this set every
+        // tick regardless of `fronts_known` (set above) -- only its delete
+        // half is latched on `fronts_known` having been seen true once, the
+        // same restart-wipe reason `front_ips` itself is gated for.
         aggregate.node_allow = front_ips.iter().copied().map(u32::from).collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
