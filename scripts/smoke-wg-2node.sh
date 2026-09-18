@@ -8,43 +8,53 @@
 # by a real wg0 uplink -- the scenario beep-ebpf's L2-header-skip fix
 # (`beep_common::uplink_l2_header_len`) targets.
 #
-# CURRENT STATUS (as of this rig's introduction): the WireGuard tunnel comes
-# up correctly and the L2-header-skip fix correctly parses a real L3
-# WireGuard packet on the ingress node (asserted below via a live
-# FWD_PENDING dump on vm-a) -- but the end-to-end round trip does NOT yet
-# complete. `bpf_redirect` from the L3-only wg0 uplink to the Ethernet-type
-# geneve0 device fails inside the kernel: confirmed via
-# `dmesg`/`trace-cmd record -e skb:kfree_skb` showing the encapsulated SYN
-# freed at `location=__bpf_redirect+0x220 reason: NOT_SPECIFIED`,
-# corroborated by geneve0's `ip -s link show` TX `dropped` counter
-# incrementing once per client attempt with zero corresponding RX on the
-# peer. This is a NEW, distinct blocker from the two issues this rig's setup
-# steps already solve (see smoke-wg-2node-remote.sh's header) -- filed
-# separately for follow-up. This script's `run` therefore ends in a
-# documented, non-zero "ROUND-TRIP: FAIL (known blocker)" rather than a
-# false pass; every step before that is a genuine, asserted PASS.
+# A prior redirect/verifier drop on this rig's original bpf_redirect(wg0 ->
+# geneve0) path has since been fixed. That fix then exposed a second,
+# downstream problem: with only 2 nodes, the "client" had to be node-b's
+# own root netns, so after decap+DNAT the packet's src (node-b's own wg0
+# address) collided with pod_ip (also bound on node-b's own lo) -- both
+# local to node-b, so the kernel martian-dropped it at ip_rcv_finish_core.
+# Real deployments never collide a client address with the backend node's
+# own address; this was purely this rig's own topology.
 #
-# Usage: scripts/smoke-wg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>]
-# Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the VIP)
-# and beep-node-b (backend Pod + the "client" -- see remote script header on
-# why a 2-node rig's client is the backend node's own root netns).
-# Both VMs must be on the SAME Lima network (directly reachable over their
-# real eth0/underlay) so the WireGuard handshake has a path to establish --
-# WireGuard is the L3 uplink under test here, not a substitute for underlay
-# reachability.
+# FIX: the client is now beep-client (lima/beep-client.yaml), a genuinely
+# separate 3rd VM non-local to either node -- the same fix already applied
+# to scripts/smoke-eth-ingress-2node.sh. beep-client never runs WireGuard
+# itself (see that profile's header), so it cannot dial node-a's wg0 VIP
+# directly; node-b relays the client's plain SYN into the tunnel as an
+# ordinary IP forward (ip_forward=1, set up below), and node-a's WireGuard
+# peer entry for node-b is widened (--extra-allowed) to admit the client's
+# real source address past WireGuard's own crypto-routing source filter.
+# The client's SYN therefore still arrives at node-a genuinely
+# WireGuard-decrypted on wg0 -- the exact mechanism under test -- while its
+# source is no longer local to node-b. The round trip now reaches a
+# genuine GREEN.
+#
+# Usage: scripts/smoke-wg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
+# Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the
+# VIP), beep-node-b (backend Pod + the client's WireGuard relay), beep-client
+# (client). All three VMs must be on the SAME Lima network (directly
+# reachable over their real eth0/underlay) so the WireGuard handshake has a
+# path to establish -- WireGuard is the L3 uplink under test here, not a
+# substitute for underlay reachability.
 #
 # Same host prerequisites as smoke.sh (nightly + rust-src + bpf-linker +
 # cargo-zigbuild); VM prerequisites: bpftool (already present) plus
 # `wireguard-tools` (installed automatically below via apt if missing) and
-# `trace-cmd` for evidence capture on failure.
+# `trace-cmd` for evidence capture on failure. beep-client has no MCP server
+# and never runs the dataplane/WG -- it's driven directly via `limactl
+# shell` from this host script, not via the remote.sh subcommand protocol
+# node-a/node-b use.
 set -euo pipefail
 
 VM_A="beep-node-a"
 VM_B="beep-node-b"
+VM_CLIENT="beep-client"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
     --vm-b) VM_B="$2"; shift 2 ;;
+    --vm-client) VM_CLIENT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -64,6 +74,7 @@ VIP_PORT="19100"
 POD_IP="198.51.100.60"
 POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18090"
+UPLINK_IFACE_B="eth0"
 
 for tool in cargo-zigbuild limactl; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
@@ -110,15 +121,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> [1/6] bringing up $VM_A and $VM_B"
+echo "==> [1/7] bringing up $VM_A, $VM_B, and $VM_CLIENT"
 for vm in "$VM_A" "$VM_B"; do
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm}[[:space:]]+Running"; then
     limactl start "$vm"
   fi
   limactl shell "$vm" -- bash -c 'command -v wg >/dev/null || sudo apt-get install -y wireguard-tools' >/dev/null
 done
+if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
+  limactl start "$VM_CLIENT"
+fi
 
-echo "==> [2/6] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
+echo "==> [2/7] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
 ( cd "$BEEP_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
 BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
 [ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
@@ -130,11 +144,12 @@ for vm in "$VM_A" "$VM_B"; do
   remote "$vm" cleanup >/dev/null 2>&1 || true
 done
 
-echo "==> [3/6] establishing the real WireGuard tunnel between $VM_A and $VM_B"
+echo "==> [3/7] establishing the real WireGuard tunnel between $VM_A and $VM_B, plus $VM_CLIENT's relay route"
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"
-[ -n "$IP_A" ] && [ -n "$IP_B" ] || {
-  echo "FAIL: could not resolve eth0 addresses ($VM_A=$IP_A, $VM_B=$IP_B) -- are both VMs on the same Lima network?" >&2
+IP_CLIENT="$(eth0_ip "$VM_CLIENT")"
+[ -n "$IP_A" ] && [ -n "$IP_B" ] && [ -n "$IP_CLIENT" ] || {
+  echo "FAIL: could not resolve eth0 addresses ($VM_A=$IP_A, $VM_B=$IP_B, $VM_CLIENT=$IP_CLIENT) -- are all 3 VMs on the same Lima network?" >&2
   exit 1
 }
 # Each side's key pair is generated independently BEFORE either side's peer
@@ -142,8 +157,15 @@ IP_B="$(eth0_ip "$VM_B")"
 # PEER's pubkey as an argument, so both pubkeys must exist first).
 PUBKEY_A="$(remote "$VM_A" pubkey)"
 PUBKEY_B="$(remote "$VM_B" pubkey)"
+# --extra-allowed: $VM_CLIENT never runs WireGuard itself (lima/beep-client.yaml),
+# so it can't dial $VM_A's wg0 VIP directly -- $VM_B relays its plain SYN
+# into the tunnel as an ordinary IP forward (ip_forward=1, set up in
+# setup-backend below). Without widening $VM_A's peer entry for $VM_B past
+# $WG_SUBNET_B/32, WireGuard's own crypto-routing source filter would drop
+# the relayed, client-sourced packet on decrypt before beep ever sees it.
 remote "$VM_A" setup-wg --self-ip "$WG_SUBNET_A" --peer-ip "$WG_SUBNET_B" \
-  --peer-pubkey "$PUBKEY_B" --peer-endpoint "${IP_B}:${WG_PORT}" --listen-port "$WG_PORT"
+  --peer-pubkey "$PUBKEY_B" --peer-endpoint "${IP_B}:${WG_PORT}" --listen-port "$WG_PORT" \
+  --extra-allowed "${IP_CLIENT}/32"
 remote "$VM_B" setup-wg --self-ip "$WG_SUBNET_B" --peer-ip "$WG_SUBNET_A" \
   --peer-pubkey "$PUBKEY_A" --peer-endpoint "${IP_A}:${WG_PORT}" --listen-port "$WG_PORT"
 
@@ -153,30 +175,60 @@ limactl shell "$VM_A" -- ping -c 2 -W 2 "$WG_SUBNET_B" >/dev/null || {
 }
 echo "WIREGUARD TUNNEL: PASS ($VM_A $WG_SUBNET_A <-> $VM_B $WG_SUBNET_B, over real underlay $IP_A/$IP_B)"
 
-echo "==> [4/6] creating geneve0 on both nodes"
+# $VM_CLIENT's only path to the VIP is through $VM_B's relay -- $VM_B is
+# directly reachable on the shared user-v2 subnet, but the WG-only VIP
+# subnet is not, so this route is required, not incidental.
+limactl shell "$VM_CLIENT" -- sudo ip route replace "${WG_SUBNET_A}/32" via "$IP_B"
+
+echo "==> [4/7] creating geneve0 on both nodes"
 remote "$VM_A" setup-geneve
 remote "$VM_B" setup-geneve
 
-echo "==> [5/6] loading beep-ebpf on both nodes (uplink=wg0) -- this is the verifier-accept gate on a real L3 WireGuard uplink"
+echo "==> [5/7] confirming $VM_B's real underlay NIC name (must not be assumed)"
+IFACE_B_ACTUAL="$(limactl shell "$VM_B" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$2; exit}'")"
+[ "$IFACE_B_ACTUAL" = "$UPLINK_IFACE_B" ] || {
+  echo "FAIL: expected $VM_B's user-v2 NIC to be '$UPLINK_IFACE_B', found '$IFACE_B_ACTUAL' -- update UPLINK_IFACE_B" >&2
+  exit 1
+}
+echo "UPLINK-IFACE-NAME: PASS ($VM_B's user-v2 NIC is $UPLINK_IFACE_B)"
+
+echo "==> [6/7] loading beep-ebpf: $VM_A uplink=wg0 (the mechanism under test), $VM_B uplink=$UPLINK_IFACE_B (its return-to-client path)"
 FIXTURE="${WG_SUBNET_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 remote "$VM_A" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_A"
-remote "$VM_B" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
+# --uplink-iface must be $VM_B's real NIC, not the wg0 default: the backend
+# pod's raw reply is un-DNAT'd and redirected straight to whatever device
+# --uplink-iface names (see try_geneve_decap_return's comment in
+# ebpf/src/main.rs), and the client (on the shared user-v2 subnet) is only
+# reachable from $VM_B over its real NIC, never over wg0 -- left at the wg0
+# default, `uplink_egress_return` never fires and the un-DNAT'd reply leaks
+# out $UPLINK_IFACE_B unencapsulated.
+remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_B" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
 
 remote "$VM_B" setup-backend --pod-ip "$POD_IP"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
 
-echo "==> [6/6] driving one client -> VIP -> cross-node backend round trip over the wg0 uplink"
-# Client = vm-b's own root netns dialing vm-a's VIP (vm-a's own wg0 address)
-# -- see smoke-wg-2node-remote.sh's header for why, with exactly 2 nodes,
-# this is the topology that genuinely exercises uplink_ingress arriving on a
-# real WireGuard device rather than a local loopback shortcut.
-if remote "$VM_B" run-client --vip-ip "$WG_SUBNET_A" --vip-port "$VIP_PORT"; then
-  echo "GATE 1 TIER-1 MECHANISM: PASS"
+echo "==> [7/7] driving one client ($VM_CLIENT) -> VIP (over wg0 ingress, via $VM_B's relay) -> cross-node backend round trip"
+# Client = the genuinely separate beep-client VM dialing $VM_A's VIP --
+# driven directly via limactl, not the remote.sh subcommand protocol
+# (beep-client has no /tmp/${BIN_NAME}-remote.sh copy and no MCP server;
+# see this script's header). A 20s cap, not 5s: the first connection pays
+# for the relay's ARP resolution plus the WG tunnel's own handshake, so the
+# first SYN(-ACK) round trip alone can take several seconds -- confirmed
+# empirically on the sibling eth-ingress rig, a 5s cap flakes on a cold rig
+# even though the dataplane mechanism itself is correct.
+set +e
+CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+CLIENT_RC=$?
+set -e
+if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
+  echo "ROUND-TRIP: PASS (client $VM_CLIENT -> VIP ${WG_SUBNET_A}:${VIP_PORT} -> cross-node backend -> response 'OK')"
+  echo "GATE 1 TIER-1 MECHANISM: PASS (wg0-ingress, symmetric return proven from a genuinely foreign client)"
   exit 0
 fi
+echo "ROUND-TRIP: FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY')" >&2
 
 echo ""
-echo "==> round trip did not complete -- collecting evidence (see this script's header for the known blocker)"
+echo "==> round trip did not complete -- collecting evidence"
 echo "---- $VM_A evidence ----"
 remote "$VM_A" dump-evidence
 echo "---- $VM_B evidence ----"

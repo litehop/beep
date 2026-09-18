@@ -15,6 +15,7 @@ PIN_DIR="/sys/fs/bpf/beep-wg2node"
 BIN="/tmp/beep-wg2node"
 LOADER_LOG="/tmp/beep-wg2node-loader.log"
 RPFILTER_SAVE_FILE="/tmp/beep-wg2node-rpfilter-all.saved"
+IPFORWARD_SAVE_FILE="/tmp/beep-wg2node-ipforward.saved"
 # Canonical's wg AppArmor profile (`/etc/apparmor.d/wg`, confirmed present on
 # the Ubuntu Lima image this rig targets) grants `/usr/bin/wg` file rw ONLY
 # under `/etc/wireguard/**` -- no `dac_override`/`dac_read_search`
@@ -55,7 +56,7 @@ genkey() {
 }
 
 setup_wg() {
-  local self_ip="" peer_ip="" peer_pubkey="" peer_endpoint="" listen_port="51820"
+  local self_ip="" peer_ip="" peer_pubkey="" peer_endpoint="" listen_port="51820" extra_allowed=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --self-ip) self_ip="$2"; shift 2 ;;
@@ -63,6 +64,7 @@ setup_wg() {
       --peer-pubkey) peer_pubkey="$2"; shift 2 ;;
       --peer-endpoint) peer_endpoint="$2"; shift 2 ;;
       --listen-port) listen_port="$2"; shift 2 ;;
+      --extra-allowed) extra_allowed="$2"; shift 2 ;;
       *) echo "setup-wg: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
@@ -74,7 +76,15 @@ setup_wg() {
   genkey
   ip link show "$WG_IFACE" >/dev/null 2>&1 || ip link add "$WG_IFACE" type wireguard
   wg set "$WG_IFACE" private-key "$WG_KEY_DIR/privatekey" listen-port "$listen_port"
-  wg set "$WG_IFACE" peer "$peer_pubkey" allowed-ips "${peer_ip}/32" endpoint "$peer_endpoint"
+  # --extra-allowed: node-a's peer entry for node-b, widened past node-b's
+  # own /32 to also admit the foreign beep-client's real address. WireGuard
+  # validates a decrypted packet's SOURCE against the sending peer's
+  # allowed-ips, so node-b relaying (ip_forward) beep-client's plain SYN
+  # into the tunnel would otherwise be silently dropped on decrypt -- the
+  # client can never be a WG peer itself (see lima/beep-client.yaml).
+  local allowed="${peer_ip}/32"
+  [ -n "$extra_allowed" ] && allowed="${allowed},${extra_allowed}"
+  wg set "$WG_IFACE" peer "$peer_pubkey" allowed-ips "$allowed" endpoint "$peer_endpoint"
   ip addr replace "${self_ip}/24" dev "$WG_IFACE"
   ip link set "$WG_IFACE" up
 
@@ -120,12 +130,22 @@ setup_backend() {
   fi
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
   sysctl -w "net.ipv4.conf.${GENEVE_IFACE}.rp_filter=0" >/dev/null
+
+  # This node is also the client's WireGuard relay (see setup_wg's
+  # --extra-allowed comment): the client's SYN arrives on eth0 destined for
+  # the VIP on node-a's wg0 subnet, which is a genuine inter-device forward,
+  # not local delivery -- the kernel drops it unless ip_forward is on.
+  if [ ! -f "$IPFORWARD_SAVE_FILE" ]; then
+    sysctl -n net.ipv4.ip_forward > "$IPFORWARD_SAVE_FILE"
+  fi
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
 }
 
 start_loader() {
   local uplink_iface="$WG_IFACE" fixture="" pod_cidr="" node_ip=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --uplink-iface) uplink_iface="$2"; shift 2 ;;
       --fixture) fixture="$2"; shift 2 ;;
       --pod-cidr) pod_cidr="$2"; shift 2 ;;
       --node-ip) node_ip="$2"; shift 2 ;;
@@ -164,7 +184,7 @@ start_loader() {
     echo "FAIL: expected 3 sched_cls programs loaded, bpftool sees $loaded" >&2
     exit 1
   }
-  echo "VERIFIER-ACCEPT: PASS"
+  echo "VERIFIER-ACCEPT: PASS (uplink-iface=$uplink_iface)"
   cat "$LOADER_LOG"
 }
 
@@ -183,37 +203,10 @@ start_backend_responder() {
   sleep 0.5
 }
 
-# Drives the client request and reports the OUTCOME either way -- a
-# currently-known dataplane blocker (see this script's header) is expected
-# to time out here, and this must FAIL LOUD with the map/counter evidence
-# rather than hang or claim a false pass.
-run_client() {
-  local vip_ip="" vip_port="" pin_dir_ingress=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --vip-ip) vip_ip="$2"; shift 2 ;;
-      --vip-port) vip_port="$2"; shift 2 ;;
-      *) echo "run-client: unknown argument: $1" >&2; exit 1 ;;
-    esac
-  done
-  set +e
-  body=$(curl -sS -m 5 "http://${vip_ip}:${vip_port}/" 2>&1)
-  rc=$?
-  set -e
-  if [ "$rc" -eq 0 ] && [ "$body" = "OK" ]; then
-    echo "ROUND-TRIP: PASS (client -> VIP ${vip_ip}:${vip_port} -> cross-node backend -> response 'OK')"
-    return 0
-  fi
-  echo "ROUND-TRIP: FAIL (curl rc=$rc, body='$body') -- run 'dump-evidence' on both nodes" >&2
-  return 1
-}
-
-# bpftool + geneve0 counters -- the evidence this rig captured for the
-# bpf_redirect(wg0 -> geneve0) finding: FWD_PENDING dumps prove
-# uplink_ingress correctly parsed a real L3 WireGuard packet (aie31.5's
-# fix), while geneve0's TX `dropped` counter incrementing on every attempt,
-# with zero corresponding RX on the peer, is the redirect failing before
-# the encapsulated packet ever leaves this node.
+# bpftool + geneve0/wg0/eth0 counters + routes -- eth0 and the route table
+# are the relay-specific evidence this rig needs beyond the original
+# geneve0/wg0 set, since the client's SYN now transits this node's eth0 (as
+# a genuine IP forward into wg0) rather than being self-originated here.
 dump_evidence() {
   echo "== bpftool map dump: VIP_MAP =="
   bpftool map dump pinned "$PIN_DIR/VIP_MAP" 2>&1 || true
@@ -221,14 +214,24 @@ dump_evidence() {
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
   echo "== bpftool map dump: FLOW_TABLE =="
   bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" 2>&1 || true
+  echo "== eth0 counters =="
+  ip -s link show eth0 2>&1 || true
   echo "== geneve0 counters =="
   ip -s link show "$GENEVE_IFACE" 2>&1 || true
   echo "== wg0 counters =="
   ip -s link show "$WG_IFACE" 2>&1 || true
+  echo "== route table =="
+  ip route show 2>&1 || true
 }
 
 cleanup() {
-  pkill -f "$BIN" 2>/dev/null || true
+  # Matches "$BIN --uplink-iface", not just "$BIN": $BIN's basename
+  # ("beep-wg2node") is a literal prefix of this script's own filename
+  # ("beep-wg2node-remote.sh"), so a bare `pkill -f "$BIN"` self-SIGTERMs
+  # the running cleanup script (invoked as `bash /tmp/beep-wg2node-remote.sh
+  # cleanup`) before it reaches the rest of these teardown steps -- same
+  # fix as smoke-eth-ingress-2node-remote.sh's cleanup().
+  pkill -f "$BIN --uplink-iface" 2>/dev/null || true
   pkill -f "nc -l -N .* 18090" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   rm -f /tmp/wg2node-response.http /tmp/wg2node-backend.log "$LOADER_LOG"
@@ -237,6 +240,10 @@ cleanup() {
   if [ -f "$RPFILTER_SAVE_FILE" ]; then
     sysctl -w net.ipv4.conf.all.rp_filter="$(cat "$RPFILTER_SAVE_FILE")" >/dev/null 2>&1 || true
     rm -f "$RPFILTER_SAVE_FILE"
+  fi
+  if [ -f "$IPFORWARD_SAVE_FILE" ]; then
+    sysctl -w net.ipv4.ip_forward="$(cat "$IPFORWARD_SAVE_FILE")" >/dev/null 2>&1 || true
+    rm -f "$IPFORWARD_SAVE_FILE"
   fi
   rm -f "$WG_KEY_DIR/privatekey"
 }
@@ -248,11 +255,10 @@ case "$cmd" in
   setup-backend) setup_backend "$@" ;;
   start-loader) start_loader "$@" ;;
   start-backend-responder) start_backend_responder "$@" ;;
-  run-client) run_client "$@" ;;
   dump-evidence) dump_evidence ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|start-loader|start-backend-responder|run-client|dump-evidence|cleanup} [args...]" >&2
+    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|start-loader|start-backend-responder|dump-evidence|cleanup} [args...]" >&2
     exit 1
     ;;
 esac
