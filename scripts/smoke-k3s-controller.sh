@@ -2,10 +2,20 @@
 # Tier-2 controller-driven integration gate: a real type=LoadBalancer
 # Service + backend Deployment/Pod + resulting EndpointSlice on the
 # k3s-on-Lima cluster (scripts/k3s-up.sh), with the beep servicelb
-# controller (deploy/daemonset.yaml, docker.io/valerauko/beep-lb:latest)
-# watching Service/EndpointSlice/Node and programming the dataplane maps
-# from LIVE watch events -- not hand-rolled fixture args like
-# scripts/smoke.sh / smoke-wg-2node.sh / smoke-eth-ingress-2node.sh.
+# controller (deploy/daemonset.yaml) watching Service/EndpointSlice/Node and
+# programming the dataplane maps from LIVE watch events -- not hand-rolled
+# fixture args like scripts/smoke.sh / smoke-wg-2node.sh /
+# smoke-eth-ingress-2node.sh.
+#
+# IMAGE: deploy/daemonset.yaml hardcodes docker.io/valerauko/beep-lb:latest,
+# which resolves to the newest RELEASE (.github/workflows/delivery.yaml's
+# `v*` tag push), not this checkout -- a main-branch commit only ever gets a
+# `:sha` tag (github.sha, the full 40-char commit sha), and that tag never
+# exists on Docker Hub yet for a commit still under test. So step [4/11]
+# below cross-builds beep-controller, docker-builds+saves it as
+# docker.io/valerauko/beep-lb:<git rev-parse HEAD>, and `k3s ctr images
+# import`s that tarball directly into both nodes' containerd -- never
+# pulled from a registry -- then overrides the DaemonSet to that tag.
 #
 # STATUS: the AppArmor/bpffs-pin blocker, the BPF_PROG_LOAD
 # verifier/CAP_PERFMON blocker, and the cross-node return-path dataplane
@@ -84,10 +94,15 @@ DEPLOY_NAME="whoami"
 VIP_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
 KUBECONFIG_SECRET="beep-controller-kubeconfig"
+IMAGE_TMPDIR=""
 
-for tool in limactl jq; do
+for tool in limactl jq docker cargo-zigbuild; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
+rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
+  echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
+  exit 1
+}
 
 map_entry_count() { # map_entry_count <vm> <map-name> -- entries in a pinned map, "" if the pin is missing/unreadable
   local vm="$1" name="$2" json
@@ -100,6 +115,7 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
+  [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
@@ -164,8 +180,44 @@ done
 echo "==> [3/11] provisioning the controller's kubeconfig Secret from $VM_A's own admin kubeconfig (see this script's header)"
 k3s_provision_kubeconfig_secret "$VM_A" "$IP_A" "$KUBECONFIG_SECRET" 1
 
-echo "==> [4/11] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
-if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
+SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+IMAGE="docker.io/valerauko/beep-lb:${SHA}"
+echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
+
+node_arch="$(limactl shell "$VM_A" -- uname -m)"
+[ "$(limactl shell "$VM_B" -- uname -m)" = "$node_arch" ] || {
+  echo "FAIL: $VM_A and $VM_B report different architectures -- this rig assumes a homogeneous node pair" >&2
+  exit 1
+}
+case "$node_arch" in
+  aarch64) rust_target="aarch64-unknown-linux-gnu.2.36"; goarch="arm64" ;;
+  x86_64) rust_target="x86_64-unknown-linux-gnu.2.36"; goarch="amd64" ;;
+  *) echo "FAIL: unsupported node architecture '$node_arch' (want aarch64 or x86_64)" >&2; exit 1 ;;
+esac
+
+# Same cross-build technique as scripts/smoke.sh (cargo-zigbuild, no QEMU),
+# glibc-pinned the same way as .github/workflows/delivery.yaml's real
+# release build, just targeting this rig's own node arch instead of both.
+( cd "$REPO_ROOT" && cargo +nightly zigbuild --release -p beep-controller --target "$rust_target" )
+mkdir -p "$REPO_ROOT/dist/linux/$goarch"
+cp "$REPO_ROOT/target/${rust_target%%.*}/release/beep-controller" "$REPO_ROOT/dist/linux/$goarch/beep-controller"
+
+docker buildx build --platform "linux/$goarch" -t "$IMAGE" --load "$REPO_ROOT" >/dev/null
+
+IMAGE_TMPDIR="$(mktemp -d)"
+docker save "$IMAGE" -o "$IMAGE_TMPDIR/beep-lb.tar"
+for vm in "$VM_A" "$VM_B"; do
+  limactl copy "$IMAGE_TMPDIR/beep-lb.tar" "$vm":/tmp/beep-lb.tar
+  # Imported straight into containerd, never pulled from a registry -- the
+  # whole point is testing this exact checkout, not whatever tag currently
+  # resolves on Docker Hub (see this script's IMAGE header note).
+  limactl shell "$vm" -- sudo k3s ctr images import /tmp/beep-lb.tar >/dev/null
+  limactl shell "$vm" -- rm -f /tmp/beep-lb.tar
+done
+rm -rf "$IMAGE_TMPDIR"
+IMAGE_TMPDIR=""
+
+if ! k3s_deploy_controller_daemonset "$REPO_ROOT" "$IMAGE"; then
   echo "CONTROLLER-DEPLOY: FAIL (see pod status/logs below -- this step is expected to PASS, see this script's header)" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
   dump_evidence

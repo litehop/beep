@@ -33,10 +33,14 @@ k3s_provision_kubeconfig_secret() { # k3s_provision_kubeconfig_secret <vm-a> <ip
 "
 }
 
-k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> -- applies deploy/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure
-  local repo_root="$1"
+k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
+  local repo_root="$1" image="${2:-}"
   kube apply -f - < "$repo_root/deploy/rbac.yaml"
-  kube apply -f - < "$repo_root/deploy/daemonset.yaml"
+  if [ -n "$image" ]; then
+    sed "s#docker.io/valerauko/beep-lb:latest#${image}#" "$repo_root/deploy/daemonset.yaml" | kube apply -f -
+  else
+    kube apply -f - < "$repo_root/deploy/daemonset.yaml"
+  fi
   controller_deploy_failed=0
   if ! kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s; then
     controller_deploy_failed=1
