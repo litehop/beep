@@ -33,8 +33,7 @@ makes the loose-mode route-existence check adversarial to satisfy
 reliably in the first place. Setting both is the same tradeoff Cilium and
 Katran ship, for the identical reason — they redirect/decap the same way.
 Calico avoids it only because it is a routing-based LB with symmetric BGP
-returns, not an eBPF-redirect one: a different architecture, not evidence
-that beep's setting is wrong for beep's architecture.
+returns, not an eBPF-redirect one.
 
 ## Consequences
 
