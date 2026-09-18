@@ -173,7 +173,12 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 /// smoke mode with no controller, by the loader seeding `--node-ip` alone.
 /// Same `HashMap<u32, u8>` shape and bare-existence-marker value as
 /// `POD_TARGETS` above; sized an order of magnitude smaller (cluster node
-/// count, not Service count).
+/// count, not Service count). v1 constraint: one IP per node (the single
+/// address `node_ips`/`front_ips` in `controller/src/watch.rs` records) --
+/// a multi-homed or NAT'd node whose actual Geneve outer-source address
+/// differs from that recorded address is dropped by this admission check.
+/// Symmetric single-IP-per-node addressing is the deployment beep v1
+/// targets; admitting every address a Node reports is tracked separately.
 #[map]
 static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 
@@ -638,7 +643,11 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // Peer-node attestation, checked before anything else this hook does
     // (`beep_common::peer_node_admission`'s doc comment): with rp_filter=0
     // node-wide, the outer tunnel source is the only thing standing between
-    // a spoofed decap-forward and delivery.
+    // a spoofed decap-forward and delivery. NODE_ALLOW is empty until the
+    // controller's Node LIST fully completes (`reconcile::DesiredEntries::
+    // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
+    // than the pre-existing POD_TARGETS check below alone required; accepted
+    // as the cost of not reintroducing a restart-wipe risk on this map.
     let is_known_peer = unsafe { NODE_ALLOW.get(tkey.__bindgen_anon_1.remote_ipv4) }.is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);

@@ -180,7 +180,16 @@ pub struct DesiredEntries {
     /// byte load (`beep-ebpf`'s module doc). Same source as `vip_map`/
     /// `target_ports`'s per-Service front-IP loop (`WatchState::desired`'s
     /// `front_ips`) -- gated on `fronts_known` below for the identical
-    /// restart-wipe reason.
+    /// restart-wipe reason, NOT the narrower `pod_targets_known` the
+    /// pre-existing `try_geneve_decap_forward` admission check (POD_TARGETS)
+    /// alone used to bound: `node_allow`'s content is the WHOLE known-node
+    /// set (like `vip_map`/`target_ports`), not this node's own entry alone
+    /// (like `pod_targets`), so gating its destructive full-sync on
+    /// `pod_targets_known` would let a restart's partially-caught-up
+    /// `node_ips` wipe already-pinned peer entries the same way `fronts_known`
+    /// exists to prevent for `vip_map`/`target_ports` -- narrowing this gate
+    /// trades that correctness property for a shorter cold-start Geneve
+    /// blackout window, and is not done here.
     pub node_allow: HashSet<u32>,
     /// Endpoints excluded from `pod_targets` by the pod-CIDR admission
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
