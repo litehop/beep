@@ -96,7 +96,12 @@ jobs:
         name: Guard the default beep-controller build excludes dhat-heap
         run: |
           set -euo pipefail
-          if cargo tree -p beep-controller -e normal | grep -q dhat; then
+          # `if cmd | grep -q ...; then` would silently pass on a cargo-tree
+          # error too: grep sees empty stdin, exits 1 (no match), and that's
+          # the only exit status the `if` ever sees. Capture cargo tree's own
+          # exit status via command substitution so `set -e` catches it.
+          tree_output=$(cargo tree -p beep-controller -e normal)
+          if grep -q dhat <<< "$tree_output"; then
             echo "FAIL: default beep-controller build pulls in dhat (dhat-heap must stay opt-in)" >&2
             exit 1
           fi
