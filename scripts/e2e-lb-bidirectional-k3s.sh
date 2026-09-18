@@ -75,6 +75,8 @@ dump_evidence() {
     echo "== dmesg (tail) =="
     limactl shell "$vm" -- sudo dmesg 2>&1 | tail -30 || true
   done
+  echo "---- controller pod describe (events) ----"
+  kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR" 2>&1 || true
   echo "---- controller pod logs (current + previous, i.e. pre-crash) ----"
   kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 2>&1 || true
   kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous 2>&1 || true
