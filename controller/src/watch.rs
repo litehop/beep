@@ -367,6 +367,13 @@ impl WatchState {
         // prevent, just keyed on this node's own entry instead of the
         // whole list.
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
+        // NODE_ALLOW's peer set is the same front_ips this loop feeds
+        // VIP_MAP/TARGET_PORTS from -- host-native (`u32::from`, not
+        // `wire_ip`), matching `tkey.remote_ipv4`'s convention
+        // (`DesiredEntries::node_allow`'s doc comment). `PinnedMaps::apply`
+        // gates this on `fronts_known` (set above) for the identical
+        // restart-wipe reason `front_ips` itself is gated for.
+        aggregate.node_allow = front_ips.iter().copied().map(u32::from).collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 

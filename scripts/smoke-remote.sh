@@ -401,6 +401,40 @@ restart_body="$(cat "$RESTART_CLIENT_OUT" 2>/dev/null || true)"
 }
 echo "RESTART FLOW CONTINUITY: PASS (client received both chunks across the loader restart: '$restart_body')"
 
+echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
+# This fixture is a self-loop (VIP_IP is also this node's own address, and
+# `--node-ip $VIP_IP` seeded NODE_ALLOW with it), so every Geneve packet
+# geneve_ingress decaps here genuinely arrives with outer source == VIP_IP.
+# Deleting VIP_IP's NODE_ALLOW entry directly (bpftool, not a loader
+# restart) changes ONLY the peer-attestation gate under test -- a restart
+# with a different --node-ip would ALSO re-prune POD_TARGETS (scoped to
+# node_ip too), confounding which gate caused a subsequent drop.
+#
+# NODE_ALLOW's key convention is host-native (`u32::from(Ipv4Addr)`, not
+# `wire_ip` -- `beep_common::DesiredEntries::node_allow`'s doc comment),
+# which on this little-endian target serializes to an IP's own octets in
+# REVERSE (LSB-first) order -- e.g. 203.0.113.1 -> raw key bytes
+# [1, 113, 0, 203]. bpftool's `key` argument takes exactly that raw
+# in-memory byte sequence.
+node_allow_key_bytes() {
+  local IFS=.
+  local octets=($1)
+  echo "${octets[3]} ${octets[2]} ${octets[1]} ${octets[0]}"
+}
+VIP_NODE_ALLOW_KEY=$(node_allow_key_bytes "$VIP_IP")
+bpftool map delete pinned "$PIN_DIR/NODE_ALLOW" key $VIP_NODE_ALLOW_KEY || {
+  echo "FAIL: could not delete VIP_IP's NODE_ALLOW entry (key bytes: $VIP_NODE_ALLOW_KEY) -- either bpftool's key syntax is wrong or NODE_ALLOW never contained this fixture's own outer tunnel source in the first place" >&2
+  exit 1
+}
+
+spoof_rc=0
+spoof_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${VIP_IP}:${VIP_PORT}/" 2>/dev/null) || spoof_rc=$?
+[ "$spoof_rc" -ne 0 ] && [ "$spoof_body" != "OK" ] || {
+  echo "FAIL: client round trip through VIP ${VIP_IP}:${VIP_PORT} unexpectedly SUCCEEDED (body '$spoof_body', curl rc $spoof_rc) after this fixture's real outer tunnel source (${VIP_IP}) was removed from NODE_ALLOW -- geneve_ingress must drop a decap whose outer source (tkey.remote_ipv4) has no NODE_ALLOW entry, not decap and deliver it" >&2
+  exit 1
+}
+echo "ANTI-SPOOF: PASS (round trip through VIP ${VIP_IP}:${VIP_PORT} correctly dropped once its own NODE_ALLOW entry was removed -- curl rc=$spoof_rc)"
+
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
 
