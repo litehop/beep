@@ -1433,6 +1433,27 @@ mod tests {
     }
 
     #[test]
+    fn egress_return_admission_advances_backend_traffic_to_the_conntrack_lookup() {
+        // The proceed branch: a packet sourced from one of this node's
+        // backend Pods must reach BackendTraffic, not NotBackendTraffic --
+        // this is the only thing that lets try_uplink_egress_return probe
+        // REV_FLOW at all. If this ever regressed to NotBackendTraffic, a
+        // live backend reply would be passed through raw instead of
+        // un-DNAT'd and re-encapsulated, breaking every return leg.
+        assert_eq!(
+            egress_return_admission(true),
+            EgressReturnAdmission::BackendTraffic,
+            "an identified backend Pod's packet must advance to the REV_FLOW lookup, not be \
+             treated as unrelated traffic"
+        );
+        assert_eq!(
+            egress_return_admission(false),
+            EgressReturnAdmission::NotBackendTraffic,
+            "traffic not sourced from a backend Pod must never advance to the REV_FLOW lookup"
+        );
+    }
+
+    #[test]
     fn egress_return_outcome_drops_an_identified_backend_pods_evicted_flow() {
         // This is the fix `egress_return_outcome` exists for: BEFORE it, a
         // REV_FLOW miss on already-identified backend traffic fell back to

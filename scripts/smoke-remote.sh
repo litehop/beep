@@ -3,9 +3,9 @@
 # run there as root by smoke.sh -- not meant to be invoked directly by a
 # human. Builds a self-contained veth-pair + netns fixture so the whole
 # client->VIP->backend round trip happens on ONE VM (the original
-# hand-verification in PR #1557 used a second physical Lima VM as the
-# client; a reproducible harness can't depend on a peer machine being
-# available). Owns geneve0 and the smoke-veth0/smoke-client fixture
+# hand-verification used a second physical Lima VM as the client; a
+# reproducible harness can't depend on a peer machine being available).
+# Owns geneve0 and the smoke-veth0/smoke-client fixture
 # exclusively for its duration -- do not run this alongside a real
 # beep deployment on the same VM.
 set -euo pipefail
@@ -214,6 +214,19 @@ echo "==> loading beep-ebpf -- this is the verifier-accept gate"
 # to disambiguate.
 start_loader "$LOADER_LOG"
 wait_for_attach "$LOADER_LOG"
+
+# Independent, kernel-truth confirmation (not just the loader's own log):
+# a verifier rejection never reaches this state at all, since program.load()
+# above would have returned Err and aborted the loader before this point.
+# The `|| true` matters: grep -c exits nonzero when it counts zero matches,
+# and under `pipefail` that would trip `set -e` on this assignment itself,
+# exiting before the check below ever runs -- silently skipping the FAIL
+# diagnostic on exactly the failure this check exists to report.
+loaded=$(bpftool prog list | grep -cE 'name (uplink_ingress|geneve_ingress|uplink_egress_return)' || true)
+[ "$loaded" -eq 3 ] || {
+  echo "FAIL: expected 3 sched_cls programs loaded, bpftool sees $loaded" >&2
+  exit 1
+}
 echo "VERIFIER-ACCEPT: PASS"
 cat "$LOADER_LOG"
 
@@ -222,15 +235,6 @@ echo "==> sampling eBPF map memory + loader RSS (before round trip)"
 # VERIFIER-ACCEPT/ROUND-TRIP fixture it's observing -- same contract
 # sample-ebpf-memory.sh's own header documents for its per-tick sampling.
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
-
-# Independent, kernel-truth confirmation (not just the loader's own log):
-# a verifier rejection never reaches this state at all, since program.load()
-# above would have returned Err and aborted the loader before this point.
-loaded=$(bpftool prog list | grep -cE 'name (uplink_ingress|geneve_ingress|uplink_egress_return)')
-[ "$loaded" -eq 3 ] || {
-  echo "FAIL: expected 3 sched_cls programs loaded, bpftool sees $loaded" >&2
-  exit 1
-}
 
 echo "==> starting backend responders on ${POD_IP}:${TARGET_PORT} and ${POD_IP}:${TARGET_PORT2}"
 # Distinct bodies, not just "both connections succeed": the bug this
