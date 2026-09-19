@@ -237,12 +237,46 @@ pub struct Config {
     pub uplink_l2_hlen: u32,
 }
 
+/// `UPLINK_CONFIG`'s value, keyed by ifindex: a hit is simultaneously
+/// admission (this ifindex is a configured `--uplink-iface`) and the L2
+/// header length to parse that uplink's packets with
+/// (`uplink_l2_header_len`'s result for its ARPHRD type) --
+/// `docs/decisions/servicelb-multi-symmetric-uplink.md`. Bounded to N
+/// configured uplinks, not a raw-ifindex-sized array: ifindex values the
+/// host assigns aren't guaranteed contiguous or small.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UplinkConfig {
+    pub l2_hlen: u32,
+}
+
+/// `FWD_PENDING`/`FLOW_TABLE`'s forward-tagged value: the backend identity
+/// `LB_FRONT_MAP` resolved for this flow, plus which physical uplink
+/// admitted it. The multi-uplink symmetric-return redirect
+/// (`try_geneve_decap_return`) needs this to send the reply back out the
+/// SAME uplink the client's packet arrived on -- `CONFIG` no longer names a
+/// single uplink to fall back on (`docs/decisions/
+/// servicelb-multi-symmetric-uplink.md`). Deliberately NOT a field added
+/// onto `LbFrontBackend` itself: that type is also `LB_FRONT_MAP`'s value,
+/// a Service->Pod mapping the controller reconciles with no notion of which
+/// uplink admitted any given packet, so folding a per-packet runtime field
+/// into it would force the controller's Service-watching code to carry and
+/// diff a value that's meaningless there.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForwardFlowValue {
+    pub backend: LbFrontBackend,
+    pub ingress_ifindex: u32,
+}
+
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LbFrontKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LbFrontBackend {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Config {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for UplinkConfig {}
 
 /// Flow-table admission: forward-path decision (`beep-ebpf`'s
 /// `try_uplink_ingress`, `docs/decisions/servicelb-flow-admission-affinity.md`).
@@ -743,6 +777,29 @@ mod tests {
         // size up to a multiple of 8 regardless) -- a length regression here
         // would silently make that trade-off no longer hold.
         assert_eq!(FLOW_KEY_LEN, 38);
+    }
+
+    // `UplinkConfig`/`ForwardFlowValue` are read via `bpf_map_lookup_elem`
+    // on the kernel side and via aya's typed `HashMap`/union read on the
+    // userspace/eBPF side respectively -- a compiler-inserted padding gap
+    // (from a field ordering that isn't already 4-byte-aligned) would leave
+    // uninitialized bytes in a value both sides must agree on byte-for-byte,
+    // exactly the class of bug `TcpFlowKey`'s own module doc warns about.
+    // Pinning the size catches a future field addition that reintroduces
+    // padding.
+
+    #[test]
+    fn uplink_config_has_no_padding() {
+        assert_eq!(core::mem::size_of::<UplinkConfig>(), 4);
+    }
+
+    #[test]
+    fn forward_flow_value_has_no_padding() {
+        // LbFrontBackend (8 bytes: 2x u32) + ingress_ifindex (4 bytes),
+        // every field already 4-byte-aligned -- a regression that reorders
+        // fields around a smaller type (e.g. a u16) would silently
+        // reintroduce a padding gap here.
+        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 12);
     }
 
     #[test]
