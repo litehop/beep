@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep_common::{LbFrontBackend, LbFrontKey};
+use beep_common::{unmap_ipv4, LbFrontBackend, LbFrontKey};
 
 use crate::reconcile::{self, DesiredEntries, MapOp};
 
@@ -25,7 +25,7 @@ pub struct PinnedMaps {
     lb_front_map: AyaHashMap<MapData, LbFrontKey, LbFrontBackend>,
     target_ports: AyaHashMap<MapData, LbFrontKey, u16>,
     pod_targets: AyaHashMap<MapData, u32, u8>,
-    node_allow: AyaHashMap<MapData, u32, u8>,
+    node_allow: AyaHashMap<MapData, [u8; 16], u8>,
     /// "Has `fronts_known` ever been true in this process." Starts `false`
     /// on every controller start (including a restart), and once
     /// `apply` observes `fronts_known == true` it stays `true` for the rest
@@ -128,12 +128,14 @@ impl PinnedMaps {
 }
 
 fn describe_lb_front_key(key: &LbFrontKey) -> String {
-    format!(
-        "{}:{}/proto={}",
-        Ipv4Addr::from(u32::from_be(key.vip_ip)),
-        u16::from_be(key.vip_port),
-        key.proto
-    )
+    // vip_ip is [u8; 16]; every value in play today is v4-mapped-v6, so this
+    // always takes the Some arm -- the None arm is just a legible fallback
+    // for a genuine v6 front, not yet reachable.
+    let vip = match unmap_ipv4(&key.vip_ip) {
+        Some(v4) => Ipv4Addr::from(u32::from_be(v4)).to_string(),
+        None => format!("{:x?}", key.vip_ip),
+    };
+    format!("{vip}:{}/proto={}", u16::from_be(key.vip_port), key.proto)
 }
 
 /// Attempts every op against `write`, loudly logging (never silently
@@ -248,12 +250,20 @@ fn node_allow_may_delete(fronts_known: bool, fronts_ever_known: bool) -> bool {
     fronts_known || fronts_ever_known
 }
 
+/// Formats a `NODE_ALLOW` peer key for logging. Keys are host-native,
+/// v4-mapped-v6 (`DesiredEntries::node_allow`'s doc comment) -- every value
+/// in play today unmaps cleanly; the fallback is just a legible stand-in for
+/// a genuine v6 peer, not yet reachable.
+fn describe_node_allow_peer(peer: [u8; 16]) -> String {
+    match unmap_ipv4(&peer) {
+        Some(v4) => Ipv4Addr::from(v4).to_string(),
+        None => format!("{peer:x?}"),
+    }
+}
+
 /// `NODE_ALLOW`'s peer-attestation full-sync -- same set-shaped,
 /// prune-then-insert pattern as `apply_pod_targets` above, reusing the same
-/// generic `beep::stale_pod_targets` set diff. Unlike `POD_TARGETS`, this
-/// map's keys are host-native (`DesiredEntries::node_allow`'s doc comment),
-/// so logging uses `Ipv4Addr::from` directly rather than `POD_TARGETS`'s
-/// `u32::from_be` unwrap.
+/// generic `beep::stale_pod_targets` set diff.
 ///
 /// `may_delete` (`node_allow_may_delete`'s output) gates the delete half of
 /// the sync: while it's `false` -- before `fronts_known` has ever been true
@@ -265,12 +275,12 @@ fn node_allow_may_delete(fronts_known: bool, fronts_ever_known: bool) -> bool {
 /// previous run already pinned, and wiping down to that subset would drop
 /// Geneve traffic from every not-yet-relisted peer.
 fn apply_node_allow(
-    map: &mut AyaHashMap<MapData, u32, u8>,
-    desired: &HashSet<u32>,
+    map: &mut AyaHashMap<MapData, [u8; 16], u8>,
+    desired: &HashSet<[u8; 16]>,
     may_delete: bool,
 ) -> anyhow::Result<()> {
-    let live: Vec<u32> = desired.iter().copied().collect();
-    let existing: Vec<u32> = if may_delete {
+    let live: Vec<[u8; 16]> = desired.iter().copied().collect();
+    let existing: Vec<[u8; 16]> = if may_delete {
         map.keys().collect::<Result<_, _>>()?
     } else {
         Vec::new()
@@ -281,7 +291,7 @@ fn apply_node_allow(
             failed += 1;
             eprintln!(
                 "controller: NODE_ALLOW delete for peer {} failed: {e:#}",
-                Ipv4Addr::from(stale)
+                describe_node_allow_peer(stale)
             );
         }
     }
@@ -291,7 +301,7 @@ fn apply_node_allow(
             eprintln!(
                 "controller: NODE_ALLOW upsert for peer {} failed (entry left unrouted -- map \
                  may be at capacity): {e:#}",
-                Ipv4Addr::from(*ip)
+                describe_node_allow_peer(*ip)
             );
         }
     }
@@ -310,7 +320,11 @@ fn apply_node_allow(
 /// `apply_pod_targets`'s destructive full-sync. Split out as its own pure
 /// function (no bpf map I/O) so this guard is unit-testable without a live
 /// pinned map.
-fn node_allow_stale_peers(existing: &[u32], live: &[u32], may_delete: bool) -> Vec<u32> {
+fn node_allow_stale_peers(
+    existing: &[[u8; 16]],
+    live: &[[u8; 16]],
+    may_delete: bool,
+) -> Vec<[u8; 16]> {
     if may_delete {
         beep::stale_pod_targets(existing, live)
     } else {
@@ -321,6 +335,7 @@ fn node_allow_stale_peers(existing: &[u32], live: &[u32], may_delete: bool) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beep_common::ipv4_mapped_v6;
 
     #[test]
     fn apply_diff_ops_continues_past_a_write_failure_so_later_entries_still_get_applied() {
@@ -375,14 +390,14 @@ mod tests {
         // computed unconditionally), this call returns `[2, 3]` instead of
         // `[]`, and every not-yet-relisted peer's Geneve traffic gets
         // dropped until the full Node LIST completes.
-        let existing = [1u32, 2, 3];
-        let live = [1u32];
+        let existing = [ipv4_mapped_v6(1), ipv4_mapped_v6(2), ipv4_mapped_v6(3)];
+        let live = [ipv4_mapped_v6(1)];
 
         let stale = node_allow_stale_peers(&existing, &live, false);
 
         assert_eq!(
             stale,
-            Vec::<u32>::new(),
+            Vec::<[u8; 16]>::new(),
             "additive-only mode (fronts_known not yet seen true) must never delete a peer, even \
              though the restarted controller's live set is a strict subset of what's already \
              pinned -- deleting here is the restart-wipe bug fronts_known exists to prevent"
@@ -395,15 +410,15 @@ mod tests {
         // Node LIST is known-complete), NODE_ALLOW must go back to a real
         // full-sync, or a peer removed from the cluster stays admitted
         // forever.
-        let existing = [1u32, 2, 3];
-        let live = [1u32];
+        let existing = [ipv4_mapped_v6(1), ipv4_mapped_v6(2), ipv4_mapped_v6(3)];
+        let live = [ipv4_mapped_v6(1)];
 
         let mut stale = node_allow_stale_peers(&existing, &live, true);
         stale.sort_unstable();
 
         assert_eq!(
             stale,
-            vec![2, 3],
+            vec![ipv4_mapped_v6(2), ipv4_mapped_v6(3)],
             "destructive full-sync mode must delete every peer no longer in the desired set, \
              the same way apply_pod_targets's full-sync already does"
         );

@@ -33,7 +33,7 @@ use beep::{
     attach_and_pin, bump_memlock_rlimit, load_ebpf, local_pod_ips, parse_fixture, populate_config,
     populate_uplink_config, stale_pod_targets, Fixture, MAP_NAMES,
 };
-use beep_common::{wire_ip, wire_port, LbFrontBackend, LbFrontKey};
+use beep_common::{ipv4_mapped_v6, wire_ip, wire_port, LbFrontBackend, LbFrontKey};
 use clap::Parser;
 
 /// Defaults from the admission-control sizing derivation
@@ -370,7 +370,7 @@ fn main() -> anyhow::Result<()> {
 /// one silently winning.
 fn fixture_key(fixture: &Fixture) -> LbFrontKey {
     LbFrontKey {
-        vip_ip: wire_ip(u32::from(fixture.vip_ip)),
+        vip_ip: ipv4_mapped_v6(wire_ip(u32::from(fixture.vip_ip))),
         vip_port: wire_port(fixture.vip_port),
         proto: fixture.proto.as_ip_proto(),
         _pad: 0,
@@ -397,8 +397,8 @@ fn populate_fixtures(
                     // byte-reversed on the wire, e.g. 192.168.109.3 ->
                     // 3.109.168.192): host-native order, unlike every other
                     // address/port field in this crate.
-                    backend_node_ip: u32::from(fixture.backend_node_ip),
-                    pod_ip: wire_ip(u32::from(fixture.pod_ip)),
+                    backend_node_ip: ipv4_mapped_v6(u32::from(fixture.backend_node_ip)),
+                    pod_ip: ipv4_mapped_v6(wire_ip(u32::from(fixture.pod_ip))),
                 },
                 0,
             )?;
@@ -461,18 +461,18 @@ fn populate_fixtures(
         // single-node fixture's self-loop decap (this node is both ingress
         // and backend for its own fixture). A real deployment's controller
         // keeps NODE_ALLOW's real peer set converged instead.
-        let mut node_allow: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+        let mut node_allow: AyaHashMap<_, [u8; 16], u8> = AyaHashMap::try_from(
             ebpf.map_mut("NODE_ALLOW")
                 .ok_or_else(|| anyhow!("no map named `NODE_ALLOW` in the eBPF object"))?,
         )?;
-        let node_ip_native = u32::from(node_ip);
-        let existing_ips: Vec<u32> = node_allow.keys().collect::<Result<_, _>>()?;
+        let node_ip_key = ipv4_mapped_v6(u32::from(node_ip));
+        let existing_ips: Vec<[u8; 16]> = node_allow.keys().collect::<Result<_, _>>()?;
         for existing in existing_ips {
-            if existing != node_ip_native {
+            if existing != node_ip_key {
                 node_allow.remove(&existing)?;
             }
         }
-        node_allow.insert(node_ip_native, 1u8, 0)?;
+        node_allow.insert(node_ip_key, 1u8, 0)?;
     }
 
     Ok(())

@@ -14,6 +14,7 @@
 use std::{collections::HashMap, net::Ipv4Addr, time::Duration};
 
 use anyhow::Context;
+use beep_common::ipv4_mapped_v6;
 use beep_kubeconfig::HyperApiClient;
 use hyper::Method;
 use serde_json::Value;
@@ -369,13 +370,18 @@ impl WatchState {
         let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
         // NODE_ALLOW's peer set is the same front_ips this loop feeds
         // LB_FRONT_MAP/TARGET_PORTS from -- host-native (`u32::from`, not
-        // `wire_ip`), matching `tkey.remote_ipv4`'s convention
+        // `wire_ip`) wrapped in `ipv4_mapped_v6` to match NODE_ALLOW's
+        // `[u8; 16]` key, matching `tkey.remote_ipv4`'s convention
         // (`DesiredEntries::node_allow`'s doc comment). Unlike LB_FRONT_MAP/
         // TARGET_PORTS, `PinnedMaps::apply_node_allow` upserts this set every
         // tick regardless of `fronts_known` (set above) -- only its delete
         // half is latched on `fronts_known` having been seen true once, the
         // same restart-wipe reason `front_ips` itself is gated for.
-        aggregate.node_allow = front_ips.iter().copied().map(u32::from).collect();
+        aggregate.node_allow = front_ips
+            .iter()
+            .copied()
+            .map(|ip| ipv4_mapped_v6(u32::from(ip)))
+            .collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -585,6 +591,8 @@ pub async fn run_list_watch(
 mod tests {
     use std::collections::HashSet;
 
+    use beep_common::unmap_ipv4;
+
     use super::*;
 
     fn node(ip: Ipv4Addr) -> NodeContext {
@@ -771,7 +779,7 @@ mod tests {
             .next()
             .expect("one front expected");
         assert_eq!(
-            backend.pod_ip.to_le_bytes(),
+            unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
             [10, 244, 0, 2],
             "the lowest-IP endpoint across BOTH EndpointSlices must win -- pooling only the \
              first-seen slice would wrongly pick .20"
@@ -839,7 +847,7 @@ mod tests {
             .next()
             .expect("one front expected");
         assert_eq!(
-            backend.pod_ip.to_le_bytes(),
+            unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
             [10, 244, 0, 9],
             "slice_a's endpoint must survive slice_b's deletion -- losing it too would \
              blackhole this front instead of just narrowing its candidate set"
@@ -1042,7 +1050,7 @@ mod tests {
         let fronts: HashSet<[u8; 4]> = desired
             .lb_front_map
             .keys()
-            .map(|k| k.vip_ip.to_le_bytes())
+            .map(|k| unmap_ipv4(&k.vip_ip).unwrap().to_le_bytes())
             .collect();
         assert_eq!(
             fronts,

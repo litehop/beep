@@ -202,24 +202,31 @@ pub fn wire_port(port: u16) -> u16 {
 /// kernel boundary is the whole point: aya's userspace `HashMap<K, V>`
 /// requires `K: Pod`, and the kernel's `BPF_MAP_TYPE_HASH` hashes/compares
 /// this struct's raw bytes.
+///
+/// `vip_ip` is `[u8; 16]`, not a bare `u32`: dual-stack support reuses the
+/// same `ipv4_mapped_v6` union shape `FLOW_TABLE`'s conntrack key already
+/// proved, so a v4 front (stored as v4-mapped-v6) and a genuine v6 front
+/// share this one key type instead of two disjoint map layouts.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LbFrontKey {
-    pub vip_ip: u32,
+    pub vip_ip: [u8; 16],
     pub vip_port: u16,
     pub proto: u8,
     pub _pad: u8,
 }
 
 /// `LB_FRONT_MAP`/`FWD_PENDING` value: the backend identity a `LbFrontKey`
-/// resolves to.
+/// resolves to. Both address fields are `[u8; 16]` for the same dual-stack
+/// reason as `LbFrontKey.vip_ip` above -- a v4 value is stored as
+/// v4-mapped-v6 via `ipv4_mapped_v6`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LbFrontBackend {
     /// Geneve remote for the forward leg -- the node hosting the chosen Pod.
-    pub backend_node_ip: u32,
+    pub backend_node_ip: [u8; 16],
     /// Pod-identifier stamped as the forward-leg Geneve option.
-    pub pod_ip: u32,
+    pub pod_ip: [u8; 16],
 }
 
 /// Host-specific runtime config the loader fills in after attach (an
@@ -565,9 +572,12 @@ pub const PROBE_LIMIT: u16 = 16;
 /// other flow's entry as its own earlier commit and silently clobber it.
 /// `new_front`: the front address the current packet arrived through -- a
 /// raw `(vip_ip, vip_port)` scalar pair, not an `ipv4_mapped_v6`-widened
-/// shape: this dataplane's front is always IPv4 at the wire level and
-/// `RevFlowValue`'s stored `vip_ip` is already a bare `u32`, so widening it
-/// just to compare is pure overhead with no correctness benefit.
+/// shape, even though `RevFlowValue`'s own stored `vip_ip` is `[u8; 16]`:
+/// today's inner-packet parsing is still IPv4-only end to end, so the
+/// caller unmaps a stored occupant's `vip_ip` back to this same `u32`
+/// wire form before calling in here -- widening this probe itself to compare
+/// 16 bytes per candidate is pure overhead with no correctness benefit until
+/// a genuine (non-mapped) v6 front exists.
 /// `original_port`: the client's real source port -- excluded as a
 /// candidate remap value so the remapped reverse key can never collide
 /// with the natural (unremapped) one.
@@ -795,11 +805,89 @@ mod tests {
 
     #[test]
     fn forward_flow_value_has_no_padding() {
-        // LbFrontBackend (8 bytes: 2x u32) + ingress_ifindex (4 bytes),
-        // every field already 4-byte-aligned -- a regression that reorders
-        // fields around a smaller type (e.g. a u16) would silently
-        // reintroduce a padding gap here.
-        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 12);
+        // LbFrontBackend (32 bytes: 2x [u8; 16], widened for dual-stack) +
+        // ingress_ifindex (4 bytes) -- LbFrontBackend's
+        // byte-array fields have no alignment requirement above 1, so
+        // ingress_ifindex's own u32 alignment is the only constraint, and it
+        // already falls on a multiple-of-4 offset (32). A regression that
+        // reorders fields around a smaller type would silently reintroduce a
+        // padding gap here.
+        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 36);
+    }
+
+    #[test]
+    fn lb_front_key_has_no_padding() {
+        // vip_ip ([u8; 16]) + vip_port (u16) + proto (u8) + _pad (u8) = 20
+        // bytes: the widened byte-array field has no alignment requirement
+        // above 1, so vip_port's u16 alignment is the only constraint, and it
+        // already falls on offset 16 (even) -- no compiler-inserted gap.
+        assert_eq!(core::mem::size_of::<LbFrontKey>(), 20);
+    }
+
+    #[test]
+    fn lb_front_backend_has_no_padding() {
+        // backend_node_ip + pod_ip, both [u8; 16] (align 1) -- concatenates
+        // with no gap regardless of order.
+        assert_eq!(core::mem::size_of::<LbFrontBackend>(), 32);
+    }
+
+    // LbFrontKey/LbFrontBackend/RevFlowValue's address fields widened from
+    // bare u32 to [u8; 16] so a v6 front/backend can share the same map
+    // shape later -- but a v4 fixture must still round-trip bit-identical
+    // through that wider shape today, or every existing v4 Service silently
+    // misroutes. `RevFlowValue` itself lives in `beep-ebpf` (ebpf-internal,
+    // not host-testable), so this pins the exact `ipv4_mapped_v6`/
+    // `unmap_ipv4` pattern its `ingress_node_ip`/`vip_ip` fields use instead.
+
+    #[test]
+    fn lb_front_key_vip_ip_round_trips_a_v4_fixture() {
+        let vip_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
+        let key = LbFrontKey {
+            vip_ip: ipv4_mapped_v6(vip_wire),
+            vip_port: wire_port(80),
+            proto: 6,
+            _pad: 0,
+        };
+        assert_eq!(
+            unmap_ipv4(&key.vip_ip),
+            Some(vip_wire),
+            "a v4 VIP stored via ipv4_mapped_v6 must unmap back to the exact wire bytes \
+             LB_FRONT_MAP was populated with, or the widened key silently corrupts every v4 \
+             front"
+        );
+    }
+
+    #[test]
+    fn lb_front_backend_addresses_round_trip_a_v4_fixture() {
+        // backend_node_ip is host-native (bpf_tunnel_key.remote_ipv4's own
+        // convention, `beep-ebpf`'s module doc), pod_ip is wire-token -- both
+        // representations are just bytes to ipv4_mapped_v6/unmap_ipv4, so
+        // both must round-trip regardless of which convention produced them.
+        let backend_node_native = u32::from_be_bytes([10, 0, 0, 6]);
+        let pod_wire = wire_ip(u32::from_be_bytes([10, 244, 1, 7]));
+        let backend = LbFrontBackend {
+            backend_node_ip: ipv4_mapped_v6(backend_node_native),
+            pod_ip: ipv4_mapped_v6(pod_wire),
+        };
+        assert_eq!(
+            unmap_ipv4(&backend.backend_node_ip),
+            Some(backend_node_native)
+        );
+        assert_eq!(unmap_ipv4(&backend.pod_ip), Some(pod_wire));
+    }
+
+    #[test]
+    fn rev_flow_value_shaped_addresses_round_trip_a_v4_fixture() {
+        // Mirrors RevFlowValue::{ingress_node_ip, vip_ip} (ebpf/src/main.rs)
+        // without importing that ebpf-internal type: both fields are the
+        // same host-native (ingress_node_ip) and wire-token (vip_ip) values
+        // as LbFrontBackend/LbFrontKey above, widened the identical way.
+        let ingress_node_native = u32::from_be_bytes([10, 0, 0, 5]);
+        let vip_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
+        let ingress_node_ip = ipv4_mapped_v6(ingress_node_native);
+        let vip_ip = ipv4_mapped_v6(vip_wire);
+        assert_eq!(unmap_ipv4(&ingress_node_ip), Some(ingress_node_native));
+        assert_eq!(unmap_ipv4(&vip_ip), Some(vip_wire));
     }
 
     #[test]
@@ -1342,8 +1430,8 @@ mod tests {
         // flow sticks to for the rest of its pre-promotion life.
         let candidate = ForwardFlowValue {
             backend: LbFrontBackend {
-                backend_node_ip: 1,
-                pod_ip: 100,
+                backend_node_ip: ipv4_mapped_v6(1),
+                pod_ip: ipv4_mapped_v6(100),
             },
             ingress_ifindex: 7,
         };
@@ -1362,15 +1450,15 @@ mod tests {
         // silently breaking session affinity.
         let pinned = ForwardFlowValue {
             backend: LbFrontBackend {
-                backend_node_ip: 1,
-                pod_ip: 100,
+                backend_node_ip: ipv4_mapped_v6(1),
+                pod_ip: ipv4_mapped_v6(100),
             },
             ingress_ifindex: 7,
         };
         let candidate = ForwardFlowValue {
             backend: LbFrontBackend {
-                backend_node_ip: 2,
-                pod_ip: 200,
+                backend_node_ip: ipv4_mapped_v6(2),
+                pod_ip: ipv4_mapped_v6(200),
             },
             ingress_ifindex: 9,
         };
