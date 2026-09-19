@@ -56,7 +56,7 @@ genkey() {
 }
 
 setup_wg() {
-  local self_ip="" peer_ip="" peer_pubkey="" peer_endpoint="" listen_port="51820" extra_allowed=""
+  local self_ip="" peer_ip="" peer_pubkey="" peer_endpoint="" listen_port="51820" extra_allowed="" family="4"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --self-ip) self_ip="$2"; shift 2 ;;
@@ -65,6 +65,7 @@ setup_wg() {
       --peer-endpoint) peer_endpoint="$2"; shift 2 ;;
       --listen-port) listen_port="$2"; shift 2 ;;
       --extra-allowed) extra_allowed="$2"; shift 2 ;;
+      --family) family="$2"; shift 2 ;;
       *) echo "setup-wg: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
@@ -72,6 +73,17 @@ setup_wg() {
     echo "setup-wg: --self-ip, --peer-ip, --peer-pubkey, --peer-endpoint all required" >&2
     exit 1
   }
+  [[ "$family" == "4" || "$family" == "6" ]] || {
+    echo "setup-wg: --family must be 4 or 6, got '$family'" >&2
+    exit 1
+  }
+  # WireGuard tunnels arbitrary IP payloads over a v4 or v6 endpoint alike,
+  # but the tunnel's OWN self/peer addressing (assigned inside this
+  # function, distinct from --peer-endpoint's outer transport address) has
+  # a family-specific mask: a v6 ULA needs a /64 self-address and /128
+  # peer allowed-ips, where v4's /24 and /32 do not apply.
+  local self_mask="24" peer_mask="32"
+  [ "$family" = "6" ] && { self_mask="64"; peer_mask="128"; }
 
   genkey
   ip link show "$WG_IFACE" >/dev/null 2>&1 || ip link add "$WG_IFACE" type wireguard
@@ -82,10 +94,10 @@ setup_wg() {
   # allowed-ips, so node-b relaying (ip_forward) beep-client's plain SYN
   # into the tunnel would otherwise be silently dropped on decrypt -- the
   # client can never be a WG peer itself (see lima/beep-client.yaml).
-  local allowed="${peer_ip}/32"
+  local allowed="${peer_ip}/${peer_mask}"
   [ -n "$extra_allowed" ] && allowed="${allowed},${extra_allowed}"
   wg set "$WG_IFACE" peer "$peer_pubkey" allowed-ips "$allowed" endpoint "$peer_endpoint"
-  ip addr replace "${self_ip}/24" dev "$WG_IFACE"
+  ip addr replace "${self_ip}/${self_mask}" dev "$WG_IFACE"
   ip link set "$WG_IFACE" up
 
   for _ in $(seq 1 20); do
