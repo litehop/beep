@@ -6,7 +6,7 @@
 //! reuse across a loader restart, the dot-in-filename EPERM avoidance in
 //! link pin paths, and map-reopen-from-pin.
 
-use std::{net::Ipv4Addr, path::Path};
+use std::{net::IpAddr, path::Path};
 
 use anyhow::{anyhow, Context};
 use aya::{
@@ -20,7 +20,7 @@ use aya::{
     sys::SyscallError,
     Ebpf, EbpfLoader,
 };
-use beep_common::{wire_ip, Config, UplinkConfig};
+use beep_common::{ipv4_mapped_v6, wire_ip, Config, UplinkConfig};
 use clap::ValueEnum;
 
 const IPPROTO_TCP: u8 = 6;
@@ -60,21 +60,87 @@ impl Proto {
 /// `--fixture` CLI flag's doc comment in `src/main.rs` for the full field
 /// semantics). Lives here, not in the binary, because `local_pod_ips`'s
 /// signature and its tests need the type.
+///
+/// Address fields are `IpAddr`, not `Ipv4Addr`: a Service and its backend
+/// Pod can each independently be IPv4 or IPv6 (`beep-ebpf`'s dual-stack
+/// inner-packet parsing), so the fixture format itself must not assume one
+/// family. `wire_ip_v6`/`tunnel_remote_v6` below widen a parsed field into
+/// the `[u8; 16]` shape the maps store, picking the convention (wire-token
+/// vs. `bpf_tunnel_key`-native) that field's map actually uses.
 #[derive(Clone, Copy, Debug)]
 pub struct Fixture {
-    pub vip_ip: Ipv4Addr,
+    pub vip_ip: IpAddr,
     pub vip_port: u16,
     pub proto: Proto,
-    pub backend_node_ip: Ipv4Addr,
-    pub pod_ip: Ipv4Addr,
+    pub backend_node_ip: IpAddr,
+    pub pod_ip: IpAddr,
     pub target_port: u16,
 }
 
+/// Widens a *wire-token* address field (`Fixture::vip_ip`/`pod_ip`) into
+/// `beep_common`'s dual-stack `[u8; 16]` shape: a v4 address goes through
+/// `wire_ip` + `ipv4_mapped_v6`, exactly the embedding `beep-ebpf`'s inner-
+/// packet parsing produces for a real v4 packet; a v6 address's own octets
+/// already ARE that same wire representation (an IPv6 address has no
+/// separate host-order form the way a v4 address's `u32` does), so no
+/// conversion beyond `Ipv6Addr::octets()` is needed.
+pub fn wire_ip_v6(ip: IpAddr) -> [u8; 16] {
+    match ip {
+        IpAddr::V4(v4) => ipv4_mapped_v6(wire_ip(u32::from(v4))),
+        IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// Widens a Geneve tunnel-remote address field (`Fixture::backend_node_ip`,
+/// and `--node-ip` for `NODE_ALLOW`) into the same `[u8; 16]` shape, but in
+/// `bpf_tunnel_key.remote_ipv4`'s host-native convention for a v4 address
+/// (confirmed empirically against a live kernel -- see `ebpf/src/main.rs`'s
+/// module doc) rather than `wire_ip_v6`'s wire-token one. A v6 address has
+/// no such host/wire distinction, so this is identical to `wire_ip_v6`'s v6
+/// arm.
+pub fn tunnel_remote_v6(ip: IpAddr) -> [u8; 16] {
+    match ip {
+        IpAddr::V4(v4) => ipv4_mapped_v6(u32::from(v4)),
+        IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// Splits a `--fixture` string on top-level `:` delimiters, treating a
+/// bracketed `[...]` span as one token -- the same convention `SocketAddr`'s
+/// own `Display`/`FromStr` uses to disambiguate a literal IPv6 address's own
+/// internal `:` characters from the fixture format's field separators.
+fn split_fixture_fields(s: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let (field, remainder) = if let Some(after_bracket) = rest.strip_prefix('[') {
+            match after_bracket.find(']') {
+                Some(end) => {
+                    let after = &after_bracket[end + 1..];
+                    (
+                        &after_bracket[..end],
+                        after.strip_prefix(':').unwrap_or(after),
+                    )
+                }
+                None => (rest, ""),
+            }
+        } else if let Some(i) = rest.find(':') {
+            (&rest[..i], &rest[i + 1..])
+        } else {
+            (rest, "")
+        };
+        fields.push(field);
+        rest = remainder;
+    }
+    fields
+}
+
 pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
-    let parts: Vec<&str> = s.split(':').collect();
+    let parts = split_fixture_fields(s);
     let [vip_ip, vip_port, proto, backend_node_ip, pod_ip, target_port] = parts.as_slice() else {
         return Err(format!(
-            "expected vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port, got `{s}`"
+            "expected vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port (bracket an IPv6 \
+             address, e.g. `[2001:db8::1]`), got `{s}`"
         ));
     };
     Ok(Fixture {
@@ -104,12 +170,16 @@ pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
 /// Wire-form pod_ips of fixtures THIS node itself backs (`backend_node_ip
 /// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `LB_FRONT_MAP`/
 /// `TARGET_PORTS` which every node populates identically from the full
-/// fixture set since any node can be ingress for any VIP.
-pub fn local_pod_ips(fixtures: &[Fixture], node_ip: Ipv4Addr) -> Vec<u32> {
+/// fixture set since any node can be ingress for any VIP. `node_ip`'s family
+/// need not match every fixture's `backend_node_ip`; `IpAddr`'s `PartialEq`
+/// already treats a v4 and a v6 address as unequal regardless of numeric
+/// value, so a cross-family fixture is correctly excluded rather than
+/// spuriously matched.
+pub fn local_pod_ips(fixtures: &[Fixture], node_ip: IpAddr) -> Vec<[u8; 16]> {
     fixtures
         .iter()
         .filter(|f| f.backend_node_ip == node_ip)
-        .map(|f| wire_ip(u32::from(f.pod_ip)))
+        .map(|f| wire_ip_v6(f.pod_ip))
         .collect()
 }
 
@@ -117,7 +187,7 @@ pub fn local_pod_ips(fixtures: &[Fixture], node_ip: Ipv4Addr) -> Vec<u32> {
 /// loader/controller run against the same pinned map) that `live` (this
 /// run's desired set) no longer claims. Split out of `populate_fixtures` as
 /// a pure function so the prune decision is testable without a live eBPF
-/// map. Generic over the key type (`u32` for `POD_TARGETS`, `[u8; 16]` for
+/// map. Generic over the key type (`[u8; 16]` for both `POD_TARGETS` and
 /// `NODE_ALLOW`) rather than duplicated per map: both are the identical
 /// prune-then-insert set diff.
 pub fn stale_pod_targets<T: Copy + Eq + std::hash::Hash>(existing: &[T], live: &[T]) -> Vec<T> {
@@ -389,6 +459,7 @@ pub fn attach_and_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn pod_targets_excludes_pods_backed_by_a_different_node() {
@@ -401,8 +472,8 @@ mod tests {
         // always passed cluster-wide and never caught a misdelivered or
         // drifted packet. If `local_pod_ips` regresses to node-blind
         // filtering, this must fail by including the non-local pod.
-        let node_ip = Ipv4Addr::new(10, 0, 0, 6);
-        let other_node_ip = Ipv4Addr::new(10, 0, 0, 7);
+        let node_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let other_node_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
         let local_fixture = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
         let remote_fixture = parse_fixture("10.0.0.5:81:tcp:10.0.0.7:10.244.1.8:8081").unwrap();
         assert_eq!(local_fixture.backend_node_ip, node_ip);
@@ -411,7 +482,7 @@ mod tests {
 
         assert_eq!(
             local_pod_ips(&fixtures, node_ip),
-            vec![wire_ip(u32::from(local_fixture.pod_ip))],
+            vec![wire_ip_v6(local_fixture.pod_ip)],
             "POD_TARGETS must contain only pods this node's own fixtures back \
              (backend_node_ip == node_ip) -- a pod backed by a different node \
              must never appear, or the decap/egress-return membership gates \
@@ -427,9 +498,9 @@ mod tests {
         // matching FLOW_TABLE reverse-tagged entry -- an unpruned stale
         // entry would misclassify unrelated traffic that later reuses this
         // address as "ours" and drop it instead of passing it through.
-        let departed_pod_ip = wire_ip(u32::from(Ipv4Addr::new(10, 244, 1, 9)));
+        let departed_pod_ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9)));
         let existing = [departed_pod_ip];
-        let live: [u32; 0] = [];
+        let live: [[u8; 16]; 0] = [];
 
         assert_eq!(
             stale_pod_targets(&existing, &live),
@@ -446,11 +517,36 @@ mod tests {
         // fixture set must survive the prune, or every reconcile would
         // drop live backends' own egress-return admission.
         let fixture = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
-        let live = [wire_ip(u32::from(fixture.pod_ip))];
+        let live = [wire_ip_v6(fixture.pod_ip)];
 
         assert!(
             stale_pod_targets(&live, &live).is_empty(),
             "a pod still claimed by the local serving-set must not be pruned from POD_TARGETS"
+        );
+    }
+
+    #[test]
+    fn local_pod_ips_accepts_a_v6_fixture_and_writes_the_raw_v6_octets() {
+        // A v6 Service/Pod must populate POD_TARGETS exactly like a v4 one
+        // does, or a v6 backend Pod silently gets no local-serving-set entry
+        // and every decap/egress-return admission check drops its traffic.
+        // Unlike a v4 pod_ip (embedded via `ipv4_mapped_v6`), a genuine v6
+        // address needs no embedding -- its own octets already are the
+        // `[u8; 16]` wire shape.
+        let node_ip: IpAddr = "2001:db8::1".parse().unwrap();
+        let fixture =
+            parse_fixture("[2001:db8::1]:80:tcp:[2001:db8::1]:[2001:db8::2]:8080").unwrap();
+        assert_eq!(fixture.backend_node_ip, node_ip);
+
+        let pod_ip: IpAddr = "2001:db8::2".parse().unwrap();
+        let IpAddr::V6(pod_v6) = pod_ip else {
+            unreachable!()
+        };
+        assert_eq!(
+            local_pod_ips(&[fixture], node_ip),
+            vec![pod_v6.octets()],
+            "a v6 fixture's pod_ip must land in POD_TARGETS as its raw octets, not silently \
+             dropped or corrupted by v4-only wire-encode logic"
         );
     }
 }

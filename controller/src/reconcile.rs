@@ -171,7 +171,7 @@ pub struct RejectedEndpoint {
 pub struct DesiredEntries {
     pub lb_front_map: HashMap<LbFrontKey, LbFrontBackend>,
     pub target_ports: HashMap<LbFrontKey, u16>,
-    pub pod_targets: HashSet<u32>,
+    pub pod_targets: HashSet<[u8; 16]>,
     /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
     /// `ipv4_mapped_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
     /// host-native value -- the same convention `LbFrontBackend::
@@ -262,12 +262,16 @@ fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
 /// See `is_admitted` for the CIDR/hostNetwork admission check itself.
 /// Arbitrary out-of-cidr pod_ips that are also != node_ip are still
 /// rejected below.
-pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) -> HashSet<u32> {
+pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) -> HashSet<[u8; 16]> {
     let mut pod_targets = HashSet::new();
     for slice in slices {
         for ep in &slice.endpoints {
             if ep.ready && ep.node_ip == node.node_ip && is_admitted(ep, node) {
-                pod_targets.insert(wire_ip(u32::from(ep.pod_ip)));
+                // POD_TARGETS' key is `[u8; 16]` (like NODE_ALLOW's), but wire_ip-wrapped
+                // like `LbFrontBackend::pod_ip` -- unlike NODE_ALLOW's host-native peer
+                // address, POD_TARGETS membership is checked against a wire-order source
+                // IP the dataplane never asks the kernel to convert for it.
+                pod_targets.insert(ipv4_mapped_v6(wire_ip(u32::from(ep.pod_ip))));
             }
         }
     }
@@ -739,7 +743,7 @@ mod tests {
 
         assert_eq!(
             desired.pod_targets,
-            HashSet::from([wire_ip(u32::from(local_pod))]),
+            HashSet::from([ipv4_mapped_v6(wire_ip(u32::from(local_pod)))]),
             "POD_TARGETS must contain only pods THIS node hosts -- a remote node's pod leaking \
              in here would misclassify that node's traffic as this node's own backend"
         );
@@ -800,7 +804,7 @@ mod tests {
 
         assert_eq!(
             desired.pod_targets,
-            HashSet::from([wire_ip(u32::from(this_node))]),
+            HashSet::from([ipv4_mapped_v6(wire_ip(u32::from(this_node)))]),
             "a hostNetwork backend (pod_ip == node_ip, outside pod_cidr) must be admitted into \
              POD_TARGETS or its forward traffic is dropped at decap on every node"
         );
