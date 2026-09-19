@@ -8,8 +8,11 @@
 #   1. zero `.debug_*` sections (what the strip removes)
 #   2. `.BTF` AND `.BTF.ext` both present (aya needs them at load time for
 #      map + relocation info -- the strip must NOT touch these)
-#   3. file size under a gross-regression ceiling (post-strip ~46KB measured
-#      via a real release build; 100KB leaves headroom for legitimate growth)
+#   3. file size under a gross-regression ceiling (post-strip ~107KB measured
+#      via a real release build with dual-stack _v4/_v6 hook duplication;
+#      128KB leaves headroom for legitimate growth -- the .debug_* check
+#      above remains the precise guard, since a genuine DWARF revert
+#      reintroduces ~270KB and is caught there regardless of this ceiling)
 #
 # Prefers `llvm-readelf` (matches the LLVM toolchain that produced the
 # object) and falls back to GNU `readelf` (always present on any Linux dev
@@ -52,7 +55,7 @@ printf '%s\n' "$sections" | grep -qxF '.BTF.ext' || {
 }
 
 size="$(wc -c < "$object" | tr -d ' ')"
-ceiling=$((100 * 1024))
+ceiling=$((128 * 1024))
 [ "$size" -lt "$ceiling" ] || {
   echo "FAIL: $object is $size bytes, >= ${ceiling}-byte gross-regression ceiling -- DWARF strip likely regressed" >&2
   exit 1
