@@ -16,6 +16,7 @@ BIN="/tmp/beep-wg2node"
 LOADER_LOG="/tmp/beep-wg2node-loader.log"
 RPFILTER_SAVE_FILE="/tmp/beep-wg2node-rpfilter-all.saved"
 IPFORWARD_SAVE_FILE="/tmp/beep-wg2node-ipforward.saved"
+IP6FORWARD_SAVE_FILE="/tmp/beep-wg2node-ip6forward.saved"
 # Canonical's wg AppArmor profile (`/etc/apparmor.d/wg`, confirmed present on
 # the Ubuntu Lima image this rig targets) grants `/usr/bin/wg` file rw ONLY
 # under `/etc/wireguard/**` -- no `dac_override`/`dac_read_search`
@@ -28,6 +29,16 @@ IPFORWARD_SAVE_FILE="/tmp/beep-wg2node-ipforward.saved"
 # wireguard-tools package hardening, and the fix is simply keeping every key
 # under this exact directory.
 WG_KEY_DIR="/etc/wireguard"
+# Dual-stack client fixture: a veth pair whose peer end lives in its own
+# netns, standing in for a genuinely foreign v4 AND v6 client on the same
+# 2-node rig -- same isolation technique smoke-remote.sh's smoke-client
+# netns already uses, chosen here (over a 3rd VM) so this node's own address
+# is never also the packet's source, which is what martian-source-drops a
+# co-located client. Both families share one veth pair since one device can
+# hold a v4 and a v6 address simultaneously.
+CLIENT_VETH="wg2ds-veth0"
+CLIENT_VETH_PEER="wg2ds-veth1"
+CLIENT_NETNS="smoke-wg2node-client"
 
 cmd="${1:-}"
 shift || true
@@ -127,16 +138,18 @@ setup_geneve() {
 # drops that mismatch. Saved/restored so this rig never leaves the VM's
 # global rp_filter permanently weakened.
 setup_backend() {
-  local pod_ip=""
+  local pod_ip="" pod_ip_v6=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pod-ip) pod_ip="$2"; shift 2 ;;
+      --pod-ip-v6) pod_ip_v6="$2"; shift 2 ;;
       *) echo "setup-backend: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
   [ -n "$pod_ip" ] || { echo "setup-backend: --pod-ip required" >&2; exit 1; }
 
   ip addr replace "${pod_ip}/32" dev lo
+  [ -n "$pod_ip_v6" ] && ip -6 addr replace "${pod_ip_v6}/128" dev lo
   if [ ! -f "$RPFILTER_SAVE_FILE" ]; then
     sysctl -n net.ipv4.conf.all.rp_filter > "$RPFILTER_SAVE_FILE"
   fi
@@ -151,28 +164,96 @@ setup_backend() {
     sysctl -n net.ipv4.ip_forward > "$IPFORWARD_SAVE_FILE"
   fi
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  # v6 forwarding is its own separate sysctl (net.ipv4.ip_forward doesn't
+  # cover it) -- only needed/toggled when a v6 pod_ip is actually in play.
+  if [ -n "$pod_ip_v6" ]; then
+    if [ ! -f "$IP6FORWARD_SAVE_FILE" ]; then
+      sysctl -n net.ipv6.conf.all.forwarding > "$IP6FORWARD_SAVE_FILE"
+    fi
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+  fi
+}
+
+# Dual-stack client fixture: idempotent create of
+# $CLIENT_VETH/$CLIENT_VETH_PEER + $CLIENT_NETNS, with a v4 and/or v6 address
+# on each end. The root end stays in this node's default netns (so ordinary
+# kernel routing -- ip_forward, enabled by setup_backend above -- carries the
+# client's packet from here toward wg0/geneve0 exactly like a real foreign
+# client's would); the peer end, isolated in $CLIENT_NETNS, is where the
+# actual curl client runs. A default route per family inside the netns is
+# enough: it has no other interface to prefer.
+setup_client_netns() {
+  local v4_root="" v4_client="" v4_prefix="" v6_root="" v6_client="" v6_prefix=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --v4-root) v4_root="$2"; shift 2 ;;
+      --v4-client) v4_client="$2"; shift 2 ;;
+      --v4-prefix) v4_prefix="$2"; shift 2 ;;
+      --v6-root) v6_root="$2"; shift 2 ;;
+      --v6-client) v6_client="$2"; shift 2 ;;
+      --v6-prefix) v6_prefix="$2"; shift 2 ;;
+      *) echo "setup-client-netns: unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$v4_root" ] && [ -n "$v4_client" ] && [ -n "$v4_prefix" ] || {
+    echo "setup-client-netns: --v4-root, --v4-client, --v4-prefix all required" >&2
+    exit 1
+  }
+  [ -n "$v6_root" ] && [ -n "$v6_client" ] && [ -n "$v6_prefix" ] || {
+    echo "setup-client-netns: --v6-root, --v6-client, --v6-prefix all required" >&2
+    exit 1
+  }
+
+  ip link show "$CLIENT_VETH" >/dev/null 2>&1 || \
+    ip link add "$CLIENT_VETH" type veth peer name "$CLIENT_VETH_PEER"
+  ip netns add "$CLIENT_NETNS" 2>/dev/null || true
+  ip link show "$CLIENT_VETH_PEER" >/dev/null 2>&1 && \
+    ip link set "$CLIENT_VETH_PEER" netns "$CLIENT_NETNS"
+
+  ip addr replace "${v4_root}/${v4_prefix}" dev "$CLIENT_VETH"
+  ip -6 addr replace "${v6_root}/${v6_prefix}" dev "$CLIENT_VETH"
+  ip link set "$CLIENT_VETH" up
+
+  ip netns exec "$CLIENT_NETNS" ip addr replace "${v4_client}/${v4_prefix}" dev "$CLIENT_VETH_PEER"
+  ip netns exec "$CLIENT_NETNS" ip -6 addr replace "${v6_client}/${v6_prefix}" dev "$CLIENT_VETH_PEER"
+  ip netns exec "$CLIENT_NETNS" ip link set "$CLIENT_VETH_PEER" up
+  ip netns exec "$CLIENT_NETNS" ip link set lo up
+  ip netns exec "$CLIENT_NETNS" ip route replace default via "$v4_root"
+  ip netns exec "$CLIENT_NETNS" ip -6 route replace default via "$v6_root"
+  echo "CLIENT-NETNS-UP: PASS (${CLIENT_NETNS}: v4 ${v4_client} via ${v4_root}, v6 ${v6_client} via ${v6_root})"
 }
 
 start_loader() {
-  local uplink_iface="$WG_IFACE" fixture="" pod_cidr="" node_ip=""
+  local uplink_iface="$WG_IFACE" pod_cidr="" node_ip=""
+  # `--fixture` is repeatable (`beep`'s own CLI, `src/main.rs`'s `Vec<Fixture>`):
+  # collected into an array here too, not a scalar, or a 2nd `--fixture`
+  # would silently overwrite the 1st instead of adding a 2nd front
+  # (confirmed empirically: a dual-stack fixture set's v4 entry vanished
+  # from LB_FRONT_MAP with a scalar `fixture=`, since only the last
+  # `--fixture` given ever survived).
+  local fixtures=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --uplink-iface) uplink_iface="$2"; shift 2 ;;
-      --fixture) fixture="$2"; shift 2 ;;
+      --fixture) fixtures+=("$2"); shift 2 ;;
       --pod-cidr) pod_cidr="$2"; shift 2 ;;
       --node-ip) node_ip="$2"; shift 2 ;;
       *) echo "start-loader: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
-  [ -n "$fixture" ] || { echo "start-loader: --fixture required" >&2; exit 1; }
+  [ "${#fixtures[@]}" -gt 0 ] || { echo "start-loader: at least one --fixture required" >&2; exit 1; }
   [ -n "$pod_cidr" ] || { echo "start-loader: --pod-cidr required" >&2; exit 1; }
   [ -n "$node_ip" ] || { echo "start-loader: --node-ip required" >&2; exit 1; }
   mkdir -p "$PIN_DIR"
 
+  local fixture_args=()
+  for f in "${fixtures[@]}"; do
+    fixture_args+=(--fixture "$f")
+  done
   nohup "$BIN" \
     --uplink-iface "$uplink_iface" --geneve-iface "$GENEVE_IFACE" --pin-dir "$PIN_DIR" \
     --pod-cidr "$pod_cidr" --node-ip "$node_ip" \
-    --fixture "$fixture" \
+    "${fixture_args[@]}" \
     >"$LOADER_LOG" 2>&1 &
   loader_pid=$!
   disown
@@ -201,24 +282,31 @@ start_loader() {
 }
 
 start_backend_responder() {
-  local pod_ip="" port=""
+  local pod_ip="" port="" family="4" nc_flag="-4" body="OK"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pod-ip) pod_ip="$2"; shift 2 ;;
       --port) port="$2"; shift 2 ;;
+      --family) family="$2"; shift 2 ;;
+      --body) body="$2"; shift 2 ;;
       *) echo "start-backend-responder: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
-  printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' > /tmp/wg2node-response.http
-  nohup nc -l -N "$pod_ip" "$port" < /tmp/wg2node-response.http > /tmp/wg2node-backend.log 2>&1 &
+  [ "$family" = "6" ] && nc_flag="-6"
+  local response_file="/tmp/wg2node-response-${port}.http"
+  local backend_log="/tmp/wg2node-backend-${port}.log"
+  printf 'HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+    "${#body}" "$body" > "$response_file"
+  nohup nc "$nc_flag" -l -N "$pod_ip" "$port" < "$response_file" > "$backend_log" 2>&1 &
   disown
   sleep 0.5
 }
 
-# bpftool + geneve0/wg0/eth0 counters + routes -- eth0 and the route table
-# are the relay-specific evidence this rig needs beyond the original
-# geneve0/wg0 set, since the client's SYN now transits this node's eth0 (as
-# a genuine IP forward into wg0) rather than being self-originated here.
+# bpftool + geneve0/wg0/eth0/client-veth counters + routes -- eth0 and the
+# route table are the relay-specific evidence this rig needs beyond the
+# original geneve0/wg0 set, since the client's SYN now transits this node's
+# eth0 (as a genuine IP forward into wg0) rather than being self-originated
+# here. The client-veth/netns block is this rig's dual-stack addition.
 dump_evidence() {
   echo "== bpftool map dump: LB_FRONT_MAP =="
   bpftool map dump pinned "$PIN_DIR/LB_FRONT_MAP" 2>&1 || true
@@ -232,6 +320,12 @@ dump_evidence() {
   ip -s link show "$GENEVE_IFACE" 2>&1 || true
   echo "== wg0 counters =="
   ip -s link show "$WG_IFACE" 2>&1 || true
+  echo "== $CLIENT_VETH counters =="
+  ip -s link show "$CLIENT_VETH" 2>&1 || true
+  echo "== $CLIENT_NETNS addrs/routes =="
+  ip netns exec "$CLIENT_NETNS" ip addr show 2>&1 || true
+  ip netns exec "$CLIENT_NETNS" ip route show 2>&1 || true
+  ip netns exec "$CLIENT_NETNS" ip -6 route show 2>&1 || true
   echo "== route table =="
   ip route show 2>&1 || true
 }
@@ -244,11 +338,13 @@ cleanup() {
   # cleanup`) before it reaches the rest of these teardown steps -- same
   # fix as smoke-eth-ingress-2node-remote.sh's cleanup().
   pkill -f "$BIN --uplink-iface" 2>/dev/null || true
-  pkill -f "nc -l -N .* 18090" 2>/dev/null || true
+  pkill -f "nc -[46] -l -N" 2>/dev/null || true
   rm -rf "$PIN_DIR"
-  rm -f /tmp/wg2node-response.http /tmp/wg2node-backend.log "$LOADER_LOG"
+  rm -f /tmp/wg2node-response*.http /tmp/wg2node-backend*.log "$LOADER_LOG"
   ip link del "$GENEVE_IFACE" 2>/dev/null || true
   ip link del "$WG_IFACE" 2>/dev/null || true
+  ip link del "$CLIENT_VETH" 2>/dev/null || true
+  ip netns del "$CLIENT_NETNS" 2>/dev/null || true
   if [ -f "$RPFILTER_SAVE_FILE" ]; then
     sysctl -w net.ipv4.conf.all.rp_filter="$(cat "$RPFILTER_SAVE_FILE")" >/dev/null 2>&1 || true
     rm -f "$RPFILTER_SAVE_FILE"
@@ -256,6 +352,10 @@ cleanup() {
   if [ -f "$IPFORWARD_SAVE_FILE" ]; then
     sysctl -w net.ipv4.ip_forward="$(cat "$IPFORWARD_SAVE_FILE")" >/dev/null 2>&1 || true
     rm -f "$IPFORWARD_SAVE_FILE"
+  fi
+  if [ -f "$IP6FORWARD_SAVE_FILE" ]; then
+    sysctl -w net.ipv6.conf.all.forwarding="$(cat "$IP6FORWARD_SAVE_FILE")" >/dev/null 2>&1 || true
+    rm -f "$IP6FORWARD_SAVE_FILE"
   fi
   rm -f "$WG_KEY_DIR/privatekey"
 }
@@ -265,12 +365,13 @@ case "$cmd" in
   pubkey) pubkey ;;
   setup-geneve) setup_geneve ;;
   setup-backend) setup_backend "$@" ;;
+  setup-client-netns) setup_client_netns "$@" ;;
   start-loader) start_loader "$@" ;;
   start-backend-responder) start_backend_responder "$@" ;;
   dump-evidence) dump_evidence ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|start-loader|start-backend-responder|dump-evidence|cleanup} [args...]" >&2
+    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|setup-client-netns|start-loader|start-backend-responder|dump-evidence|cleanup} [args...]" >&2
     exit 1
     ;;
 esac
