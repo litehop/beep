@@ -15,8 +15,8 @@
 # ambiguity a fresh single-tick file avoids by construction rather than by
 # parsing around it.
 #
-# Asserts the discovered map set is EXACTLY the 8 known beep maps, not
-# just a byte-count ceiling: a partial-discovery regression (e.g. only 7 of 8
+# Asserts the discovered map set is EXACTLY the 9 known beep maps, not
+# just a byte-count ceiling: a partial-discovery regression (e.g. only 8 of 9
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
 # is > 0 and under a gross-regression ceiling (not a tight bound, just a
@@ -42,7 +42,7 @@ total=$(awk -F, 'NR>1 { sum += $6 } END { print sum+0 }' "$csv")
 echo "discovered maps (${#names[@]}): ${names[*]:-none}"
 echo "total bytes_memlock: $total"
 
-expected=(CONFIG FWD_PENDING FLOW_TABLE TARGET_PORTS LB_FRONT_MAP POD_TARGETS EGRESS_DROPS NODE_ALLOW)
+expected=(CONFIG FWD_PENDING FLOW_TABLE TARGET_PORTS LB_FRONT_MAP POD_TARGETS EGRESS_DROPS NODE_ALLOW UPLINK_CONFIG)
 actual_sorted="$(printf '%s\n' "${names[@]}" | sort -u)"
 expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
 

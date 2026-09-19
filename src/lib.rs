@@ -11,7 +11,7 @@ use std::{net::Ipv4Addr, path::Path};
 use anyhow::{anyhow, Context};
 use aya::{
     include_bytes_aligned,
-    maps::Array as AyaArray,
+    maps::{Array as AyaArray, HashMap as AyaHashMap},
     programs::{
         links::{FdLink, LinkError, PinnedLink},
         tc::{SchedClassifierLink, TcAttachOptions},
@@ -20,7 +20,7 @@ use aya::{
     sys::SyscallError,
     Ebpf, EbpfLoader,
 };
-use beep_common::{wire_ip, Config};
+use beep_common::{wire_ip, Config, UplinkConfig};
 use clap::ValueEnum;
 
 const IPPROTO_TCP: u8 = 6;
@@ -30,8 +30,9 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-pub const MAP_NAMES: [&str; 7] = [
+pub const MAP_NAMES: [&str; 8] = [
     "CONFIG",
+    "UPLINK_CONFIG",
     "LB_FRONT_MAP",
     "TARGET_PORTS",
     "POD_TARGETS",
@@ -270,50 +271,63 @@ pub fn disable_rp_filter(iface: &str) -> anyhow::Result<()> {
 
 /// Resolves the Geneve device's ifindex (unknown until this host's `ip link`
 /// state is inspected, so it can't be a compile-time constant in the eBPF
-/// program), the uplink's L2 header length (a WireGuard/tun uplink has no
-/// Ethernet header, unlike a real NIC/veth -- see `uplink_l2_header_len`'s
-/// doc comment), and writes both to the single-entry `CONFIG` map the
-/// classifiers read at runtime.
-pub fn populate_config(
-    ebpf: &mut Ebpf,
-    geneve_iface: &str,
-    uplink_iface: &str,
-) -> anyhow::Result<()> {
+/// program) and writes it to the single-entry `CONFIG` map the classifiers
+/// read at runtime. Per-uplink data (ifindex, L2 header length) is a
+/// separate map -- see `populate_uplink_config`.
+pub fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str) -> anyhow::Result<()> {
     let geneve_ifindex = iface_index(geneve_iface)
         .with_context(|| format!("resolving ifindex for {geneve_iface}"))?;
-    let uplink_ifindex = iface_index(uplink_iface)
-        .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
-    let uplink_arphrd = iface_arphrd_type(uplink_iface)
-        .with_context(|| format!("resolving ARPHRD type for {uplink_iface}"))?;
-    let uplink_l2_hlen = beep_common::uplink_l2_header_len(uplink_arphrd);
-    eprintln!(
-        "uplink {uplink_iface}: ARPHRD type {uplink_arphrd}, L2 header skip {uplink_l2_hlen} byte(s)"
-    );
     let mut config: AyaArray<_, Config> = AyaArray::try_from(
         ebpf.map_mut("CONFIG")
             .ok_or_else(|| anyhow!("no map named `CONFIG` in the eBPF object"))?,
     )?;
-    config.set(
-        0,
-        Config {
-            geneve_ifindex,
-            uplink_ifindex,
-            uplink_l2_hlen,
-        },
-        0,
-    )?;
+    config.set(0, Config { geneve_ifindex }, 0)?;
     Ok(())
 }
 
-/// Loads and attaches the named classifier at `iface`, pinning its link
-/// under `pin_dir` so the attachment survives this process exiting. If a
-/// link is already pinned from a prior run, atomically swaps in the freshly
-/// loaded program on that same kernel link object instead of creating a
-/// second attachment.
+/// Resolves each uplink's ifindex and L2 header length (a WireGuard/tun
+/// uplink has no Ethernet header, unlike a real NIC/veth -- see
+/// `uplink_l2_header_len`'s doc comment) and writes one `UPLINK_CONFIG`
+/// entry per uplink, keyed by ifindex -- `try_uplink_ingress`'s hit-is-
+/// admission gate for multi-uplink client traffic
+/// (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
+pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyhow::Result<()> {
+    let mut uplink_config: AyaHashMap<_, u32, UplinkConfig> = AyaHashMap::try_from(
+        ebpf.map_mut("UPLINK_CONFIG")
+            .ok_or_else(|| anyhow!("no map named `UPLINK_CONFIG` in the eBPF object"))?,
+    )?;
+    for uplink_iface in uplink_ifaces {
+        let uplink_ifindex = iface_index(uplink_iface)
+            .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
+        let uplink_arphrd = iface_arphrd_type(uplink_iface)
+            .with_context(|| format!("resolving ARPHRD type for {uplink_iface}"))?;
+        let l2_hlen = beep_common::uplink_l2_header_len(uplink_arphrd);
+        eprintln!(
+            "uplink {uplink_iface}: ifindex {uplink_ifindex}, ARPHRD type {uplink_arphrd}, L2 header skip {l2_hlen} byte(s)"
+        );
+        uplink_config.insert(uplink_ifindex, UplinkConfig { l2_hlen }, 0)?;
+    }
+    Ok(())
+}
+
+/// Loads the named classifier once, then attaches it at EVERY iface in
+/// `ifaces`, pinning each link under `pin_dir` so every attachment survives
+/// this process exiting. If a link is already pinned from a prior run for a
+/// given iface, atomically swaps in the freshly loaded program on that same
+/// kernel link object instead of creating a second attachment.
+///
+/// One `program.load()` call regardless of `ifaces.len()`: aya's
+/// `load_program` errors `AlreadyLoaded` on a second call for the same
+/// program, so a multi-uplink `--uplink-iface` attaches the SAME loaded
+/// `SchedClassifier` to each configured uplink via repeated
+/// `attach_with_options`/`attach_to_link` calls on that one handle, never a
+/// second `load()`. Every link returned by `attach_with_options` MUST be
+/// pinned (or otherwise retained) individually -- an un-pinned,
+/// un-retained link auto-detaches silently on drop, with no error surfaced.
 pub fn attach_and_pin(
     ebpf: &mut Ebpf,
     name: &str,
-    iface: &str,
+    ifaces: &[&str],
     attach_type: TcAttachType,
     pin_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -327,38 +341,42 @@ pub fn attach_and_pin(
         .try_into()?;
     program.load()?;
 
-    // Pin filenames must not contain a literal `.`: this kernel's bpffs
-    // rejects `BPF_OBJ_PIN`/`BPF_OBJ_GET` on any path whose final component
-    // has a dot with EPERM (verified by bisecting an otherwise-identical
-    // repro down to a single `-` vs `.` swap) -- a narrow, surprising
-    // constraint worth more investigation, but not a verifier or aya bug.
-    let link_pin_path = pin_dir.join(format!("{name}-link"));
-    match PinnedLink::from_pin(&link_pin_path) {
-        Ok(existing) => {
-            // bpf_link_update swaps the target program on the *same* kernel
-            // link object referenced by the existing pin file, so the pin
-            // file itself needs no changes.
-            let link: SchedClassifierLink = FdLink::from(existing).try_into()?;
-            program.attach_to_link(link)?;
+    for iface in ifaces {
+        // Pin filenames must not contain a literal `.`: this kernel's bpffs
+        // rejects `BPF_OBJ_PIN`/`BPF_OBJ_GET` on any path whose final
+        // component has a dot with EPERM (verified by bisecting an
+        // otherwise-identical repro down to a single `-` vs `.` swap) -- a
+        // narrow, surprising constraint worth more investigation, but not a
+        // verifier or aya bug. Suffixed by iface so N links for the same
+        // program (one per configured uplink) each get their own pin file.
+        let link_pin_path = pin_dir.join(format!("{name}-{iface}-link"));
+        match PinnedLink::from_pin(&link_pin_path) {
+            Ok(existing) => {
+                // bpf_link_update swaps the target program on the *same*
+                // kernel link object referenced by the existing pin file, so
+                // the pin file itself needs no changes.
+                let link: SchedClassifierLink = FdLink::from(existing).try_into()?;
+                program.attach_to_link(link)?;
+            }
+            Err(LinkError::SyscallError(SyscallError { io_error, .. }))
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let link_id = program.attach_with_options(
+                    iface,
+                    attach_type,
+                    TcAttachOptions::TcxOrder(LinkOrder::default()),
+                )?;
+                let link = program.take_link(link_id)?;
+                let fd_link: FdLink = link.try_into()?;
+                fd_link.pin(&link_pin_path)?;
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(LinkError::SyscallError(SyscallError { io_error, .. }))
-            if io_error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            let link_id = program.attach_with_options(
-                iface,
-                attach_type,
-                TcAttachOptions::TcxOrder(LinkOrder::default()),
-            )?;
-            let link = program.take_link(link_id)?;
-            let fd_link: FdLink = link.try_into()?;
-            fd_link.pin(&link_pin_path)?;
-        }
-        Err(e) => return Err(e.into()),
     }
 
     // Pinning the program itself (separate from the link) is only for
     // `bpftool prog show pinned ...` introspection by name; restart-survival
-    // of the attachment depends solely on the link pin above.
+    // of the attachment depends solely on the per-iface link pins above.
     let prog_pin_path = pin_dir.join(format!("{name}-prog"));
     let _ = std::fs::remove_file(&prog_pin_path);
     program.pin(&prog_pin_path)?;

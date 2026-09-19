@@ -39,6 +39,23 @@ TARGET_PORT2="18081"
 VIP_PORT3="19102"
 TARGET_PORT3="18082"
 FLOOD_BACKEND_NODE_IP="203.0.113.250"
+# A SECOND configured uplink -- proves the multi-symmetric-uplink design
+# (docs/decisions/servicelb-multi-symmetric-uplink.md): a node admitting
+# client traffic on N uplinks must return each flow via the SAME uplink it
+# arrived on. TEST-NET-1, deliberately disjoint from the first uplink's
+# TEST-NET-3 subnet above and from POD_CIDR's TEST-NET-2 -- a genuinely
+# separate physical path, not just a second cable on the same wire.
+# `backend_node_ip` for this uplink's fixture is still VIP_IP (this node's
+# own self-loop identity, unaffected by which uplink admitted the packet).
+UPLINK2_IFACE="smoke-veth2"
+UPLINK2_PEER_IFACE="smoke-veth3"
+UPLINK2_NETNS="smoke-client2"
+UPLINK2_VIP_IP="192.0.2.1"
+UPLINK2_CLIENT_IP="192.0.2.2"
+UPLINK2_VIP_PORT="19103"
+UPLINK2_TARGET_PORT="18083"
+UPLINK2_BACKEND_LOG="/tmp/beep-smoke-backend-uplink2.log"
+UPLINK2_RESPONSE_FILE="/tmp/beep-smoke-response-uplink2.http"
 PIN_DIR="/sys/fs/bpf/beep-smoke"
 BIN="/tmp/beep-smoke"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,6 +112,7 @@ cleanup() {
   pkill -f "$BIN" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT2}" 2>/dev/null || true
+  pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${VIP_IP} ${VIP_PORT}" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
@@ -103,6 +121,8 @@ cleanup() {
   # leaving an unreachable, unnamed namespace behind (seen empirically).
   ip link del smoke-veth0 2>/dev/null || true
   ip netns del smoke-client 2>/dev/null || true
+  ip link del "$UPLINK2_IFACE" 2>/dev/null || true
+  ip netns del "$UPLINK2_NETNS" 2>/dev/null || true
   ip link del geneve0 2>/dev/null || true
   ip addr del "${POD_IP}/32" dev lo 2>/dev/null || true
   if [ -f "$RPFILTER_SAVE_FILE" ]; then
@@ -150,6 +170,16 @@ ip netns exec smoke-client ip link set smoke-veth1 up
 ip netns exec smoke-client ip link set lo up
 ip addr add "${POD_IP}/32" dev lo
 
+echo "==> creating $UPLINK2_IFACE/$UPLINK2_PEER_IFACE + $UPLINK2_NETNS netns (second uplink, stands in for e.g. a WireGuard mesh alongside the public NIC above)"
+ip link add "$UPLINK2_IFACE" type veth peer name "$UPLINK2_PEER_IFACE"
+ip netns add "$UPLINK2_NETNS"
+ip link set "$UPLINK2_PEER_IFACE" netns "$UPLINK2_NETNS"
+ip addr add "${UPLINK2_VIP_IP}/24" dev "$UPLINK2_IFACE"
+ip link set "$UPLINK2_IFACE" up
+ip netns exec "$UPLINK2_NETNS" ip addr add "${UPLINK2_CLIENT_IP}/24" dev "$UPLINK2_PEER_IFACE"
+ip netns exec "$UPLINK2_NETNS" ip link set "$UPLINK2_PEER_IFACE" up
+ip netns exec "$UPLINK2_NETNS" ip link set lo up
+
 # Required here AND on a real deployment (empirically confirmed against a
 # single-node k3s cluster): the decapped inner packet's source is the
 # external client, never reachable back out an address-less `geneve0`, so
@@ -172,11 +202,13 @@ sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
 start_loader() {
   local log="$1"
   nohup "$BIN" \
-    --uplink-iface smoke-veth0 --geneve-iface geneve0 --pin-dir "$PIN_DIR" \
+    --uplink-iface smoke-veth0 --uplink-iface "$UPLINK2_IFACE" --geneve-iface geneve0 \
+    --pin-dir "$PIN_DIR" \
     --pod-cidr "$POD_CIDR" --node-ip "$VIP_IP" \
     --fixture "${VIP_IP}:${VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT}" \
     --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
     --fixture "${VIP_IP}:${VIP_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
+    --fixture "${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${UPLINK2_TARGET_PORT}" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -259,6 +291,28 @@ body2=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT2}/
 }
 echo "MULTI-PORT ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT2} -> backend ${POD_IP}:${TARGET_PORT2} -> response 'OK2', distinct from the first Service port's target)"
 
+echo "==> starting a backend responder for the second uplink's front on ${POD_IP}:${UPLINK2_TARGET_PORT}"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK3' > "$UPLINK2_RESPONSE_FILE"
+nohup nc -l -N "$POD_IP" "$UPLINK2_TARGET_PORT" < "$UPLINK2_RESPONSE_FILE" >"$UPLINK2_BACKEND_LOG" 2>&1 &
+disown
+sleep 0.5
+
+echo "==> driving a round trip through the SECOND configured uplink ($UPLINK2_IFACE)"
+# The whole point of this check: if try_geneve_decap_return's redirect used
+# the wrong ifindex (e.g. always the FIRST uplink's, a regression to the old
+# single-uplink CONFIG.get(0) read), this response would be redirected out
+# smoke-veth0 instead of $UPLINK2_IFACE -- landing on smoke-client's netns,
+# which has no route to $UPLINK2_CLIENT_IP's subnet, not on $UPLINK2_NETNS.
+# The client here would then simply time out rather than see a wrong body,
+# so a plain success/failure check on THIS specific netns is enough to prove
+# symmetric per-uplink return, with no extra ifindex introspection needed.
+body3=$(ip netns exec "$UPLINK2_NETNS" curl -sS -m 5 "http://${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT}/")
+[ "$body3" = "OK3" ] || {
+  echo "FAIL: expected response body 'OK3' via the second uplink ($UPLINK2_IFACE), got: $body3 -- either this uplink was never admitted (UPLINK_CONFIG miss), or its return leg redirected out the wrong uplink's ifindex" >&2
+  exit 1
+}
+echo "SECOND-UPLINK ROUND-TRIP: PASS (client ${UPLINK2_CLIENT_IP} via ${UPLINK2_IFACE} -> VIP ${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT} -> backend ${POD_IP}:${UPLINK2_TARGET_PORT} -> response 'OK3', returned via the SAME uplink it arrived on)"
+
 # bpftool exits nonzero AND still prints a JSON error object to stdout for a
 # missing pin (`{"error": "..."}`) -- piping that straight into `jq length`
 # would report 1 (one key), a false-positive "entry" that would silently
@@ -271,18 +325,19 @@ map_entry_count() {
 }
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
-# The two round trips above already promoted their flows into FLOW_TABLE
-# (forward-tagged) and wrote their reverse-tagged counterparts. Flood a
-# THIRD, never-returning front (VIP_PORT3, see its definition above for why
-# the flood can never produce a return leg, and therefore never reaches
-# FLOW_TABLE at all -- FLOOD_BACKEND_NODE_IP answers to nothing) from many
-# distinct client source ports -- a stand-in for an off-path spoofed-source
-# flood -- and confirm FLOW_TABLE's established entries survive untouched
-# while FWD_PENDING absorbs the churn.
+# The three round trips above (two fronts on the first uplink, one on the
+# second) already promoted their flows into FLOW_TABLE (forward-tagged) and
+# wrote their reverse-tagged counterparts. Flood a FOURTH, never-returning
+# front (VIP_PORT3, see its definition above for why the flood can never
+# produce a return leg, and therefore never reaches FLOW_TABLE at all --
+# FLOOD_BACKEND_NODE_IP answers to nothing) from many distinct client
+# source ports -- a stand-in for an off-path spoofed-source flood -- and
+# confirm FLOW_TABLE's established entries survive untouched while
+# FWD_PENDING absorbs the churn.
 flow_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 pending_before=$(map_entry_count "$PIN_DIR/FWD_PENDING")
-[ -n "$flow_before" ] && [ "$flow_before" -ge 4 ] || {
-  echo "FAIL: expected at least 4 FLOW_TABLE entries before the flood (forward+reverse tags for the two round trips above), got '$flow_before'" >&2
+[ -n "$flow_before" ] && [ "$flow_before" -ge 6 ] || {
+  echo "FAIL: expected at least 6 FLOW_TABLE entries before the flood (forward+reverse tags for the three round trips above), got '$flow_before'" >&2
   exit 1
 }
 echo "before flood: FLOW_TABLE=$flow_before entries, FWD_PENDING=$pending_before entries"
@@ -325,8 +380,8 @@ echo "==> establishing a flow to hold open across a loader restart (a DaemonSet 
 # by FLOW_TABLE surviving it, not by a fresh forward packet re-populating it.
 #
 # Baseline captured BEFORE the fixture below starts, not a bare ">0" gate
-# after: FLOW_TABLE already holds the two earlier round trips' forward- and
-# reverse-tagged entries, so this flow's own arrival must be seen as an
+# after: FLOW_TABLE already holds the three earlier round trips' forward-
+# and reverse-tagged entries, so this flow's own arrival must be seen as an
 # INCREASE of (at least) 2 -- one forward-tagged entry from its return-leg
 # promotion, one reverse-tagged entry from the backend's forward-decap --
 # over that pre-existing count. Capturing it any later races the fixture:
