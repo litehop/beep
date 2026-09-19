@@ -24,7 +24,7 @@ use crate::reconcile::{self, DesiredEntries, MapOp};
 pub struct PinnedMaps {
     lb_front_map: AyaHashMap<MapData, LbFrontKey, LbFrontBackend>,
     target_ports: AyaHashMap<MapData, LbFrontKey, u16>,
-    pod_targets: AyaHashMap<MapData, u32, u8>,
+    pod_targets: AyaHashMap<MapData, [u8; 16], u8>,
     node_allow: AyaHashMap<MapData, [u8; 16], u8>,
     /// "Has `fronts_known` ever been true in this process." Starts `false`
     /// on every controller start (including a restart), and once
@@ -205,18 +205,18 @@ where
 /// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
 /// Same continue-past-a-failure contract as `apply_ops` above.
 fn apply_pod_targets(
-    map: &mut AyaHashMap<MapData, u32, u8>,
-    desired: &HashSet<u32>,
+    map: &mut AyaHashMap<MapData, [u8; 16], u8>,
+    desired: &HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
-    let existing: Vec<u32> = map.keys().collect::<Result<_, _>>()?;
-    let live: Vec<u32> = desired.iter().copied().collect();
+    let existing: Vec<[u8; 16]> = map.keys().collect::<Result<_, _>>()?;
+    let live: Vec<[u8; 16]> = desired.iter().copied().collect();
     let mut failed = 0;
     for stale in beep::stale_pod_targets(&existing, &live) {
         if let Err(e) = map.remove(&stale) {
             failed += 1;
             eprintln!(
                 "controller: POD_TARGETS delete for pod {} failed: {e:#}",
-                Ipv4Addr::from(u32::from_be(stale))
+                describe_pod_target_ip(stale)
             );
         }
     }
@@ -226,7 +226,7 @@ fn apply_pod_targets(
             eprintln!(
                 "controller: POD_TARGETS upsert for pod {} failed (entry left unrouted -- map \
                  may be at capacity): {e:#}",
-                Ipv4Addr::from(u32::from_be(*ip))
+                describe_pod_target_ip(*ip)
             );
         }
     }
@@ -234,6 +234,16 @@ fn apply_pod_targets(
         anyhow::bail!("{failed} write(s) to `POD_TARGETS` failed -- see per-entry errors above");
     }
     Ok(())
+}
+
+/// Formats a `POD_TARGETS` pod IP for logging. Unlike `describe_node_allow_peer`'s
+/// host-native peer key, this key is wire_ip-wrapped (`pod_targets_for_node`'s doc
+/// comment), so recovering the dotted-octet form needs the extra `u32::from_be`.
+fn describe_pod_target_ip(ip: [u8; 16]) -> String {
+    match unmap_ipv4(&ip) {
+        Some(wire) => Ipv4Addr::from(u32::from_be(wire)).to_string(),
+        None => format!("{ip:x?}"),
+    }
 }
 
 /// Whether `apply_node_allow` may delete stale peers this tick, given
