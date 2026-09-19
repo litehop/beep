@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::net::Ipv4Addr;
 
-use beep_common::{wire_ip, wire_port, LbFrontBackend, LbFrontKey};
+use beep_common::{ipv4_mapped_v6, wire_ip, wire_port, LbFrontBackend, LbFrontKey};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -172,8 +172,9 @@ pub struct DesiredEntries {
     pub lb_front_map: HashMap<LbFrontKey, LbFrontBackend>,
     pub target_ports: HashMap<LbFrontKey, u16>,
     pub pod_targets: HashSet<u32>,
-    /// Desired `NODE_ALLOW` contents: every known node's address, host-
-    /// native (not `wire_ip`) -- the same convention `LbFrontBackend::
+    /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
+    /// `ipv4_mapped_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
+    /// host-native value -- the same convention `LbFrontBackend::
     /// backend_node_ip` uses, since `beep-ebpf`'s `geneve_ingress` checks
     /// this set against `tkey.remote_ipv4`, a kernel-tunnel-key field the
     /// kernel itself converts host<->network internally, never a raw wire
@@ -192,7 +193,7 @@ pub struct DesiredEntries {
     /// so already-discovered peers get admitted without waiting for the
     /// full list, without reopening the restart-wipe window `fronts_known`
     /// exists to prevent.
-    pub node_allow: HashSet<u32>,
+    pub node_allow: HashSet<[u8; 16]>,
     /// Endpoints excluded from `pod_targets` by the pod-CIDR admission
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
     /// nothing here changes `pod_targets` itself.
@@ -225,7 +226,7 @@ pub struct DesiredEntries {
 
 fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> LbFrontKey {
     LbFrontKey {
-        vip_ip: wire_ip(u32::from(vip_ip)),
+        vip_ip: ipv4_mapped_v6(wire_ip(u32::from(vip_ip))),
         vip_port: wire_port(port.port),
         proto: port.protocol.as_ip_proto(),
         _pad: 0,
@@ -339,8 +340,8 @@ pub fn reconcile_service(
                 // Host-native, not wire_ip: the kernel's own
                 // bpf_tunnel_key.remote_ipv4 set/get converts this field
                 // itself (`src/main.rs`'s `populate_fixtures` comment).
-                backend_node_ip: u32::from(backend.node_ip),
-                pod_ip: wire_ip(u32::from(backend.pod_ip)),
+                backend_node_ip: ipv4_mapped_v6(u32::from(backend.node_ip)),
+                pod_ip: ipv4_mapped_v6(wire_ip(u32::from(backend.pod_ip))),
             },
         );
         desired
@@ -409,6 +410,7 @@ pub fn lb_front_backend_eq(a: &LbFrontBackend, b: &LbFrontBackend) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beep_common::unmap_ipv4;
 
     fn cluster_pod_cidr() -> Ipv4Cidr {
         Ipv4Cidr::new(Ipv4Addr::new(10, 244, 0, 0), 16)
@@ -465,8 +467,10 @@ mod tests {
             "exactly one front port was configured, so exactly one LB_FRONT_MAP entry is expected"
         );
         let (key, backend) = desired.lb_front_map.iter().next().unwrap();
+        let vip_wire = unmap_ipv4(&key.vip_ip)
+            .expect("a v4 VIP stored via ipv4_mapped_v6 must unmap back to a wire value");
         assert_eq!(
-            key.vip_ip.to_le_bytes(),
+            vip_wire.to_le_bytes(),
             [10, 0, 0, 1],
             "VIP wire encoding regressed vs beep_common::wire_ip's dotted-octet pin -- a \
              regression here corrupts every packet matched against this front"
@@ -476,14 +480,19 @@ mod tests {
             [0, 80],
             "VIP port wire encoding regressed vs beep_common::wire_port's network-byte-order pin"
         );
+        let pod_wire = unmap_ipv4(&backend.pod_ip)
+            .expect("a v4 pod IP stored via ipv4_mapped_v6 must unmap back to a wire value");
         assert_eq!(
-            backend.pod_ip.to_le_bytes(),
+            pod_wire.to_le_bytes(),
             [10, 244, 0, 9],
             "backend pod_ip wire encoding regressed -- the dataplane would stamp the wrong \
              Geneve pod-identifier option"
         );
+        let backend_node_native = unmap_ipv4(&backend.backend_node_ip).expect(
+            "a v4 backend node IP stored via ipv4_mapped_v6 must unmap back to a native value",
+        );
         assert_eq!(
-            backend.backend_node_ip,
+            backend_node_native,
             u32::from(node_ip),
             "backend_node_ip must stay host-native (unconverted): the kernel's own \
              bpf_tunnel_key.remote_ipv4 set/get converts it, so pre-converting here would \
@@ -577,8 +586,8 @@ mod tests {
         match &ops[0] {
             MapOp::Upsert(_, backend) => {
                 assert_eq!(
-                    backend.backend_node_ip,
-                    u32::from(other_node_ip),
+                    unmap_ipv4(&backend.backend_node_ip),
+                    Some(u32::from(other_node_ip)),
                     "the diff must point at the NEW backend's node, or traffic keeps going to \
                      the pod that no longer exists"
                 );
@@ -662,7 +671,7 @@ mod tests {
         assert_eq!(desired.target_ports.len(), 2);
         for backend in desired.lb_front_map.values() {
             assert_eq!(
-                backend.pod_ip.to_le_bytes(),
+                unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
                 [10, 244, 0, 9],
                 "both fronts back onto the same Pod in this fixture"
             );
@@ -700,7 +709,7 @@ mod tests {
 
         let (_, backend) = desired.lb_front_map.iter().next().unwrap();
         assert_eq!(
-            backend.pod_ip.to_le_bytes(),
+            unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
             [10, 244, 0, 2],
             "the lowest-IP endpoint across BOTH slices must win -- a reconcile that only looked \
              at the first slice would wrongly pick .20 here"

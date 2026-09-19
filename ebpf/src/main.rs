@@ -52,11 +52,11 @@ use beep_common::{
     backend_port_resolution, decap_forward_pod_admission, egress_return_admission,
     egress_return_outcome, encode_flow_key, encode_tcp_flow_key, forward_admission,
     fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts,
-    peer_node_admission, resolve_backend_src_port, return_authorization, BackendPortDecision,
-    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
-    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, ForwardFlowValue, FwdPendingPin,
-    LbFrontBackend, LbFrontKey, PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, UplinkConfig,
-    REDIRECTED_RETURN_MARK,
+    peer_node_admission, resolve_backend_src_port, return_authorization, unmap_ipv4,
+    BackendPortDecision, BackendPortResolution, Config, DecapForwardPodAdmission,
+    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission,
+    ForwardFlowValue, FwdPendingPin, LbFrontBackend, LbFrontKey, PeerNodeAdmission,
+    ReturnAuthorization, TcpFlowKey, UplinkConfig, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -172,16 +172,20 @@ static POD_TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(32, 0);
 /// node's own -- a node that is both ingress and backend for the same flow
 /// legitimately sees its own address as the outer source) or, in fixture/
 /// smoke mode with no controller, by the loader seeding `--node-ip` alone.
-/// Same `HashMap<u32, u8>` shape and bare-existence-marker value as
-/// `POD_TARGETS` above; sized an order of magnitude smaller (cluster node
-/// count, not Service count). v1 constraint: one IP per node (the single
-/// address `node_ips`/`front_ips` in `controller/src/watch.rs` records) --
-/// a multi-homed or NAT'd node whose actual Geneve outer-source address
-/// differs from that recorded address is dropped by this admission check.
-/// Symmetric single-IP-per-node addressing is the deployment beep v1
-/// targets; admitting every address a Node reports is tracked separately.
+/// Same bare-existence-marker value as `POD_TARGETS` above; sized an order
+/// of magnitude smaller (cluster node count, not Service count). Keyed on
+/// `[u8; 16]`, not a bare `u32`: `remote_ipv4` is embedded via
+/// `ipv4_mapped_v6` before lookup/insert so this map shares `FLOW_TABLE`'s
+/// dual-stack union-key shape -- a v6 peer will key on `remote_ipv6` the same
+/// way once a later family branch lands, with no further map-shape
+/// change. v1 constraint: one IP per node (the single address `node_ips`/
+/// `front_ips` in `controller/src/watch.rs` records) -- a multi-homed or
+/// NAT'd node whose actual Geneve outer-source address differs from that
+/// recorded address is dropped by this admission check. Symmetric
+/// single-IP-per-node addressing is the deployment beep v1 targets; admitting
+/// every address a Node reports is tracked separately.
 #[map]
-static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
+static NODE_ALLOW: HashMap<[u8; 16], u8> = HashMap::with_max_entries(16, 0);
 
 /// Ingress-side forward-flow ADMISSION tier, written at stamp time (step
 /// 2): every new flow mints here, and ONLY here (`try_uplink_ingress`, on a
@@ -271,11 +275,17 @@ pub union FlowValue {
 /// client's real port here before the packet leaves this node -- the
 /// ingress node's own return-decap step has no knowledge of any backend-
 /// local remap and must see the true client port in the inner dst.
+///
+/// `ingress_node_ip`/`vip_ip` are `[u8; 16]`, not bare `u32`: both are
+/// packed via `ipv4_mapped_v6` at write time so this value shares
+/// `FLOW_TABLE`'s dual-stack key/value shape, unmapped back with
+/// `unmap_ipv4` at each read site since today's inner-packet parsing (and
+/// therefore every value ever written here) is still IPv4-only end to end.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 pub struct RevFlowValue {
-    pub ingress_node_ip: u32,
-    pub vip_ip: u32,
+    pub ingress_node_ip: [u8; 16],
+    pub vip_ip: [u8; 16],
     pub vip_port: u16,
     pub original_client_port: u16,
 }
@@ -513,8 +523,9 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(
 
     let dst_ip: u32 = load_direct(ctx, ip_dst)?;
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
+    let vip_ip_v6 = ipv4_mapped_v6(dst_ip);
     let key = LbFrontKey {
-        vip_ip: dst_ip,
+        vip_ip: vip_ip_v6,
         vip_port: dst_port,
         proto,
         _pad: 0,
@@ -524,7 +535,6 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(
     let src_ip: u32 = load_direct(ctx, ip_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
     let client_ip_v6 = ipv4_mapped_v6(src_ip);
-    let vip_ip_v6 = ipv4_mapped_v6(dst_ip);
     // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
     // comment) uses this shape.
     let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, vip_ip_v6, dst_port, proto);
@@ -564,7 +574,12 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
     let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    tkey.__bindgen_anon_1.remote_ipv4 = backend.backend_node_ip;
+    // `?` rather than a fallback: LB_FRONT_MAP is only ever populated with
+    // v4-mapped-v6 addresses until real v6 inner-packet parsing + a
+    // remote_ipv6 tunnel-key branch lands, so this can't fail today --
+    // failing this packet's decap outright instead of silently zeroing the
+    // tunnel remote keeps that invariant enforced rather than assumed.
+    tkey.__bindgen_anon_1.remote_ipv4 = unmap_ipv4(&backend.backend_node_ip)?;
     tkey.tunnel_id = VNI_FWD;
     tkey.tunnel_ttl = 64;
     if unsafe {
@@ -583,7 +598,7 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
     opt[2] = GENEVE_OPT_TYPE_POD_ID;
     opt[3] = 1; // opt_data length in 4-byte words.
-    opt[4..8].copy_from_slice(&backend.pod_ip.to_ne_bytes());
+    opt[4..8].copy_from_slice(&unmap_ipv4(&backend.pod_ip)?.to_ne_bytes());
     if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
         != 0
     {
@@ -683,7 +698,8 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
     // than the pre-existing POD_TARGETS check below alone required; accepted
     // as the cost of not reintroducing a restart-wipe risk on this map.
-    let is_known_peer = unsafe { NODE_ALLOW.get(tkey.__bindgen_anon_1.remote_ipv4) }.is_some();
+    let is_known_peer =
+        unsafe { NODE_ALLOW.get(ipv4_mapped_v6(tkey.__bindgen_anon_1.remote_ipv4)) }.is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -732,7 +748,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // 443->8443 on the same pod (`TARGET_PORTS`' doc comment).
     let target_port = *unsafe {
         TARGET_PORTS.get(LbFrontKey {
-            vip_ip,
+            vip_ip: ipv4_mapped_v6(vip_ip),
             vip_port,
             proto,
             _pad: 0,
@@ -788,13 +804,18 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
             // flow through this same front whose real source port happens to equal
             // another flow's already-committed synthetic port would otherwise be
             // misread as that flow's own state and clobber its reverse-tagged entry.
+            // `RevFlowValue::vip_ip` is stored as `[u8; 16]`, but this probe
+            // still compares the raw `u32` wire form against `new_front`
+            // below -- unmap once here rather than widen every comparison in
+            // this hot loop, since every value ever written to `vip_ip` is
+            // v4-mapped-v6 until real v6 inner-packet parsing lands
+            // (`resolve_backend_src_port`'s doc comment). `unmap_ipv4`
+            // returning `None` (unreachable today) reads as "no occupant"
+            // here rather than propagating a drop -- `existing_occupant`/
+            // `occupant` below only ever gate a remap decision, not packet
+            // delivery.
             let existing_occupant = flow_table_get_reverse(natural_rev_key)
-                .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
-            // Raw scalars, not an `ipv4_mapped_v6`-widened pair: `RevFlowValue`'s
-            // `vip_ip` and this packet's `vip_ip` are already bare `u32`s, and the
-            // mapping is injective, so comparing the wire values directly is exactly
-            // equivalent to comparing their v6-mapped forms and turns a 20-byte
-            // compare into an 8-byte one on every probe iteration.
+                .and_then(|v| Some(((unmap_ipv4(&v.vip_ip)?, v.vip_port), v.original_client_port)));
             let new_front = (vip_ip, vip_port);
             // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
             // the source of truth for which candidate ports are actually free, not
@@ -823,8 +844,9 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
             );
             let is_reverse_key_taken = |candidate_port: u16| {
                 candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
-                let occupant = flow_table_get_reverse(candidate_key)
-                    .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
+                let occupant = flow_table_get_reverse(candidate_key).and_then(|v| {
+                    Some(((unmap_ipv4(&v.vip_ip)?, v.vip_port), v.original_client_port))
+                });
                 occupant_conflicts(occupant, new_front, client_port)
             };
             match resolve_backend_src_port(
@@ -865,8 +887,8 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     };
 
     let rev_value = RevFlowValue {
-        ingress_node_ip: unsafe { tkey.__bindgen_anon_1.remote_ipv4 },
-        vip_ip,
+        ingress_node_ip: ipv4_mapped_v6(unsafe { tkey.__bindgen_anon_1.remote_ipv4 }),
+        vip_ip: ipv4_mapped_v6(vip_ip),
         vip_port,
         original_client_port: client_port,
     };
@@ -925,7 +947,8 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32
     // Same peer-node attestation as `try_geneve_decap_forward` above -- this
     // branch used to take `tkey` unused, relying entirely on the FLOW_TABLE
     // reverse-key match with no outer-source check of its own.
-    let is_known_peer = unsafe { NODE_ALLOW.get(tkey.__bindgen_anon_1.remote_ipv4) }.is_some();
+    let is_known_peer =
+        unsafe { NODE_ALLOW.get(ipv4_mapped_v6(tkey.__bindgen_anon_1.remote_ipv4)) }.is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1183,7 +1206,10 @@ fn try_uplink_egress_return_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Op
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
     let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    tkey.__bindgen_anon_1.remote_ipv4 = rev.ingress_node_ip;
+    // `?`, not a fallback: see try_geneve_decap_forward's matching comment --
+    // this can't fail today (every RevFlowValue is written from a v4-mapped
+    // address), and a later real family branch replaces this.
+    tkey.__bindgen_anon_1.remote_ipv4 = unmap_ipv4(&rev.ingress_node_ip)?;
     tkey.tunnel_id = VNI_RET;
     tkey.tunnel_ttl = 64;
     if unsafe {
@@ -1202,7 +1228,7 @@ fn try_uplink_egress_return_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Op
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
     opt[2] = GENEVE_OPT_TYPE_VIP_ECHO;
     opt[3] = 2; // opt_data length in 4-byte words (6 bytes + 2 padding).
-    opt[4..8].copy_from_slice(&rev.vip_ip.to_ne_bytes());
+    opt[4..8].copy_from_slice(&unmap_ipv4(&rev.vip_ip)?.to_ne_bytes());
     opt[8..10].copy_from_slice(&rev.vip_port.to_ne_bytes());
     if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
         != 0

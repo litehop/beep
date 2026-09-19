@@ -113,13 +113,15 @@ pub fn local_pod_ips(fixtures: &[Fixture], node_ip: Ipv4Addr) -> Vec<u32> {
         .collect()
 }
 
-/// Pod IPs in `existing` (POD_TARGETS's current keys, carried over from a
-/// prior loader run against the same pinned map) that `live` (this run's
-/// local serving-set, i.e. `local_pod_ips`'s output) no longer claims. Split
-/// out of `populate_fixtures` as a pure function so the prune decision is
-/// testable without a live eBPF map.
-pub fn stale_pod_targets(existing: &[u32], live: &[u32]) -> Vec<u32> {
-    let live: std::collections::HashSet<u32> = live.iter().copied().collect();
+/// Keys in `existing` (a map's current contents, carried over from a prior
+/// loader/controller run against the same pinned map) that `live` (this
+/// run's desired set) no longer claims. Split out of `populate_fixtures` as
+/// a pure function so the prune decision is testable without a live eBPF
+/// map. Generic over the key type (`u32` for `POD_TARGETS`, `[u8; 16]` for
+/// `NODE_ALLOW`) rather than duplicated per map: both are the identical
+/// prune-then-insert set diff.
+pub fn stale_pod_targets<T: Copy + Eq + std::hash::Hash>(existing: &[T], live: &[T]) -> Vec<T> {
+    let live: std::collections::HashSet<T> = live.iter().copied().collect();
     existing
         .iter()
         .copied()

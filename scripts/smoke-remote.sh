@@ -463,16 +463,19 @@ echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry
 # with a different --node-ip would ALSO re-prune POD_TARGETS (scoped to
 # node_ip too), confounding which gate caused a subsequent drop.
 #
-# NODE_ALLOW's key convention is host-native (`u32::from(Ipv4Addr)`, not
-# `wire_ip` -- `beep_common::DesiredEntries::node_allow`'s doc comment),
-# which on this little-endian target serializes to an IP's own octets in
-# REVERSE (LSB-first) order -- e.g. 203.0.113.1 -> raw key bytes
+# NODE_ALLOW's key is `[u8; 16]` (widened for dual-stack), holding the
+# host-native (`u32::from(Ipv4Addr)`, not `wire_ip` --
+# `beep_common::DesiredEntries::node_allow`'s doc comment) value wrapped in
+# `ipv4_mapped_v6`: a `::ffff:0:0/96`-prefixed IPv6 address (10 zero bytes,
+# then `0xff 0xff`) with the host-native u32 copied verbatim into the last 4
+# bytes. On this little-endian target that u32 serializes to an IP's own
+# octets in REVERSE (LSB-first) order -- e.g. 203.0.113.1 -> trailing bytes
 # [1, 113, 0, 203]. bpftool's `key` argument takes exactly that raw
-# in-memory byte sequence.
+# in-memory 16-byte sequence.
 node_allow_key_bytes() {
   local IFS=.
   local octets=($1)
-  echo "${octets[3]} ${octets[2]} ${octets[1]} ${octets[0]}"
+  echo "0 0 0 0 0 0 0 0 0 0 255 255 ${octets[3]} ${octets[2]} ${octets[1]} ${octets[0]}"
 }
 VIP_NODE_ALLOW_KEY=$(node_allow_key_bytes "$VIP_IP")
 bpftool map delete pinned "$PIN_DIR/NODE_ALLOW" key $VIP_NODE_ALLOW_KEY || {
