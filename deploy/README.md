@@ -74,6 +74,17 @@ the first time, then confirm with "Verify your deployment" below.
    of controller startup, not a manual step this manifest or its operator
    needs to provide.
 
+5. **Only one uplink, `eth0`, is configured by default — add a second
+   `--uplink-iface` per additional client-facing interface a node admits
+   traffic on.** `daemonset.yaml` ships `--uplink-iface=eth0`
+   (`deploy/daemonset.yaml:119`); the flag is repeatable and required —
+   the loader refuses to start with none — so a node that also takes
+   client traffic over e.g. a WireGuard mesh interface needs a second
+   `--uplink-iface=wg0` entry alongside it, added via a local kustomize
+   patch. A flow's reply always egresses the same uplink it arrived on
+   (symmetric return) — there's no separate egress interface to configure.
+   Design rationale: `docs/decisions/servicelb-multi-symmetric-uplink.md`.
+
 ## Files
 
 - `daemonset.yaml` — one controller pod per node (`hostNetwork: true`),
