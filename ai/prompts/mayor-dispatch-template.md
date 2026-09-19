@@ -447,18 +447,21 @@ gate holds even if an MCP server connection is down.
 
 ### Known blocker — `beep-node-a`/`beep-node-b` cross-node rig
 
-The original blocker (`bpf_redirect` from `wg0` into `geneve0` dropped
-in-kernel) is fixed by PR #9 (bead `mayor-f3ru5`). `scripts/smoke-wg-2node.sh`
-now reaches a different, documented, non-flaky failure: the rig co-locates
-the "client" with the backend node, so the DNAT'd forward packet gets
-martian-source-dropped at `ip_rcv_finish_core` — see bead **beep-n24** for
-the full evidence trail and candidate fix directions. Every step through
-decap+DNAT+`REV_FLOW` population is a genuine, asserted PASS; the script's
-own output ends in a documented "ROUND-TRIP: FAIL (known blocker)" rather
-than a false green. Do not treat a `beep-node-a`/`beep-node-b` dispatch as
-"broken" just because the final round trip fails — only escalate if a step
-BEFORE that regresses, or if the failure signature differs from `beep-n24`'s
-martian-source-drop.
+`beep-n24`'s co-located martian-source-drop is CLOSED, fixed by PR #93
+(added the `beep-client` VM so the client is never co-located with the
+backend). The current real constraint: `beep_common::peer_node_admission`
+makes a bare loader (no controller, no Node-watch) admit a Geneve decap
+ONLY when its outer source is already in `NODE_ALLOW`, which
+`populate_fixtures` seeds with exactly one entry -- the node's OWN
+`--node-ip` -- and no bare-loader CLI flag widens it to a genuinely
+different peer. Left unaddressed, every `beep-node-a`/`beep-node-b` round
+trip self-loops on one node instead of a real cross-node hop. Fix: seed
+each node's `NODE_ALLOW` with the OTHER's key via a direct `bpftool map
+update` on its pinned map (a test-side fixture mimicking the controller's
+Node-watch, no loader/dataplane change) -- `scripts/smoke-wg-2node-remote.sh`'s
+`dump-node-allow-key`/`seed-node-allow` subcommands do this, and
+`scripts/smoke-wg-2node-dualstack.sh` (bead `beep-4ni`) is the reference for
+a genuine, passing dual-stack cross-node round trip built on it.
 
 ### Verification protocol
 
