@@ -19,9 +19,14 @@
 #      loads the 3 tc-bpf classifiers, and asserts the verifier ACCEPTED
 #      them (a rejection surfaces as a loader load error, checked
 #      explicitly, plus an independent `bpftool prog list` confirmation);
-#   4. drives two client -> VIP -> backend TCP round trips through the real
-#      Geneve encap/decap dataplane -- two Service ports on the SAME backend
-#      Pod -- and asserts each lands on its own distinct target port;
+#   4. drives three client -> VIP -> backend TCP round trips through the
+#      real Geneve encap/decap dataplane: two Service ports on the SAME
+#      backend Pod via the first configured uplink (asserting each lands on
+#      its own distinct target port), plus a third through a SECOND
+#      configured uplink -- proving multi-symmetric-uplink admission and
+#      per-uplink return (docs/decisions/servicelb-multi-symmetric-uplink.md);
+#      single-uplink behavior is the N=1 subset the first two round trips
+#      already exercise;
 #   5. removes this fixture's own peer-node entry from NODE_ALLOW and
 #      asserts a further round trip through the same VIP is DROPPED --
 #      proves geneve_ingress's outer-tunnel-source attestation gate actually
