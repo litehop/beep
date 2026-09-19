@@ -409,4 +409,28 @@ mod tests {
             "pod-cidr/node-ip/kubeconfig must stay required when --node-prep is absent",
         );
     }
+
+    // uplink_ifaces carries the same required_unless_present = "node_prep" as
+    // pod_cidr/node_ip/kubeconfig above, but no test exercised it directly:
+    // the two cases above both omit every required arg at once, so a
+    // regression that dropped required_unless_present from uplink_ifaces
+    // alone (making it either unconditionally required, breaking node-prep,
+    // or unconditionally optional, letting the real controller start with no
+    // uplinks and admit no client traffic) would pass both tests above.
+    #[test]
+    fn uplink_iface_required_unless_node_prep() {
+        Args::try_parse_from([
+            "beep-controller",
+            "--pod-cidr",
+            "10.244.0.0/16",
+            "--node-ip",
+            "10.0.0.1",
+            "--kubeconfig",
+            "/tmp/kubeconfig",
+        ])
+        .expect_err("--uplink-iface must stay required when --node-prep is absent");
+
+        Args::try_parse_from(["beep-controller", "--node-prep"])
+            .expect("--node-prep must not require --uplink-iface either");
+    }
 }
