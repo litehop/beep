@@ -17,7 +17,7 @@ use anyhow::Context;
 use aya::programs::TcAttachType;
 use beep::{
     attach_and_pin, bump_memlock_rlimit, disable_rp_filter, ensure_geneve_iface, load_ebpf,
-    populate_config,
+    populate_config, populate_uplink_config,
 };
 use beep_controller::{
     apply::PinnedMaps,
@@ -51,14 +51,16 @@ const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
     about = "beep ServiceLB DaemonSet: watch Kubernetes, program the dataplane"
 )]
 struct Args {
-    /// The CLIENT-FACING uplink interface (e.g. eth0) -- NOT the Geneve
-    /// tunnel device. `uplink_egress_return` only fires on the device it's
-    /// attached to,
-    /// and a backend node routes the client reply out its client-facing
-    /// NIC, not the tunnel -- attaching this to the tunnel device would leak
-    /// a raw backend-sourced reply out the real uplink unencapsulated.
-    #[arg(long, default_value = "eth0")]
-    uplink_iface: String,
+    /// The CLIENT-FACING uplink interface(s) (e.g. eth0) -- NOT the Geneve
+    /// tunnel device. Repeatable: a node admits client traffic on any
+    /// configured uplink and symmetrically returns on the same one
+    /// (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
+    /// `uplink_egress_return` only fires on the device it's attached to, and
+    /// a backend node routes the client reply out its client-facing NIC, not
+    /// the tunnel -- attaching this to the tunnel device would leak a raw
+    /// backend-sourced reply out the real uplink unencapsulated.
+    #[arg(long = "uplink-iface", required_unless_present = "node_prep")]
+    uplink_ifaces: Vec<String>,
 
     /// Geneve tunnel interface (hook: geneve ingress, both directions).
     #[arg(long, default_value = "geneve0")]
@@ -293,31 +295,34 @@ async fn main() -> anyhow::Result<()> {
     // and a clear error instead of a silent skip if it somehow didn't run.
     ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
 
-    populate_config(&mut ebpf, &args.geneve_iface, &args.uplink_iface)
-        .context("populating CONFIG map")?;
+    populate_config(&mut ebpf, &args.geneve_iface).context("populating CONFIG map")?;
+    populate_uplink_config(&mut ebpf, &args.uplink_ifaces)
+        .context("populating UPLINK_CONFIG map")?;
 
-    let hooks: [(&str, &str, TcAttachType); 3] = [
+    let uplink_iface_refs: Vec<&str> = args.uplink_ifaces.iter().map(String::as_str).collect();
+    let geneve_iface_refs = [args.geneve_iface.as_str()];
+    let hooks: [(&str, &[&str], TcAttachType); 3] = [
         (
             "uplink_ingress",
-            args.uplink_iface.as_str(),
+            uplink_iface_refs.as_slice(),
             TcAttachType::Ingress,
         ),
         (
             "geneve_ingress",
-            args.geneve_iface.as_str(),
+            geneve_iface_refs.as_slice(),
             TcAttachType::Ingress,
         ),
         (
             "uplink_egress_return",
-            args.uplink_iface.as_str(),
+            uplink_iface_refs.as_slice(),
             TcAttachType::Egress,
         ),
     ];
-    for (name, iface, attach_type) in hooks {
-        attach_and_pin(&mut ebpf, name, iface, attach_type, &args.pin_dir)
-            .with_context(|| format!("attaching {name} on {iface}"))?;
+    for (name, ifaces, attach_type) in hooks {
+        attach_and_pin(&mut ebpf, name, ifaces, attach_type, &args.pin_dir)
+            .with_context(|| format!("attaching {name} on {ifaces:?}"))?;
         eprintln!(
-            "attached {name} on {iface} ({attach_type:?}), pinned under {}",
+            "attached {name} on {ifaces:?} ({attach_type:?}), pinned under {}",
             args.pin_dir.display()
         );
     }

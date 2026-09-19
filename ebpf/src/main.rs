@@ -54,8 +54,9 @@ use beep_common::{
     fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts,
     peer_node_admission, resolve_backend_src_port, return_authorization, BackendPortDecision,
     BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
-    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, FwdPendingPin, LbFrontBackend,
-    LbFrontKey, PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, REDIRECTED_RETURN_MARK,
+    EgressReturnOutcome, FlowDirection, FlowKey, ForwardAdmission, ForwardFlowValue, FwdPendingPin,
+    LbFrontBackend, LbFrontKey, PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, UplinkConfig,
+    REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -206,11 +207,14 @@ static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 /// (`src/main.rs`'s `--fwd-pending-max-entries`), so sizing is a DaemonSet
 /// config knob, not a value baked into this object.
 ///
-/// Value type is `LbFrontBackend`, the full backend identity
-/// (`backend_node_ip` + `pod_ip`), not just the node IP: aie31.21 pins this
-/// as the per-flow affinity target, so this bead's admission logic already
-/// carries the shape aie31.21 needs -- no map-shape change once
-/// affinity-follow lands. This bead only existence-checks it.
+/// Value type is `ForwardFlowValue` (the full backend identity --
+/// `backend_node_ip` + `pod_ip` -- plus the ifindex this flow was admitted
+/// on): aie31.21 pins the backend identity as the per-flow affinity target,
+/// so this bead's admission logic already carries the shape aie31.21 needs
+/// -- no map-shape change once affinity-follow lands. The admitting ifindex
+/// rides along so `try_geneve_decap_return`'s multi-uplink symmetric-return
+/// redirect can send the reply back out the SAME uplink the client's packet
+/// arrived on (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
 ///
 /// Key type: `beep_common::TcpFlowKey`, a flat 37-byte array, not a
 /// `#[repr(C)]` struct -- `BPF_MAP_TYPE_*_HASH` compares/hashes a key's raw
@@ -234,7 +238,8 @@ static NODE_ALLOW: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 /// and evicting (the doc's core requirement over a naive `HashMap`), just
 /// with one shared table instead of per-CPU shards.
 #[map]
-static FWD_PENDING: LruHashMap<TcpFlowKey, LbFrontBackend> = LruHashMap::with_max_entries(2048, 0);
+static FWD_PENDING: LruHashMap<TcpFlowKey, ForwardFlowValue> =
+    LruHashMap::with_max_entries(2048, 0);
 
 /// Union of the three roles `FLOW_TABLE` stores, discriminated by the
 /// `FlowDirection` tag in its key. `forward` is the promoted,
@@ -248,7 +253,7 @@ static FWD_PENDING: LruHashMap<TcpFlowKey, LbFrontBackend> = LruHashMap::with_ma
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union FlowValue {
-    pub forward: LbFrontBackend,
+    pub forward: ForwardFlowValue,
     pub reverse: RevFlowValue,
     pub port_memo: PortMemoValue,
 }
@@ -350,7 +355,7 @@ static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries
 /// several call sites, no downside to forcing inlining, and it sidesteps
 /// this toolchain's non-inlined-BPF-to-BPF-call miscompile risk outright.
 #[inline(always)]
-fn flow_table_get_forward(key: FlowKey) -> Option<LbFrontBackend> {
+fn flow_table_get_forward(key: FlowKey) -> Option<ForwardFlowValue> {
     unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.forward })
 }
 
@@ -380,6 +385,18 @@ static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 /// regardless of what the uplink is.
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
+
+/// Per-uplink admission + L2 header length, keyed by ifindex
+/// (`beep_common::UplinkConfig`) -- `try_uplink_ingress`'s hit-is-admission
+/// gate for multi-uplink client traffic
+/// (`docs/decisions/servicelb-multi-symmetric-uplink.md`). One entry per
+/// configured `--uplink-iface`, written once by the loader at load time.
+/// Bounded to a realistic per-node uplink count, not a raw-ifindex-sized
+/// array -- ifindex values the host assigns aren't guaranteed contiguous.
+/// Map name kept at 13 bytes: BPF_OBJ_NAME_LEN is 16 incl. NUL, and a
+/// 17-char map name has been confirmed to truncate silently in `bpftool`.
+#[map]
+static UPLINK_CONFIG: HashMap<u32, UplinkConfig> = HashMap::with_max_entries(8, 0);
 
 /// `TcContext::load`'s underlying helper (`bpf_skb_load_bytes`) is a
 /// per-field helper call; `try_uplink_ingress`/`try_uplink_egress_return`
@@ -426,12 +443,23 @@ pub fn uplink_ingress(ctx: TcContext) -> i32 {
 }
 
 fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
-    // Runtime, not the compile-time `ETH_HLEN`-based consts below `geneve_ingress`
-    // uses: the uplink can be a real NIC/veth (14-byte Ethernet header) or an
-    // L3-only overlay like WireGuard (no L2 header at all), decided once by
-    // the loader (`Config` doc comment) since this no_std program has no
+    // A plain `__sk_buff` context-struct field read, not packet-data access
+    // -- not subject to `load_direct`'s compile-time-offset constraint
+    // below, and confirmed verifier-clean against a live kernel. At this
+    // hook the packet's ingress ifindex IS the physical uplink it just
+    // arrived on (this classifier is attached directly to that device's
+    // ingress, before any redirect).
+    let ingress_ifindex = unsafe { (*ctx.skb.skb).ingress_ifindex };
+    // A per-uplink map hit is simultaneously admission (this ifindex is a
+    // configured `--uplink-iface`) and the L2 header length to parse with --
+    // a miss means an unconfigured interface, passed through untouched like
+    // any other non-beep traffic
+    // (`docs/decisions/servicelb-multi-symmetric-uplink.md`). The uplink can
+    // be a real NIC/veth (14-byte Ethernet header) or an L3-only overlay
+    // like WireGuard (no L2 header at all) -- resolved once by the loader
+    // (`UplinkConfig`'s doc comment) since this no_std program has no
     // syscall of its own to tell the two apart.
-    let l2_hlen = CONFIG.get(0)?.uplink_l2_hlen as usize;
+    let l2_hlen = unsafe { UPLINK_CONFIG.get(ingress_ifindex) }?.l2_hlen as usize;
     // Dispatch on a const generic rather than threading `l2_hlen` through as
     // a runtime header-relative offset: this kernel's verifier never
     // re-establishes a packet pointer's safe range after a bounds check once
@@ -443,14 +471,17 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // `try_uplink_ingress_headers` needs to fold to a literal at compile
     // time, which only a const generic guarantees.
     match l2_hlen {
-        0 => try_uplink_ingress_headers::<0>(ctx),
-        ETH_HLEN => try_uplink_ingress_headers::<ETH_HLEN>(ctx),
+        0 => try_uplink_ingress_headers::<0>(ctx, ingress_ifindex),
+        ETH_HLEN => try_uplink_ingress_headers::<ETH_HLEN>(ctx, ingress_ifindex),
         _ => Some(TC_ACT_OK),
     }
 }
 
 #[inline(always)]
-fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i32> {
+fn try_uplink_ingress_headers<const L2_HLEN: usize>(
+    ctx: &TcContext,
+    ingress_ifindex: u32,
+) -> Option<i32> {
     // No Ethernet header at all on an L3-only uplink -- there's no EtherType
     // field to check; the IP-version nibble below is this path's only gate.
     if L2_HLEN == ETH_HLEN && load_direct::<u16>(ctx, 12)? != ETH_P_IPV4 {
@@ -518,7 +549,11 @@ fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<i
         // entry's LRU recency, so once minted the backend choice never
         // needs rewriting -- a write takes the bucket's raw_spinlock and can
         // run the LRU shrink path, unlike a read.
-        match fwd_pending_affinity_pin(unsafe { FWD_PENDING.get(flow_key) }.copied(), backend) {
+        let admitted = ForwardFlowValue {
+            backend,
+            ingress_ifindex,
+        };
+        match fwd_pending_affinity_pin(unsafe { FWD_PENDING.get(flow_key) }.copied(), admitted) {
             FwdPendingPin::Insert(candidate) => {
                 FWD_PENDING.insert(flow_key, candidate, 0).ok()?;
             }
@@ -942,26 +977,38 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32
     // -- proof of bidirectionality an off-path spoofer cannot produce -- so
     // promote it into FLOW_TABLE and drop the PENDING copy. A miss in both
     // is stale or spoofed, same drop the pre-split FWD_FLOW.get()? performed.
-    let in_main = flow_table_get_forward(fwd_key).is_some();
-    if !in_main {
+    //
+    // `forward_value` is also this multi-uplink redirect's only source of
+    // truth for which physical uplink to send the reply back out: unlike
+    // the old single-uplink `CONFIG.get(0).uplink_ifindex`, there is no
+    // longer one uplink to fall back on, so the ifindex the flow was
+    // admitted on (stamped by `try_uplink_ingress_headers` at mint time)
+    // MUST already be sitting in this same lookup
+    // (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
+    let existing_forward = flow_table_get_forward(fwd_key);
+    let forward_value = if let Some(value) = existing_forward {
+        Some(value)
+    } else {
         let pending_value = unsafe { FWD_PENDING.get(key) }.copied();
         match return_authorization(false, pending_value.is_some()) {
             ReturnAuthorization::Promote => {
+                let value = pending_value?;
                 FLOW_TABLE
-                    .insert(
-                        fwd_key,
-                        FlowValue {
-                            forward: pending_value?,
-                        },
-                        0,
-                    )
+                    .insert(fwd_key, FlowValue { forward: value }, 0)
                     .ok()?;
                 let _ = FWD_PENDING.remove(key);
+                Some(value)
             }
             ReturnAuthorization::Drop => return None,
-            ReturnAuthorization::Established => {}
+            // Unreachable in practice: `return_authorization`'s first
+            // argument is hardcoded `false` above, and it only ever answers
+            // `Established` when its `in_main` argument is `true`. Falling
+            // through to the `?` below (drop) rather than panicking keeps
+            // this fail-closed if that invariant ever changes.
+            ReturnAuthorization::Established => None,
         }
-    }
+    };
+    let ingress_ifindex = forward_value?.ingress_ifindex;
 
     rewrite_ip_port(
         ctx,
@@ -996,8 +1043,12 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32
     // POD_TARGETS admission into misreading this packet as the pod's raw
     // reply and dropping it.
     ctx.set_mark(REDIRECTED_RETURN_MARK);
-    let uplink_ifindex = CONFIG.get(0)?.uplink_ifindex;
-    if unsafe { bpf_redirect(uplink_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
+    // `ingress_ifindex` here is the FLOW_TABLE-stored value resolved above,
+    // NOT `ctx.skb.skb->ingress_ifindex` read fresh at this call site: this
+    // hook runs on `geneve0`'s ingress (the packet just arrived there via
+    // its own tunnel decap), so a fresh read would resolve to `geneve0`
+    // itself, not the client's uplink.
+    if unsafe { bpf_redirect(ingress_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
         return Some(TC_ACT_SHOT);
     }
     Some(TC_ACT_REDIRECT)
@@ -1028,10 +1079,17 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
         ctx.set_mark(0);
         return Some(TC_ACT_OK);
     }
-    // See `try_uplink_ingress`'s matching comment: the uplink's L2 header
-    // length is resolved once by the loader, not assumed to be Ethernet's 14
-    // bytes.
-    let l2_hlen = CONFIG.get(0)?.uplink_l2_hlen as usize;
+    // This classifier is attached to EVERY configured uplink's egress, same
+    // as `uplink_ingress` is to their ingress -- but at egress, a locally
+    // routed packet's OWN `ingress_ifindex` is unset (it was never received
+    // on any device), so unlike `try_uplink_ingress`, the per-uplink lookup
+    // here keys on `ifindex`: at a TC egress attachment this is already the
+    // device this classifier instance is transmitting on, i.e. exactly
+    // which configured uplink this invocation is running for. See
+    // `try_uplink_ingress`'s matching comment for why the L2 header length
+    // is resolved once by the loader, not assumed to be Ethernet's 14 bytes.
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let l2_hlen = unsafe { UPLINK_CONFIG.get(ifindex) }?.l2_hlen as usize;
     // See `try_uplink_ingress`'s matching comment: dispatches on a const
     // generic so every `load_direct` offset below is a compile-time literal.
     match l2_hlen {
@@ -1225,7 +1283,7 @@ fn rewrite_ip_port(
 ///
 /// `l4_off` is the caller's own L4-header base offset, not the module's
 /// `L4_OFF` const: `try_uplink_egress_return`'s call site resolves it at
-/// runtime from `Config::uplink_l2_hlen` (an L3-only WireGuard uplink has no
+/// runtime from `UplinkConfig::l2_hlen` (an L3-only WireGuard uplink has no
 /// 14-byte Ethernet header to add), while `try_geneve_decap_forward`'s
 /// (always on `geneve0`, always Ethernet-framed) passes the compile-time
 /// `L4_OFF`.

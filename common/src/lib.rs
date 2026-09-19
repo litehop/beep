@@ -223,18 +223,16 @@ pub struct LbFrontBackend {
 }
 
 /// Host-specific runtime config the loader fills in after attach (an
-/// ifindex isn't known until then). Single entry (`CONFIG` map).
+/// ifindex isn't known until then). Single entry (`CONFIG` map). Per-uplink
+/// data (ifindex, L2 header length) lives in `UplinkConfig`/`UPLINK_CONFIG`
+/// instead, since a node can admit client traffic on more than one uplink
+/// at once (`docs/decisions/servicelb-multi-symmetric-uplink.md`) --
+/// `geneve0` stays the single Geneve relay device this dataplane targets
+/// regardless of how many uplinks are configured.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Config {
     pub geneve_ifindex: u32,
-    pub uplink_ifindex: u32,
-    /// `uplink_l2_header_len`'s result for the uplink iface -- 14 for a
-    /// real Ethernet-framed NIC/veth, 0 for an L3-only uplink (WireGuard or
-    /// any other tun-style device with no L2 header). `geneve0` is
-    /// unaffected: it's always a real (Ethernet-framed) netdev regardless
-    /// of what the uplink is.
-    pub uplink_l2_hlen: u32,
 }
 
 /// `UPLINK_CONFIG`'s value, keyed by ifindex: a hit is simultaneously
@@ -313,18 +311,20 @@ pub fn forward_admission(in_main: bool) -> ForwardAdmission {
 /// answered its first packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FwdPendingPin {
-    /// No PENDING entry yet -- pin `candidate`, the backend just resolved
-    /// for this (first) packet of the flow.
-    Insert(LbFrontBackend),
+    /// No PENDING entry yet -- pin `candidate`, the backend (plus the
+    /// admitting uplink's ifindex) just resolved for this (first) packet of
+    /// the flow.
+    Insert(ForwardFlowValue),
     /// Already pinned by an earlier packet -- leave it untouched.
     Keep,
 }
 
 /// `existing`: result of a `FWD_PENDING.get(flow_key)` lookup. `candidate`:
-/// the backend `LB_FRONT_MAP` resolved for the current packet.
+/// the backend `LB_FRONT_MAP` resolved for the current packet, plus the
+/// ifindex it was admitted on.
 pub fn fwd_pending_affinity_pin(
-    existing: Option<LbFrontBackend>,
-    candidate: LbFrontBackend,
+    existing: Option<ForwardFlowValue>,
+    candidate: ForwardFlowValue,
 ) -> FwdPendingPin {
     match existing {
         Some(_) => FwdPendingPin::Keep,
@@ -1338,11 +1338,14 @@ mod tests {
     #[test]
     fn fwd_pending_pin_absent_uses_and_inserts_the_candidate() {
         // A flow's first packet has no existing pin, so the freshly-resolved
-        // backend becomes the one this flow sticks to for the rest of its
-        // pre-promotion life.
-        let candidate = LbFrontBackend {
-            backend_node_ip: 1,
-            pod_ip: 100,
+        // backend (and the uplink it was admitted on) becomes the one this
+        // flow sticks to for the rest of its pre-promotion life.
+        let candidate = ForwardFlowValue {
+            backend: LbFrontBackend {
+                backend_node_ip: 1,
+                pod_ip: 100,
+            },
+            ingress_ifindex: 7,
         };
         assert_eq!(
             fwd_pending_affinity_pin(None, candidate),
@@ -1354,15 +1357,22 @@ mod tests {
     fn fwd_pending_pin_present_keeps_the_pinned_backend_not_the_candidate() {
         // A regression that overwrites an existing pin with the newly
         // re-resolved candidate would let an established connection's
-        // mid-stream packets land on a different backend than the one that
-        // answered its first packet, silently breaking session affinity.
-        let pinned = LbFrontBackend {
-            backend_node_ip: 1,
-            pod_ip: 100,
+        // mid-stream packets land on a different backend -- or a different
+        // return uplink -- than the one that answered its first packet,
+        // silently breaking session affinity.
+        let pinned = ForwardFlowValue {
+            backend: LbFrontBackend {
+                backend_node_ip: 1,
+                pod_ip: 100,
+            },
+            ingress_ifindex: 7,
         };
-        let candidate = LbFrontBackend {
-            backend_node_ip: 2,
-            pod_ip: 200,
+        let candidate = ForwardFlowValue {
+            backend: LbFrontBackend {
+                backend_node_ip: 2,
+                pod_ip: 200,
+            },
+            ingress_ifindex: 9,
         };
         assert_eq!(
             fwd_pending_affinity_pin(Some(pinned), candidate),

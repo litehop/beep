@@ -31,7 +31,7 @@ use aya::{
 };
 use beep::{
     attach_and_pin, bump_memlock_rlimit, load_ebpf, local_pod_ips, parse_fixture, populate_config,
-    stale_pod_targets, Fixture, MAP_NAMES,
+    populate_uplink_config, stale_pod_targets, Fixture, MAP_NAMES,
 };
 use beep_common::{wire_ip, wire_port, LbFrontBackend, LbFrontKey};
 use clap::Parser;
@@ -61,9 +61,13 @@ const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
     about = "Phase 2 beep eBPF loader: Geneve encap/decap, single-flow happy path"
 )]
 struct Args {
-    /// Physical uplink interface (hooks: uplink ingress, uplink egress-return).
-    #[arg(long, default_value = "eth0")]
-    uplink_iface: String,
+    /// Physical uplink interface admitting client traffic (hooks: uplink
+    /// ingress, uplink egress-return) -- repeatable: a node with N configured
+    /// uplinks (e.g. `eth0` + `wg0`) admits, and symmetrically returns, client
+    /// traffic on any of them
+    /// (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
+    #[arg(long = "uplink-iface", required = true)]
+    uplink_ifaces: Vec<String>,
 
     /// Geneve tunnel interface (hook: geneve ingress, both directions).
     #[arg(long, default_value = "geneve0")]
@@ -237,7 +241,7 @@ fn vip_outside_service_cidr(vip: Ipv4Addr, service_cidr: Ipv4Cidr) -> Result<(),
 
 fn main() -> anyhow::Result<()> {
     let Args {
-        uplink_iface,
+        uplink_ifaces,
         geneve_iface,
         pin_dir,
         fixtures,
@@ -274,33 +278,36 @@ fn main() -> anyhow::Result<()> {
     )
     .context("loading beep-ebpf")?;
 
-    populate_config(&mut ebpf, &geneve_iface, &uplink_iface).context("populating CONFIG map")?;
+    populate_config(&mut ebpf, &geneve_iface).context("populating CONFIG map")?;
+    populate_uplink_config(&mut ebpf, &uplink_ifaces).context("populating UPLINK_CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures, node_ip)
         .context("populating LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/NODE_ALLOW fixture")?;
 
-    let hooks: [(&str, &str, TcAttachType); 3] = [
+    let uplink_iface_refs: Vec<&str> = uplink_ifaces.iter().map(String::as_str).collect();
+    let geneve_iface_refs = [geneve_iface.as_str()];
+    let hooks: [(&str, &[&str], TcAttachType); 3] = [
         (
             "uplink_ingress",
-            uplink_iface.as_str(),
+            uplink_iface_refs.as_slice(),
             TcAttachType::Ingress,
         ),
         (
             "geneve_ingress",
-            geneve_iface.as_str(),
+            geneve_iface_refs.as_slice(),
             TcAttachType::Ingress,
         ),
         (
             "uplink_egress_return",
-            uplink_iface.as_str(),
+            uplink_iface_refs.as_slice(),
             TcAttachType::Egress,
         ),
     ];
 
-    for (name, iface, attach_type) in hooks {
-        attach_and_pin(&mut ebpf, name, iface, attach_type, &pin_dir)
-            .with_context(|| format!("attaching {name} on {iface}"))?;
+    for (name, ifaces, attach_type) in hooks {
+        attach_and_pin(&mut ebpf, name, ifaces, attach_type, &pin_dir)
+            .with_context(|| format!("attaching {name} on {ifaces:?}"))?;
         eprintln!(
-            "attached {name} on {iface} ({attach_type:?}), pinned under {}",
+            "attached {name} on {ifaces:?} ({attach_type:?}), pinned under {}",
             pin_dir.display()
         );
     }
@@ -313,14 +320,14 @@ fn main() -> anyhow::Result<()> {
     // loop below is what keeps this DaemonSet container's steady-state RSS
     // below its load-time peak.
     //
-    // On a restart, attach_and_pin's reused-link branch tracks the link via
+    // On a restart, attach_and_pin's reused-link branch tracks each link via
     // `attach_to_link` rather than `take_link`, so the `SchedClassifier` here
     // still owns it -- this drop therefore runs the program's implicit
     // unload-driven detach on every restart, not only on abnormal process
-    // death. That's safe: the bpffs pin at `{name}-link` (not this process's
-    // fd) anchors the kernel link object, so the implicit detach only
-    // releases this process's handle to it and leaves the tc attachment
-    // live for the next loader to reattach to.
+    // death. That's safe: the bpffs pin at `{name}-{iface}-link` (not this
+    // process's fd) anchors each kernel link object, so the implicit detach
+    // only releases this process's handle to it and leaves the tc
+    // attachment live for the next loader to reattach to.
     drop(ebpf);
     // glibc doesn't return freed heap to the OS on its own -- without an
     // explicit trim the drop above frees the allocator's own bookkeeping

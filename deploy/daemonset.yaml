@@ -113,6 +113,10 @@ spec:
             - --pod-cidr=10.42.0.0/16
             - --node-ip=$(NODE_IP)
             - --kubeconfig=/etc/beep-controller/kubeconfig
+            # Repeatable (docs/decisions/servicelb-multi-symmetric-uplink.md)
+            # -- add a second --uplink-iface=... entry per additional
+            # client-facing NIC this node admits traffic on.
+            - --uplink-iface=eth0
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
