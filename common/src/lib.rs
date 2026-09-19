@@ -525,6 +525,32 @@ pub fn peer_node_admission(is_known_peer: bool) -> PeerNodeAdmission {
     }
 }
 
+/// Which checksum fixups a DNAT/un-DNAT address rewrite must run, decided
+/// from whether the inner packet being rewritten is IPv4 or IPv6
+/// (`beep-ebpf`'s `rewrite_ip_port`/`rewrite_ipv6_port`). IPv4 carries its
+/// own header checksum that must be kept in sync with the rewritten
+/// address; IPv6 has no such field at all, so attempting that same fixup on
+/// a v6 header corrupts whatever real header/payload bytes happen to sit at
+/// that offset instead of a checksum. Both families still need the L4
+/// pseudo-header fixup (`BPF_F_PSEUDO_HDR`) -- only the IPv4-header-checksum
+/// step differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressRewriteChecksums {
+    /// Fix up both the IPv4 header checksum and the L4 pseudo-header.
+    Ipv4HeaderAndL4Pseudo,
+    /// IPv6 has no header checksum -- fix up only the L4 pseudo-header.
+    L4PseudoOnly,
+}
+
+/// `is_ipv6`: which family the packet currently being rewritten belongs to.
+pub fn address_rewrite_checksums(is_ipv6: bool) -> AddressRewriteChecksums {
+    if is_ipv6 {
+        AddressRewriteChecksums::L4PseudoOnly
+    } else {
+        AddressRewriteChecksums::Ipv4HeaderAndL4Pseudo
+    }
+}
+
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
@@ -570,14 +596,13 @@ pub const PROBE_LIMIT: u16 = 16;
 /// distinct flow through the same front, whose real source port happens to
 /// equal some other flow's already-committed synthetic port, misread that
 /// other flow's entry as its own earlier commit and silently clobber it.
-/// `new_front`: the front address the current packet arrived through -- a
-/// raw `(vip_ip, vip_port)` scalar pair, not an `ipv4_mapped_v6`-widened
-/// shape, even though `RevFlowValue`'s own stored `vip_ip` is `[u8; 16]`:
-/// today's inner-packet parsing is still IPv4-only end to end, so the
-/// caller unmaps a stored occupant's `vip_ip` back to this same `u32`
-/// wire form before calling in here -- widening this probe itself to compare
-/// 16 bytes per candidate is pure overhead with no correctness benefit until
-/// a genuine (non-mapped) v6 front exists.
+/// `new_front`: the front address the current packet arrived through, in
+/// `RevFlowValue`'s own stored `[u8; 16]` shape (a v4 front `ipv4_mapped_v6`-
+/// embedded, a genuine v6 front as-is) -- widened from a bare `u32` once a
+/// genuine (non-mapped) v6 front became possible to parse at all; comparing
+/// only the wire-token `u32` a v4 front unmaps to would collapse every v6
+/// front's identity to whatever garbage `unmap_ipv4` produces for a
+/// non-mapped address.
 /// `original_port`: the client's real source port -- excluded as a
 /// candidate remap value so the remapped reverse key can never collide
 /// with the natural (unremapped) one.
@@ -590,8 +615,8 @@ pub const PROBE_LIMIT: u16 = 16;
 /// hoisted key buffer's port bytes in place per candidate rather than
 /// rebuilding the whole key from scratch every probe iteration.
 pub fn resolve_backend_src_port(
-    existing_occupant: Option<((u32, u16), u16)>,
-    new_front: (u32, u16),
+    existing_occupant: Option<(([u8; 16], u16), u16)>,
+    new_front: ([u8; 16], u16),
     original_port: u16,
     mut is_reverse_key_taken: impl FnMut(u16) -> bool,
 ) -> BackendPortDecision {
@@ -623,8 +648,8 @@ pub fn resolve_backend_src_port(
 /// packet's committed remap; anything else -- different front, or same
 /// front with a different client port -- is a genuine conflict.
 pub fn occupant_conflicts(
-    occupant: Option<((u32, u16), u16)>,
-    resolving_front: (u32, u16),
+    occupant: Option<(([u8; 16], u16), u16)>,
+    resolving_front: ([u8; 16], u16),
     resolving_client_port: u16,
 ) -> bool {
     matches!(occupant, Some(identity) if identity != (resolving_front, resolving_client_port))
@@ -644,10 +669,18 @@ pub const REMAP_PORT_RANGE: u16 = u16::MAX - REMAP_PORT_BASE + 1; // 16384
 /// on its own anymore (that was this fix's bug: two independently-computed
 /// seeds can coincide, and did for the majority of realistic front pairs)
 /// -- `resolve_backend_src_port`'s occupancy probe is what actually
-/// guarantees uniqueness.
-fn synthetic_port_seed(front_ip: u32, front_port: u16) -> u16 {
-    let mixed =
-        front_ip ^ front_ip.rotate_right(16) ^ (front_port as u32) ^ ((front_port as u32) << 3);
+/// guarantees uniqueness. Folds `front_ip`'s 4 words down to a `u32` before
+/// mixing (XOR is order-independent and a v4-mapped address's fixed
+/// `::ffff:0:0/96` prefix words fold to the same constant for every v4
+/// front, so two v4 fronts collide under this folded formula exactly when
+/// they collided under the pre-dual-stack formula that mixed the bare wire
+/// `u32` directly -- this is not a behavior change for any v4 front).
+fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
+    let folded = u32::from_ne_bytes(front_ip[0..4].try_into().unwrap())
+        ^ u32::from_ne_bytes(front_ip[4..8].try_into().unwrap())
+        ^ u32::from_ne_bytes(front_ip[8..12].try_into().unwrap())
+        ^ u32::from_ne_bytes(front_ip[12..16].try_into().unwrap());
+    let mixed = folded ^ folded.rotate_right(16) ^ (front_port as u32) ^ ((front_port as u32) << 3);
     (mixed as u16) % REMAP_PORT_RANGE
 }
 
@@ -952,7 +985,7 @@ mod tests {
         // The happy path (first writer, or the same flow's later packets)
         // must never remap -- doing so on every packet would break the
         // client's real connection identity for the common case.
-        let vip_a = (0x0100_000au32, 0x5000u16);
+        let vip_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
         assert_eq!(
             resolve_backend_src_port(None, vip_a, 0x9999, |_| false),
             BackendPortDecision::NoRemap
@@ -975,8 +1008,8 @@ mod tests {
         let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
         let target_port = 0x1f90u16;
         let client_src_port = 0x9999u16;
-        let front_a = (0x0100_000au32, 0x5000u16);
-        let front_b = (0x0200_000au32, 0x5001u16);
+        let front_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
+        let front_b = (ipv4_mapped_v6(0x0200_000a), 0x5001u16);
 
         // Service A's flow writes first: no existing entry, no conflict.
         let decision_a = resolve_backend_src_port(None, front_a, client_src_port, |_| false);
@@ -1019,11 +1052,11 @@ mod tests {
         // octets 30/94/158/222, all on VIP port 31000 -- a stride of 64
         // that resonates with the old formula's `rotate_right(16)` mixing)
         // all hash to the identical seed:
-        let colliding_fronts: [(u32, u16); 4] = [
-            (u32::from_ne_bytes([10, 0, 0, 30]), 31000),
-            (u32::from_ne_bytes([10, 0, 0, 94]), 31000),
-            (u32::from_ne_bytes([10, 0, 0, 158]), 31000),
-            (u32::from_ne_bytes([10, 0, 0, 222]), 31000),
+        let colliding_fronts: [([u8; 16], u16); 4] = [
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000),
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 94])), 31000),
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 158])), 31000),
+            (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 222])), 31000),
         ];
         let shared_seed = synthetic_port_seed(colliding_fronts[0].0, colliding_fronts[0].1);
         for front in &colliding_fronts[1..] {
@@ -1039,7 +1072,7 @@ mod tests {
         let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
         let target_port = 0x1f90u16;
         let client_src_port = 0x9999u16;
-        let first_writer = (u32::from_ne_bytes([10, 0, 0, 1]), 6000u16);
+        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
 
         // First writer: no existing entry, natural reverse key holds the
         // client's real port unremapped.
@@ -1116,7 +1149,10 @@ mod tests {
         let mut fronts = Vec::new();
         for ip_octet in 0u8..=250 {
             for port in [5000u16, 5001, 5002, 8080, 8443, 30000, 31000, 32000] {
-                fronts.push((u32::from_ne_bytes([10, 0, 0, ip_octet]), port));
+                fronts.push((
+                    ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, ip_octet])),
+                    port,
+                ));
             }
         }
         let first_writer = fronts[0];
@@ -1158,6 +1194,77 @@ mod tests {
     }
 
     #[test]
+    fn two_services_with_genuine_v6_fronts_get_distinct_reverse_ports() {
+        // v6 mirror of `two_services_sharing_a_backend_pod_and_client_port_get_a_unique_reverse_tuple`:
+        // this is the exact scenario `resolve_backend_src_port`'s front-
+        // tuple widening from a bare `u32` to `[u8; 16]` exists for -- two
+        // Services with genuinely distinct (non-mapped) IPv6 front
+        // addresses, not just v4 ones embedded via `ipv4_mapped_v6`.
+        let client_ip = ipv4_mapped_v6(0x0100_000a);
+        let pod_ip = ipv4_mapped_v6(0x0a00_a8c0);
+        let target_port = 0x1f90u16;
+        let client_src_port = 0x9999u16;
+        let front_a: ([u8; 16], u16) = (
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            0x5000,
+        );
+        let front_b: ([u8; 16], u16) = (
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            0x5001,
+        );
+
+        let decision_a = resolve_backend_src_port(None, front_a, client_src_port, |_| false);
+        assert_eq!(decision_a, BackendPortDecision::NoRemap);
+        let port_a = client_src_port;
+
+        let decision_b = resolve_backend_src_port(
+            Some((front_a, client_src_port)),
+            front_b,
+            client_src_port,
+            |p| p == port_a,
+        );
+        let BackendPortDecision::Remap(port_b) = decision_b else {
+            panic!("expected a remap on front-address conflict, got {decision_b:?}");
+        };
+        assert_ne!(port_b, client_src_port);
+
+        let key_a = encode_tcp_flow_key(client_ip, port_a, pod_ip, target_port, 6);
+        let key_b = encode_tcp_flow_key(client_ip, port_b, pod_ip, target_port, 6);
+        assert_ne!(
+            key_a, key_b,
+            "two genuine v6 fronts sharing a backend Pod:targetPort must still get unique \
+             reverse tuples, exactly like two v4 fronts already do"
+        );
+    }
+
+    #[test]
+    fn two_distinct_v6_fronts_sharing_trailing_bytes_are_not_confused_as_the_same_front() {
+        // Before the dual-stack widening, a front's identity was a bare
+        // `u32` -- reverting to comparing only the low 4 bytes of a v6
+        // front would misread two DISTINCT v6 fronts that happen to share
+        // those trailing bytes as the same front's own earlier commit,
+        // skipping the conflict probe and silently clobbering the other
+        // flow's REV_FLOW entry.
+        let shared_tail = [0, 0, 0, 1];
+        let mut front_a_bytes = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        front_a_bytes[12..16].copy_from_slice(&shared_tail);
+        let mut front_b_bytes = [0x20, 0x01, 0x0d, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        front_b_bytes[12..16].copy_from_slice(&shared_tail);
+        let client_port = 0x2222u16;
+
+        assert!(
+            occupant_conflicts(
+                Some(((front_a_bytes, client_port), client_port)),
+                (front_b_bytes, client_port),
+                client_port
+            ),
+            "two distinct v6 fronts must never be read as the same front just because their \
+             trailing 4 bytes match -- that would silently misread flow B as flow A's own \
+             earlier commit and skip the conflict probe"
+        );
+    }
+
+    #[test]
     fn remapped_flows_resolve_to_the_same_port_on_every_packet() {
         // The probe's occupancy closure once checked only
         // `REV_FLOW.get(candidate).is_some()`, with no comparison to the
@@ -1173,18 +1280,18 @@ mod tests {
         use std::collections::HashMap;
 
         let client_src_port = 0x9999u16;
-        let first_writer = (u32::from_ne_bytes([10, 0, 0, 1]), 6000u16);
-        let front_a = (u32::from_ne_bytes([10, 0, 0, 30]), 31000u16);
+        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
+        let front_a = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000u16);
 
         // Sim of REV_FLOW keyed by candidate port -> the (front,
         // original_client_port) identity that committed a reverse-flow
         // entry there (main.rs's occupant lookup maps a full 38-byte key to
         // a `RevFlowValue`; the port is enough here since every candidate in
         // this test shares client/pod/target).
-        let mut rev_flow: HashMap<u16, ((u32, u16), u16)> = HashMap::new();
+        let mut rev_flow: HashMap<u16, (([u8; 16], u16), u16)> = HashMap::new();
         rev_flow.insert(client_src_port, (first_writer, client_src_port));
 
-        let resolve = |rev_flow: &HashMap<u16, ((u32, u16), u16)>| {
+        let resolve = |rev_flow: &HashMap<u16, (([u8; 16], u16), u16)>| {
             resolve_backend_src_port(
                 Some((first_writer, client_src_port)),
                 front_a,
@@ -1221,7 +1328,7 @@ mod tests {
         // A genuinely different conflicting front must still land on its
         // own, distinct port -- idempotency for one flow must not collapse
         // distinctness across flows.
-        let front_b = (u32::from_ne_bytes([10, 0, 0, 94]), 31000u16);
+        let front_b = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 94])), 31000u16);
         let decision_b = resolve_backend_src_port(
             Some((first_writer, client_src_port)),
             front_b,
@@ -1256,12 +1363,12 @@ mod tests {
         use std::collections::HashMap;
 
         let client_port_a = 0x1111u16;
-        let first_writer = (u32::from_ne_bytes([10, 0, 0, 1]), 6000u16);
-        let front_a = (u32::from_ne_bytes([10, 0, 0, 30]), 31000u16);
+        let first_writer = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 1])), 6000u16);
+        let front_a = (ipv4_mapped_v6(u32::from_ne_bytes([10, 0, 0, 30])), 31000u16);
 
         // Sim of REV_FLOW keyed by candidate port -> (front,
         // original_client_port), mirroring main.rs's occupant lookup.
-        let mut rev_flow: HashMap<u16, ((u32, u16), u16)> = HashMap::new();
+        let mut rev_flow: HashMap<u16, (([u8; 16], u16), u16)> = HashMap::new();
         rev_flow.insert(client_port_a, (first_writer, client_port_a));
 
         // Flow A: conflicts with first_writer at its natural key, gets
@@ -1329,10 +1436,10 @@ mod tests {
         use std::collections::HashMap;
 
         let client_src_port = 0x9999u16;
-        let first_writer = (0x0a00_0001u32, 6000u16); // occupies the natural key
-        let front_a = (0x0a00_001eu32, 31000u16); // conflicts -> triggers a probe
+        let first_writer = (ipv4_mapped_v6(0x0a00_0001), 6000u16); // occupies the natural key
+        let front_a = (ipv4_mapped_v6(0x0a00_001e), 31000u16); // conflicts -> triggers a probe
 
-        let mut rev_flow: HashMap<u16, ((u32, u16), u16)> = HashMap::new();
+        let mut rev_flow: HashMap<u16, (([u8; 16], u16), u16)> = HashMap::new();
         rev_flow.insert(client_src_port, (first_writer, client_src_port));
 
         // An UNRELATED flow occupies the probe's very first candidate (seed
@@ -1340,10 +1447,10 @@ mod tests {
         // eviction below frees.
         let seed = synthetic_port_seed(front_a.0, front_a.1);
         let earliest_candidate = REMAP_PORT_BASE.wrapping_add(seed);
-        let unrelated_earlier_occupant = ((0x0a00_00ffu32, 9999u16), 1234u16);
+        let unrelated_earlier_occupant = ((ipv4_mapped_v6(0x0a00_00ff), 9999u16), 1234u16);
         rev_flow.insert(earliest_candidate, unrelated_earlier_occupant);
 
-        let resolve_fresh = |rev_flow: &HashMap<u16, ((u32, u16), u16)>| {
+        let resolve_fresh = |rev_flow: &HashMap<u16, (([u8; 16], u16), u16)>| {
             resolve_backend_src_port(
                 Some((first_writer, client_src_port)),
                 front_a,
@@ -1743,5 +1850,31 @@ mod tests {
         // peer's Geneve traffic keeps decapping, not dropped just because
         // the attestation gate now exists.
         assert_eq!(peer_node_admission(true), PeerNodeAdmission::Continue);
+    }
+
+    #[test]
+    fn ipv4_rewrite_still_fixes_up_its_header_checksum() {
+        // The v4 path this bead must not regress: an IPv4 header carries its
+        // own checksum field, and skipping its fixup after a DNAT/un-DNAT
+        // address rewrite would leave that field stale, corrupting every v4
+        // packet this dataplane rewrites.
+        assert_eq!(
+            address_rewrite_checksums(false),
+            AddressRewriteChecksums::Ipv4HeaderAndL4Pseudo
+        );
+    }
+
+    #[test]
+    fn ipv6_rewrite_never_attempts_an_ip_header_checksum_fixup() {
+        // IPv6 has no header checksum field at all. If this ever regressed
+        // to `Ipv4HeaderAndL4Pseudo`, `beep-ebpf`'s rewrite path would call
+        // `l3_csum_replace` at an offset that isn't a checksum on a v6
+        // header, corrupting real header/payload bytes instead of fixing up
+        // a checksum -- exactly the bug this decision function exists to
+        // prevent.
+        assert_eq!(
+            address_rewrite_checksums(true),
+            AddressRewriteChecksums::L4PseudoOnly
+        );
     }
 }
