@@ -41,6 +41,25 @@ $ sudo ./target/release/beep \
     --fixture 10.0.0.5:8080:tcp:10.0.0.6:10.244.1.7:80
 ```
 
+`--uplink-iface` is required and repeatable — there's no default, so name at
+least one physical interface admitting client traffic. Repeat it to admit
+traffic on more than one uplink at once, e.g. a public NIC plus a WireGuard
+mesh interface:
+
+```console
+$ sudo ./target/release/beep \
+    --uplink-iface eth0 --uplink-iface wg0 --geneve-iface geneve0 --pin-dir /sys/fs/bpf/beep \
+    --pod-cidr 10.244.0.0/16 \
+    --fixture 10.0.0.5:8080:tcp:10.0.0.6:10.244.1.7:80
+```
+
+A flow's reply always egresses the same uplink it arrived on (symmetric
+return), and each uplink's L2 header handling — Ethernet's 14-byte header vs.
+a WireGuard/tun interface's L3-only framing — is auto-detected from the
+interface's hardware type, not something you configure. A single
+`--uplink-iface`, as in the first example above, remains the common N=1
+case. Design rationale: `docs/decisions/servicelb-multi-symmetric-uplink.md`.
+
 `--fixture` takes `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`, and you can repeat the flag. For example, one Pod behind two Service ports (80->8080 and 443->8443) needs two `--fixture` entries that share the same `pod_ip`:
 
 ```console
