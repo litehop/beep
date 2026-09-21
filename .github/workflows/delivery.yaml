@@ -155,8 +155,13 @@ jobs:
             echo "release $tag already exists, skipping"
             exit 0
           fi
-          notes="docs/release-notes/$tag.md"
-          if [ -f "$notes" ]; then
+          version="${tag#v}"
+          notes="$(mktemp)"
+          awk -v ver="$version" '
+            /^## \[/ { in_section = ($0 == "## [" ver "]" || index($0, "## [" ver "] ") == 1) }
+            in_section { print }
+          ' CHANGELOG.md > "$notes"
+          if [ -s "$notes" ]; then
             gh release create "$tag" --title "$tag" --notes-file "$notes"
           else
             gh release create "$tag" --title "$tag" --generate-notes
