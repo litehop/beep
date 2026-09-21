@@ -67,8 +67,9 @@ use beep_common::{
     occupant_conflicts, peer_node_admission, resolve_backend_src_port, return_authorization,
     unmap_ipv4, AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
     DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey,
-    ForwardAdmission, ForwardFlowValue, FwdPendingPin, LbFrontBackend, LbFrontKey,
-    PeerNodeAdmission, ReturnAuthorization, TcpFlowKey, UplinkConfig, REDIRECTED_RETURN_MARK,
+    FlowValue, ForwardAdmission, ForwardFlowValue, FwdPendingPin, LbFrontBackend, LbFrontKey,
+    PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig,
+    REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -291,68 +292,6 @@ static NODE_ALLOW: HashMap<[u8; 16], u8> = HashMap::with_max_entries(16, 0);
 #[map]
 static FWD_PENDING: LruHashMap<TcpFlowKey, ForwardFlowValue> =
     LruHashMap::with_max_entries(2048, 0);
-
-/// Union of the three roles `FLOW_TABLE` stores, discriminated by the
-/// `FlowDirection` tag in its key. `forward` is the promoted,
-/// established-affinity value `FWD_MAIN` used to store; `reverse` is the
-/// backend-side un-DNAT conntrack value `REV_FLOW` used to store;
-/// `port_memo` persists a backend-src-port remap decision so it survives
-/// unrelated LRU churn instead of being re-derived per packet.
-/// Callers must only ever read the field matching the key's own tag -- the
-/// other field's bytes are whatever the last write to that slot happened to
-/// leave there, exactly like reading the wrong arm of any tagged union.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union FlowValue {
-    pub forward: ForwardFlowValue,
-    pub reverse: RevFlowValue,
-    pub port_memo: PortMemoValue,
-}
-
-/// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
-/// the dst rewrite) so the egress classifier (step 6) can recover the
-/// ingress node and the original VIP to echo, since by the time it runs the
-/// packet's own header no longer carries the VIP -- DNAT already overwrote
-/// it (`ebpf-lb-dataplane.md`, Conntrack & affinity).
-///
-/// `original_client_port` backs Decision 3's un-remap: when the forward
-/// decap below remapped the backend-facing source port to keep this key
-/// unique (two Services sharing a backend Pod:targetPort, client reusing
-/// one source port across both), the egress classifier restores the
-/// client's real port here before the packet leaves this node -- the
-/// ingress node's own return-decap step has no knowledge of any backend-
-/// local remap and must see the true client port in the inner dst.
-///
-/// `ingress_node_ip`/`vip_ip` are `[u8; 16]`, not bare `u32`: `ingress_node_ip`
-/// is `set_tunnel_remote`'s dual-stack node address (v4-mapped or genuine v6);
-/// `vip_ip` is the inner packet's own front address, genuine v6 for a v6 flow,
-/// `ipv4_mapped_v6`-embedded for a v4 one -- both share `FLOW_TABLE`'s
-/// dual-stack key/value shape throughout, unmapped back with `unmap_ipv4`
-/// only at the specific sites that need the v4 wire-token form (e.g. a v4
-/// `rewrite_ip_port` call).
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-pub struct RevFlowValue {
-    pub ingress_node_ip: [u8; 16],
-    pub vip_ip: [u8; 16],
-    pub vip_port: u16,
-    pub original_client_port: u16,
-}
-
-/// Backend-side persisted port-remap decision, keyed under
-/// `FlowDirection::PortMemo` on the flow's natural (client, real client
-/// port, pod, target port) tuple. `resolve_backend_src_port`'s occupancy
-/// probe only guarantees a STABLE answer while every occupant in its probe
-/// window stays alive; without this memo, an LRU eviction of some unrelated
-/// occupant at an earlier probe index between two packets of the same flow
-/// makes a fresh probe land on a DIFFERENT port than the one already in use
-/// -- breaking the reverse path mid-connection. See
-/// `beep_common::backend_port_resolution`'s doc comment.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PortMemoValue {
-    pub backend_src_port: u16,
-}
 
 /// Unified forward(established)+reverse conntrack table, replacing the
 /// former separate `FWD_MAIN`/`REV_FLOW` maps. Both roles key on the
