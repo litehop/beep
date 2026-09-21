@@ -52,8 +52,9 @@ use aya_ebpf::{
         TC_ACT_SHOT,
     },
     helpers::{
-        bpf_redirect, bpf_skb_change_head, bpf_skb_change_type, bpf_skb_get_tunnel_key,
-        bpf_skb_get_tunnel_opt, bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt,
+        bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_change_type,
+        bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_set_tunnel_key,
+        bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
@@ -1353,6 +1354,35 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32
     }
 }
 
+/// Shared tail of `try_geneve_decap_return_v4`/`_v6`'s final client-bound
+/// redirect. The packet just arrived off `geneve0`'s L3-only tunnel decap,
+/// which leaves an all-zero synthetic L2 header in place -- fine for
+/// carrying straight back onto another L3-only uplink (a tunnel device has
+/// no L2 to check), but a real Ethernet uplink's peer runs `eth_type_trans`
+/// on receipt and classifies that all-zero destination MAC
+/// `PACKET_OTHERHOST`, dropping it before IP delivery. `UPLINK_CONFIG`
+/// already carries the signal needed to tell the two apart -- `l2_hlen`,
+/// the same field `try_uplink_ingress`'s parsing branch above keys on --
+/// so an Ethernet egress (`l2_hlen == ETH_HLEN`) resolves L2 via
+/// `bpf_redirect_neigh` (FIB + neighbor lookup, done by the kernel) instead
+/// of the plain `bpf_redirect` a tunnel egress still uses unchanged.
+/// Chosen over a manual `bpf_fib_lookup` + `bpf_skb_store_bytes` header
+/// write: it's a straight swap for the existing `bpf_redirect` call, with
+/// no new map lookups or hand-built header bytes on this side.
+#[inline(always)]
+fn redirect_client_bound(ingress_ifindex: u32) -> Option<i32> {
+    let l2_hlen = unsafe { UPLINK_CONFIG.get(ingress_ifindex) }?.l2_hlen as usize;
+    let redirect = if l2_hlen == ETH_HLEN {
+        unsafe { bpf_redirect_neigh(ingress_ifindex, core::ptr::null_mut(), 0, 0) }
+    } else {
+        unsafe { bpf_redirect(ingress_ifindex, 0) }
+    };
+    if redirect as i32 != TC_ACT_REDIRECT {
+        return Some(TC_ACT_SHOT);
+    }
+    Some(TC_ACT_REDIRECT)
+}
+
 #[inline(always)]
 fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u16) -> Option<i32> {
     if ctx.load::<u8>(IP_VER_IHL).ok()? & 0x0f != 5 {
@@ -1460,11 +1490,9 @@ fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
     // NOT `ctx.skb.skb->ingress_ifindex` read fresh at this call site: this
     // hook runs on `geneve0`'s ingress (the packet just arrived there via
     // its own tunnel decap), so a fresh read would resolve to `geneve0`
-    // itself, not the client's uplink.
-    if unsafe { bpf_redirect(ingress_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
-        return Some(TC_ACT_SHOT);
-    }
-    Some(TC_ACT_REDIRECT)
+    // itself, not the client's uplink. See `redirect_client_bound`'s doc
+    // comment for why this isn't a plain `bpf_redirect` call.
+    redirect_client_bound(ingress_ifindex)
 }
 
 /// IPv6 sibling of `try_geneve_decap_return_v4`.
@@ -1528,10 +1556,7 @@ fn try_geneve_decap_return_v6(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
 
     // See try_geneve_decap_return_v4's matching comment.
     ctx.set_mark(REDIRECTED_RETURN_MARK);
-    if unsafe { bpf_redirect(ingress_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
-        return Some(TC_ACT_SHOT);
-    }
-    Some(TC_ACT_REDIRECT)
+    redirect_client_bound(ingress_ifindex)
 }
 
 /// Hook 3: egress classifier on the physical uplink, backend node (return
