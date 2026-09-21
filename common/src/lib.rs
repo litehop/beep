@@ -274,6 +274,68 @@ pub struct ForwardFlowValue {
     pub ingress_ifindex: u32,
 }
 
+/// Union of the three roles `FLOW_TABLE` stores, discriminated by the
+/// `FlowDirection` tag in its key. `forward` is the promoted,
+/// established-affinity value `FWD_MAIN` used to store; `reverse` is the
+/// backend-side un-DNAT conntrack value `REV_FLOW` used to store;
+/// `port_memo` persists a backend-src-port remap decision so it survives
+/// unrelated LRU churn instead of being re-derived per packet.
+/// Callers must only ever read the field matching the key's own tag -- the
+/// other field's bytes are whatever the last write to that slot happened to
+/// leave there, exactly like reading the wrong arm of any tagged union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union FlowValue {
+    pub forward: ForwardFlowValue,
+    pub reverse: RevFlowValue,
+    pub port_memo: PortMemoValue,
+}
+
+/// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
+/// the dst rewrite) so the egress classifier (step 6) can recover the
+/// ingress node and the original VIP to echo, since by the time it runs the
+/// packet's own header no longer carries the VIP -- DNAT already overwrote
+/// it (`ebpf-lb-dataplane.md`, Conntrack & affinity).
+///
+/// `original_client_port` backs Decision 3's un-remap: when the forward
+/// decap below remapped the backend-facing source port to keep this key
+/// unique (two Services sharing a backend Pod:targetPort, client reusing
+/// one source port across both), the egress classifier restores the
+/// client's real port here before the packet leaves this node -- the
+/// ingress node's own return-decap step has no knowledge of any backend-
+/// local remap and must see the true client port in the inner dst.
+///
+/// `ingress_node_ip`/`vip_ip` are `[u8; 16]`, not bare `u32`: `ingress_node_ip`
+/// is `set_tunnel_remote`'s dual-stack node address (v4-mapped or genuine v6);
+/// `vip_ip` is the inner packet's own front address, genuine v6 for a v6 flow,
+/// `ipv4_mapped_v6`-embedded for a v4 one -- both share `FLOW_TABLE`'s
+/// dual-stack key/value shape throughout, unmapped back with `unmap_ipv4`
+/// only at the specific sites that need the v4 wire-token form (e.g. a v4
+/// `rewrite_ip_port` call).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct RevFlowValue {
+    pub ingress_node_ip: [u8; 16],
+    pub vip_ip: [u8; 16],
+    pub vip_port: u16,
+    pub original_client_port: u16,
+}
+
+/// Backend-side persisted port-remap decision, keyed under
+/// `FlowDirection::PortMemo` on the flow's natural (client, real client
+/// port, pod, target port) tuple. `resolve_backend_src_port`'s occupancy
+/// probe only guarantees a STABLE answer while every occupant in its probe
+/// window stays alive; without this memo, an LRU eviction of some unrelated
+/// occupant at an earlier probe index between two packets of the same flow
+/// makes a fresh probe land on a DIFFERENT port than the one already in use
+/// -- breaking the reverse path mid-connection. See
+/// `backend_port_resolution`'s doc comment.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PortMemoValue {
+    pub backend_src_port: u16,
+}
+
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LbFrontKey {}
 #[cfg(feature = "user")]
@@ -282,6 +344,39 @@ unsafe impl aya::Pod for LbFrontBackend {}
 unsafe impl aya::Pod for Config {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for UplinkConfig {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FlowValue {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for RevFlowValue {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortMemoValue {}
+
+/// Safe union-arm readers for the userspace/controller side (the eBPF side
+/// already inlines these same reads directly at each of its few call sites,
+/// e.g. `flow_table_get_forward` in `beep-ebpf`). Gated to `user` rather than
+/// exposed unconditionally so `beep-ebpf`'s call sites keep naming their own
+/// `unsafe` read inline instead of going through a wrapper only one side of
+/// the boundary needs.
+#[cfg(feature = "user")]
+impl FlowValue {
+    /// Reads the `forward` arm. Caller must already know from the
+    /// `FlowKey` tag byte that this slot was written under
+    /// `FlowDirection::Forward` -- reading the wrong arm returns whatever
+    /// bytes the last write into that union slot happened to leave there.
+    pub fn as_forward(&self) -> ForwardFlowValue {
+        unsafe { self.forward }
+    }
+
+    /// Reads the `reverse` arm -- see `as_forward`'s caveat.
+    pub fn as_reverse(&self) -> RevFlowValue {
+        unsafe { self.reverse }
+    }
+
+    /// Reads the `port_memo` arm -- see `as_forward`'s caveat.
+    pub fn as_port_memo(&self) -> PortMemoValue {
+        unsafe { self.port_memo }
+    }
+}
 
 /// Flow-table admission: forward-path decision (`beep-ebpf`'s
 /// `try_uplink_ingress`, `docs/decisions/servicelb-flow-admission-affinity.md`).
@@ -849,6 +944,41 @@ mod tests {
     }
 
     #[test]
+    fn rev_flow_value_has_no_padding() {
+        // ingress_node_ip + vip_ip (2x [u8; 16], align 1, offsets 0/16) +
+        // vip_port + original_client_port (2x u16, align 2, offsets 32/34,
+        // both already even) -- no compiler-inserted gap. A regression here
+        // would silently change FLOW_TABLE's reverse-tagged value layout,
+        // desyncing the kernel-side write from a userspace reader of the
+        // identical slot via aya::Pod.
+        assert_eq!(core::mem::size_of::<RevFlowValue>(), 36);
+    }
+
+    #[test]
+    fn port_memo_value_has_no_padding() {
+        // A lone u16 -- no other field to misalign against, but pinned so a
+        // future field addition here is forced to justify its own layout
+        // rather than silently drifting FLOW_TABLE's port-memo-tagged value.
+        assert_eq!(core::mem::size_of::<PortMemoValue>(), 2);
+    }
+
+    #[test]
+    fn flow_value_size_matches_its_largest_arm_with_no_extra_padding() {
+        // FlowValue must be exactly as large as its largest arm
+        // (RevFlowValue, 36 bytes) -- any larger would mean the union picked
+        // up padding bytes FLOW_TABLE's kernel-side write leaves
+        // uninitialized, and a userspace `aya::Pod` read of a DIFFERENT arm
+        // (e.g. `as_port_memo` on a slot written as `forward`) would then
+        // read stale/uninitialized trailing bytes as if they were real
+        // field data instead of cleanly aliasing the smaller arm's prefix.
+        assert_eq!(
+            core::mem::size_of::<FlowValue>(),
+            core::mem::size_of::<RevFlowValue>()
+        );
+        assert_eq!(core::mem::size_of::<FlowValue>(), 36);
+    }
+
+    #[test]
     fn lb_front_key_has_no_padding() {
         // vip_ip ([u8; 16]) + vip_port (u16) + proto (u8) + _pad (u8) = 20
         // bytes: the widened byte-array field has no alignment requirement
@@ -868,9 +998,7 @@ mod tests {
     // bare u32 to [u8; 16] so a v6 front/backend can share the same map
     // shape later -- but a v4 fixture must still round-trip bit-identical
     // through that wider shape today, or every existing v4 Service silently
-    // misroutes. `RevFlowValue` itself lives in `beep-ebpf` (ebpf-internal,
-    // not host-testable), so this pins the exact `ipv4_mapped_v6`/
-    // `unmap_ipv4` pattern its `ingress_node_ip`/`vip_ip` fields use instead.
+    // misroutes.
 
     #[test]
     fn lb_front_key_vip_ip_round_trips_a_v4_fixture() {
@@ -911,16 +1039,24 @@ mod tests {
 
     #[test]
     fn rev_flow_value_shaped_addresses_round_trip_a_v4_fixture() {
-        // Mirrors RevFlowValue::{ingress_node_ip, vip_ip} (ebpf/src/main.rs)
-        // without importing that ebpf-internal type: both fields are the
-        // same host-native (ingress_node_ip) and wire-token (vip_ip) values
-        // as LbFrontBackend/LbFrontKey above, widened the identical way.
+        // ingress_node_ip is host-native (bpf_tunnel_key.remote_ipv4's own
+        // convention, `beep-ebpf`'s module doc), vip_ip is wire-token --
+        // both must round-trip through RevFlowValue's actual fields, or a
+        // v4-flow's reverse-tagged FLOW_TABLE entry silently corrupts the
+        // ingress echo on the return leg.
         let ingress_node_native = u32::from_be_bytes([10, 0, 0, 5]);
         let vip_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
-        let ingress_node_ip = ipv4_mapped_v6(ingress_node_native);
-        let vip_ip = ipv4_mapped_v6(vip_wire);
-        assert_eq!(unmap_ipv4(&ingress_node_ip), Some(ingress_node_native));
-        assert_eq!(unmap_ipv4(&vip_ip), Some(vip_wire));
+        let value = RevFlowValue {
+            ingress_node_ip: ipv4_mapped_v6(ingress_node_native),
+            vip_ip: ipv4_mapped_v6(vip_wire),
+            vip_port: wire_port(80),
+            original_client_port: wire_port(443),
+        };
+        assert_eq!(
+            unmap_ipv4(&value.ingress_node_ip),
+            Some(ingress_node_native)
+        );
+        assert_eq!(unmap_ipv4(&value.vip_ip), Some(vip_wire));
     }
 
     #[test]
