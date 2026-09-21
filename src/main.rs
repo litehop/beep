@@ -23,22 +23,84 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{anyhow, Context};
 use aya::{
-    maps::{HashMap as AyaHashMap, MapData},
+    maps::{HashMap as AyaHashMap, Map, MapData},
     programs::TcAttachType,
     Ebpf,
 };
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, load_ebpf, local_pod_ips, parse_fixture, populate_config,
-    populate_uplink_config, stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture, MAP_NAMES,
+    attach_and_pin, bump_memlock_rlimit, evict_pod_flows, load_ebpf, local_pod_ips, parse_fixture,
+    populate_config, populate_uplink_config, stale_pod_targets, tunnel_remote_v6, wire_ip_v6,
+    Fixture, MAP_NAMES,
 };
-use beep_common::{wire_port, LbFrontBackend, LbFrontKey};
+use beep_common::{
+    wire_port, FlowKey, FlowValue, ForwardFlowValue, LbFrontBackend, LbFrontKey, TcpFlowKey,
+};
 use clap::Parser;
+
+/// `beep evict-pod <pod-ip> [--pin-dir <dir>]`: a HIDDEN, test-only one-shot
+/// that runs the real conntrack eviction sweep (`beep::evict_pod_flows`)
+/// against a running loader's already-pinned maps, without going through a
+/// live kube API. Not advertised in `--help` -- dispatched by literal argv[1]
+/// match in `main` below, before `Args::parse()` ever runs, so it never
+/// appears in `Args`' own derived CLI surface at all. Exists solely so
+/// `scripts/smoke.sh` (which never runs `beep-controller`, the real trigger
+/// for this sweep -- `controller/src/apply.rs`'s `apply_pod_targets`) can
+/// exercise the exact same sweep logic production reconciles run.
+#[derive(Parser, Debug)]
+struct EvictPodArgs {
+    /// Pod IP to evict.
+    pod_ip: IpAddr,
+
+    /// Same bpffs pin directory the target loader instance was started
+    /// with.
+    #[arg(long, default_value = "/sys/fs/bpf/beep")]
+    pin_dir: PathBuf,
+}
+
+fn open_pinned_hash_map<K: aya::Pod, V: aya::Pod>(
+    pin_dir: &Path,
+    name: &str,
+) -> anyhow::Result<AyaHashMap<MapData, K, V>> {
+    let path = pin_dir.join(name);
+    let map_data = MapData::from_pin(&path)
+        .with_context(|| format!("opening pinned map `{name}` from {}", path.display()))?;
+    AyaHashMap::try_from(Map::HashMap(map_data))
+        .with_context(|| format!("map `{name}` is not a BPF_MAP_TYPE_HASH"))
+}
+
+/// Deletes `pod_ip`'s `POD_TARGETS` entry and runs `beep::evict_pod_flows`
+/// against the pinned `FWD_PENDING`/`FLOW_TABLE` -- the exact same two steps
+/// `controller/src/apply.rs`'s `apply_pod_targets` runs on every reconcile
+/// tick for a departed pod, so this trigger proves the real sweep logic
+/// rather than a stand-in.
+fn run_evict_pod(args: EvictPodArgs) -> anyhow::Result<()> {
+    let EvictPodArgs { pod_ip, pin_dir } = args;
+    let departed_pod = wire_ip_v6(pod_ip);
+
+    let mut pod_targets: AyaHashMap<MapData, [u8; 16], u8> =
+        open_pinned_hash_map(&pin_dir, "POD_TARGETS")?;
+    let mut fwd_pending: AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue> =
+        open_pinned_hash_map(&pin_dir, "FWD_PENDING")?;
+    let mut flow_table: AyaHashMap<MapData, FlowKey, FlowValue> =
+        open_pinned_hash_map(&pin_dir, "FLOW_TABLE")?;
+
+    if let Err(e) = pod_targets.remove(&departed_pod) {
+        eprintln!("evict-pod: POD_TARGETS delete for {pod_ip} failed: {e:#}");
+    }
+    evict_pod_flows(&mut fwd_pending, &mut flow_table, departed_pod)
+        .context("conntrack eviction sweep")?;
+    eprintln!(
+        "evict-pod: swept POD_TARGETS/FWD_PENDING/FLOW_TABLE for pod {pod_ip} under {}",
+        pin_dir.display()
+    );
+    Ok(())
+}
 
 /// Defaults from the admission-control sizing derivation
 /// (`beep-ebpf`'s `FWD_PENDING`/`FLOW_TABLE` doc comments): PENDING is the
@@ -338,6 +400,14 @@ fn vip_outside_service_cidr(vip: IpAddr, service_cidr: IpCidr) -> Result<(), Str
 }
 
 fn main() -> anyhow::Result<()> {
+    // Hidden `evict-pod` dispatch: checked by literal argv[1] BEFORE
+    // `Args::parse()` runs, so this trigger never registers with clap's own
+    // subcommand/help machinery and is invisible to `beep --help`
+    // (`EvictPodArgs`'s doc comment).
+    if std::env::args().nth(1).as_deref() == Some("evict-pod") {
+        return run_evict_pod(EvictPodArgs::parse_from(std::env::args().skip(1)));
+    }
+
     let Args {
         uplink_ifaces,
         geneve_iface,
