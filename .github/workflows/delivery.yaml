@@ -40,7 +40,7 @@ jobs:
       # which needs nightly + rust-src regardless of the host build's own
       # target. The gnu targets are for beep-controller itself.
       # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           components: rust-src, llvm-tools
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
