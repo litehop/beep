@@ -55,4 +55,4 @@ silently relying on it, lets an operator choose.
   trust (VLAN isolation, switch anti-spoof).
 - Related, not decided here: the `NODE_ALLOW` startup blackout tradeoff
   (`docs/decisions/node-allow-startup-blackout.md`, beep-joe) and
-  multi-IP-per-node `NODE_ALLOW` (beep-eix).
+  multi-IP-per-node `NODE_ALLOW` (beep-5ng).
