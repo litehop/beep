@@ -1,9 +1,11 @@
 //! Applies a `reconcile::DesiredEntries` to the dataplane's pinned
 //! `LB_FRONT_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` maps. Opens them from their bpffs
 //! pins (`beep::attach_and_pin`'s loader already created them at load time)
-//! rather than holding an `Ebpf` handle, so this process never touches
-//! `FWD_PENDING`/`FLOW_TABLE` -- the kernel-written conntrack tables must
-//! survive untouched across every controller reconcile.
+//! rather than holding an `Ebpf` handle. Also opens `FWD_PENDING`/`FLOW_TABLE`
+//! -- narrowed from "never touches" to "touches only via one targeted,
+//! per-departed-pod conntrack eviction" (`apply_pod_targets`/
+//! `beep::evict_pod_flows`): the kernel-written rows for every OTHER flow
+//! must still survive every controller reconcile untouched.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,18 +16,24 @@ use std::{
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep_common::{unmap_ipv4, LbFrontBackend, LbFrontKey};
+use beep_common::{
+    unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, LbFrontBackend, LbFrontKey, TcpFlowKey,
+};
 
 use crate::reconcile::{self, DesiredEntries, MapOp};
 
-/// The four controller-written maps, opened once from their pins and kept
-/// open across every reconcile tick (avoids a `MapData::from_pin` syscall
-/// round trip per event).
+/// The six controller-written/-swept maps, opened once from their pins and
+/// kept open across every reconcile tick (avoids a `MapData::from_pin`
+/// syscall round trip per event).
 pub struct PinnedMaps {
     lb_front_map: AyaHashMap<MapData, LbFrontKey, LbFrontBackend>,
     target_ports: AyaHashMap<MapData, LbFrontKey, u16>,
     pod_targets: AyaHashMap<MapData, [u8; 16], u8>,
     node_allow: AyaHashMap<MapData, [u8; 16], u8>,
+    /// Opened for the eviction sweep only (`apply_pod_targets`) -- never
+    /// diffed/full-synced like the four maps above.
+    fwd_pending: AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
+    flow_table: AyaHashMap<MapData, FlowKey, FlowValue>,
     /// "Has `fronts_known` ever been true in this process." Starts `false`
     /// on every controller start (including a restart), and once
     /// `apply` observes `fronts_known == true` it stays `true` for the rest
@@ -53,6 +61,16 @@ impl PinnedMaps {
             target_ports: open_hash_map(pin_dir, "TARGET_PORTS")?,
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
             node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
+            // Both `FWD_PENDING`/`FLOW_TABLE` are `BPF_MAP_TYPE_LRU_HASH`
+            // (`ebpf/src/main.rs`), not `BPF_MAP_TYPE_HASH` -- `open_hash_map`
+            // still opens them correctly regardless: aya's `HashMap<K, V>`
+            // wrapper accepts either kernel map type on conversion (its
+            // `impl_try_from_map!` macro's `HashMap from HashMap|LruHashMap`
+            // arm), and this helper's `Map::HashMap(map_data)` construction
+            // is just a compile-time `TryFrom` selector, not a runtime check
+            // against the fd's actual kernel map type.
+            fwd_pending: open_hash_map(pin_dir, "FWD_PENDING")?,
+            flow_table: open_hash_map(pin_dir, "FLOW_TABLE")?,
             fronts_ever_known: false,
         })
     }
@@ -113,8 +131,13 @@ impl PinnedMaps {
         )
         .context("applying NODE_ALLOW");
         let pod_targets_result = if desired.pod_targets_known {
-            apply_pod_targets(&mut self.pod_targets, &desired.pod_targets)
-                .context("applying POD_TARGETS")
+            apply_pod_targets(
+                &mut self.pod_targets,
+                &mut self.fwd_pending,
+                &mut self.flow_table,
+                &desired.pod_targets,
+            )
+            .context("applying POD_TARGETS")
         } else {
             Ok(())
         };
@@ -204,8 +227,17 @@ where
 /// full membership sync -- same prune-then-insert pattern as the loader's
 /// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
 /// Same continue-past-a-failure contract as `apply_ops` above.
+///
+/// Each stale (departed) pod IP also runs `beep::evict_pod_flows` against
+/// `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
+/// conntrack rows would otherwise pin routing to a dead backend, or
+/// misroute a FUTURE, unrelated owner of that pod IP if it's reused. Run
+/// even if the `POD_TARGETS` delete itself failed: a write error on this one map
+/// must not leave stale conntrack state behind too.
 fn apply_pod_targets(
     map: &mut AyaHashMap<MapData, [u8; 16], u8>,
+    fwd_pending: &mut AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
+    flow_table: &mut AyaHashMap<MapData, FlowKey, FlowValue>,
     desired: &HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
     let existing: Vec<[u8; 16]> = map.keys().collect::<Result<_, _>>()?;
@@ -216,6 +248,13 @@ fn apply_pod_targets(
             failed += 1;
             eprintln!(
                 "controller: POD_TARGETS delete for pod {} failed: {e:#}",
+                describe_pod_target_ip(stale)
+            );
+        }
+        if let Err(e) = beep::evict_pod_flows(fwd_pending, flow_table, stale) {
+            failed += 1;
+            eprintln!(
+                "controller: conntrack eviction sweep for departed pod {} failed: {e:#}",
                 describe_pod_target_ip(stale)
             );
         }

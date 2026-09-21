@@ -341,6 +341,8 @@ unsafe impl aya::Pod for LbFrontKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LbFrontBackend {}
 #[cfg(feature = "user")]
+unsafe impl aya::Pod for ForwardFlowValue {}
+#[cfg(feature = "user")]
 unsafe impl aya::Pod for Config {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for UplinkConfig {}
