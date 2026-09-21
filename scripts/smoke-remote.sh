@@ -84,6 +84,25 @@ RESTART_BACKEND_LOG="/tmp/beep-smoke-restart-backend.log"
 RESTART_CLIENT_OUT="/tmp/beep-smoke-restart-client.out"
 RESTART_LOADER_LOG="/tmp/beep-smoke-loader-restart.log"
 
+# Selective conntrack eviction fixture: a front OF ITS OWN,
+# not reused from the round trips above, so the eviction assertions below
+# aren't confounded by conntrack rows those other flows already wrote for
+# POD_IP. `EVICT_FRONT_POD_IP` is mutated across this section's own loader
+# restarts (evicted-pod -> replacement pod -> the same pod IP reused) --
+# `start_loader` below reads it at call time, not at definition time.
+EVICT_VIP_PORT="19104"
+EVICT_TARGET_PORT="18084"
+EVICT_FRONT_POD_IP="$POD_IP"
+EVICT_RESPONSE_FILE="/tmp/beep-smoke-response-evict.http"
+EVICT_BACKEND_LOG="/tmp/beep-smoke-backend-evict.log"
+REPLACEMENT_POD_IP="198.51.100.60"
+REPLACEMENT_RESPONSE_FILE="/tmp/beep-smoke-response-replacement.http"
+REPLACEMENT_BACKEND_LOG="/tmp/beep-smoke-backend-replacement.log"
+REUSE_RESPONSE_FILE="/tmp/beep-smoke-response-reuse.http"
+REUSE_BACKEND_LOG="/tmp/beep-smoke-backend-reuse.log"
+EVICT_LOADER_LOG_REPLACEMENT="/tmp/beep-smoke-loader-evict-replacement.log"
+EVICT_LOADER_LOG_REUSE="/tmp/beep-smoke-loader-evict-reuse.log"
+
 cmd="${1:-}"
 
 # Releases the backend's blocking read on the signal fifo (the
@@ -113,6 +132,8 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT2}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${VIP_IP} ${VIP_PORT}" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
@@ -125,6 +146,7 @@ cleanup() {
   ip netns del "$UPLINK2_NETNS" 2>/dev/null || true
   ip link del geneve0 2>/dev/null || true
   ip addr del "${POD_IP}/32" dev lo 2>/dev/null || true
+  ip addr del "${REPLACEMENT_POD_IP}/32" dev lo 2>/dev/null || true
   if [ -f "$RPFILTER_SAVE_FILE" ]; then
     sysctl -w net.ipv4.conf.all.rp_filter="$(cat "$RPFILTER_SAVE_FILE")" >/dev/null 2>&1 || true
     rm -f "$RPFILTER_SAVE_FILE"
@@ -169,6 +191,10 @@ ip netns exec smoke-client ip addr add "${CLIENT_IP}/24" dev smoke-veth1
 ip netns exec smoke-client ip link set smoke-veth1 up
 ip netns exec smoke-client ip link set lo up
 ip addr add "${POD_IP}/32" dev lo
+# The eviction test's "replacement pod" phase below re-points a front at
+# this address -- added up front alongside POD_IP so both aliases exist for
+# the whole run, not just from the point they're first used.
+ip addr add "${REPLACEMENT_POD_IP}/32" dev lo
 
 echo "==> creating $UPLINK2_IFACE/$UPLINK2_PEER_IFACE + $UPLINK2_NETNS netns (second uplink, stands in for e.g. a WireGuard mesh alongside the public NIC above)"
 ip link add "$UPLINK2_IFACE" type veth peer name "$UPLINK2_PEER_IFACE"
@@ -209,6 +235,7 @@ start_loader() {
     --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
     --fixture "${VIP_IP}:${VIP_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
     --fixture "${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${UPLINK2_TARGET_PORT}" \
+    --fixture "${VIP_IP}:${EVICT_VIP_PORT}:tcp:${VIP_IP}:${EVICT_FRONT_POD_IP}:${EVICT_TARGET_PORT}" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -240,6 +267,24 @@ wait_for_attach() {
     cat "$log" >&2
     exit 1
   }
+}
+
+# Stops the running loader and waits for it to actually exit before a
+# restart starts a second instance against the same --pin-dir -- two
+# concurrent instances would both attach_to_link-swap the same pinned links,
+# racing each other instead of cleanly simulating a single rollout/eviction/
+# OOM-kill restart.
+stop_loader() {
+  pkill -f "$BIN" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    pgrep -f "$BIN" >/dev/null || break
+    sleep 0.2
+  done
+  pgrep -f "$BIN" >/dev/null && {
+    echo "FAIL: old loader process did not exit before the restart" >&2
+    exit 1
+  }
+  return 0
 }
 
 echo "==> loading beep-ebpf -- this is the verifier-accept gate"
@@ -322,6 +367,59 @@ map_entry_count() {
   local json
   json=$(bpftool map dump pinned "$1" --json 2>/dev/null) || { echo ""; return; }
   jq 'length' <<<"$json" 2>/dev/null || echo ""
+}
+
+# Same fallback-on-missing-pin caution as map_entry_count above.
+map_json() {
+  bpftool map dump pinned "$1" --json 2>/dev/null || echo "[]"
+}
+
+# `beep_common::wire_ip_v6`'s embedding: a jq array-literal of the "0xXX"
+# hex-string tokens bpftool's --json dump uses for each byte (NOT plain
+# integers -- confirmed against a live dump). Natural (non-reversed) octet
+# order at bytes 12..16 -- the SAME convention POD_TARGETS' key,
+# FWD_PENDING/FLOW_TABLE's Forward-tagged VALUE (`ForwardFlowValue.backend.
+# pod_ip`), and FLOW_TABLE's Reverse/PortMemo-tagged KEY (`other_ip`) all
+# use, unlike NODE_ALLOW's host-native REVERSED form (a different map, not
+# touched by this eviction sweep).
+pod_ip_v6_json_bytes() {
+  local IFS=.
+  local octets=($1)
+  printf '["0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0xff","0xff","0x%02x","0x%02x","0x%02x","0x%02x"]' \
+    "${octets[0]}" "${octets[1]}" "${octets[2]}" "${octets[3]}"
+}
+
+# True (jq -e exit 0) if POD_TARGETS still has an entry for pod IP $1.
+pod_targets_has_pod() {
+  local want
+  want=$(pod_ip_v6_json_bytes "$1")
+  map_json "$PIN_DIR/POD_TARGETS" | jq -e --argjson want "$want" 'any(.[]; .key == $want)' >/dev/null
+}
+
+# True if FWD_PENDING still has a row whose value's backend pod_ip (bytes
+# 16..32 of `ForwardFlowValue`) is pod IP $1 -- FWD_PENDING's key never
+# carries pod identity at all, only the value does.
+fwd_pending_has_pod() {
+  local want
+  want=$(pod_ip_v6_json_bytes "$1")
+  map_json "$PIN_DIR/FWD_PENDING" | jq -e --argjson want "$want" 'any(.[]; .value[16:32] == $want)' >/dev/null
+}
+
+# True if FLOW_TABLE still has a row decoding to pod IP $1 for ANY of its
+# three roles: Forward-tagged (key[37] == "0x00") rows match on the VALUE's
+# pod_ip (bytes 16..32, same layout as FWD_PENDING above); Reverse- and
+# PortMemo-tagged rows (key[37] != "0x00") match on the KEY's own bytes
+# 16..32 instead (`decode_tcp_flow_key`'s `other_ip`) -- both share the
+# identical key-based match, so one clause covers both tags.
+flow_table_has_pod() {
+  local want
+  want=$(pod_ip_v6_json_bytes "$1")
+  map_json "$PIN_DIR/FLOW_TABLE" | jq -e --argjson want "$want" '
+    any(.[];
+      (.key[37] == "0x00" and .value[16:32] == $want) or
+      (.key[37] != "0x00" and .key[16:32] == $want)
+    )
+  ' >/dev/null
 }
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
@@ -413,16 +511,7 @@ done
 echo "conntrack before restart: FLOW_TABLE=$fwd_before entries (baseline $flow_baseline)"
 
 echo "==> restarting the loader against the same --pin-dir (simulates a DaemonSet image rollout/eviction/OOM kill)"
-pkill -f "$BIN" 2>/dev/null || true
-for _ in $(seq 1 20); do
-  pgrep -f "$BIN" >/dev/null || break
-  sleep 0.2
-done
-pgrep -f "$BIN" >/dev/null && {
-  echo "FAIL: old loader process did not exit before the restart" >&2
-  exit 1
-}
-
+stop_loader
 start_loader "$RESTART_LOADER_LOG"
 wait_for_attach "$RESTART_LOADER_LOG"
 echo "RESTART VERIFIER-ACCEPT: PASS"
@@ -453,6 +542,79 @@ restart_body="$(cat "$RESTART_CLIENT_OUT" 2>/dev/null || true)"
   exit 1
 }
 echo "RESTART FLOW CONTINUITY: PASS (client received both chunks across the loader restart: '$restart_body')"
+
+echo "==> selective conntrack eviction: establishing a flow on a DEDICATED front to evict"
+# A front of its own (EVICT_VIP_PORT/EVICT_TARGET_PORT), not reused from the
+# round trips above, so this section's before/after assertions aren't
+# confounded by conntrack rows those other flows already wrote for POD_IP.
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nEVICT1' > "$EVICT_RESPONSE_FILE"
+nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" < "$EVICT_RESPONSE_FILE" >"$EVICT_BACKEND_LOG" 2>&1 &
+disown
+sleep 0.5
+evict_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${EVICT_VIP_PORT}/")
+[ "$evict_body" = "EVICT1" ] || {
+  echo "FAIL: expected response body 'EVICT1' from the dedicated eviction-test front, got: $evict_body" >&2
+  exit 1
+}
+echo "EVICTION-FIXTURE ROUND-TRIP: PASS (established FWD_PENDING/promoted FLOW_TABLE forward+reverse state for pod ${POD_IP})"
+
+echo "==> running the hidden 'beep evict-pod' one-shot for pod ${POD_IP}"
+"$BIN" evict-pod --pin-dir "$PIN_DIR" "$POD_IP" || {
+  echo "FAIL: 'beep evict-pod ${POD_IP}' exited nonzero" >&2
+  exit 1
+}
+
+pod_targets_has_pod "$POD_IP" && {
+  echo "FAIL: POD_TARGETS still contains an entry for evicted pod ${POD_IP}" >&2
+  exit 1
+}
+echo "EVICTION ASSERTION 1/2 (POD_TARGETS): PASS (no entry for evicted pod ${POD_IP})"
+
+fwd_pending_has_pod "$POD_IP" && {
+  echo "FAIL: FWD_PENDING still has a row for evicted pod ${POD_IP} -- a departed pod's pre-promotion forward entry survived the sweep and could still be promoted into FLOW_TABLE by a later packet" >&2
+  exit 1
+}
+flow_table_has_pod "$POD_IP" && {
+  echo "FAIL: FLOW_TABLE still has a row (Forward-tagged value or Reverse/PortMemo-tagged key) for evicted pod ${POD_IP} -- the sweep left stale conntrack state that could misroute a future flow reusing this pod IP" >&2
+  exit 1
+}
+echo "EVICTION ASSERTION 2/2 (FWD_PENDING + FLOW_TABLE): PASS (zero rows decode to evicted pod ${POD_IP} across all three roles: Forward/Reverse/PortMemo)"
+
+echo "==> restarting the loader with a REPLACEMENT pod at the same front and confirming the sweep didn't wedge it"
+EVICT_FRONT_POD_IP="$REPLACEMENT_POD_IP"
+stop_loader
+start_loader "$EVICT_LOADER_LOG_REPLACEMENT"
+wait_for_attach "$EVICT_LOADER_LOG_REPLACEMENT"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nREPLACEMENT' > "$REPLACEMENT_RESPONSE_FILE"
+nohup nc -l -N "$REPLACEMENT_POD_IP" "$EVICT_TARGET_PORT" < "$REPLACEMENT_RESPONSE_FILE" >"$REPLACEMENT_BACKEND_LOG" 2>&1 &
+disown
+sleep 0.5
+replacement_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${EVICT_VIP_PORT}/")
+[ "$replacement_body" = "REPLACEMENT" ] || {
+  echo "FAIL: expected response body 'REPLACEMENT' after re-pointing the front at a new backend pod, got: $replacement_body -- the eviction sweep must not wedge the front against a replacement endpoint" >&2
+  exit 1
+}
+echo "REPLACEMENT-POD ROUND-TRIP: PASS (front now correctly reaches the replacement pod ${REPLACEMENT_POD_IP})"
+
+echo "==> restarting the loader again, reusing the ORIGINAL (evicted) pod IP, and confirming the fresh flow isn't a resurrected stale one"
+EVICT_FRONT_POD_IP="$POD_IP"
+stop_loader
+start_loader "$EVICT_LOADER_LOG_REUSE"
+wait_for_attach "$EVICT_LOADER_LOG_REUSE"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nREUSE' > "$REUSE_RESPONSE_FILE"
+nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" < "$REUSE_RESPONSE_FILE" >"$REUSE_BACKEND_LOG" 2>&1 &
+disown
+sleep 0.5
+reuse_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${EVICT_VIP_PORT}/")
+[ "$reuse_body" = "REUSE" ] || {
+  echo "FAIL: expected response body 'REUSE' from the reused pod IP, got: $reuse_body" >&2
+  exit 1
+}
+flow_table_has_pod "$POD_IP" || {
+  echo "FAIL: FLOW_TABLE has no row decoding to pod ${POD_IP} after the reused-IP round trip succeeded -- the flow can't have actually routed through beep-ebpf's conntrack path, so this isn't proving anything about pod-IP reuse" >&2
+  exit 1
+}
+echo "POD-IP-REUSE ROUND-TRIP: PASS (fresh flow through reused pod IP ${POD_IP} routes correctly; provably NOT a resurrected stale entry, since the EVICTION ASSERTION above already proved zero rows for this pod survived before this new flow was ever established)"
 
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
 # This fixture is a self-loop (VIP_IP is also this node's own address, and

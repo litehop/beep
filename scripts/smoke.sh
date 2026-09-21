@@ -27,7 +27,13 @@
 #      per-uplink return (docs/decisions/servicelb-multi-symmetric-uplink.md);
 #      single-uplink behavior is the N=1 subset the first two round trips
 #      already exercise;
-#   5. removes this fixture's own peer-node entry from NODE_ALLOW and
+#   5. drives a flow, runs the hidden `beep evict-pod` one-shot (the
+#      selective conntrack eviction sweep's test trigger), and asserts via
+#      bpftool that POD_TARGETS/FWD_PENDING/FLOW_TABLE no longer carry any
+#      row for the evicted pod, that a replacement pod at the same front is
+#      reachable, and that reusing the evicted pod's IP for a fresh flow
+#      doesn't resurrect stale reverse/port-memo state;
+#   6. removes this fixture's own peer-node entry from NODE_ALLOW and
 #      asserts a further round trip through the same VIP is DROPPED --
 #      proves geneve_ingress's outer-tunnel-source attestation gate actually
 #      rejects an unattested source rather than merely compiling.
