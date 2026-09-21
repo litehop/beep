@@ -271,7 +271,7 @@ jobs:
       - name: Build beep-ebpf + beep + beep-controller
         run: cargo build --release -p beep -p beep-controller
 
-      # Guards build.rs's post-link DWARF strip (mayor-aie31.19) from a
+      # Guards build.rs's post-link DWARF strip from a
       # silent future revert -- a fresh checkout's target/ has exactly one
       # build.rs invocation, so exactly one OUT_DIR/beep-ebpf to find.
       - name: Assert the embedded eBPF object stays DWARF-stripped
