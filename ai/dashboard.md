@@ -1,42 +1,48 @@
 # Dashboard
 
-**Updated 2026-09-10T09:29Z · SESSION WRAPPED · Resume: `bd prime` → this file.**
+**Updated 2026-09-21 · SESSION LIVE (mayor).** Main @ `197dff3`, up to date with origin. **3 loops ARMED. 0 workers, 0 open worker PRs.** **0.3.0 bumped on main — READY TO TAG.**
 
-**Outcome:** Controller-shipping wave landed end-to-end. Image LIVE + pullable at `valerauko/beep-lb:latest` (dual-arch glibc), and the delivery pipeline now builds in CI (setup-zig + trixie + rust-cache, ~4min) and publishes on main — **confirmed working on main**. Board clean: no open PRs, no workers, no worktrees, all Lima VMs free.
+## 🎯 WHAT NEEDS THE OPERATOR NOW
+- **Tag `v0.3.0` (operator-only).** Main `197dff3` is the release commit: all 5 crates at 0.3.0, CHANGELOG dated. Cut it with:
+  `git tag v0.3.0 && git push origin v0.3.0` → fires `delivery.yaml` (Docker image `docker.io/valerauko/beep-lb:v0.3.0` + `:latest`, GitHub Release from CHANGELOG). I do NOT tag/push releases.
+- (Renovate PR #123 — operator handling; mayor hands-off.)
+- `beep-5lw` design fork PARKED (slot-renumbering vs BackendId); impl blocks on eviction epic `beep-03i`.
 
-## 🎯 Operator — what needs you now
-- Nothing — session is wrapped.
+## ✅ Merged this session
+- **#125** (beep-1no) — workspace version bump 0.2.0→0.3.0 + CHANGELOG dated.
+- **#124** (beep-9au) — consolidated release notes into root `CHANGELOG.md`; removed `docs/release-notes/*`; repointed `delivery.yaml`.
+- **#121** (beep-5lx) — 0.3.0 gate: valid L2 header on Ethernet client-egress return leg.
+- **#120** (beep-8vn + beep-3e0) — ci.yaml bead-ID leak + 2 ADR citations.
 
-**Stance:** correctness > security > perf > features; pre-alpha, break freely; bare-metal (node's PHYSICAL IP is the front, no cloud LB/BGP); merge-on-green.
-**Gate:** `ebpf-build` + `ebpf-memory-smoke` required. Delivery = `delivery.yaml` on push:main (+ `workflow_dispatch` with `push` input, default false = dry-run).
+## 🗺 v1.0 roadmap
+0.3.0 (ready to tag) → real-hardware [beep-903] → perf+code-quality audit (**beep-uqn**) → security audit → docs. **beep-03i** eviction = FIRM v1 req (NOT built). v6 Geneve *outer*: **beep-8b0** (P3).
 
-## ▶ Next major (for the next mayor)
-- **beep-s5k** P2 — controller-driven e2e on the k3s rig (real Service → beep → backend round trip). The whole stack is now shipped (image live; controller feature-complete: watch→reconcile→program maps + `status.loadBalancer.ingress` + hostNet). This is the validation gate. Depends on `mayor-9gr0n`.
-- **`mayor-9gr0n`** (controller epic) is CODE-COMPLETE + shipped but left OPEN — its done-when includes live integration, which IS beep-s5k. Close it once beep-s5k proves the controller live.
-
-## Backlog (filed this session)
-- **beep-pw4** P3 — PR-gate the aarch64-gnu cross-compile (delivery builds it; only amd64 PR-covered).
-- **beep-5jb** P3 (PARKED) — split `ebpf-build` job → lint/test/build (needs ruleset-22605658 coord on a clean board).
-- **beep-867** P4 — strengthen `is_redirected_return_mark` test (reject non-marker nonzero).
-- **mayor-axzsf** P3 — rename misleading "VIP" (real confusion, surfaced live this session).
-- Other open: `mayor-waqhd` (kube-proxy/flannel coexistence — Phase 6; note the beep-nxn status-IP overlap), `mayor-g9l0f` (e2e/conformance wiring, informed by #35's findings doc), `beep-n24` (cross-node martian-source blocker), `mayor-aie31.21` (affinity), + P3/P4 misc.
-
-## ✅ Merged this session (7 PRs)
-#34 image+delivery.yaml · #35 sonobuoy findings · #36 status.loadBalancer.ingress · #37 hostNet relax · #38 return-leg fix (vip==pod_ip) · #39 CI-native build · #40 setup-zig+trixie+dry-run pipeline fix.
-
-## Memories banked
-`ci-rust-cache-convention` · `rust-cache-matrix-keying-gotcha` (matrix legs need per-target key; sequential doesn't).
-
-## Key learnings (session)
-- **hostNetwork semantics:** in bare-metal the front IS the node's physical IP, so a hostNet backend has vip-adjacent addressing; the guard black-holed it (fixed #37+#38). Perimeter defense = firewall's job (ufw/NetworkPolicy), not the LB.
-- **Verify CI-only steps IN CI:** #39 shipped a hand-rolled zig install that passed local build but died on `tar -C /usr/local` in CI. #40 added a `workflow_dispatch` dry-run so pipeline changes are provable on a branch before merge — use it.
+## 🗄 Handoff / START NEXT SESSION
+Beads LOCAL (no remote). Parked: `beep-5lw`. Post-0.3.0 P4 follow-ons: **beep-c9k** (delivery.yaml extraction test), **beep-puf** (cold-cache rig). All VMs FREE. No worktrees.
+- **If session was closed, re-arm loops:** 15m tick `7,22,37,52 * * * *` · 60m reread `13 * * * *` · 60m hygiene `43 * * * *`.
+- **Verify after operator tags `v0.3.0`:** `delivery.yaml` run green + GitHub Release body rendered from CHANGELOG (first use of the new extraction path) + Docker image published. Then bump these dashboard sections to `[0.3.0] shipped`.
 
 ## Cron loops
 <!-- BEGIN AUTO: cron-loops -->
 15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
 <!-- END AUTO: cron-loops -->
 
+## Open PRs
+<!-- BEGIN AUTO: open-prs -->
+- #123 chore: Configure Renovate (`renovate/configure`) — operator handling.
+<!-- END AUTO: open-prs -->
+
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-09-10T09:29Z — Branch `main` @ b39a9b3, up to date with origin. 0 open PRs, only `main` locally, all VMs free. Working-tree: dashboard + .beads/*.jsonl (operator commits out-of-session).
+2026-09-21 — main @ `197dff3`, up to date with origin/main.
 <!-- END AUTO: repo-state -->
+
+## 🌲 Worktrees
+<!-- BEGIN AUTO: worktrees -->
+None.
+<!-- END AUTO: worktrees -->
+
+## 📋 Review queue
+<!-- BEGIN AUTO: review-queue -->
+0 pending.
+<!-- END AUTO: review-queue -->
