@@ -14,7 +14,7 @@ controller-side apply path (`controller/src/apply.rs`,
 (gated on `fronts_known`, the Node LIST watch's initial-sync completion)
 and `POD_TARGETS` (gated on the narrower `pod_targets_known`, this node's
 own entry resolved). A reviewer on #98
-(pullrequestreview-5244341782) asked which signal should gate
+(pullrequestreview-5244211971) asked which signal should gate
 `NODE_ALLOW`.
 
 ## Decision
