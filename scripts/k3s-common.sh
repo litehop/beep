@@ -14,9 +14,46 @@ eth0_ip() { # eth0_ip <vm> -- this VM's real underlay address
   limactl shell "$1" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1"
 }
 
-k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy-mode] -- brings up the k3s server/agent pair (scripts/k3s-up.sh) and starts the client VM if it isn't already running; proxy-mode forwards to k3s-up.sh --proxy-mode (default iptables, matching k3s-up.sh's own default) so a caller can drive an IPVS-mode cluster without k3s-up.sh's own default silently resetting it back to iptables on the next invocation
-  local vm_a="$1" vm_b="$2" vm_client="$3" proxy_mode="${4:-iptables}"
-  "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b" --proxy-mode "$proxy_mode"
+# Static LAN-side v6 ULA for beep-node-a/beep-node-b/beep-client's real eth0
+# NIC, fd00:beef:98::/64 -- the SAME prefix and host suffixes
+# scripts/smoke-wg-2node.sh's --family 6 mode already assigns to vm-b/
+# vm-client (its LAN_ULA_B/LAN_ULA_CLIENT) so the two rigs never fight over
+# conflicting addresses on the same physical VM. Lima's user-v2 switch
+# forwards v6 unicast between VMs (confirmed live) but never hands out a
+# routable address of its own (no RA/DHCPv6 -- bd memories
+# lima-ipv6-reconciled-with-u7s), hence the static assignment.
+K3S_LAN_ULA_A="fd00:beef:98::3"
+K3S_LAN_ULA_B="fd00:beef:98::4"
+K3S_LAN_ULA_CLIENT="fd00:beef:98::14"
+
+k3s_seed_lan_v6() { # k3s_seed_lan_v6 <vm> <addr> [<vm> <addr> ...] -- idempotently assigns each vm its own /64 ULA on eth0, then seeds a full-mesh of static "ip -6 neigh" entries between every pair. Needed because Lima's usermode switch drops the multicast NDP that would otherwise resolve neighbors automatically (same gap smoke-wg-2node.sh's --family 6 mode works around for its own vm-b/vm-client pair).
+  local vms=() addrs=() macs=() i j
+  while [ "$#" -gt 0 ]; do
+    vms+=("$1")
+    addrs+=("$2")
+    shift 2
+  done
+  for i in "${!vms[@]}"; do
+    limactl shell "${vms[$i]}" -- sudo ip -6 addr replace "${addrs[$i]}/64" dev eth0
+    macs[$i]="$(limactl shell "${vms[$i]}" -- cat /sys/class/net/eth0/address)"
+  done
+  for i in "${!vms[@]}"; do
+    for j in "${!vms[@]}"; do
+      [ "$i" = "$j" ] && continue
+      limactl shell "${vms[$i]}" -- sudo ip -6 neigh replace "${addrs[$j]}" lladdr "${macs[$j]}" dev eth0 nud permanent
+    done
+  done
+}
+
+k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy-mode] [dual-stack: 0|1] -- brings up the k3s server/agent pair (scripts/k3s-up.sh) and starts the client VM if it isn't already running; proxy-mode forwards to k3s-up.sh --proxy-mode (default iptables, matching k3s-up.sh's own default) so a caller can drive an IPVS-mode cluster without k3s-up.sh's own default silently resetting it back to iptables on the next invocation. dual-stack forwards to k3s-up.sh --dual-stack.
+  local vm_a="$1" vm_b="$2" vm_client="$3" proxy_mode="${4:-iptables}" dual_stack="${5:-0}"
+  # A plain string, not an array: an empty bash array's "${arr[@]}" expansion
+  # is an unbound-variable error under `set -u` on bash < 4.4 (macOS's
+  # default /bin/bash is 3.2) -- confirmed live (smoke-k3s-controller.sh's
+  # `set -euo pipefail` tripped on exactly this).
+  local dual_stack_arg=""
+  [ "$dual_stack" = "1" ] && dual_stack_arg="--dual-stack"
+  "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b" --proxy-mode "$proxy_mode" $dual_stack_arg
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm_client}[[:space:]]+Running"; then
     limactl start "$vm_client"
   fi

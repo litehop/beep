@@ -453,9 +453,9 @@ start_backend_responder() {
   # concurrently-running other-family listener (dual-stack rigs) alive.
   # `pkill` only sends SIGTERM and returns immediately -- it does not wait
   # for the old process to actually exit and release the port, so the bind
-  # below could rarely race a not-yet-freed socket (PR #143 review). Wait
-  # for the OLD pid specifically (bounded to ~2s) rather than just firing
-  # the signal and hoping.
+  # below could rarely race a not-yet-freed socket. Wait for the OLD pid
+  # specifically (bounded to ~2s) rather than just firing the signal and
+  # hoping.
   local old_pid
   old_pid="$(pgrep -f "nc ${nc_flag} -v -l -N ${pod_ip} ${port}\$" 2>/dev/null || true)"
   if [ -n "$old_pid" ]; then
