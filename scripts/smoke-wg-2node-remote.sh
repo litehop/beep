@@ -451,6 +451,24 @@ seed_node_allow() {
   echo "NODE-ALLOW-SEED: PASS (added peer key ${key_hex// /:})"
 }
 
+# Counterpart to seed_node_allow -- lets a caller remove a specific entry
+# (e.g. this node's own self-entry) instead of only ever adding, needed to
+# isolate a genuinely peer-only NODE_ALLOW for the peer-attestation
+# regression check in smoke-wg-2node.sh's BEEP_PEER_ATTESTATION_CHECK path.
+delete_node_allow() {
+  local key_hex=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --key-hex) key_hex="$2"; shift 2 ;;
+      *) echo "delete-node-allow: unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$key_hex" ] || { echo "delete-node-allow: --key-hex required" >&2; exit 1; }
+  # shellcheck disable=SC2086 # $key_hex is a bpftool-supplied space-separated byte list, meant to split.
+  bpftool map delete pinned "$PIN_DIR/NODE_ALLOW" key $key_hex
+  echo "NODE-ALLOW-DELETE: PASS (removed key ${key_hex// /:})"
+}
+
 # RX+TX packet count on $WG_IFACE as one number -- the host driver diffs
 # this before/after a round trip as its wg0-traversal evidence: a genuine
 # cross-node encap/decap must move this counter, unlike the same-node
@@ -547,11 +565,12 @@ case "$cmd" in
   start-backend-responder) start_backend_responder "$@" ;;
   dump-node-allow-key) dump_node_allow_key ;;
   seed-node-allow) seed_node_allow "$@" ;;
+  delete-node-allow) delete_node_allow "$@" ;;
   wg-packet-count) wg_packet_count ;;
   dump-evidence) dump_evidence ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|setup-client-netns|setup-client-tunnels|start-loader|start-backend-responder|dump-node-allow-key|seed-node-allow|wg-packet-count|dump-evidence|cleanup} [args...]" >&2
+    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|setup-client-netns|setup-client-tunnels|start-loader|start-backend-responder|dump-node-allow-key|seed-node-allow|delete-node-allow|wg-packet-count|dump-evidence|cleanup} [args...]" >&2
     exit 1
     ;;
 esac
