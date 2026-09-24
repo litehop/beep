@@ -44,6 +44,35 @@ pub fn unmap_ipv4(v6: &[u8; 16]) -> Option<u32> {
     }
 }
 
+/// The GET-side decision every peer-attestation / `ingress_node_ip` read in
+/// `beep-ebpf`'s `geneve_ingress` needs (`peer_node_admission`'s doc comment
+/// for the threat this closes): `bpf_skb_get_tunnel_key` populates exactly
+/// one union arm of `bpf_tunnel_key`, `remote_ipv4` or `remote_ipv6`,
+/// depending on which `flags` argument the GET call actually succeeded with
+/// (`used_ipv6` -- the kernel errors outright if `flags` doesn't match the
+/// tunnel's real family, so the caller must have already discovered this by
+/// probing). Reading the wrong arm silently produces garbage instead of the
+/// outer tunnel source, mis-attesting every genuine peer on that underlay --
+/// this function existing separately from `beep-ebpf`'s call sites is the
+/// regression backstop: a caller that hardcodes `used_ipv6 = false` (the bug
+/// this closed) is testable here without a live kernel. A genuine v6
+/// address's `remote_ipv6` words go in with no byte-swap, one word per
+/// 4-byte chunk (`beep-ebpf`'s module doc: unlike `remote_ipv4`, an IPv6
+/// address has no separate host/wire representation to convert between); a
+/// v4 address is embedded `ipv4_mapped_v6` so both arms land in the same
+/// dual-stack `[u8; 16]` shape every map here keys on.
+pub fn tunnel_remote_addr(used_ipv6: bool, remote_ipv4: u32, remote_ipv6: [u32; 4]) -> [u8; 16] {
+    if used_ipv6 {
+        let mut addr = [0u8; 16];
+        for (i, word) in remote_ipv6.iter().enumerate() {
+            addr[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        addr
+    } else {
+        ipv4_mapped_v6(remote_ipv4)
+    }
+}
+
 /// Packs a TCP/UDP flow key. `client_port`/`other_port` are wire tokens
 /// (see module doc); `other` is the VIP on the forward/ingress role or the
 /// backend Pod on the reverse/backend role (`ebpf-lb-dataplane.md`).
@@ -592,24 +621,25 @@ pub fn decap_forward_pod_admission(is_local_pod: bool) -> DecapForwardPodAdmissi
 /// before either function's own admission gate above ever runs. With
 /// `rp_filter=0` node-wide (`docs/decisions/geneve-rp-filter-disable.md`),
 /// the kernel backstop that would otherwise drop an outer packet with a
-/// spoofed source is gone; `tkey.remote_ipv4` (the outer source, as decap'd
-/// by `bpf_skb_get_tunnel_key`) is the only remaining thing to check it
-/// against. A miss here is dropped, not passed through as unrelated traffic
-/// the way `EgressReturnAdmission::NotBackendTraffic` is -- unlike that
-/// hook, `geneve_ingress` sees only beep's own Geneve VNIs, so an unknown
-/// outer source is never legitimate non-beep traffic, only a spoof or a
-/// not-yet-converged peer.
+/// spoofed source is gone; the outer tunnel source (as decap'd by
+/// `bpf_skb_get_tunnel_key`, `remote_ipv4` or `remote_ipv6` depending on the
+/// underlay's family -- `tunnel_remote_addr` above) is the only remaining
+/// thing to check it against. A miss here is dropped, not passed through as
+/// unrelated traffic the way `EgressReturnAdmission::NotBackendTraffic` is
+/// -- unlike that hook, `geneve_ingress` sees only beep's own Geneve VNIs,
+/// so an unknown outer source is never legitimate non-beep traffic, only a
+/// spoof or a not-yet-converged peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerNodeAdmission {
-    /// `tkey.remote_ipv4` is not a member of this node's current
+    /// The outer tunnel source is not a member of this node's current
     /// `NODE_ALLOW` -- drop rather than decap+deliver traffic whose outer
     /// tunnel source cannot be attested.
     Drop,
-    /// `tkey.remote_ipv4` is a known peer -- proceed with the decap.
+    /// The outer tunnel source is a known peer -- proceed with the decap.
     Continue,
 }
 
-/// `is_known_peer`: `NODE_ALLOW.get(tkey.remote_ipv4)` membership. Same
+/// `is_known_peer`: `NODE_ALLOW.get(tunnel_remote_addr(..))` membership. Same
 /// existence-only shape as `decap_forward_pod_admission`'s `is_local_pod`
 /// above -- membership alone is checked, never a second field, so a peer
 /// node's address staying in the cluster's Node set is sufficient regardless
@@ -908,6 +938,37 @@ mod tests {
         // disjoint.
         let real_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert_eq!(unmap_ipv4(&real_v6), None);
+    }
+
+    #[test]
+    fn tunnel_remote_addr_reads_the_v6_arm_when_get_populated_it() {
+        // Every GET-side peer-attestation site used to read
+        // `remote_ipv4` unconditionally, so a genuine v6-underlay peer's
+        // outer tunnel source was coerced through `ipv4_mapped_v6` on the
+        // low 32 bits of a v6 address instead of its real address -- NODE_
+        // ALLOW could never contain that value, so the peer was always
+        // dropped. `used_ipv6 = true` must read `remote_ipv6`, not fall
+        // back to the v4 arm.
+        let remote_ipv6 = [0x0102_0304u32, 0x0506_0708, 0x090a_0b0c, 0x0d0e_0f10];
+        let addr = tunnel_remote_addr(true, 0xdead_beef, remote_ipv6);
+        let mut expected = [0u8; 16];
+        for (i, word) in remote_ipv6.iter().enumerate() {
+            expected[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        assert_eq!(addr, expected);
+        assert_ne!(
+            addr,
+            ipv4_mapped_v6(0xdead_beef),
+            "a v6 peer's address must never collide with the v4 arm's ipv4_mapped_v6 embedding"
+        );
+    }
+
+    #[test]
+    fn tunnel_remote_addr_reads_the_v4_arm_when_get_populated_it() {
+        // Every existing v4-underlay deployment's peer attestation must
+        // keep working exactly as before the family branch was added.
+        let addr = tunnel_remote_addr(false, 0xdead_beef, [0; 4]);
+        assert_eq!(addr, ipv4_mapped_v6(0xdead_beef));
     }
 
     #[test]

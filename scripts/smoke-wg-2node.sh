@@ -41,9 +41,14 @@
 # --family 6: proves WireGuard's tunnel carries IPv6 end-to-end between
 # vm-a and vm-b, using a static ULA on each side of wg0 (Lima's own
 # network hands out v6 link-local only, never anything routable -- see
-# lima-ipv6-reconciled-with-u7s). This is a 2-node-only, beep-dataplane-free
-# check: it stops after the tunnel is up and never touches vm-client,
-# geneve, or the loader, since beep itself is still IPv4-only.
+# lima-ipv6-reconciled-with-u7s), THEN continues into a full v6-UNDERLAY
+# beep dataplane round trip: --node-ip/the fixture's
+# backend_node_ip/the VIP itself are all wg0's own v6 ULA, so the Geneve
+# tunnel's outer encap/decap -- not just WireGuard's transport -- runs over
+# v6 end to end. vm-client relays through vm-b exactly like the v4 rig
+# below, over a second, separate v6 ULA statically assigned to vm-b's and
+# vm-client's real LAN NIC (again because Lima hands out v6 link-local
+# only there too).
 #
 # Same host prerequisites as smoke.sh (nightly + rust-src + bpf-linker +
 # cargo-zigbuild); VM prerequisites: bpftool (already present) plus
@@ -93,15 +98,23 @@ POD_IP="198.51.100.60"
 POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18090"
 UPLINK_IFACE_B="eth0"
+# v6-underlay-only: a SEPARATE v6 ULA from WG_ULA_A/B's own
+# tunnel-inner prefix, statically assigned to vm-b's and vm-client's real
+# LAN NIC (eth0) so vm-client's relay-via-vm-b leg has a routable v6
+# next-hop -- the same role $IP_B/$IP_CLIENT play for the v4 rig's relay
+# below, needed here too since Lima's shared network never hands out a
+# routable v6 address of its own (this script's --family 6 header note).
+LAN_ULA_B="fd00:beef:98::4"
+LAN_ULA_CLIENT="fd00:beef:98::14"
+POD_IP_V6="fd00:beef:60::60"
+POD_CIDR_V6="fd00:beef:60::/64"
 
 command -v limactl >/dev/null || { echo "FAIL: limactl not found on PATH" >&2; exit 1; }
-if [ "$FAMILY" = "4" ]; then
-  command -v cargo-zigbuild >/dev/null || { echo "FAIL: cargo-zigbuild not found on PATH" >&2; exit 1; }
-  rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
-    echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
-    exit 1
-  }
-fi
+command -v cargo-zigbuild >/dev/null || { echo "FAIL: cargo-zigbuild not found on PATH" >&2; exit 1; }
+rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
+  echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
+  exit 1
+}
 
 remote() { # remote <vm> <args...> -- runs smoke-wg-2node-remote.sh as root on <vm>
   local vm="$1"; shift
@@ -140,72 +153,61 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ "$FAMILY" = "4" ]; then
-  echo "==> [1/7] bringing up $VM_A, $VM_B, and $VM_CLIENT"
-else
-  echo "==> [1/3] bringing up $VM_A and $VM_B (--family 6: $VM_CLIENT/geneve/loader are out of scope, beep is still v4-only)"
-fi
+STEP_TOTAL=7
+[ "$FAMILY" = "6" ] && STEP_TOTAL=9
+echo "==> [1/$STEP_TOTAL] bringing up $VM_A, $VM_B, and $VM_CLIENT"
 for vm in "$VM_A" "$VM_B"; do
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm}[[:space:]]+Running"; then
     limactl start "$vm"
   fi
   limactl shell "$vm" -- bash -c 'command -v wg >/dev/null || sudo apt-get install -y wireguard-tools' >/dev/null
 done
-if [ "$FAMILY" = "4" ]; then
-  if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
-    limactl start "$VM_CLIENT"
-  fi
+if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM_CLIENT}[[:space:]]+Running"; then
+  limactl start "$VM_CLIENT"
 fi
 
-if [ "$FAMILY" = "4" ]; then
-  echo "==> [2/7] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
-  ( cd "$BEEP_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
-  BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
-  [ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
-else
-  echo "==> [2/3] copying the remote rig script only (no beep binary needed -- the loader is never started)"
-fi
+# --family 6 now drives a full beep dataplane round trip too (not just the
+# WireGuard transport check), so both families need the cross-built binary
+# on both nodes.
+echo "==> [2/$STEP_TOTAL] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
+( cd "$BEEP_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
+BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
+[ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
 
 for vm in "$VM_A" "$VM_B"; do
-  if [ "$FAMILY" = "4" ]; then
-    limactl copy "$BIN" "$vm":"/tmp/${BIN_NAME}"
-    limactl copy "$REMOTE_SCRIPT" "$vm":"/tmp/${BIN_NAME}-remote.sh"
-    limactl shell "$vm" -- bash -c "chmod +x /tmp/${BIN_NAME} /tmp/${BIN_NAME}-remote.sh"
-  else
-    limactl copy "$REMOTE_SCRIPT" "$vm":"/tmp/${BIN_NAME}-remote.sh"
-    limactl shell "$vm" -- bash -c "chmod +x /tmp/${BIN_NAME}-remote.sh"
-  fi
+  limactl copy "$BIN" "$vm":"/tmp/${BIN_NAME}"
+  limactl copy "$REMOTE_SCRIPT" "$vm":"/tmp/${BIN_NAME}-remote.sh"
+  limactl shell "$vm" -- bash -c "chmod +x /tmp/${BIN_NAME} /tmp/${BIN_NAME}-remote.sh"
   remote "$vm" cleanup >/dev/null 2>&1 || true
 done
 
-if [ "$FAMILY" = "4" ]; then
-  echo "==> [3/7] establishing the real WireGuard tunnel between $VM_A and $VM_B, plus $VM_CLIENT's relay route"
-else
-  echo "==> [3/3] establishing the real WireGuard tunnel between $VM_A and $VM_B, then proving it carries IPv6"
-fi
+echo "==> [3/$STEP_TOTAL] establishing the real WireGuard tunnel between $VM_A and $VM_B, plus $VM_CLIENT's relay route"
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"
 [ -n "$IP_A" ] && [ -n "$IP_B" ] || {
   echo "FAIL: could not resolve eth0 addresses ($VM_A=$IP_A, $VM_B=$IP_B) -- are both VMs on the same Lima network?" >&2
   exit 1
 }
-if [ "$FAMILY" = "4" ]; then
-  IP_CLIENT="$(eth0_ip "$VM_CLIENT")"
-  [ -n "$IP_CLIENT" ] || {
-    echo "FAIL: could not resolve eth0 address for $VM_CLIENT -- is it on the same Lima network?" >&2
-    exit 1
-  }
-fi
+IP_CLIENT="$(eth0_ip "$VM_CLIENT")"
+[ -n "$IP_CLIENT" ] || {
+  echo "FAIL: could not resolve eth0 address for $VM_CLIENT -- is it on the same Lima network?" >&2
+  exit 1
+}
 # Each side's key pair is generated independently BEFORE either side's peer
 # config is known -- avoids a chicken-and-egg ordering (setup-wg needs the
 # PEER's pubkey as an argument, so both pubkeys must exist first).
 PUBKEY_A="$(remote "$VM_A" pubkey)"
 PUBKEY_B="$(remote "$VM_B" pubkey)"
 if [ "$FAMILY" = "6" ]; then
-  # No --extra-allowed here: --family 6 never involves $VM_CLIENT's relay,
-  # so node-b's own /128 peer entry is all node-a needs to admit.
+  # --extra-allowed: $VM_CLIENT relays into the v6 tunnel via $VM_B's plain
+  # IP forward exactly like the v4 path below, over a SEPARATE v6 ULA on
+  # their shared LAN NIC ($LAN_ULA_B/$LAN_ULA_CLIENT, assigned in step
+  # [4/9]) -- $VM_A's peer entry for $VM_B must admit that address too, or
+  # WireGuard's own crypto-routing source filter drops the relayed,
+  # client-sourced packet on decrypt before beep ever sees it.
   remote "$VM_A" setup-wg --family 6 --self-ip "$WG_ULA_A" --peer-ip "$WG_ULA_B" \
-    --peer-pubkey "$PUBKEY_B" --peer-endpoint "${IP_B}:${WG_PORT}" --listen-port "$WG_PORT"
+    --peer-pubkey "$PUBKEY_B" --peer-endpoint "${IP_B}:${WG_PORT}" --listen-port "$WG_PORT" \
+    --extra-allowed "${LAN_ULA_CLIENT}/128"
   remote "$VM_B" setup-wg --family 6 --self-ip "$WG_ULA_B" --peer-ip "$WG_ULA_A" \
     --peer-pubkey "$PUBKEY_A" --peer-endpoint "${IP_A}:${WG_PORT}" --listen-port "$WG_PORT"
 
@@ -215,24 +217,66 @@ if [ "$FAMILY" = "6" ]; then
   }
   echo "WIREGUARD TUNNEL (v6): PASS ($VM_A $WG_ULA_A <-> $VM_B $WG_ULA_B, over real v4 underlay $IP_A/$IP_B)"
 
-  # A plain nc -6 payload delivery, independent of ping's ICMP-only proof:
-  # confirms wg0 carries a genuine TCP/v6 byte stream (the 3-way handshake
-  # and the server's ACKs of the payload both require the return leg to
-  # carry v6 too, so a successful delivery already proves both directions).
-  NC_PORT="19620"
-  NC_PAYLOAD="beep-v6-payload"
-  limactl shell "$VM_B" -- bash -c "rm -f /tmp/wg2node-v6-payload.log; nohup nc -l -N -6 ${WG_ULA_B} ${NC_PORT} > /tmp/wg2node-v6-payload.log 2>&1 & disown"
-  sleep 0.5
-  limactl shell "$VM_A" -- bash -c "printf '%s' '${NC_PAYLOAD}' | nc -6 -w 3 ${WG_ULA_B} ${NC_PORT}"
-  NC_RECEIVED="$(limactl shell "$VM_B" -- cat /tmp/wg2node-v6-payload.log)"
-  limactl shell "$VM_B" -- rm -f /tmp/wg2node-v6-payload.log
-  [ "$NC_RECEIVED" = "$NC_PAYLOAD" ] || {
-    echo "FAIL: nc -6 payload over wg0 not received intact by $VM_B (got '$NC_RECEIVED')" >&2
+  echo "==> [4/9] giving $VM_B and $VM_CLIENT a shared v6 ULA on their real LAN NIC (Lima hands out v6 link-local only)"
+  limactl shell "$VM_B" -- sudo ip -6 addr replace "${LAN_ULA_B}/64" dev eth0
+  limactl shell "$VM_CLIENT" -- sudo ip -6 addr replace "${LAN_ULA_CLIENT}/64" dev eth0
+  # Lima's vz shared-network backend doesn't propagate IPv6 multicast
+  # between sibling VMs (confirmed empirically: tcpdump on $VM_B's eth0
+  # sees ZERO packets for a neighbor solicitation $VM_CLIENT sends), so
+  # NDP -- multicast-based, unlike ARP's broadcast -- can never resolve
+  # either side's link-layer address on this LAN segment. A static neigh
+  # entry sidesteps NDP outright; both MACs are already known, so nothing
+  # is actually being discovered here that this script doesn't already have.
+  MAC_B="$(limactl shell "$VM_B" -- bash -c "ip link show eth0 | awk '/link\/ether/{print \$2}'")"
+  MAC_CLIENT="$(limactl shell "$VM_CLIENT" -- bash -c "ip link show eth0 | awk '/link\/ether/{print \$2}'")"
+  limactl shell "$VM_B" -- sudo ip -6 neigh replace "$LAN_ULA_CLIENT" lladdr "$MAC_CLIENT" dev eth0 nud permanent
+  limactl shell "$VM_CLIENT" -- sudo ip -6 neigh replace "$LAN_ULA_B" lladdr "$MAC_B" dev eth0 nud permanent
+
+  echo "==> [5/9] creating geneve0 on both nodes"
+  remote "$VM_A" setup-geneve
+  remote "$VM_B" setup-geneve
+
+  echo "==> [6/9] confirming $VM_B's real underlay NIC name (must not be assumed)"
+  IFACE_B_ACTUAL="$(limactl shell "$VM_B" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$2; exit}'")"
+  [ "$IFACE_B_ACTUAL" = "$UPLINK_IFACE_B" ] || {
+    echo "FAIL: expected $VM_B's user-v2 NIC to be '$UPLINK_IFACE_B', found '$IFACE_B_ACTUAL' -- update UPLINK_IFACE_B" >&2
     exit 1
   }
-  echo "WG-V6-PAYLOAD: PASS (nc -6 delivered '$NC_RECEIVED' $VM_A -> $WG_ULA_B:$NC_PORT over wg0)"
-  echo "GATE: WIREGUARD-CARRIES-IPV6: PASS (transport only -- beep's own dataplane is still IPv4-only)"
-  exit 0
+  echo "UPLINK-IFACE-NAME: PASS ($VM_B's user-v2 NIC is $UPLINK_IFACE_B)"
+
+  # VIP, --node-ip, and the fixture's backend_node_ip are all wg0's v6 ULA,
+  # so the Geneve tunnel's outer SET (set_tunnel_remote) and GET
+  # (get_tunnel_key/tunnel_remote) both run their v6 arm end to end,
+  # not just WireGuard's own v6-agnostic transport.
+  echo "==> [7/9] loading beep-ebpf with a v6-underlay --node-ip on both nodes"
+  FIXTURE_V6="[${WG_ULA_A}]:${VIP_PORT}:tcp:[${WG_ULA_B}]:[${POD_IP_V6}]:${TARGET_PORT}"
+  remote "$VM_A" start-loader --fixture "$FIXTURE_V6" --pod-cidr "$POD_CIDR_V6" --node-ip "$WG_ULA_A"
+  remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_B" --fixture "$FIXTURE_V6" --pod-cidr "$POD_CIDR_V6" --node-ip "$WG_ULA_B"
+
+  remote "$VM_B" setup-backend --pod-ip-v6 "$POD_IP_V6"
+  remote "$VM_B" start-backend-responder --pod-ip "$POD_IP_V6" --port "$TARGET_PORT" --family 6
+
+  echo "==> [8/9] routing $VM_CLIENT's v6 traffic to the VIP via $VM_B's relay"
+  limactl shell "$VM_CLIENT" -- sudo ip -6 route replace "${WG_ULA_A}/128" via "$LAN_ULA_B"
+
+  echo "==> [9/9] driving one client ($VM_CLIENT) -> v6 VIP (over wg0 ingress, via $VM_B's relay) -> cross-node backend round trip"
+  set +e
+  CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://[${WG_ULA_A}]:${VIP_PORT}/" 2>&1)"
+  CLIENT_RC=$?
+  set -e
+  if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
+    echo "ROUND-TRIP (v6 underlay): PASS (client $VM_CLIENT -> VIP [${WG_ULA_A}]:${VIP_PORT} -> cross-node backend -> response 'OK')"
+    echo "GATE: V6-UNDERLAY DATAPLANE: PASS (family-aware Geneve tunnel-key GET/SET proven end to end over a v6 underlay)"
+    exit 0
+  fi
+  echo "ROUND-TRIP (v6 underlay): FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY')" >&2
+  echo ""
+  echo "==> round trip did not complete -- collecting evidence"
+  echo "---- $VM_A evidence ----"
+  remote "$VM_A" dump-evidence
+  echo "---- $VM_B evidence ----"
+  remote "$VM_B" dump-evidence
+  exit 1
 fi
 # --extra-allowed: $VM_CLIENT never runs WireGuard itself (lima/beep-client.yaml),
 # so it can't dial $VM_A's wg0 VIP directly -- $VM_B relays its plain SYN

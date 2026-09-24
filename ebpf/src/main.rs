@@ -65,11 +65,11 @@ use beep_common::{
     egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
     forward_admission, fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark,
     occupant_conflicts, peer_node_admission, resolve_backend_src_port, return_authorization,
-    unmap_ipv4, AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
-    DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey,
-    FlowValue, ForwardAdmission, ForwardFlowValue, FwdPendingPin, LbFrontBackend, LbFrontKey,
-    PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig,
-    REDIRECTED_RETURN_MARK,
+    tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums, BackendPortDecision,
+    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
+    EgressReturnOutcome, FlowDirection, FlowKey, FlowValue, ForwardAdmission, ForwardFlowValue,
+    FwdPendingPin, LbFrontBackend, LbFrontKey, PeerNodeAdmission, PortMemoValue,
+    ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -207,26 +207,22 @@ static POD_TARGETS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(32, 0);
 
 /// Peer-node attestation for the outer Geneve tunnel source
 /// (`beep_common::peer_node_admission`'s doc comment for the threat this
-/// closes). Keyed on `tkey.remote_ipv4` -- the outer source
-/// `bpf_skb_get_tunnel_key` decap'd, in ITS host-native byte-order
-/// convention (module doc), deliberately NOT `POD_TARGETS`' raw-wire-token
-/// convention, since the two maps key on values read through different
-/// paths (a kernel helper vs. a raw packet load). Populated by the
+/// closes). Keyed on `tunnel_remote`'s `[u8; 16]` -- the outer source
+/// `bpf_skb_get_tunnel_key` decap'd, family-aware GET side
+/// (`get_tunnel_key`/`tunnel_remote`), deliberately NOT `POD_TARGETS`'
+/// raw-wire-token convention, since the two maps key on values read through
+/// different paths (a kernel helper vs. a raw packet load). Populated by the
 /// controller's Node watch (every known node's address, including this
 /// node's own -- a node that is both ingress and backend for the same flow
 /// legitimately sees its own address as the outer source) or, in fixture/
 /// smoke mode with no controller, by the loader seeding `--node-ip` alone.
 /// Same bare-existence-marker value as `POD_TARGETS` above; sized an order
 /// of magnitude smaller (cluster node count, not Service count). Keyed on
-/// `[u8; 16]`, not a bare `u32`: `remote_ipv4` is embedded via
-/// `ipv4_mapped_v6` before lookup/insert so this map shares `FLOW_TABLE`'s
-/// dual-stack union-key shape. Still `remote_ipv4`-only on the GET side
-/// today (`geneve_ingress`'s tunnel-key read): the peer-attestation lookup
-/// itself doesn't yet branch on whether the OUTER Geneve underlay is v4 or
-/// v6 -- that's a separate concern from this bead's inner-packet family
-/// support, and every fixture/smoke deployment today runs a v4-only
-/// underlay regardless of the inner packet's own family. v1 constraint: one
-/// IP per node (the single address `node_ips`/
+/// `[u8; 16]`, not a bare `u32`: a v4 outer source is embedded via
+/// `ipv4_mapped_v6`, a genuine v6 one read as-is, so this map shares
+/// `FLOW_TABLE`'s dual-stack union-key shape and admits either underlay
+/// family (`beep_common::tunnel_remote_addr`'s doc comment). v1 constraint:
+/// one IP per node (the single address `node_ips`/
 /// `front_ips` in `controller/src/watch.rs` records) -- a multi-homed or
 /// NAT'd node whose actual Geneve outer-source address differs from that
 /// recorded address is dropped by this admission check. Symmetric
@@ -462,6 +458,45 @@ fn set_tunnel_remote(tkey: &mut bpf_tunnel_key, node_ip: &[u8; 16]) -> u64 {
             BPF_F_TUNINFO_IPV6 as u64
         }
     }
+}
+
+/// GET-side counterpart of `set_tunnel_remote`: `bpf_skb_get_tunnel_key`
+/// errors outright (`-EPROTO`, `net/core/filter.c`) when its `flags`
+/// argument doesn't match the tunnel's actual family, so a single flags=0
+/// call -- the only kind `geneve_ingress` ever made before this -- silently
+/// drops every packet on a v6 underlay instead of just mis-attesting it.
+/// Tries v4 (flags=0) first: the exact call every existing v4-underlay
+/// deployment already makes, completely unaffected by this fallback, since
+/// it only ever fires once that first call has already failed. Returns
+/// which arm succeeded alongside `tkey` so callers can pick the matching
+/// union field (`tunnel_remote` below).
+#[inline(always)]
+fn get_tunnel_key(ctx: &TcContext) -> Option<(bpf_tunnel_key, bool)> {
+    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
+    let size = core::mem::size_of::<bpf_tunnel_key>() as u32;
+    if unsafe { bpf_skb_get_tunnel_key(ctx.skb.skb, &mut tkey, size, 0) } == 0 {
+        return Some((tkey, false));
+    }
+    if unsafe { bpf_skb_get_tunnel_key(ctx.skb.skb, &mut tkey, size, BPF_F_TUNINFO_IPV6 as u64) }
+        == 0
+    {
+        return Some((tkey, true));
+    }
+    None
+}
+
+/// The union-read every peer-attestation/`ingress_node_ip` site below needs
+/// instead of reaching into `tkey.__bindgen_anon_1.remote_ipv4` directly --
+/// `used_ipv6` (from `get_tunnel_key`) says which arm is actually valid;
+/// the decision itself is `beep_common::tunnel_remote_addr`, unit-tested
+/// there without a live kernel.
+#[inline(always)]
+fn tunnel_remote(tkey: &bpf_tunnel_key, used_ipv6: bool) -> [u8; 16] {
+    tunnel_remote_addr(
+        used_ipv6,
+        unsafe { tkey.__bindgen_anon_1.remote_ipv4 },
+        unsafe { tkey.__bindgen_anon_1.remote_ipv6 },
+    )
 }
 
 /// Hook 1: ingress classifier on the physical uplink, every node (forward
@@ -815,22 +850,14 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
 /// site, forcing inlining has no downside and sidesteps the bug entirely.
 #[classifier]
 pub fn geneve_ingress(ctx: TcContext) -> i32 {
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    if unsafe {
-        bpf_skb_get_tunnel_key(
-            ctx.skb.skb,
-            &mut tkey,
-            core::mem::size_of::<bpf_tunnel_key>() as u32,
-            0,
-        )
-    } != 0
-    {
-        return TC_ACT_OK;
-    }
+    let (tkey, used_ipv6) = match get_tunnel_key(&ctx) {
+        Some(result) => result,
+        None => return TC_ACT_OK,
+    };
 
     match tkey.tunnel_id {
-        VNI_FWD => try_geneve_decap_forward(&ctx, &tkey).unwrap_or(TC_ACT_SHOT),
-        VNI_RET => try_geneve_decap_return(&ctx, &tkey).unwrap_or(TC_ACT_SHOT),
+        VNI_FWD => try_geneve_decap_forward(&ctx, &tkey, used_ipv6).unwrap_or(TC_ACT_SHOT),
+        VNI_RET => try_geneve_decap_return(&ctx, &tkey, used_ipv6).unwrap_or(TC_ACT_SHOT),
         _ => TC_ACT_OK,
     }
 }
@@ -845,7 +872,11 @@ pub fn geneve_ingress(ctx: TcContext) -> i32 {
 /// an inbound decap leaves the now-foreign-dst'd packet to the kernel's own
 /// routing, which is flannel's job from here, not ours.
 #[inline(always)]
-fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32> {
+fn try_geneve_decap_forward(
+    ctx: &TcContext,
+    tkey: &bpf_tunnel_key,
+    used_ipv6: bool,
+) -> Option<i32> {
     // Peer-node attestation, checked before anything else this hook does
     // (`beep_common::peer_node_admission`'s doc comment): with rp_filter=0
     // node-wide, the outer tunnel source is the only thing standing between
@@ -854,8 +885,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
     // than the pre-existing POD_TARGETS check below alone required; accepted
     // as the cost of not reintroducing a restart-wipe risk on this map.
-    let is_known_peer =
-        unsafe { NODE_ALLOW.get(ipv4_mapped_v6(tkey.__bindgen_anon_1.remote_ipv4)) }.is_some();
+    let is_known_peer = unsafe { NODE_ALLOW.get(tunnel_remote(tkey, used_ipv6)) }.is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -889,8 +919,8 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
     }
 
     match ctx.load::<u16>(12).ok()? {
-        ETH_P_IPV4 => try_geneve_decap_forward_v4(ctx, tkey, pod_ip_v6),
-        ETH_P_IPV6 => try_geneve_decap_forward_v6(ctx, tkey, pod_ip_v6),
+        ETH_P_IPV4 => try_geneve_decap_forward_v4(ctx, tkey, used_ipv6, pod_ip_v6),
+        ETH_P_IPV6 => try_geneve_decap_forward_v6(ctx, tkey, used_ipv6, pod_ip_v6),
         _ => Some(TC_ACT_OK),
     }
 }
@@ -899,6 +929,7 @@ fn try_geneve_decap_forward(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i3
 fn try_geneve_decap_forward_v4(
     ctx: &TcContext,
     tkey: &bpf_tunnel_key,
+    used_ipv6: bool,
     pod_ip_v6: [u8; 16],
 ) -> Option<i32> {
     if ctx.load::<u8>(IP_VER_IHL).ok()? & 0x0f != 5 {
@@ -1052,7 +1083,7 @@ fn try_geneve_decap_forward_v4(
     };
 
     let rev_value = RevFlowValue {
-        ingress_node_ip: ipv4_mapped_v6(unsafe { tkey.__bindgen_anon_1.remote_ipv4 }),
+        ingress_node_ip: tunnel_remote(tkey, used_ipv6),
         vip_ip: vip_ip_v6,
         vip_port,
         original_client_port: client_port,
@@ -1116,6 +1147,7 @@ fn try_geneve_decap_forward_v4(
 fn try_geneve_decap_forward_v6(
     ctx: &TcContext,
     tkey: &bpf_tunnel_key,
+    used_ipv6: bool,
     pod_ip_v6: [u8; 16],
 ) -> Option<i32> {
     let proto: u8 = ctx.load(IP6_NEXT_HDR).ok()?;
@@ -1212,7 +1244,7 @@ fn try_geneve_decap_forward_v6(
     };
 
     let rev_value = RevFlowValue {
-        ingress_node_ip: ipv4_mapped_v6(unsafe { tkey.__bindgen_anon_1.remote_ipv4 }),
+        ingress_node_ip: tunnel_remote(tkey, used_ipv6),
         vip_ip: vip_ip_v6,
         vip_port,
         original_client_port: client_port,
@@ -1262,12 +1294,11 @@ fn try_geneve_decap_forward_v6(
 /// forward entry is stale or spoofed), then un-DNAT src back to the VIP and
 /// let normal routing carry it out to the client.
 #[inline(always)]
-fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key) -> Option<i32> {
+fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bool) -> Option<i32> {
     // Same peer-node attestation as `try_geneve_decap_forward` above -- this
     // branch used to take `tkey` unused, relying entirely on the FLOW_TABLE
     // reverse-key match with no outer-source check of its own.
-    let is_known_peer =
-        unsafe { NODE_ALLOW.get(ipv4_mapped_v6(tkey.__bindgen_anon_1.remote_ipv4)) }.is_some();
+    let is_known_peer = unsafe { NODE_ALLOW.get(tunnel_remote(tkey, used_ipv6)) }.is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
