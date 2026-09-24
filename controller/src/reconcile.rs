@@ -8,9 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use beep_common::{ipv4_mapped_v6, wire_ip, wire_port, LbFrontBackend, LbFrontKey};
+use beep::{tunnel_remote_v6, wire_ip_v6};
+use beep_common::{wire_port, LbFrontBackend, LbFrontKey};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -67,12 +68,87 @@ impl Ipv4Cidr {
     }
 }
 
-// So a caller (`main.rs`'s `apply_reconcile`) can name the misconfigured
-// `--pod-cidr` value in its WARN without reaching into this type's private
-// fields.
 impl std::fmt::Display for Ipv4Cidr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+/// v6 analog of `Ipv4Cidr`, same `u128`-masked-comparison shape -- kept as
+/// its own type rather than a generic one so each family's bit width (`u32`
+/// vs `u128`) stays a plain, unambiguous integer operation.
+// `pub`, unlike its fields/methods below: `IpCidr::V6` (a `pub` enum
+// variant) holds one of these, and a variant's field type can't be less
+// visible than the enum itself (`private_interfaces`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv6Cidr {
+    network: Ipv6Addr,
+    prefix_len: u8,
+}
+
+impl Ipv6Cidr {
+    fn new(network: Ipv6Addr, prefix_len: u8) -> Self {
+        let mask = Self::mask(prefix_len);
+        Ipv6Cidr {
+            network: Ipv6Addr::from(u128::from(network) & mask),
+            prefix_len,
+        }
+    }
+
+    fn mask(prefix_len: u8) -> u128 {
+        if prefix_len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix_len)
+        }
+    }
+
+    fn contains(&self, ip: Ipv6Addr) -> bool {
+        let mask = Self::mask(self.prefix_len);
+        (u128::from(ip) & mask) == (u128::from(self.network) & mask)
+    }
+}
+
+impl std::fmt::Display for Ipv6Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+/// `NodeContext::pod_cidr`'s dual-stack shape, mirroring the loader's own
+/// `Ipv4Cidr`/`IpCidr` split (`src/main.rs`): a Service's VIP and its
+/// backend Pod can each independently be v4 or v6, so `is_admitted` must
+/// compare a dual-stack `Endpoint.pod_ip` against a CIDR of either family
+/// without assuming one. `--pod-cidr` stays v4-only for now (`main.rs`'s
+/// CLI parser always produces `IpCidr::V4`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpCidr {
+    V4(Ipv4Cidr),
+    V6(Ipv6Cidr),
+}
+
+impl IpCidr {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (IpCidr::V4(cidr), IpAddr::V4(ip)) => cidr.contains(ip),
+            (IpCidr::V6(cidr), IpAddr::V6(ip)) => cidr.contains(ip),
+            // A v6 pod_ip can never be "inside" a v4 pod_cidr (or vice
+            // versa) -- `is_admitted`'s hostNetwork disjunct is still free
+            // to admit it, same as an out-of-range same-family address.
+            _ => false,
+        }
+    }
+}
+
+// So a caller (`main.rs`'s `apply_reconcile`) can name the misconfigured
+// `--pod-cidr` value in its WARN without reaching into either CIDR
+// variant's private fields.
+impl std::fmt::Display for IpCidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpCidr::V4(cidr) => cidr.fmt(f),
+            IpCidr::V6(cidr) => cidr.fmt(f),
+        }
     }
 }
 
@@ -97,8 +173,8 @@ impl std::fmt::Display for Ipv4Cidr {
 /// laxer than this -- no loader change accompanies this relaxation.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeContext {
-    pub node_ip: Ipv4Addr,
-    pub pod_cidr: Ipv4Cidr,
+    pub node_ip: IpAddr,
+    pub pod_cidr: IpCidr,
 }
 
 /// One `Service.spec.ports[]` entry: `port` is the VIP-facing front port,
@@ -118,7 +194,7 @@ pub struct ServicePort {
 /// A `type=LoadBalancer` Service's parsed view: front VIP plus its ports.
 #[derive(Clone, Debug)]
 pub struct ServiceView {
-    pub vip_ip: Ipv4Addr,
+    pub vip_ip: IpAddr,
     pub ports: Vec<ServicePort>,
 }
 
@@ -133,8 +209,8 @@ pub struct ServiceView {
 /// added container port yet).
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    pub pod_ip: Ipv4Addr,
-    pub node_ip: Ipv4Addr,
+    pub pod_ip: IpAddr,
+    pub node_ip: IpAddr,
     pub ready: bool,
     pub ports: Vec<u16>,
 }
@@ -159,7 +235,7 @@ pub struct EndpointSliceView {
 /// naming why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedEndpoint {
-    pub pod_ip: Ipv4Addr,
+    pub pod_ip: IpAddr,
     pub reason: &'static str,
 }
 
@@ -224,9 +300,9 @@ pub struct DesiredEntries {
     pub pod_targets_known: bool,
 }
 
-fn front_key(vip_ip: Ipv4Addr, port: &ServicePort) -> LbFrontKey {
+fn front_key(vip_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
     LbFrontKey {
-        vip_ip: ipv4_mapped_v6(wire_ip(u32::from(vip_ip))),
+        vip_ip: wire_ip_v6(vip_ip),
         vip_port: wire_port(port.port),
         proto: port.protocol.as_ip_proto(),
         _pad: 0,
@@ -267,11 +343,11 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     for slice in slices {
         for ep in &slice.endpoints {
             if ep.ready && ep.node_ip == node.node_ip && is_admitted(ep, node) {
-                // POD_TARGETS' key is `[u8; 16]` (like NODE_ALLOW's), but wire_ip-wrapped
-                // like `LbFrontBackend::pod_ip` -- unlike NODE_ALLOW's host-native peer
-                // address, POD_TARGETS membership is checked against a wire-order source
-                // IP the dataplane never asks the kernel to convert for it.
-                pod_targets.insert(ipv4_mapped_v6(wire_ip(u32::from(ep.pod_ip))));
+                // POD_TARGETS' key is `[u8; 16]` (like NODE_ALLOW's), but wire-token
+                // (`wire_ip_v6`) like `LbFrontBackend::pod_ip` -- unlike NODE_ALLOW's
+                // host-native peer address, POD_TARGETS membership is checked against a
+                // wire-order source IP the dataplane never asks the kernel to convert for it.
+                pod_targets.insert(wire_ip_v6(ep.pod_ip));
             }
         }
     }
@@ -343,9 +419,11 @@ pub fn reconcile_service(
             LbFrontBackend {
                 // Host-native, not wire_ip: the kernel's own
                 // bpf_tunnel_key.remote_ipv4 set/get converts this field
-                // itself (`src/main.rs`'s `populate_fixtures` comment).
-                backend_node_ip: ipv4_mapped_v6(u32::from(backend.node_ip)),
-                pod_ip: ipv4_mapped_v6(wire_ip(u32::from(backend.pod_ip))),
+                // itself (`src/main.rs`'s `populate_fixtures` comment) --
+                // `tunnel_remote_v6` is that convention's dual-stack widening
+                // (`src/lib.rs`).
+                backend_node_ip: tunnel_remote_v6(backend.node_ip),
+                pod_ip: wire_ip_v6(backend.pod_ip),
             },
         );
         desired
@@ -416,20 +494,38 @@ mod tests {
     use super::*;
     use beep_common::unmap_ipv4;
 
-    fn cluster_pod_cidr() -> Ipv4Cidr {
-        Ipv4Cidr::new(Ipv4Addr::new(10, 244, 0, 0), 16)
+    fn cluster_pod_cidr() -> IpCidr {
+        IpCidr::V4(Ipv4Cidr::new(Ipv4Addr::new(10, 244, 0, 0), 16))
     }
 
     fn node(ip: Ipv4Addr) -> NodeContext {
         NodeContext {
-            node_ip: ip,
+            node_ip: IpAddr::V4(ip),
             pod_cidr: cluster_pod_cidr(),
+        }
+    }
+
+    fn node_v6(ip: Ipv6Addr, pod_cidr: IpCidr) -> NodeContext {
+        NodeContext {
+            node_ip: IpAddr::V6(ip),
+            pod_cidr,
         }
     }
 
     fn single_port_service(vip_ip: Ipv4Addr, port: u16, target_port: u16) -> ServiceView {
         ServiceView {
-            vip_ip,
+            vip_ip: IpAddr::V4(vip_ip),
+            ports: vec![ServicePort {
+                port,
+                protocol: Protocol::Tcp,
+                target_port,
+            }],
+        }
+    }
+
+    fn single_port_service_v6(vip_ip: Ipv6Addr, port: u16, target_port: u16) -> ServiceView {
+        ServiceView {
+            vip_ip: IpAddr::V6(vip_ip),
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -440,8 +536,17 @@ mod tests {
 
     fn ready_endpoint(pod_ip: Ipv4Addr, node_ip: Ipv4Addr, ports: Vec<u16>) -> Endpoint {
         Endpoint {
-            pod_ip,
-            node_ip,
+            pod_ip: IpAddr::V4(pod_ip),
+            node_ip: IpAddr::V4(node_ip),
+            ready: true,
+            ports,
+        }
+    }
+
+    fn ready_endpoint_v6(pod_ip: Ipv6Addr, node_ip: Ipv6Addr, ports: Vec<u16>) -> Endpoint {
+        Endpoint {
+            pod_ip: IpAddr::V6(pod_ip),
+            node_ip: IpAddr::V6(node_ip),
             ready: true,
             ports,
         }
@@ -646,7 +751,7 @@ mod tests {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let pod_ip = Ipv4Addr::new(10, 244, 0, 9);
         let svc = ServiceView {
-            vip_ip: Ipv4Addr::new(10, 0, 0, 1),
+            vip_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             ports: vec![
                 ServicePort {
                     port: 80,
@@ -743,7 +848,7 @@ mod tests {
 
         assert_eq!(
             desired.pod_targets,
-            HashSet::from([ipv4_mapped_v6(wire_ip(u32::from(local_pod)))]),
+            HashSet::from([wire_ip_v6(IpAddr::V4(local_pod))]),
             "POD_TARGETS must contain only pods THIS node hosts -- a remote node's pod leaking \
              in here would misclassify that node's traffic as this node's own backend"
         );
@@ -774,7 +879,7 @@ mod tests {
         assert_eq!(
             desired.rejected,
             vec![RejectedEndpoint {
-                pod_ip: implausible_pod,
+                pod_ip: IpAddr::V4(implausible_pod),
                 reason: "pod_ip is outside the configured --pod-cidr and is not this node's \
                          own address (hostNetwork)",
             }],
@@ -804,9 +909,130 @@ mod tests {
 
         assert_eq!(
             desired.pod_targets,
-            HashSet::from([ipv4_mapped_v6(wire_ip(u32::from(this_node)))]),
+            HashSet::from([wire_ip_v6(IpAddr::V4(this_node))]),
             "a hostNetwork backend (pod_ip == node_ip, outside pod_cidr) must be admitted into \
              POD_TARGETS or its forward traffic is dropped at decap on every node"
+        );
+    }
+
+    // A v6 Service's VIP/backend must be stored as raw v6 octets, not passed
+    // through the v4-mapped-v6 embedding a v4 address needs -- reusing that
+    // embedding for a genuine v6 address would silently corrupt every field
+    // into a bogus `::ffff:`-prefixed value the dataplane can't route. Also
+    // exercises `Ipv6Cidr::contains` directly (the pod is admitted via the
+    // CIDR disjunct, not the hostNetwork one).
+    #[test]
+    fn reconcile_wire_encodes_v6_addresses_as_raw_octets_not_v4_mapped() {
+        let node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let pod_cidr = Ipv6Cidr::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0), 64);
+        let node = node_v6(node_ip, IpCidr::V6(pod_cidr));
+        let vip_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let pod_ip = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9);
+        let svc = single_port_service_v6(vip_ip, 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![ready_endpoint_v6(pod_ip, node_ip, vec![8080])],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node);
+
+        assert_eq!(
+            desired.lb_front_map.len(),
+            1,
+            "exactly one front port was configured, so exactly one LB_FRONT_MAP entry is expected"
+        );
+        let (key, backend) = desired.lb_front_map.iter().next().unwrap();
+        assert_eq!(
+            key.vip_ip,
+            vip_ip.octets(),
+            "a v6 VIP must be stored as its own raw octets, not re-embedded via \
+             ipv4_mapped_v6 -- a v6-only front would otherwise resolve to a bogus address"
+        );
+        assert!(
+            unmap_ipv4(&key.vip_ip).is_none(),
+            "a genuine v6 VIP must never unmap as if it were a v4-mapped one, or it would \
+             collide with a v4 front that maps to the same 32 low bits"
+        );
+        assert_eq!(
+            backend.pod_ip,
+            pod_ip.octets(),
+            "a v6 backend pod_ip must stay raw octets -- the dataplane would stamp the wrong \
+             Geneve pod-identifier option otherwise"
+        );
+        assert_eq!(
+            backend.backend_node_ip,
+            node_ip.octets(),
+            "a v6 backend_node_ip must stay raw octets: like the v4 case this field is never \
+             passed through wire_ip, but a v6 address also has no separate host/wire form to \
+             convert in the first place"
+        );
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([pod_ip.octets()]),
+            "POD_TARGETS must admit a v6 pod inside a v6 pod_cidr the same way a v4 one inside \
+             a v4 pod_cidr is admitted"
+        );
+    }
+
+    // bare metal has no cloud LB/BGP virtual IP, so a hostNetwork pod's IP IS
+    // the node IP regardless of family -- an operator running today's
+    // v4-only --pod-cidr must not lose v6 hostNetwork admission because of
+    // it: `IpCidr::contains` returns false across families instead of
+    // wrongly matching, and `is_admitted`'s hostNetwork disjunct still
+    // admits the pod.
+    #[test]
+    fn hostnetwork_v6_endpoint_is_admitted_despite_an_ipv4_only_pod_cidr() {
+        let node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let node = node_v6(node_ip, cluster_pod_cidr());
+        let svc = single_port_service_v6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![ready_endpoint_v6(node_ip, node_ip, vec![8080])],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node);
+
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([node_ip.octets()]),
+            "a v6 hostNetwork backend must be admitted into POD_TARGETS even though the \
+             configured pod_cidr is v4-only -- rejecting every v6 hostNetwork pod on every \
+             node would repeat the pre-dual-stack POD_TARGETS black hole, just for v6 instead \
+             of v4"
+        );
+    }
+
+    // The anti-spoof rejection (`is_admitted`'s doc comment) must hold for v6
+    // too: a v6 pod_ip that is neither inside any configured pod_cidr nor
+    // the hostNetwork signature must still be excluded, the same as an
+    // implausible v4 one is.
+    #[test]
+    fn v6_pod_ip_outside_pod_cidr_and_not_hostnetwork_is_rejected() {
+        let node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let node = node_v6(node_ip, cluster_pod_cidr());
+        let svc = single_port_service_v6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 80, 8080);
+        let implausible_pod = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 99);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![ready_endpoint_v6(implausible_pod, node_ip, vec![8080])],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node);
+
+        assert!(
+            desired.pod_targets.is_empty(),
+            "a v6 pod_ip outside every configured pod_cidr and not equal to node_ip must not \
+             be admitted -- an untrusted EndpointSlice entry's node_ip claim must stay \
+             cross-checked for v6 the same way it is for v4"
+        );
+        assert_eq!(
+            desired.rejected,
+            vec![RejectedEndpoint {
+                pod_ip: IpAddr::V6(implausible_pod),
+                reason: "pod_ip is outside the configured --pod-cidr and is not this node's \
+                         own address (hostNetwork)",
+            }],
+            "the exclusion must name the offending v6 pod_ip too, or the pod-cidr \
+             misconfiguration diagnostic (`endpoint_reporting_a_pod_ip_outside_the_node_cidr_\
+             is_excluded_from_pod_targets`'s doc comment) silently stops working once a \
+             cluster goes dual-stack"
         );
     }
 
