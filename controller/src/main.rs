@@ -8,7 +8,7 @@
 //! process idles between watch events.
 
 use std::{
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -21,7 +21,7 @@ use beep::{
 };
 use beep_controller::{
     apply::PinnedMaps,
-    reconcile::{DesiredEntries, Ipv4Cidr, NodeContext},
+    reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, NodeContext},
     status::ensure_node_ingress,
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -203,8 +203,11 @@ async fn run_controller_loop(
         move |event: Value| {
             let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &node);
-            if let Some(key) = changed {
-                publish_ingress(&client, key, node.node_ip);
+            // `ensure_node_ingress` (status.rs) stays v4-only, and so does
+            // `--node-ip` itself, so this is never actually a v6 address
+            // today.
+            if let (Some(key), IpAddr::V4(node_ip)) = (changed, node.node_ip) {
+                publish_ingress(&client, key, node_ip);
             }
         }
     };
@@ -352,14 +355,15 @@ async fn main() -> anyhow::Result<()> {
         bearer: None,
     });
 
-    let node = NodeContext {
-        node_ip: args
-            .node_ip
-            .expect("clap requires --node-ip unless --node-prep, which already returned above"),
-        pod_cidr: args
-            .pod_cidr
-            .expect("clap requires --pod-cidr unless --node-prep, which already returned above"),
-    };
+    let node =
+        NodeContext {
+            node_ip: IpAddr::V4(args.node_ip.expect(
+                "clap requires --node-ip unless --node-prep, which already returned above",
+            )),
+            pod_cidr: IpCidr::V4(args.pod_cidr.expect(
+                "clap requires --pod-cidr unless --node-prep, which already returned above",
+            )),
+        };
     let state = Arc::new(Mutex::new(WatchState::default()));
     let maps = Arc::new(Mutex::new(
         PinnedMaps::open(&args.pin_dir).context("opening pinned dataplane maps")?,

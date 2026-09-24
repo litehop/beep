@@ -11,7 +11,11 @@
 //! `is_resource_expired`, `list_resource_version`) and tested directly --
 //! the loop itself is a thin, deliberately un-tested wrapper around them.
 
-use std::{collections::HashMap, net::Ipv4Addr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
 
 use anyhow::Context;
 use beep_common::ipv4_mapped_v6;
@@ -324,7 +328,10 @@ impl WatchState {
         // full-sync FREEZES (stops updating) rather than wiping -- worse
         // than staying current, but self-healing on relist and strictly
         // better than the pre-fix full-wipe.
-        let self_node_known = self.node_ips.values().any(|&ip| ip == node.node_ip);
+        let self_node_known = self
+            .node_ips
+            .values()
+            .any(|&ip| IpAddr::V4(ip) == node.node_ip);
         let mut aggregate = DesiredEntries {
             fronts_known: self.nodes_listed,
             pod_targets_known: self_node_known,
@@ -431,8 +438,8 @@ impl WatchState {
                                 .and_then(|n| self.node_ips.get(n))
                                 .copied()?;
                             Some(Endpoint {
-                                pod_ip: e.pod_ip,
-                                node_ip,
+                                pod_ip: IpAddr::V4(e.pod_ip),
+                                node_ip: IpAddr::V4(node_ip),
                                 ready: e.ready,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
                             })
@@ -456,7 +463,7 @@ impl WatchState {
             }
             for front_ip in &front_ips {
                 let view = ServiceView {
-                    vip_ip: *front_ip,
+                    vip_ip: IpAddr::V4(*front_ip),
                     ports: ports.clone(),
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
@@ -597,8 +604,11 @@ mod tests {
 
     fn node(ip: Ipv4Addr) -> NodeContext {
         NodeContext {
-            node_ip: ip,
-            pod_cidr: reconcile::Ipv4Cidr::new(Ipv4Addr::new(10, 244, 0, 0), 16),
+            node_ip: IpAddr::V4(ip),
+            pod_cidr: reconcile::IpCidr::V4(reconcile::Ipv4Cidr::new(
+                Ipv4Addr::new(10, 244, 0, 0),
+                16,
+            )),
         }
     }
 
@@ -1236,7 +1246,7 @@ mod tests {
         assert_eq!(
             desired.rejected,
             vec![reconcile::RejectedEndpoint {
-                pod_ip: Ipv4Addr::new(192, 168, 1, 9),
+                pod_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)),
                 reason: "pod_ip is outside the configured --pod-cidr and is not this node's \
                          own address (hostNetwork)",
             }],
