@@ -76,6 +76,15 @@ done
   echo "FAIL: --family must be 4 or 6, got '$FAMILY'" >&2
   exit 1
 }
+# Opt-in regression check: geneve_ingress's peer attestation
+# (beep_common::peer_node_admission) currently reads the LOCAL tunnel
+# endpoint on GET, not the genuine remote peer, so NODE_ALLOW self-matches
+# instead of attesting anyone (see ai/findings/ for the investigation this
+# check codifies). Unset/0 by default: this check is EXPECTED TO FAIL
+# against today's dataplane code, so it must not run as part of the default
+# green gate -- set BEEP_PEER_ATTESTATION_CHECK=1 to exercise it once the
+# dataplane fix lands, or to reproduce the bug.
+BEEP_PEER_ATTESTATION_CHECK="${BEEP_PEER_ATTESTATION_CHECK:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -344,6 +353,59 @@ set -e
 if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
   echo "ROUND-TRIP: PASS (client $VM_CLIENT -> VIP ${WG_SUBNET_A}:${VIP_PORT} -> cross-node backend -> response 'OK')"
   echo "GATE 1 TIER-1 MECHANISM: PASS (wg0-ingress, symmetric return proven from a genuinely foreign client)"
+  if [ "$BEEP_PEER_ATTESTATION_CHECK" = "1" ]; then
+    # Isolates a genuinely peer-only NODE_ALLOW on $VM_B (self-entry
+    # explicitly removed, not left alongside the peer key) and asserts the
+    # two outcomes a real peer-attestation fix must produce. Both
+    # assertions FAIL against today's dataplane code -- that is expected
+    # until the fix lands, which is why this whole block is opt-in rather
+    # than part of the default gate above.
+    echo ""
+    echo "==> [optional] BEEP_PEER_ATTESTATION_CHECK: isolating peer-only NODE_ALLOW admission"
+    PEER_KEY_A="$(remote "$VM_A" dump-node-allow-key)"
+    SELF_KEY_B="$(remote "$VM_B" dump-node-allow-key)"
+    PEER_CHECK_FAIL=0
+
+    echo "----> case 1: $VM_B's NODE_ALLOW = peer-only ($VM_A's real key, self-entry removed) -- round trip must PASS"
+    remote "$VM_B" delete-node-allow --key-hex "$SELF_KEY_B"
+    remote "$VM_B" seed-node-allow --key-hex "$PEER_KEY_A"
+    # start-backend-responder's nc listener is one-shot (no -k) -- the
+    # GATE 1 round trip above already consumed it, so it must be restarted
+    # before every subsequent attempt here or a dead backend (not the
+    # NODE_ALLOW state under test) would decide the outcome.
+    remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
+    set +e
+    PEER_BODY_1="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+    PEER_RC_1=$?
+    set -e
+    if [ "$PEER_RC_1" -eq 0 ] && [ "$PEER_BODY_1" = "OK" ]; then
+      echo "PEER-ATTESTATION (peer-only admits the real peer): PASS"
+    else
+      echo "PEER-ATTESTATION (peer-only admits the real peer): FAIL (curl rc=$PEER_RC_1, body='$PEER_BODY_1') -- expected until the dataplane fix lands"
+      PEER_CHECK_FAIL=1
+    fi
+
+    echo "----> case 2: $VM_B's NODE_ALLOW = self-only (no real peer key) -- a packet from the real peer must be DROPPED"
+    remote "$VM_B" delete-node-allow --key-hex "$PEER_KEY_A"
+    remote "$VM_B" seed-node-allow --key-hex "$SELF_KEY_B"
+    remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
+    set +e
+    PEER_BODY_2="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+    PEER_RC_2=$?
+    set -e
+    if [ "$PEER_RC_2" -ne 0 ]; then
+      echo "PEER-ATTESTATION (self-only drops the real peer): PASS"
+    else
+      echo "PEER-ATTESTATION (self-only drops the real peer): FAIL (curl unexpectedly succeeded, body='$PEER_BODY_2') -- expected until the dataplane fix lands"
+      PEER_CHECK_FAIL=1
+    fi
+
+    if [ "$PEER_CHECK_FAIL" -eq 1 ]; then
+      echo "GATE: PEER-ATTESTATION REGRESSION: FAIL (expected until the dataplane fix lands)"
+      exit 1
+    fi
+    echo "GATE: PEER-ATTESTATION REGRESSION: PASS"
+  fi
   exit 0
 fi
 echo "ROUND-TRIP: FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY')" >&2
