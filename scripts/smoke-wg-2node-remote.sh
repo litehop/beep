@@ -175,9 +175,15 @@ setup_backend() {
       *) echo "setup-backend: unknown argument: $1" >&2; exit 1 ;;
     esac
   done
-  [ -n "$pod_ip" ] || { echo "setup-backend: --pod-ip required" >&2; exit 1; }
+  # v4-underlay rigs always pass --pod-ip; a v6-underlay-only rig has no v4
+  # pod at all, so only --pod-ip-v6 is required then -- at least one family
+  # must be given, not always v4 specifically.
+  [ -n "$pod_ip" ] || [ -n "$pod_ip_v6" ] || {
+    echo "setup-backend: at least one of --pod-ip/--pod-ip-v6 required" >&2
+    exit 1
+  }
 
-  ip addr replace "${pod_ip}/32" dev lo
+  [ -n "$pod_ip" ] && ip addr replace "${pod_ip}/32" dev lo
   [ -n "$pod_ip_v6" ] && ip -6 addr replace "${pod_ip_v6}/128" dev lo
   for cidr in "${return_routes[@]}"; do
     case "$cidr" in
