@@ -11,14 +11,10 @@
 //! `is_resource_expired`, `list_resource_version`) and tested directly --
 //! the loop itself is a thin, deliberately un-tested wrapper around them.
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
+use std::{collections::HashMap, net::IpAddr, time::Duration};
 
 use anyhow::Context;
-use beep_common::ipv4_mapped_v6;
+use beep::tunnel_remote_v6;
 use beep_kubeconfig::HyperApiClient;
 use hyper::Method;
 use serde_json::Value;
@@ -58,7 +54,7 @@ struct RawSlicePort {
 
 #[derive(Clone, Debug)]
 struct RawEndpoint {
-    pod_ip: Ipv4Addr,
+    pod_ip: IpAddr,
     node_name: Option<String>,
     ready: bool,
 }
@@ -70,9 +66,9 @@ struct RawEndpointSlice {
 }
 
 /// Accumulated view of every known LoadBalancer Service, its EndpointSlices,
-/// and the Node-name -> IP map needed to resolve `EndpointSlice.endpoints[].
-/// nodeName` into `reconcile::Endpoint.node_ip`. Fed exclusively by
-/// `apply_*_event`, then turned into dataplane map entries by `desired`.
+/// and the Node-name -> IP-list map needed to resolve `EndpointSlice.
+/// endpoints[].nodeName` into `reconcile::Endpoint.node_ip`. Fed exclusively
+/// by `apply_*_event`, then turned into dataplane map entries by `desired`.
 #[derive(Default)]
 pub struct WatchState {
     services: HashMap<ServiceKey, RawService>,
@@ -81,7 +77,12 @@ pub struct WatchState {
     // must be tracked (added/updated/removed) independently, or updating one
     // slice would silently drop every other slice's endpoints.
     slices: HashMap<ServiceKey, HashMap<String, RawEndpointSlice>>,
-    node_ips: HashMap<String, Ipv4Addr>,
+    // Every `InternalIP` a Node object reports, not just one -- a
+    // dual-stack node lists both a v4 and a v6 entry, and dropping either
+    // would make that whole family invisible to `front_ips`/`NODE_ALLOW`
+    // below (`desired`'s doc comments) even though the node genuinely
+    // serves it.
+    node_ips: HashMap<String, Vec<IpAddr>>,
     // Whether the initial Node LIST has completed at least once. `false`
     // means `node_ips` is empty (or partial) purely because the LIST hasn't
     // delivered its results yet, NOT because the cluster genuinely has no
@@ -195,17 +196,50 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
     Some(RawEndpointSlice { ports, endpoints })
 }
 
-/// Parses a `Node` object's first `InternalIP` address -- the value
-/// `LbFrontBackend.backend_node_ip` needs as the Geneve tunnel remote for a pod
-/// hosted on this node (`reconcile::Endpoint.node_ip`'s doc comment).
-fn parse_node_internal_ip(obj: &Value) -> Option<Ipv4Addr> {
-    obj["status"]["addresses"]
-        .as_array()?
+/// Parses EVERY `InternalIP` address a `Node` object reports, not just one
+/// -- a dual-stack node lists a v4 and a v6 entry, and picking only the
+/// first would make that node's other family invisible to `front_ips`/
+/// `NODE_ALLOW` (`desired`'s doc comments), which need to see all of them
+/// (`pick_underlay_ip` below is what narrows a peer's list back down to the
+/// one Geneve tunnel remote a given endpoint resolution needs). An address
+/// that fails to parse is logged and skipped, not silently dropped -- a
+/// malformed apiserver response should be diagnosable, not just quietly
+/// lose a family.
+fn parse_node_internal_ips(obj: &Value) -> Vec<IpAddr> {
+    let Some(addresses) = obj["status"]["addresses"].as_array() else {
+        return Vec::new();
+    };
+    addresses
         .iter()
-        .find(|a| a["type"] == "InternalIP")?["address"]
-        .as_str()?
-        .parse()
-        .ok()
+        .filter(|a| a["type"] == "InternalIP")
+        .filter_map(|a| a["address"].as_str())
+        .filter_map(|s| match s.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                eprintln!("controller: Node InternalIP {s:?} failed to parse, dropping: {e}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Picks the ONE Geneve tunnel remote (`Endpoint.node_ip`, `LbFrontBackend.
+/// backend_node_ip`) to use for a peer node that reports more than one
+/// `InternalIP` family. Prefers the peer address matching `local_node_ip`'s
+/// own family (this node's `--node-ip`) -- the common case, where a
+/// same-family front stays same-family end to end -- and falls back to the
+/// peer's other family when there's no match, e.g. a v6-only local node
+/// reaching a dual-stack peer, or a dual-stack local node reaching a
+/// v6-only one. Returns `None` only when `peer_ips` is empty, which
+/// `WatchState::node_ips` never stores (`apply_node_event` only inserts a
+/// non-empty list).
+fn pick_underlay_ip(peer_ips: &[IpAddr], local_node_ip: IpAddr) -> Option<IpAddr> {
+    let local_is_v6 = local_node_ip.is_ipv6();
+    peer_ips
+        .iter()
+        .find(|ip| ip.is_ipv6() == local_is_v6)
+        .or(peer_ips.first())
+        .copied()
 }
 
 impl WatchState {
@@ -279,8 +313,14 @@ impl WatchState {
                 self.node_ips.remove(&name);
             }
             EventKind::Upsert => {
-                if let Some(ip) = parse_node_internal_ip(obj) {
-                    self.node_ips.insert(name, ip);
+                let ips = parse_node_internal_ips(obj);
+                // Only overwrite on a successful parse, same as the
+                // single-`Option` version this replaces -- a Node update
+                // that reports zero parseable InternalIP entries leaves
+                // this node's previously-known address(es) in place rather
+                // than wiping them.
+                if !ips.is_empty() {
+                    self.node_ips.insert(name, ips);
                 }
             }
         }
@@ -331,7 +371,7 @@ impl WatchState {
         let self_node_known = self
             .node_ips
             .values()
-            .any(|&ip| IpAddr::V4(ip) == node.node_ip);
+            .any(|ips| ips.contains(&node.node_ip));
         let mut aggregate = DesiredEntries {
             fronts_known: self.nodes_listed,
             pod_targets_known: self_node_known,
@@ -374,21 +414,22 @@ impl WatchState {
         // takes to land -- the same restart bug `fronts_known` exists to
         // prevent, just keyed on this node's own entry instead of the
         // whole list.
-        let front_ips: Vec<Ipv4Addr> = self.node_ips.values().copied().collect();
+        // Every InternalIP of every known node, not one-per-node: a
+        // dual-stack node's v4 AND v6 address must each become a front (and
+        // a NODE_ALLOW peer) -- narrowing to one family here is `desired`'s
+        // caller's job (Service `spec.ipFamilies`-scoped fronting), not
+        // this aggregation's.
+        let front_ips: Vec<IpAddr> = self.node_ips.values().flatten().copied().collect();
         // NODE_ALLOW's peer set is the same front_ips this loop feeds
-        // LB_FRONT_MAP/TARGET_PORTS from -- host-native (`u32::from`, not
-        // `wire_ip`) wrapped in `ipv4_mapped_v6` to match NODE_ALLOW's
-        // `[u8; 16]` key, matching `tkey.remote_ipv4`'s convention
-        // (`DesiredEntries::node_allow`'s doc comment). Unlike LB_FRONT_MAP/
-        // TARGET_PORTS, `PinnedMaps::apply_node_allow` upserts this set every
-        // tick regardless of `fronts_known` (set above) -- only its delete
-        // half is latched on `fronts_known` having been seen true once, the
-        // same restart-wipe reason `front_ips` itself is gated for.
-        aggregate.node_allow = front_ips
-            .iter()
-            .copied()
-            .map(|ip| ipv4_mapped_v6(u32::from(ip)))
-            .collect();
+        // LB_FRONT_MAP/TARGET_PORTS from -- host-native, wrapped in
+        // `tunnel_remote_v6` to match NODE_ALLOW's `[u8; 16]` key, matching
+        // `tkey.remote_ipv4`'s convention (`DesiredEntries::node_allow`'s
+        // doc comment). Unlike LB_FRONT_MAP/TARGET_PORTS, `PinnedMaps::
+        // apply_node_allow` upserts this set every tick regardless of
+        // `fronts_known` (set above) -- only its delete half is latched on
+        // `fronts_known` having been seen true once, the same restart-wipe
+        // reason `front_ips` itself is gated for.
+        aggregate.node_allow = front_ips.iter().copied().map(tunnel_remote_v6).collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -436,10 +477,10 @@ impl WatchState {
                                 .node_name
                                 .as_deref()
                                 .and_then(|n| self.node_ips.get(n))
-                                .copied()?;
+                                .and_then(|ips| pick_underlay_ip(ips, node.node_ip))?;
                             Some(Endpoint {
-                                pod_ip: IpAddr::V4(e.pod_ip),
-                                node_ip: IpAddr::V4(node_ip),
+                                pod_ip: e.pod_ip,
+                                node_ip,
                                 ready: e.ready,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
                             })
@@ -463,7 +504,7 @@ impl WatchState {
             }
             for front_ip in &front_ips {
                 let view = ServiceView {
-                    vip_ip: IpAddr::V4(*front_ip),
+                    vip_ip: *front_ip,
                     ports: ports.clone(),
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
@@ -596,8 +637,12 @@ pub async fn run_list_watch(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
 
+    use beep::wire_ip_v6;
     use beep_common::unmap_ipv4;
 
     use super::*;
@@ -1461,5 +1506,221 @@ mod tests {
     fn list_resource_version_is_none_when_missing() {
         let body = serde_json::json!({"items": []});
         assert_eq!(list_resource_version(&body), None);
+    }
+
+    // Regression for the v6-only-node gap: `parse_node_internal_ip` used to
+    // return `Option<Ipv4Addr>`, so a v6-only node's InternalIP failed
+    // `.parse::<Ipv4Addr>()` and returned `None` with no log -- that node
+    // never entered front_ips/NODE_ALLOW and was invisible to the whole
+    // reconcile loop, even though it genuinely serves this Service.
+    #[test]
+    fn v6_only_node_is_not_invisible_to_the_reconcile_loop() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        let v6_node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": v6_node_ip.to_string()},
+                ]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 9)));
+
+        assert!(
+            desired
+                .node_allow
+                .contains(&tunnel_remote_v6(IpAddr::V6(v6_node_ip))),
+            "a v6-only node's InternalIP must be admitted into NODE_ALLOW, or a mixed fleet \
+             can never attest that peer's Geneve tunnel"
+        );
+        assert_eq!(
+            desired.lb_front_map.len(),
+            1,
+            "a v6-only node's own address must still become an LB_FRONT_MAP front -- \
+             silently dropping an unparseable-as-v4 InternalIP would make that node invisible \
+             as an ingress, even though it genuinely serves this Service"
+        );
+        let front_key = desired.lb_front_map.keys().next().unwrap();
+        assert_eq!(
+            front_key.vip_ip,
+            wire_ip_v6(IpAddr::V6(v6_node_ip)),
+            "the front's vip_ip must be the v6-only node's own address, not silently dropped \
+             or truncated"
+        );
+    }
+
+    // A dual-stack node reports one InternalIP per family in the SAME
+    // `status.addresses` list; collecting only the first entry (the
+    // pre-fix behavior) would silently drop whichever family sorts second,
+    // splitting a mixed v4/v6 fleet's front set in half.
+    #[test]
+    fn dual_stack_node_with_two_internal_ip_entries_fronts_both_families() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        assert!(
+            desired.node_allow.contains(&tunnel_remote_v6(v4)),
+            "the dual-stack node's v4 InternalIP must still reach NODE_ALLOW"
+        );
+        assert!(
+            desired.node_allow.contains(&tunnel_remote_v6(v6)),
+            "the dual-stack node's v6 InternalIP must ALSO reach NODE_ALLOW -- picking only \
+             the first-seen family would leave v6 peers unattested on a mixed fleet"
+        );
+    }
+
+    // RawEndpoint.pod_ip used to be Ipv4Addr-typed, so
+    // `.parse::<Ipv4Addr>().ok()?` inside `parse_endpoint_slice`'s
+    // filter_map silently dropped every v6 pod address, leaving a Service
+    // backed only by v6 pods with zero admitted backends.
+    #[test]
+    fn v6_pod_address_in_an_endpoint_slice_is_admitted_as_a_backend() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        let v6_pod_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9);
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": [v6_pod_ip.to_string()], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(
+            desired.lb_front_map.len(),
+            1,
+            "a v6 pod address must still resolve to a backend candidate -- an Ipv4Addr-typed \
+             RawEndpoint.pod_ip would drop it at parse time and leave this front with no \
+             backend at all"
+        );
+        let (_, backend) = desired.lb_front_map.iter().next().unwrap();
+        assert_eq!(
+            backend.pod_ip,
+            wire_ip_v6(IpAddr::V6(v6_pod_ip)),
+            "the resolved backend's pod_ip must be the v6 address itself, not a mangled or \
+             zeroed value"
+        );
+    }
+
+    // The Geneve tunnel remote for a peer node that reports more than one
+    // InternalIP family: same-family-as-local wins when available, so a
+    // same-family front stays same-family end to end.
+    #[test]
+    fn pick_underlay_ip_local_v4_peer_dual_stack_prefers_v4() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6));
+        let local_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(
+            pick_underlay_ip(&[v4, v6], local_v4),
+            Some(v4),
+            "a v4 local node reaching a dual-stack peer must tunnel over the peer's v4 \
+             address, keeping the common case same-family end to end"
+        );
+    }
+
+    #[test]
+    fn pick_underlay_ip_local_v6_peer_dual_stack_prefers_v6() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6));
+        let local_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        assert_eq!(
+            pick_underlay_ip(&[v4, v6], local_v6),
+            Some(v6),
+            "a v6 local node reaching a dual-stack peer must tunnel over the peer's v6 \
+             address, keeping the common case same-family end to end"
+        );
+    }
+
+    // The other side: a peer that reports only ONE family, different from
+    // the local node's own -- there is no common family, so this must fall
+    // back to the peer's lone address instead of leaving it unreachable.
+    #[test]
+    fn pick_underlay_ip_local_v4_peer_v6_only_falls_back() {
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6));
+        let local_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(
+            pick_underlay_ip(&[v6], local_v4),
+            Some(v6),
+            "a v4 local node reaching a v6-only peer has no common family -- it must still \
+             fall back to the peer's only address, or that peer's backends become \
+             permanently unreachable from this node"
+        );
+    }
+
+    #[test]
+    fn pick_underlay_ip_local_v6_peer_v4_only_falls_back() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let local_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        assert_eq!(
+            pick_underlay_ip(&[v4], local_v6),
+            Some(v4),
+            "a v6 local node reaching a v4-only peer must fall back the same way, in the \
+             other direction"
+        );
     }
 }

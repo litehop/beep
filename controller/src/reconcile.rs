@@ -119,8 +119,9 @@ impl std::fmt::Display for Ipv6Cidr {
 /// `Ipv4Cidr`/`IpCidr` split (`src/main.rs`): a Service's VIP and its
 /// backend Pod can each independently be v4 or v6, so `is_admitted` must
 /// compare a dual-stack `Endpoint.pod_ip` against a CIDR of either family
-/// without assuming one. `--pod-cidr` stays v4-only for now (`main.rs`'s
-/// CLI parser always produces `IpCidr::V4`).
+/// without assuming one. `main.rs`'s CLI parser (`parse_ip_cidr`) picks
+/// `IpCidr::V4`/`V6` off the configured `--pod-cidr` network address's own
+/// family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpCidr {
     V4(Ipv4Cidr),
@@ -249,7 +250,7 @@ pub struct DesiredEntries {
     pub target_ports: HashMap<LbFrontKey, u16>,
     pub pod_targets: HashSet<[u8; 16]>,
     /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
-    /// `ipv4_mapped_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
+    /// `tunnel_remote_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
     /// host-native value -- the same convention `LbFrontBackend::
     /// backend_node_ip` uses, since `beep-ebpf`'s `geneve_ingress` checks
     /// this set against `tkey.remote_ipv4`, a kernel-tunnel-key field the
