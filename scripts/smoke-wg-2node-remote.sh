@@ -408,14 +408,28 @@ start_backend_responder() {
   local backend_log="/tmp/wg2node-backend-${port}.log"
   printf 'HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
     "${#body}" "$body" > "$response_file"
+  # `-N` (no `-k`) makes nc exit after ONE connection -- but a case whose
+  # request never reached nc (e.g. dropped by NODE_ALLOW) leaves the prior
+  # invocation still bound, so this restart's bind would otherwise either
+  # fail outright or (worse) silently leave the STALE listener from a
+  # previous case serving the next one, undetected since the two cases
+  # already share pod_ip/port/body. Killing by exact pod_ip+port keeps a
+  # concurrently-running other-family listener (dual-stack rigs) alive.
+  pkill -f "nc ${nc_flag} -v -l -N ${pod_ip} ${port}\$" 2>/dev/null || true
   # `-v`: nc logs "Connection received on <peer-ip> <peer-port>" to
   # $backend_log on accept -- the host driver's client-IP-preservation
   # assertion (the whole point of a genuine cross-node round trip, not just
   # a passing curl) greps this for the client's OWN tunnel-inner address,
   # not this node's or any NAT'd address.
   nohup nc "$nc_flag" -v -l -N "$pod_ip" "$port" < "$response_file" > "$backend_log" 2>&1 &
+  local nc_pid=$!
   disown
   sleep 0.5
+  kill -0 "$nc_pid" 2>/dev/null || {
+    echo "FAIL: start-backend-responder: nc did not stay bound on ${pod_ip}:${port} (see $backend_log):" >&2
+    cat "$backend_log" >&2
+    exit 1
+  }
 }
 
 # `beep_common::peer_node_admission`'s doc comment: fixture/smoke mode has
