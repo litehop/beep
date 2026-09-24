@@ -1168,6 +1168,7 @@ mod tests {
                         {"name": "http", "port": 80, "protocol": "TCP"},
                         {"name": "metrics", "port": 9000, "protocol": "TCP"},
                     ],
+                    "ipFamilies": ["IPv4"],
                 },
             },
         }));
