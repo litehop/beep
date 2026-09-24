@@ -66,23 +66,18 @@ struct RawServicePort {
 #[derive(Clone, Debug, Default)]
 struct RawService {
     ports: Vec<RawServicePort>,
-    // `None` means "front/publish on every known family", the pre-
-    // ipFamilies-aware behaviour -- `parse_service` uses this both for a
-    // genuinely missing/empty `spec.ipFamilies` (old cached object or test
-    // fixture; the apiserver always sets this on a live Service) and is
-    // never constructed as `Some(vec![])`.
-    ip_families: Option<Vec<Family>>,
+    // Always non-empty: `parse_service` skips (returns `None` for) a
+    // Service whose `spec.ipFamilies` is missing/empty, so this struct is
+    // never constructed with no families to front.
+    ip_families: Vec<Family>,
 }
 
 impl RawService {
     /// Whether this Service should be fronted/published on `family` --
     /// `spec.ipFamilies`-scoped fronting (the operator decision this type
-    /// exists for). A Service with no parsed `ipFamilies` fronts every
-    /// family, matching the pre-dual-stack-aware behaviour.
+    /// exists for).
     fn fronts_family(&self, family: Family) -> bool {
-        self.ip_families
-            .as_ref()
-            .is_none_or(|families| families.contains(&family))
+        self.ip_families.contains(&family)
     }
 }
 
@@ -182,9 +177,10 @@ fn parse_protocol(s: Option<&str>) -> Option<Protocol> {
 
 /// Parses `spec.ipFamilies` (e.g. `["IPv4"]`, `["IPv4", "IPv6"]`) into the
 /// families `RawService::fronts_family` should admit. `None` for a missing
-/// or empty list -- `parse_service`'s caller logs that case, since the
-/// apiserver always populates this field on a live Service (only an old
-/// cached object or a test fixture omits it).
+/// or empty list -- `parse_service`'s caller skips the Service entirely in
+/// that case, since the apiserver always populates this field on a live
+/// Service (only an old cached object or a malformed test fixture omits
+/// it).
 fn parse_ip_families(obj: &Value) -> Option<Vec<Family>> {
     let families: Vec<Family> = obj["spec"]["ipFamilies"]
         .as_array()?
@@ -206,7 +202,9 @@ fn parse_ip_families(obj: &Value) -> Option<Vec<Family>> {
 /// `None` for a non-`LoadBalancer` Service (or one missing `spec` entirely)
 /// -- this dataplane only ever fronts `type=LoadBalancer` traffic
 /// (`ebpf-lb-dataplane.md`'s node-owned-address model), so anything else
-/// must never reach `reconcile_service`.
+/// must never reach `reconcile_service`. Also returns `None` for a Service
+/// with a missing/empty `spec.ipFamilies` -- see the `parse_ip_families`
+/// call below.
 fn parse_service(obj: &Value) -> Option<RawService> {
     if obj["spec"]["type"].as_str()? != "LoadBalancer" {
         return None;
@@ -222,21 +220,19 @@ fn parse_service(obj: &Value) -> Option<RawService> {
             })
         })
         .collect();
-    let ip_families = parse_ip_families(obj);
-    // Deliberate default: a missing/empty spec.ipFamilies (old cached
-    // object or test fixture -- a live apiserver always sets this) fronts
-    // and publishes on every known family, matching the behaviour before
-    // this Service ever gained ipFamilies-scoping, rather than the
-    // opposite (silently fronting nowhere).
-    if ip_families.is_none() {
+    // Fail closed: a missing/empty spec.ipFamilies (an old cached object or
+    // malformed input -- a live apiserver always sets this) skips the
+    // Service entirely, the same as any other unparseable Service, rather
+    // than fronting/publishing it on every known family.
+    let Some(ip_families) = parse_ip_families(obj) else {
         let namespace = obj["metadata"]["namespace"].as_str().unwrap_or("?");
         let name = metadata_name(obj).unwrap_or_else(|| "?".to_owned());
         eprintln!(
-            "controller: Service {namespace}/{name} has no spec.ipFamilies (missing/empty) -- \
-             defaulting to fronting/publishing every known node address family instead of \
-             restricting to spec.ipFamilies"
+            "controller: WARN Service {namespace}/{name} has no spec.ipFamilies (missing/empty) \
+             -- skipping it rather than fronting/publishing on every known family"
         );
-    }
+        return None;
+    };
     Some(RawService { ports, ip_families })
 }
 
@@ -413,6 +409,14 @@ impl WatchState {
             .into_iter()
             .filter(|ip| svc.fronts_family(Family::of(*ip)))
             .collect()
+    }
+
+    /// Every currently-tracked Service's key -- used to republish
+    /// `status.loadBalancer.ingress` for ALL of them when this node's own
+    /// address set changes (`main.rs`'s `on_node`), since a Node event
+    /// carries no signal about which Service specifically is affected.
+    pub fn service_keys(&self) -> Vec<ServiceKey> {
+        self.services.keys().cloned().collect()
     }
 
     pub fn apply_endpoint_slice_event(&mut self, event: &Value) {
@@ -848,7 +852,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         assert_eq!(
@@ -881,7 +889,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         });
         state.apply_service_event(&add);
@@ -903,7 +915,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         assert_eq!(
@@ -920,7 +936,11 @@ mod tests {
             "type": "DELETED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         assert_eq!(
@@ -954,7 +974,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1012,7 +1036,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1080,7 +1108,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1189,7 +1221,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         // Deliberately no `apply_node_event` for "node-a".
@@ -1228,7 +1264,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1293,7 +1333,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         // A Node event has already landed (the Node watch's own list races
@@ -1359,7 +1403,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1420,7 +1468,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1482,7 +1534,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         // node-b (a DIFFERENT, remote node) has already landed in the
@@ -1538,7 +1594,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         // The Node LIST completed and genuinely found zero Node objects.
@@ -1569,7 +1629,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1680,7 +1744,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4", "IPv6"],
+                },
             },
         }));
         let v6_node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
@@ -1743,7 +1811,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -1784,7 +1856,11 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"namespace": "default", "name": "svc-a"},
-                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
             },
         }));
         state.apply_node_event(&serde_json::json!({
@@ -2124,15 +2200,15 @@ mod tests {
         );
     }
 
-    // The apiserver always populates spec.ipFamilies on a live Service;
-    // the only source of a missing/empty value is an old cached object or
-    // a test fixture (every other test in this file omits it). The chosen
-    // default is "front every known family", matching this codebase's
-    // behaviour before ipFamilies-scoping existed -- reverting to "front
-    // nothing" here would silently blackhole every Service the rest of
-    // this file constructs without ever setting the field.
+    // The apiserver always populates spec.ipFamilies on a live Service; the
+    // only source of a missing/empty value is an old cached object or
+    // malformed input. Fronting every known family in that case (the
+    // pre-fix default) would expose the Service on a family it never
+    // declared support for, exactly where ipFamilies-scoping matters most
+    // -- so parse_service skips the Service entirely instead, the same as
+    // any other unparseable Service.
     #[test]
-    fn missing_ip_families_defaults_to_fronting_every_known_family() {
+    fn missing_ip_families_service_is_not_fronted() {
         let mut state = WatchState::default();
         state.apply_service_event(&serde_json::json!({
             "type": "ADDED",
@@ -2167,10 +2243,11 @@ mod tests {
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
-        assert_eq!(
-            desired.lb_front_map.len(),
-            2,
-            "a Service with no spec.ipFamilies must default to fronting every known family"
+        assert!(
+            desired.lb_front_map.is_empty(),
+            "a Service with no spec.ipFamilies must be skipped entirely, not fronted on every \
+             known family -- fronting it anyway would expose the Service on a family it never \
+             declared support for"
         );
     }
 

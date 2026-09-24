@@ -8,6 +8,7 @@
 //! process idles between watch events.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -192,6 +193,18 @@ fn warn_on_rejected_endpoints(desired: &DesiredEntries, node: &NodeContext) {
     );
 }
 
+/// Whether a Node event actually changed the set of addresses THIS node's
+/// own Node object reports -- `on_node`'s decision on whether to republish
+/// `status.loadBalancer.ingress` for every tracked Service. A Node event
+/// that leaves this node's own addresses unchanged (a label-only update,
+/// or the same address redelivered) must not trigger a redundant status
+/// write for every Service just because *some* Node event fired.
+fn own_node_ips_changed(before: &[IpAddr], after: &[IpAddr]) -> bool {
+    let before: HashSet<&IpAddr> = before.iter().collect();
+    let after: HashSet<&IpAddr> = after.iter().collect();
+    before != after
+}
+
 /// Re-asserts this node's own address(es) in `status.loadBalancer.ingress`
 /// for the ONE Service `key` that just changed -- not every tracked
 /// Service -- since a Service watch event only ever means that Service's
@@ -265,9 +278,35 @@ async fn run_controller_loop(
     let on_node = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
+        let client = Arc::clone(&client);
         move |event: Value| {
+            let before = state.lock().unwrap().own_node_ips(node.node_ip);
             state.lock().unwrap().apply_node_event(&event);
             apply_reconcile(&state, &maps, &node);
+            let after = state.lock().unwrap().own_node_ips(node.node_ip);
+            // This node's own address set actually changed (e.g. its second
+            // family just resolved) -- re-publish every tracked Service's
+            // ingress, not just the one Service watch would otherwise
+            // target, since a Service added before this resolution never
+            // gets another chance to publish the newly-resolved family.
+            if own_node_ips_changed(&before, &after) {
+                // Bound to a `let` rather than locked inline in the `for`
+                // head: a `for`-loop scrutinee's temporaries live for the
+                // whole loop, so an inline `state.lock().unwrap()` here
+                // would hold the Mutex across every iteration and deadlock
+                // on the `state.lock()` calls inside the loop body below.
+                let keys = state.lock().unwrap().service_keys();
+                for key in keys {
+                    let (own_ips, desired_ips) = {
+                        let state = state.lock().unwrap();
+                        (
+                            state.own_node_ips(node.node_ip),
+                            state.ips_to_publish(&key, node.node_ip),
+                        )
+                    };
+                    publish_ingress(&client, key, own_ips, desired_ips);
+                }
+            }
         }
     };
     // Fires once the initial Node LIST has fully delivered -- flips
@@ -533,6 +572,40 @@ mod tests {
                 Ipv6Addr::new(0xfd00, 0x10, 0x244, 0, 0, 0, 0, 0),
                 56
             )))
+        );
+    }
+
+    // `on_node`'s startup race: a Service can be ADDED before this node's
+    // own multi-family Node object resolves its second family, so that
+    // family never reaches status.loadBalancer.ingress unless the LATER
+    // Node event that resolves it re-publishes. Reverting to "never
+    // republish from on_node" would fail this by never detecting the
+    // change at all.
+    #[test]
+    fn own_node_ips_changed_detects_a_newly_resolved_second_family() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        assert!(
+            own_node_ips_changed(&[v4], &[v4, v6]),
+            "a Node event that resolves this node's second family must be detected as a \
+             change, or a Service added before that resolution would never gain the second \
+             family in its status.loadBalancer.ingress"
+        );
+    }
+
+    // The other side: a Node event that redelivers the same address set
+    // (e.g. an unrelated label update, or a duplicate watch delivery) must
+    // not be treated as a change, or `on_node` would republish
+    // status.loadBalancer.ingress for every tracked Service on every such
+    // no-op event.
+    #[test]
+    fn own_node_ips_changed_ignores_a_no_op_node_event() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        assert!(
+            !own_node_ips_changed(&[v4], &[v4]),
+            "a Node event that doesn't change this node's own address set must not be treated \
+             as one, or every unrelated Node update would trigger a redundant status write for \
+             every tracked Service"
         );
     }
 }
