@@ -492,6 +492,16 @@ if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ] \
 
   if [ "$PEER_CHECK_FAIL" -eq 1 ]; then
     echo "GATE: PEER-ATTESTATION REGRESSION: FAIL"
+    echo ""
+    echo "==> peer-attestation check did not pass -- collecting evidence"
+    echo "---- $VM_A wg0 tcpdump ----"
+    remote "$VM_A" dump-tcpdump wg0
+    echo "---- $VM_B wg0 tcpdump ----"
+    remote "$VM_B" dump-tcpdump wg0
+    echo "---- $VM_A evidence ----"
+    remote "$VM_A" dump-evidence
+    echo "---- $VM_B evidence ----"
+    remote "$VM_B" dump-evidence
     exit 1
   fi
   echo "GATE: PEER-ATTESTATION REGRESSION: PASS"
