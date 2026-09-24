@@ -34,6 +34,28 @@ pub struct ServiceKey {
     pub name: String,
 }
 
+/// One `spec.ipFamilies[]` entry. Determines which node address families a
+/// Service may be fronted/published on -- a `SingleStack` Service lists
+/// exactly one; `RequireDualStack`/`PreferDualStack` both list both
+/// (`spec.ipFamilyPolicy` itself is never parsed separately: the apiserver
+/// already normalizes a policy's outcome into `ipFamilies`, so there is
+/// nothing left for a policy value to decide here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    fn of(ip: IpAddr) -> Self {
+        if ip.is_ipv6() {
+            Family::V6
+        } else {
+            Family::V4
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RawServicePort {
     name: Option<String>,
@@ -44,6 +66,24 @@ struct RawServicePort {
 #[derive(Clone, Debug, Default)]
 struct RawService {
     ports: Vec<RawServicePort>,
+    // `None` means "front/publish on every known family", the pre-
+    // ipFamilies-aware behaviour -- `parse_service` uses this both for a
+    // genuinely missing/empty `spec.ipFamilies` (old cached object or test
+    // fixture; the apiserver always sets this on a live Service) and is
+    // never constructed as `Some(vec![])`.
+    ip_families: Option<Vec<Family>>,
+}
+
+impl RawService {
+    /// Whether this Service should be fronted/published on `family` --
+    /// `spec.ipFamilies`-scoped fronting (the operator decision this type
+    /// exists for). A Service with no parsed `ipFamilies` fronts every
+    /// family, matching the pre-dual-stack-aware behaviour.
+    fn fronts_family(&self, family: Family) -> bool {
+        self.ip_families
+            .as_ref()
+            .is_none_or(|families| families.contains(&family))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +180,28 @@ fn parse_protocol(s: Option<&str>) -> Option<Protocol> {
     }
 }
 
+/// Parses `spec.ipFamilies` (e.g. `["IPv4"]`, `["IPv4", "IPv6"]`) into the
+/// families `RawService::fronts_family` should admit. `None` for a missing
+/// or empty list -- `parse_service`'s caller logs that case, since the
+/// apiserver always populates this field on a live Service (only an old
+/// cached object or a test fixture omits it).
+fn parse_ip_families(obj: &Value) -> Option<Vec<Family>> {
+    let families: Vec<Family> = obj["spec"]["ipFamilies"]
+        .as_array()?
+        .iter()
+        .filter_map(|f| match f.as_str()? {
+            "IPv4" => Some(Family::V4),
+            "IPv6" => Some(Family::V6),
+            _ => None,
+        })
+        .collect();
+    if families.is_empty() {
+        None
+    } else {
+        Some(families)
+    }
+}
+
 /// Parses a `Service` object into its LoadBalancer front ports. Returns
 /// `None` for a non-`LoadBalancer` Service (or one missing `spec` entirely)
 /// -- this dataplane only ever fronts `type=LoadBalancer` traffic
@@ -160,7 +222,22 @@ fn parse_service(obj: &Value) -> Option<RawService> {
             })
         })
         .collect();
-    Some(RawService { ports })
+    let ip_families = parse_ip_families(obj);
+    // Deliberate default: a missing/empty spec.ipFamilies (old cached
+    // object or test fixture -- a live apiserver always sets this) fronts
+    // and publishes on every known family, matching the behaviour before
+    // this Service ever gained ipFamilies-scoping, rather than the
+    // opposite (silently fronting nowhere).
+    if ip_families.is_none() {
+        let namespace = obj["metadata"]["namespace"].as_str().unwrap_or("?");
+        let name = metadata_name(obj).unwrap_or_else(|| "?".to_owned());
+        eprintln!(
+            "controller: Service {namespace}/{name} has no spec.ipFamilies (missing/empty) -- \
+             defaulting to fronting/publishing every known node address family instead of \
+             restricting to spec.ipFamilies"
+        );
+    }
+    Some(RawService { ports, ip_families })
 }
 
 /// Parses an `EndpointSlice` object. `conditions.ready` defaults to `true`
@@ -300,6 +377,42 @@ impl WatchState {
                 }
             },
         }
+    }
+
+    /// Every address THIS node's own Node object reports (found by locating
+    /// the Node entry whose `InternalIP` list contains `local_node_ip`) --
+    /// the anchor set `status::merged_ingress` uses to tell this node's own
+    /// `status.loadBalancer.ingress` entries apart from another node's.
+    /// Falls back to `[local_node_ip]` alone when this node's own Node
+    /// entry hasn't resolved yet (the startup race `desired`'s
+    /// `pod_targets_known` doc comment covers for POD_TARGETS): the
+    /// CLI-configured `--node-ip` is always a valid entry for itself
+    /// regardless of watch timing, so status-publishing for that one
+    /// family never regresses versus before this node gained multi-family
+    /// awareness.
+    pub fn own_node_ips(&self, local_node_ip: IpAddr) -> Vec<IpAddr> {
+        self.node_ips
+            .values()
+            .find(|ips| ips.contains(&local_node_ip))
+            .cloned()
+            .unwrap_or_else(|| vec![local_node_ip])
+    }
+
+    /// The subset of `own_node_ips` this node should publish to `key`'s
+    /// `status.loadBalancer.ingress` right now -- narrowed to `key`'s own
+    /// `spec.ipFamilies`, the same way `desired`'s front_ip loop narrows
+    /// LB_FRONT_MAP/TARGET_PORTS. A dual-stack Service on a dual-stack node
+    /// returns both addresses, so its caller publishes a two-entry
+    /// ingress; a family this node lacks, or a family the Service doesn't
+    /// list, is never returned. Empty when `key` isn't tracked.
+    pub fn ips_to_publish(&self, key: &ServiceKey, local_node_ip: IpAddr) -> Vec<IpAddr> {
+        let Some(svc) = self.services.get(key) else {
+            return Vec::new();
+        };
+        self.own_node_ips(local_node_ip)
+            .into_iter()
+            .filter(|ip| svc.fronts_family(Family::of(*ip)))
+            .collect()
     }
 
     pub fn apply_endpoint_slice_event(&mut self, event: &Value) {
@@ -442,10 +555,12 @@ impl WatchState {
         // prevent, just keyed on this node's own entry instead of the
         // whole list.
         // Every InternalIP of every known node, not one-per-node: a
-        // dual-stack node's v4 AND v6 address must each become a front (and
-        // a NODE_ALLOW peer) -- narrowing to one family here is `desired`'s
-        // caller's job (Service `spec.ipFamilies`-scoped fronting), not
-        // this aggregation's.
+        // dual-stack node's v4 AND v6 address must each become a NODE_ALLOW
+        // peer, and a candidate LB_FRONT_MAP/TARGET_PORTS front -- narrowing the
+        // latter to a specific Service's own `spec.ipFamilies` happens in the
+        // per-Service loop below (`RawService::fronts_family`), not here:
+        // NODE_ALLOW's peer set must stay every family regardless of which
+        // families any one Service opts into.
         let front_ips: Vec<IpAddr> = self.node_ips.values().flatten().copied().collect();
         // NODE_ALLOW's peer set is the same front_ips this loop feeds
         // LB_FRONT_MAP/TARGET_PORTS from -- host-native, wrapped in
@@ -541,7 +656,13 @@ impl WatchState {
             if !self.nodes_listed {
                 continue;
             }
-            for front_ip in &front_ips {
+            // Scoped to THIS Service's own spec.ipFamilies: a SingleStack
+            // [IPv4] Service must not become reachable on a node's v6
+            // address just because that node happens to have one.
+            for front_ip in front_ips
+                .iter()
+                .filter(|ip| svc.fronts_family(Family::of(**ip)))
+            {
                 let view = ServiceView {
                     vip_ip: *front_ip,
                     ports: ports.clone(),
@@ -1787,6 +1908,414 @@ mod tests {
             !pick.shared_family,
             "no family is shared here either -- this direction must be flagged as the \
              fallback too, not just the v4-local case above"
+        );
+    }
+
+    // Operator decision (HONOUR spec.ipFamilies): a SingleStack [IPv4]
+    // Service must not become reachable on a node's v6 address just
+    // because that node happens to have one.
+    #[test]
+    fn single_stack_v4_service_is_not_fronted_on_a_dual_stack_nodes_v6_address() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(
+            desired.lb_front_map.len(),
+            1,
+            "a SingleStack IPv4 Service must front on this node's v4 address only, not also \
+             create a front on the same node's v6 address"
+        );
+        let front_key = desired.lb_front_map.keys().next().unwrap();
+        assert_eq!(
+            unmap_ipv4(&front_key.vip_ip).unwrap().to_le_bytes(),
+            [10, 0, 0, 5],
+            "the sole front that exists must be this node's v4 address, not its v6 one"
+        );
+    }
+
+    // The v6 side of the same decision, so a SingleStack [IPv6] Service is
+    // symmetric with the v4 case above rather than just falling through to
+    // "front every family" by omission.
+    #[test]
+    fn single_stack_v6_service_is_fronted_only_on_the_v6_address() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv6"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(
+            desired.lb_front_map.len(),
+            1,
+            "a SingleStack IPv6 Service must front on this node's v6 address only, not also \
+             create a front on the same node's v4 address"
+        );
+        let front_key = desired.lb_front_map.keys().next().unwrap();
+        assert_eq!(
+            front_key.vip_ip,
+            wire_ip_v6(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5))),
+            "the sole front that exists must be this node's v6 address, not its v4 one"
+        );
+    }
+
+    // RequireDualStack/PreferDualStack both list both families in
+    // spec.ipFamilies -- a dual-stack Service on a dual-stack node must
+    // front on both, or a client of whichever family is missing can never
+    // reach this node for the Service at all.
+    #[test]
+    fn dual_stack_service_on_a_dual_stack_node_is_fronted_on_both_families() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4", "IPv6"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(
+            desired.lb_front_map.len(),
+            2,
+            "a dual-stack Service on a dual-stack node must front on BOTH families, not just \
+             whichever one the reconciling node's own --node-ip happens to be"
+        );
+    }
+
+    // A v6-only node has no v4 address to front on at all -- a v4-only
+    // Service must front nowhere on it, not fall back to some other
+    // address.
+    #[test]
+    fn v6_only_node_fronts_nothing_for_a_v4_only_service() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "2001:db8::5"}]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert!(
+            desired.lb_front_map.is_empty(),
+            "a v6-only node must front nothing for a v4-only Service -- there is no v4 \
+             address on this node to front on"
+        );
+    }
+
+    // The apiserver always populates spec.ipFamilies on a live Service;
+    // the only source of a missing/empty value is an old cached object or
+    // a test fixture (every other test in this file omits it). The chosen
+    // default is "front every known family", matching this codebase's
+    // behaviour before ipFamilies-scoping existed -- reverting to "front
+    // nothing" here would silently blackhole every Service the rest of
+    // this file constructs without ever setting the field.
+    #[test]
+    fn missing_ip_families_defaults_to_fronting_every_known_family() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {"type": "LoadBalancer", "ports": [{"port": 80, "protocol": "TCP"}]},
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        assert_eq!(
+            desired.lb_front_map.len(),
+            2,
+            "a Service with no spec.ipFamilies must default to fronting every known family"
+        );
+    }
+
+    // status.rs's ensure_node_ingress publishes one ingress entry per IP
+    // this returns -- a dual-stack Service on a dual-stack node must
+    // return BOTH of this node's own addresses, or a client of whichever
+    // family is missing could never discover this node as ready.
+    #[test]
+    fn ips_to_publish_returns_both_families_for_a_dual_stack_service_on_a_dual_stack_node() {
+        let mut state = WatchState::default();
+        let key = ServiceKey {
+            namespace: "default".to_owned(),
+            name: "svc-a".to_owned(),
+        };
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4", "IPv6"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+
+        let publish_ips: HashSet<IpAddr> = state
+            .ips_to_publish(&key, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            publish_ips,
+            HashSet::from([
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5)),
+            ]),
+            "a dual-stack Service on a dual-stack node must publish BOTH of this node's own \
+             addresses, so status.loadBalancer.ingress ends up with a two-entry ingress"
+        );
+    }
+
+    // The other side: a SingleStack [IPv4] Service on the same dual-stack
+    // node must publish ONLY the v4 address -- publishing the v6 one too
+    // would claim readiness on a family this node isn't actually fronting
+    // the Service on.
+    #[test]
+    fn ips_to_publish_narrows_to_the_services_own_ip_families() {
+        let mut state = WatchState::default();
+        let key = ServiceKey {
+            namespace: "default".to_owned(),
+            name: "svc-a".to_owned(),
+        };
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "InternalIP", "address": "2001:db8::5"},
+                ]},
+            },
+        }));
+
+        let publish_ips = state.ips_to_publish(&key, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(
+            publish_ips,
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))],
+            "a SingleStack IPv4 Service must publish only this node's v4 address, not also \
+             its v6 one"
+        );
+    }
+
+    // A v6-only node has no v4 address at all, so a v4-only Service must
+    // publish nothing for it -- there is no ingress entry to add, and this
+    // node genuinely isn't reachable on that family.
+    #[test]
+    fn ips_to_publish_is_empty_when_the_node_has_no_address_in_the_services_families() {
+        let mut state = WatchState::default();
+        let key = ServiceKey {
+            namespace: "default".to_owned(),
+            name: "svc-a".to_owned(),
+        };
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        let v6_only = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": v6_only.to_string()}]},
+            },
+        }));
+
+        assert!(
+            state.ips_to_publish(&key, v6_only).is_empty(),
+            "a v6-only node must publish nothing for a v4-only Service -- it has no v4 \
+             address to add"
+        );
+    }
+
+    // Before this node's own Node object has resolved (startup race, or a
+    // relist in progress), own_node_ips must still return the
+    // CLI-configured --node-ip alone, or status-publishing for that
+    // already-known family would regress to publishing nothing until the
+    // Node LIST catches up -- a real behavior loss versus before this node
+    // gained multi-family awareness.
+    #[test]
+    fn own_node_ips_falls_back_to_the_configured_node_ip_before_the_node_list_resolves() {
+        let state = WatchState::default();
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(
+            state.own_node_ips(local),
+            vec![local],
+            "before this node's own Node object has resolved, own_node_ips must still return \
+             its CLI-configured --node-ip alone"
         );
     }
 }

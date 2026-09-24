@@ -192,18 +192,30 @@ fn warn_on_rejected_endpoints(desired: &DesiredEntries, node: &NodeContext) {
     );
 }
 
-/// Re-asserts this node's own address in `status.loadBalancer.ingress` for
-/// the ONE Service `key` that just changed -- not every tracked Service --
-/// since a Service watch event only ever means that Service's own status
-/// could be stale. `tokio::spawn`s rather than awaiting inline in the
-/// (synchronous) watch-event callback: `run_list_watch`'s `on_event` is a
-/// plain `FnMut`, not an async fn, so a network round trip here can't be
-/// awaited inline without blocking the single `current_thread` runtime this
-/// process's other two list-watches also depend on.
-fn publish_ingress(client: &Arc<HyperApiClient>, key: ServiceKey, node_ip: Ipv4Addr) {
+/// Re-asserts this node's own address(es) in `status.loadBalancer.ingress`
+/// for the ONE Service `key` that just changed -- not every tracked
+/// Service -- since a Service watch event only ever means that Service's
+/// own status could be stale. `own_ips`/`desired_ips` are
+/// `WatchState::own_node_ips`/`ips_to_publish`'s outputs: a single
+/// `ensure_node_ingress` call both publishes every family `key` currently
+/// fronts on this node and prunes any of this node's own entries for a
+/// family it stopped fronting (`status::merged_ingress`'s doc comment).
+/// `tokio::spawn`s rather than awaiting inline in the (synchronous)
+/// watch-event callback: `run_list_watch`'s `on_event` is a plain `FnMut`,
+/// not an async fn, so a network round trip here can't be awaited inline
+/// without blocking the single `current_thread` runtime this process's
+/// other two list-watches also depend on.
+fn publish_ingress(
+    client: &Arc<HyperApiClient>,
+    key: ServiceKey,
+    own_ips: Vec<IpAddr>,
+    desired_ips: Vec<IpAddr>,
+) {
     let client = Arc::clone(client);
     tokio::spawn(async move {
-        if let Err(e) = ensure_node_ingress(&client, &key.namespace, &key.name, node_ip).await {
+        if let Err(e) =
+            ensure_node_ingress(&client, &key.namespace, &key.name, &own_ips, &desired_ips).await
+        {
             eprintln!(
                 "controller: publishing status.loadBalancer.ingress for {}/{} failed: {e:#}",
                 key.namespace, key.name
@@ -230,12 +242,15 @@ async fn run_controller_loop(
         move |event: Value| {
             let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &node);
-            // `ensure_node_ingress` (status.rs) stays v4-only for now
-            // (dual-stack status publishing is a separate change) -- a v6
-            // `--node-ip` skips this status update rather than publishing
-            // a wrong/truncated ingress address.
-            if let (Some(key), IpAddr::V4(node_ip)) = (changed, node.node_ip) {
-                publish_ingress(&client, key, node_ip);
+            if let Some(key) = changed {
+                let (own_ips, desired_ips) = {
+                    let state = state.lock().unwrap();
+                    (
+                        state.own_node_ips(node.node_ip),
+                        state.ips_to_publish(&key, node.node_ip),
+                    )
+                };
+                publish_ingress(&client, key, own_ips, desired_ips);
             }
         }
     };
