@@ -223,6 +223,26 @@ fn parse_node_internal_ips(obj: &Value) -> Vec<IpAddr> {
         .collect()
 }
 
+/// "IPv4"/"IPv6", for naming a family in a log line.
+fn family_label(ip: IpAddr) -> &'static str {
+    if ip.is_ipv6() {
+        "IPv6"
+    } else {
+        "IPv4"
+    }
+}
+
+/// The outcome of `pick_underlay_ip` narrowing a peer node's `InternalIP`
+/// list down to one Geneve tunnel remote. `shared_family` is `false` only
+/// on the no-common-family fallback (`pick_underlay_ip`'s doc comment) --
+/// callers use this to WARN about a tunnel remote this node may not be able
+/// to route, without needing to capture stderr in a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnderlayPick {
+    ip: IpAddr,
+    shared_family: bool,
+}
+
 /// Picks the ONE Geneve tunnel remote (`Endpoint.node_ip`, `LbFrontBackend.
 /// backend_node_ip`) to use for a peer node that reports more than one
 /// `InternalIP` family. Prefers the peer address matching `local_node_ip`'s
@@ -230,16 +250,23 @@ fn parse_node_internal_ips(obj: &Value) -> Vec<IpAddr> {
 /// same-family front stays same-family end to end -- and falls back to the
 /// peer's other family when there's no match, e.g. a v6-only local node
 /// reaching a dual-stack peer, or a dual-stack local node reaching a
-/// v6-only one. Returns `None` only when `peer_ips` is empty, which
-/// `WatchState::node_ips` never stores (`apply_node_event` only inserts a
-/// non-empty list).
-fn pick_underlay_ip(peer_ips: &[IpAddr], local_node_ip: IpAddr) -> Option<IpAddr> {
+/// v6-only one; `UnderlayPick::shared_family` is `false` exactly on that
+/// fallback, so a caller can WARN that the resulting tunnel remote may not
+/// be routable from this node. Returns `None` only when `peer_ips` is
+/// empty, which `WatchState::node_ips` never stores (`apply_node_event`
+/// only inserts a non-empty list).
+fn pick_underlay_ip(peer_ips: &[IpAddr], local_node_ip: IpAddr) -> Option<UnderlayPick> {
     let local_is_v6 = local_node_ip.is_ipv6();
-    peer_ips
-        .iter()
-        .find(|ip| ip.is_ipv6() == local_is_v6)
-        .or(peer_ips.first())
-        .copied()
+    if let Some(ip) = peer_ips.iter().find(|ip| ip.is_ipv6() == local_is_v6) {
+        return Some(UnderlayPick {
+            ip: *ip,
+            shared_family: true,
+        });
+    }
+    peer_ips.first().map(|ip| UnderlayPick {
+        ip: *ip,
+        shared_family: false,
+    })
 }
 
 impl WatchState {
@@ -473,11 +500,23 @@ impl WatchState {
                             // dropped for THIS reconcile pass rather than
                             // guessed at -- the next Node event re-triggers
                             // a reconcile that picks it up correctly.
-                            let node_ip = e
-                                .node_name
-                                .as_deref()
-                                .and_then(|n| self.node_ips.get(n))
-                                .and_then(|ips| pick_underlay_ip(ips, node.node_ip))?;
+                            let node_ip = e.node_name.as_deref().and_then(|peer_name| {
+                                let peer_ips = self.node_ips.get(peer_name)?;
+                                let pick = pick_underlay_ip(peer_ips, node.node_ip)?;
+                                if !pick.shared_family {
+                                    let peer_family = family_label(pick.ip);
+                                    eprintln!(
+                                        "controller: WARN peer node {peer_name:?} shares no \
+                                         address family with this node's own --node-ip ({}) \
+                                         -- peer only has {peer_family}; falling back to its \
+                                         {peer_family} address {} as the Geneve tunnel remote, \
+                                         which this node may not be able to route",
+                                        family_label(node.node_ip),
+                                        pick.ip,
+                                    );
+                                }
+                                Some(pick.ip)
+                            })?;
                             Some(Endpoint {
                                 pod_ip: e.pod_ip,
                                 node_ip,
@@ -1675,11 +1714,17 @@ mod tests {
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
         let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6));
         let local_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let pick = pick_underlay_ip(&[v4, v6], local_v4).expect("peer_ips is non-empty");
         assert_eq!(
-            pick_underlay_ip(&[v4, v6], local_v4),
-            Some(v4),
+            pick.ip, v4,
             "a v4 local node reaching a dual-stack peer must tunnel over the peer's v4 \
              address, keeping the common case same-family end to end"
+        );
+        assert!(
+            pick.shared_family,
+            "a peer address in the local node's own family must never be reported as the \
+             no-common-family fallback, or the WARN this flag drives would fire on the \
+             common, healthy case"
         );
     }
 
@@ -1688,27 +1733,43 @@ mod tests {
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
         let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6));
         let local_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        let pick = pick_underlay_ip(&[v4, v6], local_v6).expect("peer_ips is non-empty");
         assert_eq!(
-            pick_underlay_ip(&[v4, v6], local_v6),
-            Some(v6),
+            pick.ip, v6,
             "a v6 local node reaching a dual-stack peer must tunnel over the peer's v6 \
              address, keeping the common case same-family end to end"
+        );
+        assert!(
+            pick.shared_family,
+            "a peer address in the local node's own family must never be reported as the \
+             no-common-family fallback, or the WARN this flag drives would fire on the \
+             common, healthy case"
         );
     }
 
     // The other side: a peer that reports only ONE family, different from
     // the local node's own -- there is no common family, so this must fall
-    // back to the peer's lone address instead of leaving it unreachable.
+    // back to the peer's lone address instead of leaving it unreachable, and
+    // must flag the fallback so the caller can WARN that the resulting
+    // Geneve tunnel remote may not be routable from this node. Reverting
+    // `shared_family` back to always-`true` would pass every other test in
+    // this file while silently dropping that WARN.
     #[test]
     fn pick_underlay_ip_local_v4_peer_v6_only_falls_back() {
         let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6));
         let local_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let pick = pick_underlay_ip(&[v6], local_v4).expect("peer_ips is non-empty");
         assert_eq!(
-            pick_underlay_ip(&[v6], local_v4),
-            Some(v6),
+            pick.ip, v6,
             "a v4 local node reaching a v6-only peer has no common family -- it must still \
              fall back to the peer's only address, or that peer's backends become \
              permanently unreachable from this node"
+        );
+        assert!(
+            !pick.shared_family,
+            "no family is shared here, so this must be flagged as the fallback -- the caller \
+             uses this flag to WARN that the Geneve tunnel remote it just programmed may not \
+             be routable from this node"
         );
     }
 
@@ -1716,11 +1777,16 @@ mod tests {
     fn pick_underlay_ip_local_v6_peer_v4_only_falls_back() {
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
         let local_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5));
+        let pick = pick_underlay_ip(&[v4], local_v6).expect("peer_ips is non-empty");
         assert_eq!(
-            pick_underlay_ip(&[v4], local_v6),
-            Some(v4),
+            pick.ip, v4,
             "a v6 local node reaching a v4-only peer must fall back the same way, in the \
              other direction"
+        );
+        assert!(
+            !pick.shared_family,
+            "no family is shared here either -- this direction must be flagged as the \
+             fallback too, not just the v4-local case above"
         );
     }
 }
