@@ -27,8 +27,37 @@
 # real source address past WireGuard's own crypto-routing source filter.
 # The client's SYN therefore still arrives at node-a genuinely
 # WireGuard-decrypted on wg0 -- the exact mechanism under test -- while its
-# source is no longer local to node-b. The round trip now reaches a
-# genuine GREEN.
+# source is no longer local to node-b.
+#
+# SECOND FIX: the above still self-looped on node-b. node-b's own
+# `--uplink-iface eth0` gave it a `uplink_ingress` classifier on the SAME
+# device the client's SYN transits en route to node-a -- and LB_FRONT_MAP is
+# deliberately unfiltered by node ownership (any node can be ingress for any
+# VIP, so TARGET_PORTS' forward-decap lookup on the real backend node needs
+# the real front's key regardless of which node "owns" that VIP) -- so
+# node-b's eth0 ingress matched the in-transit SYN and Geneve-encapped it to
+# itself before it ever reached node-a. The client's packet never crossed
+# wg0 at all (confirmed: wg0 rx/tx counters unchanged, node-a's FLOW_TABLE
+# empty). In a real WireGuard/Tailscale mesh this can't happen: every node
+# has a direct peer-to-peer tunnel to every other node, so node-a's traffic
+# never transits a third node as an incidental router. beep-client's lack of
+# a WireGuard identity of its own is what forces this rig to relay through
+# node-b at all -- so the fix keeps that relay (unavoidable with a 2-node
+# mesh and a non-mesh-member client) but stops it from ALSO being a beep
+# admission point: node-b no longer takes `--uplink-iface eth0` (defaults to
+# wg0, its real per-node-owned uplink), so its `uplink_ingress`/
+# `uplink_egress_return` hooks never see the client's raw, un-tunneled SYN
+# at all -- that packet is now a plain, un-intercepted kernel IP-forward
+# hop, exactly like a real intermediate router that isn't running beep. The
+# backend pod's own reply is forced onto wg0 (not eth0's connected LAN
+# route) via `setup-backend --return-route`, so node-b's egress-return hook
+# -- now on wg0 -- still catches it and re-Geneves it back to node-a
+# symmetrically. NODE_ALLOW is seeded bidirectionally right after each
+# node's own loader starts (mimics a controller's Node-watch, no bare-loader
+# CLI knob exists) since BOTH directions now genuinely cross wg0 with the
+# real peer's address, not a self-loop. Verified genuinely cross-node below:
+# wg0 rx/tx packet counters move on BOTH nodes, and node-a's FLOW_TABLE
+# gains an entry it didn't have before the round trip.
 #
 # Usage: scripts/smoke-wg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>] [--family 4|6]
 # Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the
@@ -76,16 +105,13 @@ done
   echo "FAIL: --family must be 4 or 6, got '$FAMILY'" >&2
   exit 1
 }
-# Opt-in regression check: geneve_ingress's peer attestation
-# (beep_common::peer_node_admission) currently reads the LOCAL tunnel
-# endpoint on GET, not the genuine remote peer, so NODE_ALLOW self-matches
-# instead of attesting anyone (see ai/findings/ for the investigation this
-# check codifies). Unset/0 by default: this check is EXPECTED TO FAIL
-# against today's dataplane code, so it must not run as part of the default
-# green gate -- set BEEP_PEER_ATTESTATION_CHECK=1 to exercise it once the
-# dataplane fix lands, or to reproduce the bug.
-BEEP_PEER_ATTESTATION_CHECK="${BEEP_PEER_ATTESTATION_CHECK:-0}"
-
+# Peer attestation regression check, default-on: once the rig's
+# self-loop was fixed (this script's header), a live run confirmed
+# `geneve_ingress`'s peer attestation (`beep_common::peer_node_admission`)
+# genuinely admits a peer-only NODE_ALLOW and genuinely drops a self-only
+# one against a real cross-node packet -- there is no dataplane bug (see
+# `bd memories wg-2node-rig-self-loop`), so this now runs unconditionally as
+# part of the default gate rather than behind an opt-in flag.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BEEP_DIR="$REPO_ROOT"
@@ -162,8 +188,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-STEP_TOTAL=7
-[ "$FAMILY" = "6" ] && STEP_TOTAL=9
+STEP_TOTAL=8
+[ "$FAMILY" = "6" ] && STEP_TOTAL=10
 echo "==> [1/$STEP_TOTAL] bringing up $VM_A, $VM_B, and $VM_CLIENT"
 for vm in "$VM_A" "$VM_B"; do
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm}[[:space:]]+Running"; then
@@ -226,7 +252,7 @@ if [ "$FAMILY" = "6" ]; then
   }
   echo "WIREGUARD TUNNEL (v6): PASS ($VM_A $WG_ULA_A <-> $VM_B $WG_ULA_B, over real v4 underlay $IP_A/$IP_B)"
 
-  echo "==> [4/9] giving $VM_B and $VM_CLIENT a shared v6 ULA on their real LAN NIC (Lima hands out v6 link-local only)"
+  echo "==> [4/10] giving $VM_B and $VM_CLIENT a shared v6 ULA on their real LAN NIC (Lima hands out v6 link-local only)"
   limactl shell "$VM_B" -- sudo ip -6 addr replace "${LAN_ULA_B}/64" dev eth0
   limactl shell "$VM_CLIENT" -- sudo ip -6 addr replace "${LAN_ULA_CLIENT}/64" dev eth0
   # Lima's vz shared-network backend doesn't propagate IPv6 multicast
@@ -241,11 +267,11 @@ if [ "$FAMILY" = "6" ]; then
   limactl shell "$VM_B" -- sudo ip -6 neigh replace "$LAN_ULA_CLIENT" lladdr "$MAC_CLIENT" dev eth0 nud permanent
   limactl shell "$VM_CLIENT" -- sudo ip -6 neigh replace "$LAN_ULA_B" lladdr "$MAC_B" dev eth0 nud permanent
 
-  echo "==> [5/9] creating geneve0 on both nodes"
+  echo "==> [5/10] creating geneve0 on both nodes"
   remote "$VM_A" setup-geneve
   remote "$VM_B" setup-geneve
 
-  echo "==> [6/9] confirming $VM_B's real underlay NIC name (must not be assumed)"
+  echo "==> [6/10] confirming $VM_B's real underlay NIC name (must not be assumed)"
   IFACE_B_ACTUAL="$(limactl shell "$VM_B" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$2; exit}'")"
   [ "$IFACE_B_ACTUAL" = "$UPLINK_IFACE_B" ] || {
     echo "FAIL: expected $VM_B's user-v2 NIC to be '$UPLINK_IFACE_B', found '$IFACE_B_ACTUAL' -- update UPLINK_IFACE_B" >&2
@@ -257,30 +283,69 @@ if [ "$FAMILY" = "6" ]; then
   # so the Geneve tunnel's outer SET (set_tunnel_remote) and GET
   # (get_tunnel_key/tunnel_remote) both run their v6 arm end to end,
   # not just WireGuard's own v6-agnostic transport.
-  echo "==> [7/9] loading beep-ebpf with a v6-underlay --node-ip on both nodes"
+  echo "==> [7/10] loading beep-ebpf with a v6-underlay --node-ip on both nodes ($VM_B uplink=wg0 default, NOT eth0 -- see this script's header on why eth0 there self-looped)"
   FIXTURE_V6="[${WG_ULA_A}]:${VIP_PORT}:tcp:[${WG_ULA_B}]:[${POD_IP_V6}]:${TARGET_PORT}"
   remote "$VM_A" start-loader --fixture "$FIXTURE_V6" --pod-cidr "$POD_CIDR_V6" --node-ip "$WG_ULA_A"
-  remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_B" --fixture "$FIXTURE_V6" --pod-cidr "$POD_CIDR_V6" --node-ip "$WG_ULA_B"
+  remote "$VM_B" start-loader --fixture "$FIXTURE_V6" --pod-cidr "$POD_CIDR_V6" --node-ip "$WG_ULA_B"
 
-  remote "$VM_B" setup-backend --pod-ip-v6 "$POD_IP_V6"
+  echo "==> [8/10] seeding NODE_ALLOW bidirectionally (mimics a controller's Node-watch, no bare-loader CLI knob exists) and starting the v6 backend"
+  # Each node's own key only exists AFTER its loader (re)starts above
+  # (populate_fixtures prunes any pre-existing NODE_ALLOW entry not matching
+  # --node-ip), and must be captured HERE, before either map holds more than
+  # one entry -- dump-node-allow-key returns bpftool's first dumped entry,
+  # which is only unambiguously "this node's own key" while it's the only
+  # entry present.
+  NODE_A_KEY="$(remote "$VM_A" dump-node-allow-key)"
+  NODE_B_KEY="$(remote "$VM_B" dump-node-allow-key)"
+  remote "$VM_B" seed-node-allow --key-hex "$NODE_A_KEY"
+  remote "$VM_A" seed-node-allow --key-hex "$NODE_B_KEY"
+  # --return-route: $VM_B's pod reply (dst=$VM_CLIENT's real LAN address)
+  # would otherwise take $VM_B's connected-LAN route out eth0 -- a device
+  # with no beep hook on it anymore -- leaking the un-DNAT'd reply straight
+  # to the client instead of symmetrically re-Geneving it back to $VM_A.
+  # Forcing it via wg0 (where $VM_B's uplink_egress_return now actually
+  # lives) restores that.
+  remote "$VM_B" setup-backend --pod-ip-v6 "$POD_IP_V6" --return-route "${LAN_ULA_CLIENT}/128"
   remote "$VM_B" start-backend-responder --pod-ip "$POD_IP_V6" --port "$TARGET_PORT" --family 6
 
-  echo "==> [8/9] routing $VM_CLIENT's v6 traffic to the VIP via $VM_B's relay"
+  echo "==> [9/10] routing $VM_CLIENT's v6 traffic to the VIP via $VM_B's relay"
   limactl shell "$VM_CLIENT" -- sudo ip -6 route replace "${WG_ULA_A}/128" via "$LAN_ULA_B"
 
-  echo "==> [9/9] driving one client ($VM_CLIENT) -> v6 VIP (over wg0 ingress, via $VM_B's relay) -> cross-node backend round trip"
+  # wg0-traversal + FLOW_TABLE evidence: a genuine cross-node round trip
+  # must move wg0's own packet counters on BOTH nodes and leave $VM_A's
+  # FLOW_TABLE holding an entry it didn't have before -- the same-node
+  # self-loop this rig replaces did neither (see this script's header).
+  WG_A_BEFORE="$(remote "$VM_A" wg-packet-count)"
+  WG_B_BEFORE="$(remote "$VM_B" wg-packet-count)"
+  FLOW_A_BEFORE="$(remote "$VM_A" flow-table-count)"
+  remote "$VM_A" start-tcpdump wg0
+  remote "$VM_B" start-tcpdump wg0
+
+  echo "==> [10/10] driving one client ($VM_CLIENT) -> v6 VIP (over wg0 ingress, via $VM_B's relay) -> cross-node backend round trip"
   set +e
   CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://[${WG_ULA_A}]:${VIP_PORT}/" 2>&1)"
   CLIENT_RC=$?
   set -e
-  if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
+  WG_A_AFTER="$(remote "$VM_A" wg-packet-count)"
+  WG_B_AFTER="$(remote "$VM_B" wg-packet-count)"
+  FLOW_A_AFTER="$(remote "$VM_A" flow-table-count)"
+
+  if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ] \
+    && [ "$WG_A_AFTER" -gt "$WG_A_BEFORE" ] && [ "$WG_B_AFTER" -gt "$WG_B_BEFORE" ] \
+    && [ "$FLOW_A_AFTER" -gt "$FLOW_A_BEFORE" ]; then
     echo "ROUND-TRIP (v6 underlay): PASS (client $VM_CLIENT -> VIP [${WG_ULA_A}]:${VIP_PORT} -> cross-node backend -> response 'OK')"
-    echo "GATE: V6-UNDERLAY DATAPLANE: PASS (family-aware Geneve tunnel-key GET/SET proven end to end over a v6 underlay)"
+    echo "WG0-TRAVERSAL (v6): PASS ($VM_A wg0 packets $WG_A_BEFORE -> $WG_A_AFTER, $VM_B wg0 packets $WG_B_BEFORE -> $WG_B_AFTER -- both moved, not a same-node self-loop)"
+    echo "FLOW-TABLE (v6): PASS ($VM_A FLOW_TABLE entries $FLOW_A_BEFORE -> $FLOW_A_AFTER)"
+    echo "GATE: V6-UNDERLAY DATAPLANE: PASS (family-aware Geneve tunnel-key GET/SET proven end to end over a genuinely cross-node v6 underlay)"
     exit 0
   fi
-  echo "ROUND-TRIP (v6 underlay): FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY')" >&2
+  echo "ROUND-TRIP (v6 underlay): FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY', wg0 $VM_A $WG_A_BEFORE->$WG_A_AFTER, $VM_B $WG_B_BEFORE->$WG_B_AFTER, FLOW_TABLE(a) $FLOW_A_BEFORE->$FLOW_A_AFTER)" >&2
   echo ""
   echo "==> round trip did not complete -- collecting evidence"
+  echo "---- $VM_A wg0 tcpdump ----"
+  remote "$VM_A" dump-tcpdump wg0
+  echo "---- $VM_B wg0 tcpdump ----"
+  remote "$VM_B" dump-tcpdump wg0
   echo "---- $VM_A evidence ----"
   remote "$VM_A" dump-evidence
   echo "---- $VM_B evidence ----"
@@ -310,11 +375,11 @@ echo "WIREGUARD TUNNEL: PASS ($VM_A $WG_SUBNET_A <-> $VM_B $WG_SUBNET_B, over re
 # subnet is not, so this route is required, not incidental.
 limactl shell "$VM_CLIENT" -- sudo ip route replace "${WG_SUBNET_A}/32" via "$IP_B"
 
-echo "==> [4/7] creating geneve0 on both nodes"
+echo "==> [4/8] creating geneve0 on both nodes"
 remote "$VM_A" setup-geneve
 remote "$VM_B" setup-geneve
 
-echo "==> [5/7] confirming $VM_B's real underlay NIC name (must not be assumed)"
+echo "==> [5/8] confirming $VM_B's real underlay NIC name (must not be assumed)"
 IFACE_B_ACTUAL="$(limactl shell "$VM_B" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$2; exit}'")"
 [ "$IFACE_B_ACTUAL" = "$UPLINK_IFACE_B" ] || {
   echo "FAIL: expected $VM_B's user-v2 NIC to be '$UPLINK_IFACE_B', found '$IFACE_B_ACTUAL' -- update UPLINK_IFACE_B" >&2
@@ -322,22 +387,42 @@ IFACE_B_ACTUAL="$(limactl shell "$VM_B" -- bash -c "ip -4 -o addr show eth0 | aw
 }
 echo "UPLINK-IFACE-NAME: PASS ($VM_B's user-v2 NIC is $UPLINK_IFACE_B)"
 
-echo "==> [6/7] loading beep-ebpf: $VM_A uplink=wg0 (the mechanism under test), $VM_B uplink=$UPLINK_IFACE_B (its return-to-client path)"
+echo "==> [6/8] loading beep-ebpf: $VM_A uplink=wg0 (the mechanism under test), $VM_B uplink=wg0 default too (NOT $UPLINK_IFACE_B -- see this script's header on why eth0 there self-looped)"
 FIXTURE="${WG_SUBNET_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 remote "$VM_A" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_A"
-# --uplink-iface must be $VM_B's real NIC, not the wg0 default: the backend
-# pod's raw reply is un-DNAT'd and redirected straight to whatever device
-# --uplink-iface names (see try_geneve_decap_return's comment in
-# ebpf/src/main.rs), and the client (on the shared user-v2 subnet) is only
-# reachable from $VM_B over its real NIC, never over wg0 -- left at the wg0
-# default, `uplink_egress_return` never fires and the un-DNAT'd reply leaks
-# out $UPLINK_IFACE_B unencapsulated.
-remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_B" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
+remote "$VM_B" start-loader --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
 
-remote "$VM_B" setup-backend --pod-ip "$POD_IP"
+echo "==> [7/8] seeding NODE_ALLOW bidirectionally (mimics a controller's Node-watch, no bare-loader CLI knob exists) and starting the backend"
+# Each node's own key only exists AFTER its loader (re)starts above
+# (populate_fixtures prunes any pre-existing NODE_ALLOW entry not matching
+# --node-ip), and must be captured HERE, before either map holds more than
+# one entry -- dump-node-allow-key returns bpftool's first dumped entry,
+# which is only unambiguously "this node's own key" while it's the only
+# entry present.
+NODE_A_KEY="$(remote "$VM_A" dump-node-allow-key)"
+NODE_B_KEY="$(remote "$VM_B" dump-node-allow-key)"
+remote "$VM_B" seed-node-allow --key-hex "$NODE_A_KEY"
+remote "$VM_A" seed-node-allow --key-hex "$NODE_B_KEY"
+# --return-route: $VM_B's pod reply (dst=$VM_CLIENT's real LAN address)
+# would otherwise take $VM_B's connected-LAN route out $UPLINK_IFACE_B -- a
+# device with no beep hook on it anymore -- leaking the un-DNAT'd reply
+# straight to the client instead of symmetrically re-Geneving it back to
+# $VM_A. Forcing it via wg0 (where $VM_B's uplink_egress_return now
+# actually lives) restores that.
+remote "$VM_B" setup-backend --pod-ip "$POD_IP" --return-route "${IP_CLIENT}/32"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
 
-echo "==> [7/7] driving one client ($VM_CLIENT) -> VIP (over wg0 ingress, via $VM_B's relay) -> cross-node backend round trip"
+# wg0-traversal + FLOW_TABLE evidence: a genuine cross-node round trip must
+# move wg0's own packet counters on BOTH nodes and leave $VM_A's FLOW_TABLE
+# holding an entry it didn't have before -- the same-node self-loop this
+# rig replaces did neither (see this script's header).
+WG_A_BEFORE="$(remote "$VM_A" wg-packet-count)"
+WG_B_BEFORE="$(remote "$VM_B" wg-packet-count)"
+FLOW_A_BEFORE="$(remote "$VM_A" flow-table-count)"
+remote "$VM_A" start-tcpdump wg0
+remote "$VM_B" start-tcpdump wg0
+
+echo "==> [8/8] driving one client ($VM_CLIENT) -> VIP (over wg0 ingress, via $VM_B's relay) -> cross-node backend round trip"
 # Client = the genuinely separate beep-client VM dialing $VM_A's VIP --
 # driven directly via limactl, not the remote.sh subcommand protocol
 # (beep-client has no /tmp/${BIN_NAME}-remote.sh copy and no MCP server;
@@ -350,68 +435,76 @@ set +e
 CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
 CLIENT_RC=$?
 set -e
-if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
+WG_A_AFTER="$(remote "$VM_A" wg-packet-count)"
+WG_B_AFTER="$(remote "$VM_B" wg-packet-count)"
+FLOW_A_AFTER="$(remote "$VM_A" flow-table-count)"
+
+if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ] \
+  && [ "$WG_A_AFTER" -gt "$WG_A_BEFORE" ] && [ "$WG_B_AFTER" -gt "$WG_B_BEFORE" ] \
+  && [ "$FLOW_A_AFTER" -gt "$FLOW_A_BEFORE" ]; then
   echo "ROUND-TRIP: PASS (client $VM_CLIENT -> VIP ${WG_SUBNET_A}:${VIP_PORT} -> cross-node backend -> response 'OK')"
-  echo "GATE 1 TIER-1 MECHANISM: PASS (wg0-ingress, symmetric return proven from a genuinely foreign client)"
-  if [ "$BEEP_PEER_ATTESTATION_CHECK" = "1" ]; then
-    # Isolates a genuinely peer-only NODE_ALLOW on $VM_B (self-entry
-    # explicitly removed, not left alongside the peer key) and asserts the
-    # two outcomes a real peer-attestation fix must produce. Both
-    # assertions FAIL against today's dataplane code -- that is expected
-    # until the fix lands, which is why this whole block is opt-in rather
-    # than part of the default gate above.
-    echo ""
-    echo "==> [optional] BEEP_PEER_ATTESTATION_CHECK: isolating peer-only NODE_ALLOW admission"
-    PEER_KEY_A="$(remote "$VM_A" dump-node-allow-key)"
-    SELF_KEY_B="$(remote "$VM_B" dump-node-allow-key)"
-    PEER_CHECK_FAIL=0
+  echo "WG0-TRAVERSAL: PASS ($VM_A wg0 packets $WG_A_BEFORE -> $WG_A_AFTER, $VM_B wg0 packets $WG_B_BEFORE -> $WG_B_AFTER -- both moved, not a same-node self-loop)"
+  echo "FLOW-TABLE: PASS ($VM_A FLOW_TABLE entries $FLOW_A_BEFORE -> $FLOW_A_AFTER)"
+  echo "GATE 1 TIER-1 MECHANISM: PASS (wg0-ingress, symmetric return proven from a genuinely foreign client, over a verified cross-node path)"
 
-    echo "----> case 1: $VM_B's NODE_ALLOW = peer-only ($VM_A's real key, self-entry removed) -- round trip must PASS"
-    remote "$VM_B" delete-node-allow --key-hex "$SELF_KEY_B"
-    remote "$VM_B" seed-node-allow --key-hex "$PEER_KEY_A"
-    # start-backend-responder's nc listener is one-shot (no -k) -- the
-    # GATE 1 round trip above already consumed it, so it must be restarted
-    # before every subsequent attempt here or a dead backend (not the
-    # NODE_ALLOW state under test) would decide the outcome.
-    remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
-    set +e
-    PEER_BODY_1="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
-    PEER_RC_1=$?
-    set -e
-    if [ "$PEER_RC_1" -eq 0 ] && [ "$PEER_BODY_1" = "OK" ]; then
-      echo "PEER-ATTESTATION (peer-only admits the real peer): PASS"
-    else
-      echo "PEER-ATTESTATION (peer-only admits the real peer): FAIL (curl rc=$PEER_RC_1, body='$PEER_BODY_1') -- expected until the dataplane fix lands"
-      PEER_CHECK_FAIL=1
-    fi
+  # Isolates a genuinely peer-only NODE_ALLOW on $VM_B (self-entry
+  # explicitly removed, not left alongside the peer key) and asserts the
+  # two outcomes a real peer-attestation mechanism must produce. Default-on:
+  # with the self-loop above fixed, a live run confirmed both assertions
+  # genuinely hold against a real cross-node packet -- see this script's
+  # header and `bd memories wg-2node-rig-self-loop`.
+  echo ""
+  echo "==> BEEP_PEER_ATTESTATION_CHECK: isolating peer-only NODE_ALLOW admission"
+  PEER_CHECK_FAIL=0
 
-    echo "----> case 2: $VM_B's NODE_ALLOW = self-only (no real peer key) -- a packet from the real peer must be DROPPED"
-    remote "$VM_B" delete-node-allow --key-hex "$PEER_KEY_A"
-    remote "$VM_B" seed-node-allow --key-hex "$SELF_KEY_B"
-    remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
-    set +e
-    PEER_BODY_2="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
-    PEER_RC_2=$?
-    set -e
-    if [ "$PEER_RC_2" -ne 0 ]; then
-      echo "PEER-ATTESTATION (self-only drops the real peer): PASS"
-    else
-      echo "PEER-ATTESTATION (self-only drops the real peer): FAIL (curl unexpectedly succeeded, body='$PEER_BODY_2') -- expected until the dataplane fix lands"
-      PEER_CHECK_FAIL=1
-    fi
-
-    if [ "$PEER_CHECK_FAIL" -eq 1 ]; then
-      echo "GATE: PEER-ATTESTATION REGRESSION: FAIL (expected until the dataplane fix lands)"
-      exit 1
-    fi
-    echo "GATE: PEER-ATTESTATION REGRESSION: PASS"
+  echo "----> case 1: $VM_B's NODE_ALLOW = peer-only ($VM_A's real key, self-entry removed) -- round trip must PASS"
+  remote "$VM_B" delete-node-allow --key-hex "$NODE_B_KEY"
+  # start-backend-responder's nc listener is one-shot (no -k) -- the
+  # GATE 1 round trip above already consumed it, so it must be restarted
+  # before every subsequent attempt here or a dead backend (not the
+  # NODE_ALLOW state under test) would decide the outcome.
+  remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
+  set +e
+  PEER_BODY_1="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+  PEER_RC_1=$?
+  set -e
+  if [ "$PEER_RC_1" -eq 0 ] && [ "$PEER_BODY_1" = "OK" ]; then
+    echo "PEER-ATTESTATION (peer-only admits the real peer): PASS"
+  else
+    echo "PEER-ATTESTATION (peer-only admits the real peer): FAIL (curl rc=$PEER_RC_1, body='$PEER_BODY_1')"
+    PEER_CHECK_FAIL=1
   fi
+
+  echo "----> case 2: $VM_B's NODE_ALLOW = self-only (no real peer key) -- a packet from the real peer must be DROPPED"
+  remote "$VM_B" delete-node-allow --key-hex "$NODE_A_KEY"
+  remote "$VM_B" seed-node-allow --key-hex "$NODE_B_KEY"
+  remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
+  set +e
+  PEER_BODY_2="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+  PEER_RC_2=$?
+  set -e
+  if [ "$PEER_RC_2" -ne 0 ]; then
+    echo "PEER-ATTESTATION (self-only drops the real peer): PASS"
+  else
+    echo "PEER-ATTESTATION (self-only drops the real peer): FAIL (curl unexpectedly succeeded, body='$PEER_BODY_2')"
+    PEER_CHECK_FAIL=1
+  fi
+
+  if [ "$PEER_CHECK_FAIL" -eq 1 ]; then
+    echo "GATE: PEER-ATTESTATION REGRESSION: FAIL"
+    exit 1
+  fi
+  echo "GATE: PEER-ATTESTATION REGRESSION: PASS"
   exit 0
 fi
-echo "ROUND-TRIP: FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY')" >&2
+echo "ROUND-TRIP: FAIL (curl rc=$CLIENT_RC, body='$CLIENT_BODY', wg0 $VM_A $WG_A_BEFORE->$WG_A_AFTER, $VM_B $WG_B_BEFORE->$WG_B_AFTER, FLOW_TABLE(a) $FLOW_A_BEFORE->$FLOW_A_AFTER)" >&2
 
 echo ""
 echo "==> round trip did not complete -- collecting evidence"
+echo "---- $VM_A wg0 tcpdump ----"
+remote "$VM_A" dump-tcpdump wg0
+echo "---- $VM_B wg0 tcpdump ----"
+remote "$VM_B" dump-tcpdump wg0
 echo "---- $VM_A evidence ----"
 remote "$VM_A" dump-evidence
 echo "---- $VM_B evidence ----"

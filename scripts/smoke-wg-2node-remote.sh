@@ -167,10 +167,10 @@ setup_backend() {
       --pod-ip-v6) pod_ip_v6="$2"; shift 2 ;;
       # `uplink_egress_return`'s TC-egress hook only ever fires for a
       # destination the kernel's OWN routing table already resolves to
-      # $WG_IFACE -- a genuinely cross-node client's tunnel-inner subnet
-      # (see $IPTNL_IFACE's comment) has no such route by default, since it
-      # never physically touches this node's LAN. Repeatable: one v4 + one
-      # v6 CIDR for a dual-stack round trip.
+      # $WG_IFACE -- a genuinely cross-node client's address (whether a
+      # synthetic tunnel-inner one or, for smoke-wg-2node.sh's real 3rd-VM
+      # client, its genuine LAN address) has no such route by default.
+      # Repeatable: one v4 + one v6 CIDR for a dual-stack round trip.
       --return-route) return_routes+=("$2"); shift 2 ;;
       *) echo "setup-backend: unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -185,10 +185,32 @@ setup_backend() {
 
   [ -n "$pod_ip" ] && ip addr replace "${pod_ip}/32" dev lo
   [ -n "$pod_ip_v6" ] && ip -6 addr replace "${pod_ip_v6}/128" dev lo
+  # A plain (destination-only) route to the client via $WG_IFACE would ALSO
+  # capture a completely different packet that happens to share the same
+  # destination: the ingress node's fully return-decapped, un-DNAT'd reply,
+  # relayed back through this node's wg0 en route to the real client's LAN.
+  # That packet arrives ON wg0 already, and this node has no WireGuard peer
+  # whose allowed-ips cover the client's address (only the OTHER node's own
+  # wg0 subnet) -- routing it back OUT wg0 is a dead-end the kernel can't
+  # resolve, and it gets ICMP-unreachable'd instead of forwarded on to the
+  # client via eth0, confirmed via a live tcpdump capture on wg0.
+  # Scoping the route to a separate table, entered only for traffic SOURCED
+  # from the pod's own address (`ip rule ... from`), fixes this: the pod's
+  # own raw reply (src=pod_ip) takes this table's wg0 route and hits
+  # uplink_egress_return, while the ingress node's relayed reply (src=the
+  # VIP, rewritten by its own un-DNAT step) falls through to the main
+  # table's ordinary connected route out eth0, as it must.
+  local rt_table=100
   for cidr in "${return_routes[@]}"; do
     case "$cidr" in
-      *:*) ip -6 route replace "$cidr" dev "$WG_IFACE" ;;
-      *) ip route replace "$cidr" dev "$WG_IFACE" ;;
+      *:*)
+        ip -6 rule add from "${pod_ip_v6}" table "$rt_table" 2>/dev/null || true
+        ip -6 route replace "$cidr" dev "$WG_IFACE" table "$rt_table"
+        ;;
+      *)
+        ip rule add from "${pod_ip}" table "$rt_table" 2>/dev/null || true
+        ip route replace "$cidr" dev "$WG_IFACE" table "$rt_table"
+        ;;
     esac
   done
   if [ ! -f "$RPFILTER_SAVE_FILE" ]; then
@@ -392,6 +414,20 @@ start_loader() {
   cat "$LOADER_LOG"
 }
 
+start_tcpdump() {
+  local iface="${1:-$WG_IFACE}"
+  nohup tcpdump -ni "$iface" -w "/tmp/wg2node-${iface}.pcap" >"/tmp/wg2node-tcpdump-${iface}.log" 2>&1 &
+  disown
+  sleep 0.3
+}
+
+dump_tcpdump() {
+  local iface="${1:-$WG_IFACE}"
+  pkill -f "tcpdump -ni $iface" 2>/dev/null || true
+  sleep 0.3
+  tcpdump -nr "/tmp/wg2node-${iface}.pcap" 2>&1 | head -200 || true
+}
+
 start_backend_responder() {
   local pod_ip="" port="" family="4" nc_flag="-4" body="OK"
   while [[ $# -gt 0 ]]; do
@@ -415,7 +451,27 @@ start_backend_responder() {
   # previous case serving the next one, undetected since the two cases
   # already share pod_ip/port/body. Killing by exact pod_ip+port keeps a
   # concurrently-running other-family listener (dual-stack rigs) alive.
-  pkill -f "nc ${nc_flag} -v -l -N ${pod_ip} ${port}\$" 2>/dev/null || true
+  # `pkill` only sends SIGTERM and returns immediately -- it does not wait
+  # for the old process to actually exit and release the port, so the bind
+  # below could rarely race a not-yet-freed socket (PR #143 review). Wait
+  # for the OLD pid specifically (bounded to ~2s) rather than just firing
+  # the signal and hoping.
+  local old_pid
+  old_pid="$(pgrep -f "nc ${nc_flag} -v -l -N ${pod_ip} ${port}\$" 2>/dev/null || true)"
+  if [ -n "$old_pid" ]; then
+    # Unquoted below: pgrep can (rarely) return more than one matching pid
+    # (one per line), and each must reach `kill`/`kill -0` as its own word,
+    # not one multi-line argument.
+    # shellcheck disable=SC2086
+    kill $old_pid 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      # shellcheck disable=SC2086
+      kill -0 $old_pid 2>/dev/null || break
+      sleep 0.1
+    done
+    # shellcheck disable=SC2086
+    kill -0 $old_pid 2>/dev/null && kill -9 $old_pid 2>/dev/null || true
+  fi
   # `-v`: nc logs "Connection received on <peer-ip> <peer-port>" to
   # $backend_log on accept -- the host driver's client-IP-preservation
   # assertion (the whole point of a genuine cross-node round trip, not just
@@ -494,6 +550,15 @@ wg_packet_count() {
   echo "$((rx + tx))"
 }
 
+# Number of live FLOW_TABLE entries -- the host driver's second piece of
+# cross-node evidence alongside wg_packet_count: the ingress node's forward
+# entry is only ever written by uplink_ingress admitting a client SYN on a
+# configured uplink, so a nonzero count here (where zero beforehand) proves
+# this node genuinely ran ingress admission, not just relayed bytes.
+flow_table_count() {
+  bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" -j | jq 'length'
+}
+
 # bpftool + geneve0/wg0/eth0/client-veth counters + routes -- eth0 and the
 # route table are the relay-specific evidence this rig needs beyond the
 # original geneve0/wg0 set, since the client's SYN now transits this node's
@@ -511,6 +576,14 @@ dump_evidence() {
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
   echo "== bpftool map dump: FLOW_TABLE =="
   bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" 2>&1 || true
+  echo "== bpftool map dump: POD_TARGETS =="
+  bpftool map dump pinned "$PIN_DIR/POD_TARGETS" 2>&1 || true
+  echo "== bpftool map dump: UPLINK_CONFIG =="
+  bpftool map dump pinned "$PIN_DIR/UPLINK_CONFIG" 2>&1 || true
+  echo "== wg show =="
+  wg show "$WG_IFACE" 2>&1 || true
+  echo "== backend logs =="
+  cat /tmp/wg2node-backend-*.log 2>&1 || true
   echo "== eth0 counters =="
   ip -s link show eth0 2>&1 || true
   echo "== geneve0 counters =="
@@ -542,6 +615,8 @@ cleanup() {
   # fix as smoke-eth-ingress-2node-remote.sh's cleanup().
   pkill -f "$BIN --uplink-iface" 2>/dev/null || true
   pkill -f "nc -[46] -v -l -N" 2>/dev/null || true
+  pkill -f "tcpdump -ni" 2>/dev/null || true
+  rm -f /tmp/wg2node-*.pcap /tmp/wg2node-tcpdump-*.log
   rm -rf "$PIN_DIR"
   rm -f /tmp/wg2node-response*.http /tmp/wg2node-backend*.log "$LOADER_LOG"
   ip link del "$GENEVE_IFACE" 2>/dev/null || true
@@ -553,6 +628,15 @@ cleanup() {
   # $IP6TNL_IFACE_PEER, $CLIENT_VETH_PEER) all die with the netns itself --
   # no separate delete needed.
   ip netns del "$CLIENT_NETNS" 2>/dev/null || true
+  # setup_backend's --return-route policy-routing rules (table 100): looped
+  # deletes since more than one `ip rule add from ... table 100` can exist
+  # (e.g. a prior v4 run's rule left behind if this same node is reused for
+  # a v6 run without an intervening cleanup) -- `ip rule del` only removes
+  # ONE matching rule per call.
+  for _ in 1 2 3 4; do ip rule del table 100 2>/dev/null || break; done
+  for _ in 1 2 3 4; do ip -6 rule del table 100 2>/dev/null || break; done
+  ip route flush table 100 2>/dev/null || true
+  ip -6 route flush table 100 2>/dev/null || true
   if [ -f "$RPFILTER_SAVE_FILE" ]; then
     sysctl -w net.ipv4.conf.all.rp_filter="$(cat "$RPFILTER_SAVE_FILE")" >/dev/null 2>&1 || true
     rm -f "$RPFILTER_SAVE_FILE"
@@ -580,11 +664,14 @@ case "$cmd" in
   dump-node-allow-key) dump_node_allow_key ;;
   seed-node-allow) seed_node_allow "$@" ;;
   delete-node-allow) delete_node_allow "$@" ;;
+  start-tcpdump) start_tcpdump "$@" ;;
+  dump-tcpdump) dump_tcpdump "$@" ;;
   wg-packet-count) wg_packet_count ;;
+  flow-table-count) flow_table_count ;;
   dump-evidence) dump_evidence ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|setup-client-netns|setup-client-tunnels|start-loader|start-backend-responder|dump-node-allow-key|seed-node-allow|delete-node-allow|wg-packet-count|dump-evidence|cleanup} [args...]" >&2
+    echo "usage: $0 {setup-wg|pubkey|setup-geneve|setup-backend|setup-client-netns|setup-client-tunnels|start-loader|start-backend-responder|dump-node-allow-key|seed-node-allow|delete-node-allow|start-tcpdump|dump-tcpdump|wg-packet-count|flow-table-count|dump-evidence|cleanup} [args...]" >&2
     exit 1
     ;;
 esac
