@@ -87,7 +87,7 @@ pub struct Ipv6Cidr {
 }
 
 impl Ipv6Cidr {
-    fn new(network: Ipv6Addr, prefix_len: u8) -> Self {
+    pub fn new(network: Ipv6Addr, prefix_len: u8) -> Self {
         let mask = Self::mask(prefix_len);
         Ipv6Cidr {
             network: Ipv6Addr::from(u128::from(network) & mask),
