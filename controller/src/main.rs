@@ -8,7 +8,7 @@
 //! process idles between watch events.
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -21,7 +21,7 @@ use beep::{
 };
 use beep_controller::{
     apply::PinnedMaps,
-    reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, NodeContext},
+    reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     status::ensure_node_ingress,
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -82,18 +82,18 @@ struct Args {
     #[arg(long)]
     node_prep: bool,
 
-    /// Cluster pod CIDR (e.g. `10.244.0.0/16`) -- scopes `POD_TARGETS`
-    /// membership to endpoints whose pod_ip actually falls inside it
-    /// (`reconcile::NodeContext`'s doc comment).
-    #[arg(long = "pod-cidr", value_parser = parse_ipv4_cidr, required_unless_present = "node_prep")]
-    pod_cidr: Option<Ipv4Cidr>,
+    /// Cluster pod CIDR (e.g. `10.244.0.0/16` or `fd00:10:244::/56`) --
+    /// scopes `POD_TARGETS` membership to endpoints whose pod_ip actually
+    /// falls inside it (`reconcile::NodeContext`'s doc comment).
+    #[arg(long = "pod-cidr", value_parser = parse_ip_cidr, required_unless_present = "node_prep")]
+    pod_cidr: Option<IpCidr>,
 
     /// This node's own address: the LB front IP every `type=LoadBalancer`
     /// Service resolves to on this node (the node-owned-address model,
     /// `ebpf-lb-dataplane.md`), and the value `POD_TARGETS` scopes local
     /// backend membership against.
     #[arg(long = "node-ip", required_unless_present = "node_prep")]
-    node_ip: Option<Ipv4Addr>,
+    node_ip: Option<IpAddr>,
 
     /// Path to a kubeconfig with credentials for this DaemonSet's watch.
     #[arg(long, required_unless_present = "node_prep")]
@@ -131,6 +131,33 @@ fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
         return Err(format!("pod_cidr prefix_len `{prefix_len}` must be 0..=32"));
     }
     Ok(Ipv4Cidr::new(network, prefix_len))
+}
+
+/// `--pod-cidr`'s dual-stack parser, same family dispatch as the loader's
+/// own `parse_ip_cidr` (`src/main.rs`): the network address's own family,
+/// not a separate flag, picks `IpCidr::V4`/`V6`, so an operator configures
+/// exactly one CIDR for whichever pod network family this cluster actually
+/// runs.
+fn parse_ip_cidr(s: &str) -> Result<IpCidr, String> {
+    let (network, prefix_len) = s
+        .split_once('/')
+        .ok_or_else(|| format!("expected network_ip/prefix_len, got `{s}`"))?;
+    if network.parse::<Ipv6Addr>().is_ok() {
+        let network: Ipv6Addr = network
+            .parse()
+            .map_err(|e| format!("pod_cidr network `{network}`: {e}"))?;
+        let prefix_len: u8 = prefix_len
+            .parse()
+            .map_err(|e| format!("pod_cidr prefix_len `{prefix_len}`: {e}"))?;
+        if prefix_len > 128 {
+            return Err(format!(
+                "pod_cidr prefix_len `{prefix_len}` must be 0..=128"
+            ));
+        }
+        Ok(IpCidr::V6(Ipv6Cidr::new(network, prefix_len)))
+    } else {
+        parse_ipv4_cidr(s).map(IpCidr::V4)
+    }
 }
 
 fn apply_reconcile(state: &Mutex<WatchState>, maps: &Mutex<PinnedMaps>, node: &NodeContext) {
@@ -203,9 +230,10 @@ async fn run_controller_loop(
         move |event: Value| {
             let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &node);
-            // `ensure_node_ingress` (status.rs) stays v4-only, and so does
-            // `--node-ip` itself, so this is never actually a v6 address
-            // today.
+            // `ensure_node_ingress` (status.rs) stays v4-only for now
+            // (dual-stack status publishing is a separate change) -- a v6
+            // `--node-ip` skips this status update rather than publishing
+            // a wrong/truncated ingress address.
             if let (Some(key), IpAddr::V4(node_ip)) = (changed, node.node_ip) {
                 publish_ingress(&client, key, node_ip);
             }
@@ -355,15 +383,14 @@ async fn main() -> anyhow::Result<()> {
         bearer: None,
     });
 
-    let node =
-        NodeContext {
-            node_ip: IpAddr::V4(args.node_ip.expect(
-                "clap requires --node-ip unless --node-prep, which already returned above",
-            )),
-            pod_cidr: IpCidr::V4(args.pod_cidr.expect(
-                "clap requires --pod-cidr unless --node-prep, which already returned above",
-            )),
-        };
+    let node = NodeContext {
+        node_ip: args
+            .node_ip
+            .expect("clap requires --node-ip unless --node-prep, which already returned above"),
+        pod_cidr: args
+            .pod_cidr
+            .expect("clap requires --pod-cidr unless --node-prep, which already returned above"),
+    };
     let state = Arc::new(Mutex::new(WatchState::default()));
     let maps = Arc::new(Mutex::new(
         PinnedMaps::open(&args.pin_dir).context("opening pinned dataplane maps")?,
@@ -436,5 +463,61 @@ mod tests {
 
         Args::try_parse_from(["beep-controller", "--node-prep"])
             .expect("--node-prep must not require --uplink-iface either");
+    }
+
+    // The loader's own CLI (`src/main.rs`) already accepts a v6 --node-ip;
+    // the controller's own `--node-ip` rejected one outright at argument
+    // parsing until this change, so a v6-only node's DaemonSet could never
+    // even start, regardless of anything watch.rs does.
+    #[test]
+    fn node_ip_accepts_a_v6_literal() {
+        let args = Args::try_parse_from([
+            "beep-controller",
+            "--uplink-iface",
+            "eth0",
+            "--pod-cidr",
+            "10.244.0.0/16",
+            "--node-ip",
+            "2001:db8::1",
+            "--kubeconfig",
+            "/tmp/kubeconfig",
+        ])
+        .expect(
+            "--node-ip must accept a v6 literal, or a v6-only node can never start this \
+             DaemonSet",
+        );
+        assert_eq!(
+            args.node_ip,
+            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
+        );
+    }
+
+    // Mirrors the loader's own dual-stack `--pod-cidr`: the network
+    // address's family alone picks `IpCidr::V4`/`V6`, so a v6 cluster pod
+    // network doesn't need a separate flag to configure.
+    #[test]
+    fn pod_cidr_accepts_a_v6_literal() {
+        let args = Args::try_parse_from([
+            "beep-controller",
+            "--uplink-iface",
+            "eth0",
+            "--pod-cidr",
+            "fd00:10:244::/56",
+            "--node-ip",
+            "2001:db8::1",
+            "--kubeconfig",
+            "/tmp/kubeconfig",
+        ])
+        .expect(
+            "--pod-cidr must accept a v6 literal, or a v6-only cluster's pod CIDR can never be \
+             configured",
+        );
+        assert_eq!(
+            args.pod_cidr,
+            Some(IpCidr::V6(Ipv6Cidr::new(
+                Ipv6Addr::new(0xfd00, 0x10, 0x244, 0, 0, 0, 0, 0),
+                56
+            )))
+        );
     }
 }
