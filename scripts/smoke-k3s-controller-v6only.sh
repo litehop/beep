@@ -16,8 +16,15 @@
 # CROSS-NODE PROOF: a reply alone can't distinguish a real traversal from a
 # same-node self-loop, so the gate also requires (a) geneve0 counters moving
 # on both nodes, (b) Geneve-over-v6 packets captured on each node's eth0 in
-# BOTH directions between the two ULAs and none over v4, and (c) a FLOW_TABLE
-# entry for the client's v6 address on the ingress node.
+# BOTH directions between the two ULAs, with the v4 UDP/6081 DROP rule's packet
+# counter still 0 on both nodes (the eth0 capture sits after that drop, so only
+# the counter proves no v4 Geneve was attempted), and (c) a FLOW_TABLE entry for
+# the client's v6 address on the ingress node.
+#
+# NOT COVERED: a dual-stack ingress node fronting a v6-only backend node. k3s
+# rejects a v6-only node inside a dual-stack cluster, so that mix cannot be
+# built on k3s; it is exercised only by the controller's unit tests and needs
+# real hardware (gate 3) to run end to end.
 #
 # Usage: scripts/smoke-k3s-controller-v6only.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
 #
@@ -88,6 +95,10 @@ map_dump() { # map_dump <vm> <map-name> -- raw bpftool JSON dump of a pinned map
   fi
   rm -f "$out_file" "$err_file"
   return "$rc"
+}
+
+v4_block_pkts() { # v4_block_pkts <vm> -- packet counter of the v4 UDP/6081 DROP rule on stdout; exit 1 unless exactly one such rule exists (the capture on eth0 sits after this netfilter OUTPUT drop, so only this counter sees blocked v4 Geneve attempts)
+  limactl shell "$1" -- sudo bash -c "iptables -nvxL OUTPUT | awk -v tag='$V4_GENEVE_BLOCK_TAG' 'index(\$0, tag) && \$3 == \"DROP\" && /udp dpt:6081/ {n++; p=\$1} END {if (n != 1) exit 1; print p}'"
 }
 
 dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
@@ -189,9 +200,12 @@ done
 rm -rf "$IMAGE_TMPDIR"
 IMAGE_TMPDIR=""
 for vm in "$VM_A" "$VM_B"; do
+  limactl shell "$vm" -- sudo bash -c "while iptables -D OUTPUT -p udp --dport 6081 -m comment --comment '$V4_GENEVE_BLOCK_TAG' -j DROP 2>/dev/null; do :; done"
   limactl shell "$vm" -- sudo iptables -I OUTPUT -p udp --dport 6081 -m comment --comment "$V4_GENEVE_BLOCK_TAG" -j DROP
+  blocked_pkts="$(v4_block_pkts "$vm")" || { echo "V4-GENEVE-BLOCKED: FAIL ($vm: could not read back exactly one v4 UDP/6081 DROP rule after inserting it)" >&2; exit 1; }
+  echo "  $vm: v4 UDP/6081 DROP rule read back (packets so far: $blocked_pkts)"
 done
-echo "V4-GENEVE-BLOCKED: PASS (v4 UDP/6081 egress dropped on $VM_A and $VM_B, so a v4 tunnel remote could not carry traffic; Lima's own control channel needs eth0's v4 address, so it stays)"
+echo "V4-GENEVE-BLOCKED: PASS (v4 UDP/6081 egress dropped on $VM_A and $VM_B -- rule read back from iptables on each, so a v4 tunnel remote could not carry traffic; Lima's own control channel needs eth0's v4 address, so it stays)"
 
 if ! k3s_deploy_controller_daemonset "$REPO_ROOT" "$IMAGE"; then
   echo "CONTROLLER-DEPLOY: FAIL (see pod status/logs below -- this step is expected to PASS)" >&2
@@ -293,7 +307,7 @@ v6_bytes() { # v6_bytes <fd00:beef:98::N> -- jq array literal of the address's 1
 
 echo "==> [8/12] confirming the controller programmed the v6 front on $VM_A and the backend's admission on $VM_B"
 # bpftool's --json dump has no BTF for these structs, so key/value are flat
-# arrays of "0xNN" byte strings: FRONT_META key = vip_ip[0..16) + vip_port
+# arrays of "0xNN" byte strings: FRONT_META key = front_ip[0..16) + front_port
 # BE [16..18) + proto + pad; value = generation u32 LE [0..4) + count u16 +
 # flags u16. FRONT_ENDPOINTS key = that same 20-byte front key + generation
 # u32 LE [20..24) + slot u16 [24..26) + pad; value = backend_node_ip[0..16) +
@@ -373,16 +387,24 @@ cap_count() { # cap_count <vm> <tcpdump-filter> -- packets in the capture matchi
 for vm in "$VM_A" "$VM_B"; do
   fwd="$(cap_count "$vm" "ip6 and src $ULA_A and dst $ULA_B and udp port 6081")"
   ret="$(cap_count "$vm" "ip6 and src $ULA_B and dst $ULA_A and udp port 6081")"
-  v4="$(cap_count "$vm" "ip and udp port 6081")"
-  if [ "$fwd" -ge 1 ] && [ "$ret" -ge 1 ] && [ "$v4" -eq 0 ]; then
-    echo "  $vm eth0: Geneve/v6 $ULA_A->$ULA_B=$fwd, $ULA_B->$ULA_A=$ret, Geneve/v4=$v4"
+  if [ "$fwd" -ge 1 ] && [ "$ret" -ge 1 ]; then
+    echo "  $vm eth0: Geneve/v6 $ULA_A->$ULA_B=$fwd, $ULA_B->$ULA_A=$ret"
   else
-    echo "UNDERLAY-V6-TRAVERSAL: FAIL ($vm eth0 capture: $ULA_A->$ULA_B=$fwd, $ULA_B->$ULA_A=$ret, Geneve/v4=$v4; wanted both v6 directions >= 1 and no v4)" >&2
+    echo "UNDERLAY-V6-TRAVERSAL: FAIL ($vm eth0 capture: $ULA_A->$ULA_B=$fwd, $ULA_B->$ULA_A=$ret; wanted both v6 directions >= 1)" >&2
     dump_evidence
     exit 1
   fi
 done
-echo "UNDERLAY-V6-TRAVERSAL: PASS (Geneve over v6 observed on both nodes' eth0 in both directions between $ULA_A and $ULA_B, none over v4 -- forward and symmetric return crossed the v6 underlay)"
+echo "UNDERLAY-V6-TRAVERSAL: PASS (Geneve over v6 observed on both nodes' eth0 in both directions between $ULA_A and $ULA_B -- forward and symmetric return crossed the v6 underlay)"
+for vm in "$VM_A" "$VM_B"; do
+  v4_attempts="$(v4_block_pkts "$vm")" || { echo "NO-V4-GENEVE: FAIL ($vm: cannot read back exactly one v4 UDP/6081 DROP rule -- v4 attempts are unknown)" >&2; dump_evidence; exit 1; }
+  if ! [[ "$v4_attempts" =~ ^[0-9]+$ ]] || [ "$v4_attempts" -ne 0 ]; then
+    echo "NO-V4-GENEVE: FAIL ($vm's v4 UDP/6081 DROP rule counted '$v4_attempts' packets -- the dataplane attempted v4 Geneve on a v6-only cluster)" >&2
+    dump_evidence
+    exit 1
+  fi
+done
+echo "NO-V4-GENEVE: PASS (the v4 UDP/6081 DROP rule's packet counter is 0 on $VM_A and $VM_B after the round trip -- no v4 Geneve was ever attempted, not merely none seen past the drop)"
 
 echo "==> [12/12] confirming a FLOW_TABLE entry for the client exists on the ingress node"
 dump="$(map_dump "$VM_A" FLOW_TABLE)" || { echo "FAIL: cannot read $VM_A FLOW_TABLE" >&2; dump_evidence; exit 1; }

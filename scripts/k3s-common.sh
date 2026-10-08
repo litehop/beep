@@ -52,11 +52,33 @@ k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy
   # default /bin/bash is 3.2) -- confirmed live (smoke-k3s-controller.sh's
   # `set -euo pipefail` tripped on exactly this).
   local dual_stack_arg=""
+  if [ "$dual_stack" = "1" ] && [ "$v6_only" = "1" ]; then
+    echo "FAIL: dual-stack and v6-only are mutually exclusive" >&2
+    return 1
+  fi
   [ "$dual_stack" = "1" ] && dual_stack_arg="--dual-stack"
   [ "$v6_only" = "1" ] && dual_stack_arg="--v6-only"
   "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b" --proxy-mode "$proxy_mode" $dual_stack_arg
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm_client}[[:space:]]+Running"; then
     limactl start "$vm_client"
+  fi
+}
+
+k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 0|1> <k3s-installed: 0|1> <read-ok: 0|1> <internal-ips> -- prints keep, reinstall, or unreadable. A reinstall wipes the cluster, so it needs a positive read of the node's InternalIPs: an installed k3s whose kubectl failed or answered empty (apiserver briefly down) is unreadable, never "not shaped as requested". A plain call keeps a dual-stack cluster but cannot use a v6-only one (the agent joins over v4).
+  local dual="$1" v6_only="$2" installed="$3" read_ok="$4" addrs="$5" have_v4=0 have_v6=0
+  [ "$installed" = "1" ] || { echo keep; return 0; }
+  case "$addrs" in *.*) have_v4=1 ;; esac
+  case "$addrs" in *:*) have_v6=1 ;; esac
+  if [ "$read_ok" != "1" ] || { [ "$have_v4" = "0" ] && [ "$have_v6" = "0" ]; }; then
+    echo unreadable
+  elif [ "$v6_only" = "1" ]; then
+    { [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; } && echo keep || echo reinstall
+  elif [ "$dual" = "1" ]; then
+    { [ "$have_v6" = "1" ] && [ "$have_v4" = "1" ]; } && echo keep || echo reinstall
+  elif [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; then
+    echo reinstall
+  else
+    echo keep
   fi
 }
 
@@ -131,6 +153,8 @@ k3s_teardown_controller() { # k3s_teardown_controller <repo-root> <secret-name> 
 
 kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)
   local child
+  # Freeze first: a fork-looping process would otherwise spawn children after the pgrep snapshot below and escape the kill.
+  kill -STOP "$1" 2>/dev/null || true
   for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
   kill -9 "$1" 2>/dev/null || true
 }
@@ -152,30 +176,38 @@ bounded_run() { # bounded_run <seconds> <cmd...> -- runs cmd with the caller's s
   wait "$bg_pid"
 }
 
+host_port() { # host_port <addr> <port> -- addr:port, bracketing IPv6 literals (URL authority and the backend's RemoteAddr both use this form); an already-bracketed addr is left alone
+  case "$1" in
+    \[*) echo "$1:$2" ;;
+    *:*) echo "[$1]:$2" ;;
+    *) echo "$1:$2" ;;
+  esac
+}
+
+k3s_ev() { # k3s_ev <limit> <label> <cmd...> -- bounded_run with stderr folded into stdout; a timeout prints a loud EVIDENCE TIMEOUT line and returns 0 so the dump continues
+  local limit="$1" label="$2" rc=0
+  shift 2
+  bounded_run "$limit" "$@" 2>&1 || rc=$?
+  [ "$rc" -ne 124 ] || echo "EVIDENCE TIMEOUT: '$label' did not complete within ${limit}s (node wedged?)"
+}
+
 k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR. Every call is bounded to ${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}s; a call that times out prints a loud EVIDENCE TIMEOUT line and the dump continues, so a wedged node yields partial evidence rather than a hang.
   local vm_a="$1" vm_b="$2" pin_dir="$3" limit="${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}" vm m
-  ev() { # ev <label> <cmd...>
-    local label="$1" rc=0
-    shift
-    bounded_run "$limit" "$@" 2>&1 || rc=$?
-    [ "$rc" -ne 124 ] || echo "EVIDENCE TIMEOUT: '$label' did not complete within ${limit}s (node wedged?)"
-  }
   for vm in "$vm_a" "$vm_b"; do
     echo "---- $vm evidence ----"
     for m in FRONT_META FRONT_ENDPOINTS POD_TARGETS FLOW_TABLE; do
       echo "== bpftool map dump: $m =="
-      ev "$vm bpftool $m" limactl shell "$vm" -- sudo bpftool map dump pinned "$pin_dir/$m"
+      k3s_ev "$limit" "$vm bpftool $m" limactl shell "$vm" -- sudo bpftool map dump pinned "$pin_dir/$m"
     done
     echo "== ip -s link (eth0, geneve0) =="
-    ev "$vm eth0 stats" limactl shell "$vm" -- ip -s link show eth0
-    ev "$vm geneve0 stats" limactl shell "$vm" -- ip -s link show geneve0
+    k3s_ev "$limit" "$vm eth0 stats" limactl shell "$vm" -- ip -s link show eth0
+    k3s_ev "$limit" "$vm geneve0 stats" limactl shell "$vm" -- ip -s link show geneve0
     echo "== dmesg (tail) =="
-    ev "$vm dmesg" limactl shell "$vm" -- bash -c 'sudo dmesg | tail -30'
+    k3s_ev "$limit" "$vm dmesg" limactl shell "$vm" -- bash -c 'sudo dmesg | tail -30'
   done
   echo "---- controller pod describe (events) ----"
-  ev "controller describe" kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR"
+  k3s_ev "$limit" "controller describe" kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR"
   echo "---- controller pod logs (current + previous, i.e. pre-crash) ----"
-  ev "controller logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100
-  ev "controller previous logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous
+  k3s_ev "$limit" "controller logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100
+  k3s_ev "$limit" "controller previous logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous
 }
-

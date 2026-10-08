@@ -346,38 +346,42 @@ echo "SERVICE STATUS: PASS (each Service's status.loadBalancer.ingress matches e
 echo "==> [8/12] confirming $VM_A's own dataplane front is programmed for each family it should serve, and NOT for families it shouldn't"
 # bpftool's --json dump has no BTF for LbFrontKey, so `key`/`value` are each
 # a flat array of "0xNN" byte strings (address order), not named
-# vip_ip/vip_port fields. Bytes [0..16)=vip_ip, [16..18)=vip_port
+# front_ip/front_port fields. Bytes [0..16)=front_ip, [16..18)=front_port
 # (beep_common::wire_port() = port.to_be(); on this LE host that store+load
 # round-trip nets out to the raw bytes being the port's plain big-endian
-# (network) representation, so compare against that directly). vip_ip's v4
+# (network) representation, so compare against that directly). front_ip's v4
 # case is stored as v4-mapped-v6 (bytes[10..12] == ff,ff -- LbFrontKey's own
 # doc comment).
-front_has_family() { # front_has_family <vm> <port> <family: v4|v6> -- true if FRONT_META has a key at this port whose vip_ip byte pattern matches the requested family
-  local vm="$1" port="$2" family="$3" hi lo dump
+front_has_family() { # front_has_family <vm> <port> <family: v4|v6> [any] -- true if FRONT_META has a key at this port whose front_ip byte pattern matches the requested family AND (unless "any") FRONT_ENDPOINTS holds an entry under that front's live generation (FRONT_META value[0..4) = generation u32 LE; FRONT_ENDPOINTS key = the 20-byte front key + generation [20..24)). "any" is for absence checks: a stale or half-programmed front must still count as present.
+  local vm="$1" port="$2" family="$3" mode="${4:-live}" hi lo dump ep_dump="[]"
   hi="$(printf '0x%02x' $(( (port >> 8) & 0xff )))"
   lo="$(printf '0x%02x' $(( port & 0xff )))"
   dump="$(map_dump "$vm" FRONT_META)" || { echo "FAIL: cannot read $vm FRONT_META -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
+  if [ "$mode" != "any" ]; then
+    ep_dump="$(map_dump "$vm" FRONT_ENDPOINTS)" || { echo "FAIL: cannot read $vm FRONT_ENDPOINTS -- front endpoint presence is unknown" >&2; dump_evidence; exit 1; }
+  fi
   local rc=0
-  jq -e --arg hi "$hi" --arg lo "$lo" --arg fam "$family" '
-    map(.key) | any(.[]; . as $k |
+  jq -e --arg hi "$hi" --arg lo "$lo" --arg fam "$family" --arg mode "$mode" --argjson eps "$ep_dump" '
+    any(.[]; . as $m | $m.key as $k |
       ($k[16] == $hi and $k[17] == $lo) and
       (if $fam == "v4" then ($k[10] == "0xff" and $k[11] == "0xff")
-       else ($k[10] != "0xff" or $k[11] != "0xff") end))
+       else ($k[10] != "0xff" or $k[11] != "0xff") end) and
+      ($mode == "any" or any($eps[]; (.key[0:20] == $k[0:20]) and (.key[20:24] == $m.value[0:4]))))
   ' <<<"$dump" >/dev/null 2>&1 || rc=$?
   # jq -e: 1 = filter false/null (a real answer); >1 = jq itself failed (unparseable dump).
-  [ "$rc" -le 1 ] || { echo "FAIL: $vm FRONT_META dump is not parseable JSON -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
+  [ "$rc" -le 1 ] || { echo "FAIL: $vm FRONT_META/FRONT_ENDPOINTS dump is not parseable JSON -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
   return "$rc"
 }
-front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A FRONT_META has no v4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
-front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A FRONT_META has no v6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
-front_has_family "$VM_A" "$PORT_V4" v4 || { echo "FAIL: $VM_A FRONT_META has no v4 front for $SVC_V4 (port $PORT_V4)" >&2; dump_evidence; exit 1; }
-if front_has_family "$VM_A" "$PORT_V4" v6; then
+front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_V4" v4 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev4 front for $SVC_V4 (port $PORT_V4)" >&2; dump_evidence; exit 1; }
+if front_has_family "$VM_A" "$PORT_V4" v6 any; then
   echo "FAIL: $VM_A FRONT_META has a v6 front for SingleStack-IPv4 $SVC_V4 (port $PORT_V4) -- should be v4-only" >&2
   dump_evidence
   exit 1
 fi
-front_has_family "$VM_A" "$PORT_V6" v6 || { echo "FAIL: $VM_A FRONT_META has no v6 front for $SVC_V6 (port $PORT_V6)" >&2; dump_evidence; exit 1; }
-if front_has_family "$VM_A" "$PORT_V6" v4; then
+front_has_family "$VM_A" "$PORT_V6" v6 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev6 front for $SVC_V6 (port $PORT_V6)" >&2; dump_evidence; exit 1; }
+if front_has_family "$VM_A" "$PORT_V6" v4 any; then
   echo "FAIL: $VM_A FRONT_META has a v4 front for SingleStack-IPv6 $SVC_V6 (port $PORT_V6) -- should be v6-only" >&2
   dump_evidence
   exit 1
@@ -392,12 +396,6 @@ GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
 GENEVE_B_BEFORE="$(geneve_pkts "$VM_B")"
 
 echo "==> [10/12] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
-host_port() { # host_port <addr> <port> -- addr:port, bracketing IPv6 literals (URL authority and the backend's RemoteAddr both use this form)
-  case "$1" in
-    *:*) echo "[$1]:$2" ;;
-    *) echo "$1:$2" ;;
-  esac
-}
 http_url() { # http_url <addr> <port>
   echo "http://$(host_port "$1" "$2")/"
 }
@@ -424,11 +422,11 @@ round_trip -6 "$ULA_A" "$PORT_DUAL" "$ULA_CLIENT" >/dev/null || { echo "ROUND-TR
 echo "ROUND-TRIP-DUAL-V6: PASS (client $ULA_CLIENT -> $SVC_DUAL v6 front [$ULA_A]:$PORT_DUAL -> backend on $VM_B, client IP preserved)"
 
 echo "==> [11/12] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
-expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
+expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family (an RST proves only that no front serves it; the FRONT_META absence check in step 8 covers "beep never programmed one"). LC_ALL=C pins curl's English errno text. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
   local flag="$1" addr="$2" port="$3" out rc url
   url="$(http_url "$addr" "$port")"
   set +e
-  out="$(limactl shell "$VM_CLIENT" -- curl -sSv "$flag" -m 5 "$url" 2>&1)"
+  out="$(limactl shell "$VM_CLIENT" -- env LC_ALL=C curl -sSv "$flag" -m 5 "$url" 2>&1)"
   rc=$?
   set -e
   if [ "$rc" -eq 7 ] && grep -qF "failed: Connection refused" <<<"$out"; then
