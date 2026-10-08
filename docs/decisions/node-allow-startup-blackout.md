@@ -10,7 +10,7 @@ allowlist that compensates for `rp_filter=0`
 (`docs/decisions/geneve-rp-filter-disable.md`): it validates a decapped
 packet's tunnel-source IP against the set of known peer nodes. Its
 controller-side apply path (`controller/src/apply.rs`,
-`controller/src/reconcile.rs`) sits alongside `VIP_MAP`/`TARGET_PORTS`
+`controller/src/reconcile.rs`) sits alongside `FRONT_META`/`FRONT_ENDPOINTS`
 (gated on `fronts_known`, the Node LIST watch's initial-sync completion)
 and `POD_TARGETS` (gated on the narrower `pod_targets_known`, this node's
 own entry resolved). A reviewer on #98
@@ -25,12 +25,12 @@ own entry resolved). A reviewer on #98
 ## Rationale
 
 `NODE_ALLOW`'s desired content is the whole known-peer-node set — it is
-`VIP_MAP`/`TARGET_PORTS`-shaped (cluster-wide), not `POD_TARGETS`-shaped
+`FRONT_META`/`FRONT_ENDPOINTS`-shaped (cluster-wide), not `POD_TARGETS`-shaped
 (this node's own entry). Gating a destructive full-sync on
 `pod_targets_known` would let a controller restart apply a partially
 caught-up Node LIST as the new full `NODE_ALLOW` state, wiping
 already-pinned peer entries mid-list — the exact restart-wipe bug
-`fronts_known` exists to prevent for `VIP_MAP`/`TARGET_PORTS`. The
+`fronts_known` exists to prevent for `FRONT_META`/`FRONT_ENDPOINTS`. The
 narrower signal answers "do I know my own node yet?"; `NODE_ALLOW` needs
 "do I know every node yet?", which only `fronts_known` answers. Restart-
 wipe safety (a correctness risk: wrongly evicting a legitimate peer) is
