@@ -147,6 +147,15 @@ socket: loads tc-bpf programs once, watches `Service`/`EndpointSlice`,
 writes maps on change, idle. Pinned under `/sys/fs/bpf` so restarts keep
 flow state.
 
+At load time the loader compares each pinned map's type, key size, value
+size and `max_entries` against the embedded object's map definitions (parsed
+from the ELF, plus the `--*-max-entries` overrides; no kernel objects are
+created). A mismatched pin is unlinked and recreated empty, with a log line;
+matching pins are reused. Conntrack maps lose their flows when recreated.
+Unlinking does not touch the old map: tc programs attached by the previous
+loader keep referencing it until the new loader re-attaches, so a restart
+briefly serves from the old map before the new shape takes effect.
+
 First upgrade to the `FRONT_META` + `FRONT_ENDPOINTS` layout starts with an
 empty `FRONT_META`: until the controller's first reconcile fills it, new
 flows pass to the host unbalanced (an absent front is not a front).

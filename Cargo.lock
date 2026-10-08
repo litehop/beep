@@ -267,6 +267,7 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-build",
+ "aya-obj",
  "beep-common",
  "clap",
  "libc",

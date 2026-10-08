@@ -13,7 +13,7 @@ use std::{net::IpAddr, path::Path};
 use anyhow::{anyhow, Context};
 use aya::{
     include_bytes_aligned,
-    maps::{Array as AyaArray, HashMap as AyaHashMap, MapData},
+    maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, MapInfo},
     programs::{
         links::{FdLink, LinkError, PinnedLink},
         tc::{SchedClassifierLink, TcAttachOptions},
@@ -388,8 +388,8 @@ pub fn capacity_hint(map_name: &str) -> String {
         _ => return String::new(),
     };
     format!(
-        "if `{map_name}` is full (E2BIG), raise `{flag}`; the cap applies only when the pin is \
-         created, so delete the pinned `{map_name}` to resize an existing one"
+        "if `{map_name}` is full (E2BIG), raise `{flag}`; a changed cap recreates the pinned \
+         `{map_name}` on the next loader start"
     )
 }
 
@@ -403,10 +403,10 @@ pub fn capacity_hint(map_name: &str) -> String {
 /// `node_allow_max_entries`/`pod_targets_max_entries`
 /// size the six maps whose entry count scales with cluster/Service state --
 /// a load-time DaemonSet config knob, not a value baked into the eBPF
-/// object -- and only take effect the first time each pin path is created (a
-/// reused pin from a prior run opens the existing map via its live fd and
-/// silently ignores this override; see `EbpfLoader::map_max_entries`'s own
-/// semantics).
+/// object. aya itself silently ignores an override for an already-pinned map
+/// (`EbpfLoader::map_max_entries`'s own semantics), so
+/// `recreate_mismatched_pins` first deletes any pin whose type/key/value
+/// size/max_entries differs from the request, logging each one.
 ///
 /// Shared by the `beep` loader binary and the controller binary (Phase 5's
 /// Service/EndpointSlice watcher) so both embed and load the exact same
@@ -424,22 +424,170 @@ pub fn load_ebpf(
     for name in remove_legacy_map_pins(pin_dir)? {
         eprintln!("beep: removed legacy map pin {name} (replaced by FRONT_META/FRONT_ENDPOINTS)");
     }
+    let max_entries = [
+        ("FWD_PENDING", fwd_pending_max_entries),
+        ("FLOW_TABLE", flow_table_max_entries),
+        ("FRONT_META", front_meta_max_entries),
+        ("FRONT_ENDPOINTS", front_endpoints_max_entries),
+        ("NODE_ALLOW", node_allow_max_entries),
+        ("POD_TARGETS", pod_targets_max_entries),
+    ];
+    let requested = requested_shapes(ebpf_object(), &max_entries)?;
+    recreate_mismatched_pins(&BpffsPins(pin_dir), &requested)?;
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
         loader.map_pin_path(name, pin_dir.join(name));
     }
-    loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
-    loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
-    loader.map_max_entries("FRONT_META", front_meta_max_entries);
-    loader.map_max_entries("FRONT_ENDPOINTS", front_endpoints_max_entries);
-    loader.map_max_entries("NODE_ALLOW", node_allow_max_entries);
-    loader.map_max_entries("POD_TARGETS", pod_targets_max_entries);
+    for &(name, size) in &max_entries {
+        loader.map_max_entries(name, size);
+    }
     loader
-        .load(include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/beep-ebpf"
-        )))
+        .load(ebpf_object())
         .context("loading the beep-ebpf object")
+}
+
+fn ebpf_object() -> &'static [u8] {
+    include_bytes_aligned!(concat!(env!("OUT_DIR"), "/beep-ebpf"))
+}
+
+/// The kernel-visible definition of a map: what must match for a reused pin
+/// to be interchangeable with a freshly created one. `map_type` is the raw
+/// `bpf_map_type` id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapShape {
+    pub map_type: u32,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+}
+
+impl MapShape {
+    fn from_info(info: &MapInfo) -> anyhow::Result<Self> {
+        Ok(Self {
+            map_type: info.map_type()? as u32,
+            key_size: info.key_size(),
+            value_size: info.value_size(),
+            max_entries: info.max_entries(),
+        })
+    }
+}
+
+/// One human-readable `field old -> new` entry per differing field; empty
+/// means the existing pin is safe to reuse. aya reuses any pin it finds
+/// without comparing it to the object's definition, so a stale layout or cap
+/// would otherwise be served silently.
+pub fn map_shape_mismatches(existing: &MapShape, requested: &MapShape) -> Vec<String> {
+    let mut diffs = Vec::new();
+    for (field, old, new) in [
+        ("map_type", existing.map_type, requested.map_type),
+        ("key_size", existing.key_size, requested.key_size),
+        ("value_size", existing.value_size, requested.value_size),
+        ("max_entries", existing.max_entries, requested.max_entries),
+    ] {
+        if old != new {
+            diffs.push(format!("{field} {old} -> {new}"));
+        }
+    }
+    diffs
+}
+
+/// The shape `load` would create for each of `MAP_NAMES`, read from the
+/// object's own ELF map definitions plus the `max_entries` overrides -- no
+/// kernel object is created.
+fn requested_shapes(
+    object: &[u8],
+    max_entries: &[(&str, u32)],
+) -> anyhow::Result<Vec<(&'static str, MapShape)>> {
+    let parsed = aya_obj::Object::parse(object)
+        .map_err(|e| anyhow!("parsing the beep-ebpf object's map definitions: {e}"))?;
+    MAP_NAMES
+        .iter()
+        .map(|&name| {
+            let map = parsed
+                .maps
+                .get(name)
+                .ok_or_else(|| anyhow!("map {name} is missing from the beep-ebpf object"))?;
+            let max = max_entries
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(map.max_entries(), |&(_, v)| v);
+            Ok((
+                name,
+                MapShape {
+                    map_type: map.map_type(),
+                    key_size: map.key_size(),
+                    value_size: map.value_size(),
+                    max_entries: max,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Where pinned maps live: read a pin's shape, delete a pin.
+trait PinStore {
+    /// `None` if no pin exists under `name`.
+    fn shape(&self, name: &str) -> anyhow::Result<Option<MapShape>>;
+    fn remove(&self, name: &str) -> anyhow::Result<()>;
+}
+
+struct BpffsPins<'a>(&'a Path);
+
+impl PinStore for BpffsPins<'_> {
+    fn shape(&self, name: &str) -> anyhow::Result<Option<MapShape>> {
+        let pin = self.0.join(name);
+        if !pin.exists() {
+            return Ok(None);
+        }
+        let info = MapInfo::from_pin(&pin)
+            .with_context(|| format!("reading pinned map {}", pin.display()))?;
+        MapShape::from_info(&info).map(Some)
+    }
+
+    fn remove(&self, name: &str) -> anyhow::Result<()> {
+        let pin = self.0.join(name);
+        std::fs::remove_file(&pin).with_context(|| format!("removing stale pin {}", pin.display()))
+    }
+}
+
+/// Deletes every pin whose shape differs from `requested`, so the load that
+/// follows recreates it empty; matching pins are left alone and reused.
+/// Policy: pre-1.0 recreate-and-log beats refusing to start; conntrack maps
+/// (`FWD_PENDING`/`FLOW_TABLE`) lose their flows, which the log line says.
+/// Returns the names it deleted.
+///
+/// Unlinking a pin does not touch the old map: tc programs attached by the
+/// previous loader keep referencing it until the new loader re-attaches, so
+/// right after a restart traffic is still served from the old (stale-shape)
+/// map. Not a correctness hazard -- the old programs only ever see the old map
+/// -- but the new shape takes effect only once attach completes.
+fn recreate_mismatched_pins(
+    pins: &dyn PinStore,
+    requested: &[(&'static str, MapShape)],
+) -> anyhow::Result<Vec<&'static str>> {
+    let mut removed = Vec::new();
+    for &(name, wanted) in requested {
+        let Some(existing) = pins.shape(name)? else {
+            continue;
+        };
+        let diffs = map_shape_mismatches(&existing, &wanted);
+        if diffs.is_empty() {
+            continue;
+        }
+        let lossy = if matches!(name, "FWD_PENDING" | "FLOW_TABLE") {
+            "; its conntrack state is dropped"
+        } else {
+            ""
+        };
+        eprintln!(
+            "beep: pinned map {name} differs from the requested definition ({}); \
+             deleting and recreating it{lossy}",
+            diffs.join(", ")
+        );
+        pins.remove(name)?;
+        removed.push(name);
+    }
+    Ok(removed)
 }
 
 /// Reads the uplink's Linux ARPHRD_* hardware type from sysfs -- the no_std
@@ -544,6 +692,40 @@ pub fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str) -> anyhow::Result<()
     Ok(())
 }
 
+fn arphrd_name(arphrd: u16) -> &'static str {
+    match arphrd {
+        1 => "ETHER",
+        6 => "IEEE802",
+        32 => "INFINIBAND",
+        512 => "PPP",
+        519 => "RAWIP",
+        768 => "TUNNEL",
+        769 => "TUNNEL6",
+        776 => "SIT",
+        778 => "IPGRE",
+        823 => "IP6GRE",
+        0xFFFE => "NONE",
+        _ => "unknown",
+    }
+}
+
+/// `beep_common::uplink_l2_header_len`, failing at load time -- naming the
+/// interface, its ARPHRD type and the supported set -- instead of letting an
+/// unsupported link type silently no-op in the dataplane.
+fn uplink_l2_hlen_or_err(iface: &str, arphrd: u16) -> anyhow::Result<u32> {
+    beep_common::uplink_l2_header_len(arphrd).ok_or_else(|| {
+        let supported: Vec<String> = std::iter::once(beep_common::ARPHRD_ETHER)
+            .chain(beep_common::L3_ONLY_ARPHRD)
+            .map(|t| format!("{t} ({})", arphrd_name(t)))
+            .collect();
+        anyhow!(
+            "uplink {iface} has unsupported ARPHRD type {arphrd} ({}); supported types: {}",
+            arphrd_name(arphrd),
+            supported.join(", ")
+        )
+    })
+}
+
 /// Resolves each uplink's ifindex and L2 header length (a WireGuard/tun
 /// uplink has no Ethernet header, unlike a real NIC/veth -- see
 /// `uplink_l2_header_len`'s doc comment) and writes one `UPLINK_CONFIG`
@@ -560,7 +742,7 @@ pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyh
             .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
         let uplink_arphrd = iface_arphrd_type(uplink_iface)
             .with_context(|| format!("resolving ARPHRD type for {uplink_iface}"))?;
-        let l2_hlen = beep_common::uplink_l2_header_len(uplink_arphrd);
+        let l2_hlen = uplink_l2_hlen_or_err(uplink_iface, uplink_arphrd)?;
         eprintln!(
             "uplink {uplink_iface}: ifindex {uplink_ifindex}, ARPHRD type {uplink_arphrd}, L2 header skip {l2_hlen} byte(s)"
         );
@@ -712,6 +894,123 @@ mod tests {
         for name in MAP_NAMES {
             assert!(name.len() <= 15, "{name} exceeds BPF_OBJ_NAME_LEN - 1");
         }
+    }
+
+    fn shape(max_entries: u32) -> MapShape {
+        MapShape {
+            map_type: BPF_MAP_TYPE_HASH,
+            key_size: 16,
+            value_size: 1,
+            max_entries,
+        }
+    }
+
+    #[test]
+    fn identical_pin_shape_is_reused_so_conntrack_survives_a_restart() {
+        assert!(map_shape_mismatches(&shape(32), &shape(32)).is_empty());
+    }
+
+    #[test]
+    fn smaller_pinned_cap_is_flagged_so_an_upgrade_does_not_keep_the_old_cap() {
+        // The old 16/32 caps silently outliving the raised defaults left the
+        // 17th node unreachable; aya never notices on its own.
+        assert_eq!(
+            map_shape_mismatches(&shape(16), &shape(32)),
+            ["max_entries 16 -> 32"]
+        );
+    }
+
+    #[test]
+    fn key_value_or_type_change_is_flagged_so_a_stale_layout_is_never_served() {
+        let old = shape(32);
+        let new = MapShape {
+            map_type: 9,
+            key_size: 40,
+            value_size: 8,
+            max_entries: 32,
+        };
+        assert_eq!(
+            map_shape_mismatches(&old, &new),
+            ["map_type 1 -> 9", "key_size 16 -> 40", "value_size 1 -> 8"]
+        );
+    }
+
+    const BPF_MAP_TYPE_HASH: u32 = 1;
+
+    struct FakePins {
+        pins: std::cell::RefCell<std::collections::BTreeMap<&'static str, MapShape>>,
+    }
+
+    impl FakePins {
+        fn new(pins: &[(&'static str, MapShape)]) -> Self {
+            Self {
+                pins: std::cell::RefCell::new(pins.iter().copied().collect()),
+            }
+        }
+    }
+
+    impl PinStore for FakePins {
+        fn shape(&self, name: &str) -> anyhow::Result<Option<MapShape>> {
+            Ok(self.pins.borrow().get(name).copied())
+        }
+        fn remove(&self, name: &str) -> anyhow::Result<()> {
+            self.pins
+                .borrow_mut()
+                .remove(name)
+                .map(|_| ())
+                .ok_or_else(|| anyhow!("no pin {name}"))
+        }
+    }
+
+    #[test]
+    fn only_mismatched_pins_are_deleted_so_matching_conntrack_survives_an_upgrade() {
+        // Deleting a matching pin would drop live flows on every restart;
+        // not deleting a mismatched one keeps the stale cap. Dropping the
+        // comparison or the remove call fails this test.
+        let pins = FakePins::new(&[
+            ("NODE_ALLOW", shape(16)),
+            ("POD_TARGETS", shape(128)),
+            ("FLOW_TABLE", shape(1000)),
+        ]);
+        let requested = [
+            ("NODE_ALLOW", shape(32)),
+            ("POD_TARGETS", shape(128)),
+            ("FLOW_TABLE", shape(1000)),
+            ("FRONT_META", shape(8)),
+        ];
+        let removed = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert_eq!(removed, ["NODE_ALLOW"]);
+        let left: Vec<_> = pins.pins.borrow().keys().copied().collect();
+        assert_eq!(left, ["FLOW_TABLE", "POD_TARGETS"]);
+    }
+
+    #[test]
+    fn requested_shapes_come_from_the_object_with_overrides_applied() {
+        // The upgrade check compares pins against these; a wrong source here
+        // either recreates every restart or never recreates.
+        let default = requested_shapes(ebpf_object(), &[]).unwrap();
+        let overridden = requested_shapes(ebpf_object(), &[("NODE_ALLOW", 16)]).unwrap();
+        assert_eq!(default.len(), MAP_NAMES.len());
+        let get = |v: &[(&str, MapShape)], n: &str| v.iter().find(|(m, _)| *m == n).unwrap().1;
+        assert_eq!(get(&overridden, "NODE_ALLOW").max_entries, 16);
+        assert_ne!(get(&default, "NODE_ALLOW").max_entries, 16);
+        assert_eq!(
+            get(&default, "POD_TARGETS"),
+            get(&overridden, "POD_TARGETS")
+        );
+    }
+
+    #[test]
+    fn unsupported_uplink_arphrd_fails_naming_iface_type_and_supported_set() {
+        let err = uplink_l2_hlen_or_err("ib0", 32).unwrap_err().to_string();
+        assert!(err.contains("ib0"), "{err}");
+        assert!(err.contains("32 (INFINIBAND)"), "{err}");
+        assert!(
+            err.contains("1 (ETHER)") && err.contains("65534 (NONE)"),
+            "{err}"
+        );
+        assert_eq!(uplink_l2_hlen_or_err("eth0", 1).unwrap(), 14);
+        assert_eq!(uplink_l2_hlen_or_err("wg0", 0xFFFE).unwrap(), 0);
     }
 
     #[test]
