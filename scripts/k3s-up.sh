@@ -14,22 +14,31 @@
 # when the flag is omitted -- extra unused v6 InternalIPs don't affect a
 # single-stack-only caller's own assertions.
 #
-# Usage: scripts/k3s-up.sh [--vm-a <server-vm>] [--vm-b <agent-vm>] [--proxy-mode <iptables|ipvs>] [--dual-stack]
+# --v6-only builds a genuinely IPv6-only cluster: v6-only cluster-cidr/
+# service-cidr and a v6-only --node-ip on both nodes (static LAN ULA; the
+# agent joins over v6), so neither Node object carries a v4 InternalIP. k3s
+# rejects a v6-only node in a dual-stack cluster, so the shape is cluster-wide.
+# Same reinstall-on-mismatch rule as --dual-stack; mutually exclusive with it.
+#
+# Usage: scripts/k3s-up.sh [--vm-a <server-vm>] [--vm-b <agent-vm>] [--proxy-mode <iptables|ipvs>] [--dual-stack | --v6-only]
 set -euo pipefail
 
 VM_A="beep-node-a"
 VM_B="beep-node-b"
 PROXY_MODE="iptables"
 DUAL_STACK=0
+V6_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
     --vm-b) VM_B="$2"; shift 2 ;;
     --proxy-mode) PROXY_MODE="$2"; shift 2 ;;
     --dual-stack) DUAL_STACK=1; shift ;;
+    --v6-only) V6_ONLY=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+[ "$DUAL_STACK" = "0" ] || [ "$V6_ONLY" = "0" ] || { echo "FAIL: --dual-stack and --v6-only are mutually exclusive" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=k3s-common.sh
@@ -92,32 +101,58 @@ IP_A="$(eth0_ip "$VM_A")"
 
 NODE_IP_A="$IP_A"
 NODE_IP_B_ARG=""
-DUAL_STACK_CIDR_ARGS=""
-if [ "$DUAL_STACK" = "1" ]; then
+SERVER_URL="https://$IP_A:6443"
+CIDR_ARGS=""
+if [ "$DUAL_STACK" = "1" ] || [ "$V6_ONLY" = "1" ]; then
   echo "==> [1b/4] assigning static LAN v6 (fd00:beef:98::/64) on $VM_A/$VM_B"
   k3s_seed_lan_v6 "$VM_A" "$K3S_LAN_ULA_A" "$VM_B" "$K3S_LAN_ULA_B"
+fi
+if [ "$V6_ONLY" = "1" ]; then
+  # flannel refuses to start without a default v6 route; Lima hands out no RA,
+  # so give each node a high-metric on-link one (the LAN is the only v6 link).
+  for vm in "$VM_A" "$VM_B"; do
+    limactl shell "$vm" -- sudo ip -6 route replace default dev eth0 metric 2048
+  done
+  NODE_IP_A="$K3S_LAN_ULA_A"
+  NODE_IP_B_ARG=" --node-ip=$K3S_LAN_ULA_B"
+  SERVER_URL="https://[$K3S_LAN_ULA_A]:6443"
+  CIDR_ARGS=" --cluster-cidr=fd00:beef:42::/56 --service-cidr=fd00:beef:43::/112"
+elif [ "$DUAL_STACK" = "1" ]; then
   NODE_IP_A="$IP_A,$K3S_LAN_ULA_A"
   NODE_IP_B_ARG=" --node-ip=$(eth0_ip "$VM_B"),$K3S_LAN_ULA_B"
-  # cluster-cidr/service-cidr are immutable after install (flannel/apiserver
-  # allocate from them at first bring-up) -- a live cluster not already
-  # shaped dual-stack needs a full uninstall+reinstall, not just a restart
-  # with new EXEC args, to avoid leaving stale single-stack CNI/iptables
-  # state behind.
-  DUAL_STACK_CIDR_ARGS=" --cluster-cidr=10.42.0.0/16,fd00:beef:42::/56 --service-cidr=10.43.0.0/16,fd00:beef:43::/112"
-  already_dual_stack=0
-  if limactl shell "$VM_A" -- test -x /usr/local/bin/k3s >/dev/null 2>&1; then
-    addrs="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
-    case "$addrs" in *:*) already_dual_stack=1 ;; esac
-  fi
-  if [ "$already_dual_stack" = "0" ]; then
-    echo "==> $VM_A/$VM_B are not yet dual-stack-shaped -- uninstalling k3s before reinstalling with dual-stack cluster-cidr/service-cidr"
-    limactl shell "$VM_B" -- sudo bash -c '[ -x /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true' >/dev/null 2>&1 || true
-    limactl shell "$VM_A" -- sudo bash -c '[ -x /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh || true' >/dev/null 2>&1 || true
-  fi
+  CIDR_ARGS=" --cluster-cidr=10.42.0.0/16,fd00:beef:42::/56 --service-cidr=10.43.0.0/16,fd00:beef:43::/112"
+fi
+# cluster-cidr/service-cidr/node-ip families are immutable after install
+# (flannel/apiserver allocate from them at first bring-up, and k3s refuses an
+# agent whose node-ip family differs from the cluster-cidr's) -- a live
+# cluster not already shaped as requested needs a full uninstall+reinstall,
+# not just a restart with new EXEC args, to avoid leaving stale CNI/iptables
+# state behind. A plain call never reverts a dual-stack cluster, but cannot
+# use a v6-only one (the agent joins over v4), so that is reinstalled too.
+have_v4=0
+have_v6=0
+addrs=""
+if limactl shell "$VM_A" -- test -x /usr/local/bin/k3s >/dev/null 2>&1; then
+  addrs="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+  case "$addrs" in *.*) have_v4=1 ;; esac
+  case "$addrs" in *:*) have_v6=1 ;; esac
+fi
+reinstall=0
+if [ "$V6_ONLY" = "1" ]; then
+  { [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; } || reinstall=1
+elif [ "$DUAL_STACK" = "1" ]; then
+  { [ "$have_v6" = "1" ] && [ "$have_v4" = "1" ]; } || reinstall=1
+elif [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; then
+  reinstall=1
+fi
+if [ "$reinstall" = "1" ]; then
+  echo "==> $VM_A/$VM_B are not shaped as requested (dual-stack=$DUAL_STACK v6-only=$V6_ONLY, live InternalIPs: '${addrs:-none}') -- uninstalling k3s before reinstalling"
+  limactl shell "$VM_B" -- sudo bash -c '[ -x /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true' >/dev/null 2>&1 || true
+  limactl shell "$VM_A" -- sudo bash -c '[ -x /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh || true' >/dev/null 2>&1 || true
 fi
 
-echo "==> [2/4] installing k3s server on $VM_A (node-ip=$NODE_IP_A, --disable=servicelb,traefik, proxy-mode=$PROXY_MODE, dual-stack=$DUAL_STACK)"
-limactl shell "$VM_A" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --disable=servicelb,traefik --node-ip=$NODE_IP_A --write-kubeconfig-mode=644$KUBE_PROXY_ARG$DUAL_STACK_CIDR_ARGS' sh -"
+echo "==> [2/4] installing k3s server on $VM_A (node-ip=$NODE_IP_A, --disable=servicelb,traefik, proxy-mode=$PROXY_MODE, dual-stack=$DUAL_STACK, v6-only=$V6_ONLY)"
+limactl shell "$VM_A" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --disable=servicelb,traefik --node-ip=$NODE_IP_A --write-kubeconfig-mode=644$KUBE_PROXY_ARG$CIDR_ARGS' sh -"
 
 echo "==> waiting for $VM_A's k3s server to be ready"
 limactl shell "$VM_A" -- sudo bash -c '
@@ -132,8 +167,8 @@ limactl shell "$VM_A" -- sudo bash -c '
 TOKEN="$(limactl shell "$VM_A" -- sudo cat /var/lib/rancher/k3s/server/node-token)"
 [ -n "$TOKEN" ] || { echo "FAIL: could not read $VM_A's k3s node-token" >&2; exit 1; }
 
-echo "==> [3/4] installing k3s agent on $VM_B (joining https://$IP_A:6443, proxy-mode=$PROXY_MODE, dual-stack=$DUAL_STACK)"
-limactl shell "$VM_B" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='agent$KUBE_PROXY_ARG$NODE_IP_B_ARG' K3S_URL='https://$IP_A:6443' K3S_TOKEN='$TOKEN' sh -"
+echo "==> [3/4] installing k3s agent on $VM_B (joining $SERVER_URL, proxy-mode=$PROXY_MODE, dual-stack=$DUAL_STACK, v6-only=$V6_ONLY)"
+limactl shell "$VM_B" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='agent$KUBE_PROXY_ARG$NODE_IP_B_ARG' K3S_URL='$SERVER_URL' K3S_TOKEN='$TOKEN' sh -"
 
 echo "==> [4/4] waiting for both nodes to report Ready"
 limactl shell "$VM_A" -- sudo bash -c '
