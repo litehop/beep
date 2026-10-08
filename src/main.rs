@@ -142,8 +142,8 @@ struct Args {
     /// One FRONT_IP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
     /// to cover one Pod behind more than one Service port (a plain multi-port
     /// Service, or one Pod backing two distinct Services) -- each repetition
-    /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). front address is this
-    /// node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
+    /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). The front address is
+    /// this node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
     /// Format: `front_ip:front_port:proto:backend_node_ip:pod_ip:target_port`
     /// (`proto` is `tcp` or `udp`).
     #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
@@ -696,7 +696,7 @@ fn populate_fixtures(
 mod tests {
     use super::*;
 
-    // A hostNetwork Pod's IP equals its node's IP, i.e. front-IP (front)
+    // A hostNetwork Pod's IP equals its node's IP, i.e. front-IP
     // space -- so a front placed inside the pod CIDR is not disjoint from
     // pod-IP space by construction, only by configuration, and lets a
     // forward flow key (keyed on the front) and a reverse flow key (keyed on

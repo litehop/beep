@@ -11,7 +11,7 @@
 //! edited to a narrower `spec.ipFamilies`) -- see `merged_ingress`.
 //!
 //! `ip` is the only field ever set on the entry this node writes.
-//! `ipMode` is deliberately left unset -- it defaults to `front` semantics,
+//! `ipMode` is deliberately left unset -- it defaults to the Kubernetes `ipMode: VIP` semantics,
 //! while explicit `Proxy` makes the upstream ESIPP e2e spec self-skip
 //! (`test/e2e/network/loadbalancer.go:1054`, tracking
 //! https://issues.k8s.io/123714).
