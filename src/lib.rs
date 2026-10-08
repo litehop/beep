@@ -608,17 +608,14 @@ mod tests {
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
 
-    #[test]
-    fn default_caps_fit_16_dual_stack_nodes_and_64_dual_stack_pods() {
-        assert!(
-            DEFAULT_NODE_ALLOW_MAX_ENTRIES >= 16 * 2,
-            "the 17th dual-stack node would be silently unreachable"
-        );
-        assert!(
-            DEFAULT_POD_TARGETS_MAX_ENTRIES >= 64 * 2,
-            "the 65th dual-stack pod on a node would be silently undeliverable"
-        );
-    }
+    const _: () = assert!(
+        DEFAULT_NODE_ALLOW_MAX_ENTRIES >= 16 * 2,
+        "the 17th dual-stack node would be silently unreachable"
+    );
+    const _: () = assert!(
+        DEFAULT_POD_TARGETS_MAX_ENTRIES >= 64 * 2,
+        "the 65th dual-stack pod on a node would be silently undeliverable"
+    );
 
     #[test]
     fn capacity_hint_names_the_map_and_the_flag_to_raise() {
