@@ -18,7 +18,8 @@ use anyhow::Context;
 use aya::programs::TcAttachType;
 use beep::{
     attach_and_pin, bump_memlock_rlimit, disable_rp_filter, ensure_geneve_iface, load_ebpf,
-    populate_config, populate_uplink_config,
+    populate_config, populate_uplink_config, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
+    DEFAULT_POD_TARGETS_MAX_ENTRIES,
 };
 use beep_controller::{
     apply::PinnedMaps,
@@ -116,6 +117,16 @@ struct Args {
     /// `TARGET_PORTS` max_entries (see `beep-ebpf`'s doc comment).
     #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
     target_ports_max_entries: u32,
+
+    /// `NODE_ALLOW` max_entries: one entry per node underlay address, so a
+    /// dual-stack node costs two (see `beep-ebpf`'s doc comment).
+    #[arg(long, default_value_t = DEFAULT_NODE_ALLOW_MAX_ENTRIES)]
+    node_allow_max_entries: u32,
+
+    /// `POD_TARGETS` max_entries: one entry per local backend pod IP, so a
+    /// dual-stack pod costs two (see `beep-ebpf`'s doc comment).
+    #[arg(long, default_value_t = DEFAULT_POD_TARGETS_MAX_ENTRIES)]
+    pod_targets_max_entries: u32,
 }
 
 fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
@@ -370,6 +381,8 @@ async fn main() -> anyhow::Result<()> {
         args.flow_table_max_entries,
         args.lb_front_map_max_entries,
         args.target_ports_max_entries,
+        args.node_allow_max_entries,
+        args.pod_targets_max_entries,
     )
     .context("loading beep-ebpf")?;
 
@@ -517,6 +530,43 @@ mod tests {
 
         Args::try_parse_from(["beep-controller", "--node-prep"])
             .expect("--node-prep must not require --uplink-iface either");
+    }
+
+    const REQUIRED: [&str; 9] = [
+        "beep-controller",
+        "--uplink-iface",
+        "eth0",
+        "--pod-cidr",
+        "10.244.0.0/16",
+        "--node-ip",
+        "10.0.0.1",
+        "--kubeconfig",
+        "/tmp/kubeconfig",
+    ];
+
+    // The 17th dual-stack node (or 65th dual-stack pod) is silently
+    // unreachable if the caps regress below the sized defaults.
+    #[test]
+    fn node_allow_and_pod_targets_caps_default_to_the_sized_values() {
+        let args = Args::try_parse_from(REQUIRED).unwrap();
+        assert_eq!(args.node_allow_max_entries, 32);
+        assert_eq!(args.pod_targets_max_entries, 128);
+    }
+
+    // An operator with a bigger cluster must be able to raise the caps at
+    // deploy time; a flag that parses but is not forwarded would not help,
+    // so the field is checked end to end through `Args`.
+    #[test]
+    fn node_allow_and_pod_targets_caps_are_flag_overridable() {
+        let args = Args::try_parse_from(REQUIRED.into_iter().chain([
+            "--node-allow-max-entries",
+            "64",
+            "--pod-targets-max-entries",
+            "512",
+        ]))
+        .unwrap();
+        assert_eq!(args.node_allow_max_entries, 64);
+        assert_eq!(args.pod_targets_max_entries, 512);
     }
 
     // The loader's own CLI (`src/main.rs`) already accepts a v6 --node-ip;

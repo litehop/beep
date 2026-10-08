@@ -34,9 +34,10 @@ use aya::{
     Ebpf,
 };
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, evict_pod_flows, load_ebpf, local_pod_ips, parse_fixture,
-    populate_config, populate_uplink_config, stale_pod_targets, tunnel_remote_v6, wire_ip_v6,
-    Fixture, MAP_NAMES,
+    attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows, load_ebpf, local_pod_ips,
+    parse_fixture, populate_config, populate_uplink_config, stale_pod_targets, tunnel_remote_v6,
+    wire_ip_v6, Fixture, DEFAULT_NODE_ALLOW_MAX_ENTRIES, DEFAULT_POD_TARGETS_MAX_ENTRIES,
+    MAP_NAMES,
 };
 use beep_common::{
     wire_port, FlowKey, FlowValue, ForwardFlowValue, LbFrontBackend, LbFrontKey, TcpFlowKey,
@@ -214,6 +215,16 @@ struct Args {
     /// `TARGET_PORTS` max_entries -- see `beep-ebpf`'s doc comment.
     #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
     target_ports_max_entries: u32,
+
+    /// `NODE_ALLOW` max_entries -- one entry per node underlay address, so a
+    /// dual-stack node costs two. See `beep-ebpf`'s doc comment.
+    #[arg(long, default_value_t = DEFAULT_NODE_ALLOW_MAX_ENTRIES)]
+    node_allow_max_entries: u32,
+
+    /// `POD_TARGETS` max_entries -- one entry per local backend pod IP, so a
+    /// dual-stack pod costs two. See `beep-ebpf`'s doc comment.
+    #[arg(long, default_value_t = DEFAULT_POD_TARGETS_MAX_ENTRIES)]
+    pod_targets_max_entries: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -420,6 +431,8 @@ fn main() -> anyhow::Result<()> {
         flow_table_max_entries,
         lb_front_map_max_entries,
         target_ports_max_entries,
+        node_allow_max_entries,
+        pod_targets_max_entries,
     } = Args::parse();
 
     for fixture in &fixtures {
@@ -443,6 +456,8 @@ fn main() -> anyhow::Result<()> {
         flow_table_max_entries,
         lb_front_map_max_entries,
         target_ports_max_entries,
+        node_allow_max_entries,
+        pod_targets_max_entries,
     )
     .context("loading beep-ebpf")?;
 
@@ -615,7 +630,9 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture], node_ip: IpAddr) -> 
             pod_targets.remove(&ip)?;
         }
         for pod_ip in &local_ips {
-            pod_targets.insert(pod_ip, 1u8, 0)?;
+            pod_targets
+                .insert(pod_ip, 1u8, 0)
+                .with_context(|| capacity_hint("POD_TARGETS"))?;
         }
     }
 
@@ -638,7 +655,9 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture], node_ip: IpAddr) -> 
                 node_allow.remove(&existing)?;
             }
         }
-        node_allow.insert(node_ip_key, 1u8, 0)?;
+        node_allow
+            .insert(node_ip_key, 1u8, 0)
+            .with_context(|| capacity_hint("NODE_ALLOW"))?;
     }
 
     Ok(())
@@ -795,6 +814,41 @@ mod tests {
             vip_outside_pod_cidr(vip, pod_cidr).is_ok(),
             "a v6 VIP outside the v6 pod CIDR is a legitimate config and must not be rejected"
         );
+    }
+
+    const REQUIRED_ARGS: [&str; 9] = [
+        "beep",
+        "--uplink-iface",
+        "eth0",
+        "--fixture",
+        "10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080",
+        "--pod-cidr",
+        "10.244.0.0/16",
+        "--node-ip",
+        "10.0.0.6",
+    ];
+
+    // The 17th dual-stack node (or 65th dual-stack pod) is silently
+    // unreachable if the caps regress below the sized defaults.
+    #[test]
+    fn node_allow_and_pod_targets_caps_default_to_the_sized_values() {
+        let args = Args::try_parse_from(REQUIRED_ARGS).unwrap();
+        assert_eq!(args.node_allow_max_entries, 32);
+        assert_eq!(args.pod_targets_max_entries, 128);
+    }
+
+    // A bigger cluster must be able to raise the caps at deploy time.
+    #[test]
+    fn node_allow_and_pod_targets_caps_are_flag_overridable() {
+        let args = Args::try_parse_from(REQUIRED_ARGS.into_iter().chain([
+            "--node-allow-max-entries",
+            "64",
+            "--pod-targets-max-entries",
+            "512",
+        ]))
+        .unwrap();
+        assert_eq!(args.node_allow_max_entries, 64);
+        assert_eq!(args.pod_targets_max_entries, 512);
     }
 
     #[test]
