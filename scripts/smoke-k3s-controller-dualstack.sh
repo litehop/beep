@@ -35,6 +35,10 @@
 # uses for $VM_B/$VM_CLIENT, so the two rigs never fight over addressing).
 #
 # Usage: scripts/smoke-k3s-controller-dualstack.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
+#
+# Test hook: BEEP_SMOKE_MAP_DUMP_TIMEOUT=<seconds> (default 20) bounds each
+# bpftool map dump; 0 forces every dump to time out, which must FAIL the gate
+# at the first map check (an unreadable map is never treated as empty).
 set -euo pipefail
 
 VM_A="beep-node-a"
@@ -82,27 +86,39 @@ rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src (inst
   exit 1
 }
 
-map_dump() { # map_dump <vm> <map-name> -- raw bpftool JSON dump of a pinned map, "[]" if the pin is missing/unreadable/the call times out. Bounded to 20s rather than a bare `limactl shell` call: observed live, a loaded node's SSH session can wedge indefinitely under this rig's load, which would otherwise hang the whole gate rather than failing loud (macOS has no `timeout` builtin, so this polls a backgrounded call).
-  local vm="$1" name="$2" out_file waited
+kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+  kill -9 "$1" 2>/dev/null || true
+}
+
+map_dump() { # map_dump <vm> <map-name> -- raw bpftool JSON dump of a pinned map on stdout, exit 0 (a genuinely empty map prints "[]"); exit 1 with the reason on stderr if the pin is missing/unreadable, bpftool/limactl fails, or the call times out. Callers MUST treat non-zero as a gate FAIL, never as "empty": an absence check must not pass on a dump that never happened. Bounded to ${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}s rather than a bare `limactl shell` call: observed live, a loaded node's SSH session can wedge indefinitely under this rig's load, which would otherwise hang the whole gate rather than failing loud (macOS has no `timeout` builtin, so this polls a backgrounded call).
+  local vm="$1" name="$2" out_file err_file waited limit="${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}" rc=0
   out_file="$(mktemp)"
-  ( limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>/dev/null > "$out_file" ) &
+  err_file="$(mktemp)"
+  ( limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>"$err_file" > "$out_file" ) &
   local bg_pid=$!
   waited=0
-  while kill -0 "$bg_pid" 2>/dev/null && [ "$waited" -lt 20 ]; do
+  while kill -0 "$bg_pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
     sleep 1
     waited=$((waited + 1))
   done
   if kill -0 "$bg_pid" 2>/dev/null; then
-    echo "WARN: map_dump $vm/$name timed out after 20s -- treating as empty" >&2
-    kill -9 "$bg_pid" 2>/dev/null
-  fi
-  wait "$bg_pid" 2>/dev/null
-  if [ -s "$out_file" ]; then
-    cat "$out_file"
+    kill_tree "$bg_pid"
+    wait "$bg_pid" 2>/dev/null || true
+    echo "map_dump $vm/$name timed out after ${limit}s" >&2
+    rc=1
+  elif ! wait "$bg_pid"; then
+    echo "map_dump $vm/$name failed: $(tr '\n' ' ' < "$err_file")" >&2
+    rc=1
+  elif [ ! -s "$out_file" ]; then
+    echo "map_dump $vm/$name returned no output" >&2
+    rc=1
   else
-    echo "[]"
+    cat "$out_file"
   fi
-  rm -f "$out_file"
+  rm -f "$out_file" "$err_file"
+  return "$rc"
 }
 
 dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
@@ -349,15 +365,20 @@ echo "==> [8/12] confirming $VM_A's own dataplane front is programmed for each f
 # case is stored as v4-mapped-v6 (bytes[10..12] == ff,ff -- LbFrontKey's own
 # doc comment).
 front_has_family() { # front_has_family <vm> <port> <family: v4|v6> -- true if LB_FRONT_MAP has a key at this port whose vip_ip byte pattern matches the requested family
-  local vm="$1" port="$2" family="$3" hi lo
+  local vm="$1" port="$2" family="$3" hi lo dump
   hi="$(printf '0x%02x' $(( (port >> 8) & 0xff )))"
   lo="$(printf '0x%02x' $(( port & 0xff )))"
-  map_dump "$vm" LB_FRONT_MAP | jq -e --arg hi "$hi" --arg lo "$lo" --arg fam "$family" '
+  dump="$(map_dump "$vm" LB_FRONT_MAP)" || { echo "FAIL: cannot read $vm LB_FRONT_MAP -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
+  local rc=0
+  jq -e --arg hi "$hi" --arg lo "$lo" --arg fam "$family" '
     map(.key) | any(.[]; . as $k |
       ($k[16] == $hi and $k[17] == $lo) and
       (if $fam == "v4" then ($k[10] == "0xff" and $k[11] == "0xff")
        else ($k[10] != "0xff" or $k[11] != "0xff") end))
-  ' >/dev/null 2>&1
+  ' <<<"$dump" >/dev/null 2>&1 || rc=$?
+  # jq -e: 1 = filter false/null (a real answer); >1 = jq itself failed (unparseable dump).
+  [ "$rc" -le 1 ] || { echo "FAIL: $vm LB_FRONT_MAP dump is not parseable JSON -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
+  return "$rc"
 }
 front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A LB_FRONT_MAP has no v4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
 front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A LB_FRONT_MAP has no v6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
@@ -373,7 +394,7 @@ if front_has_family "$VM_A" "$PORT_V6" v4; then
   dump_evidence
   exit 1
 fi
-pod_targets_b=$(map_dump "$VM_B" POD_TARGETS | jq 'length')
+pod_targets_b=$(map_dump "$VM_B" POD_TARGETS | jq 'length') || { echo "FAIL: cannot read $VM_B POD_TARGETS" >&2; dump_evidence; exit 1; }
 [ "$pod_targets_b" -ge 1 ] || { echo "FAIL: $VM_B's POD_TARGETS has no entries -- the backend Pod was never admitted" >&2; dump_evidence; exit 1; }
 echo "MAP-PROGRAMMING: PASS ($VM_A LB_FRONT_MAP has v4+v6 fronts for $SVC_DUAL, v4-only for $SVC_V4, v6-only for $SVC_V6; $VM_B POD_TARGETS=$pod_targets_b entries)"
 
@@ -434,7 +455,7 @@ else
 fi
 
 echo "==> [12/12] confirming a conntrack/FLOW_TABLE entry exists on the ingress node"
-flow_a=$(map_dump "$VM_A" FLOW_TABLE | jq 'length')
+flow_a=$(map_dump "$VM_A" FLOW_TABLE | jq 'length') || { echo "FAIL: cannot read $VM_A FLOW_TABLE" >&2; dump_evidence; exit 1; }
 [ "$flow_a" -ge 1 ] || {
   echo "FAIL: $VM_A's FLOW_TABLE has no entries ($flow_a) after completed round trips" >&2
   dump_evidence
