@@ -13,7 +13,7 @@ use std::{net::IpAddr, path::Path};
 use anyhow::{anyhow, Context};
 use aya::{
     include_bytes_aligned,
-    maps::{Array as AyaArray, HashMap as AyaHashMap, MapData},
+    maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, MapInfo, MapType},
     programs::{
         links::{FdLink, LinkError, PinnedLink},
         tc::{SchedClassifierLink, TcAttachOptions},
@@ -388,8 +388,8 @@ pub fn capacity_hint(map_name: &str) -> String {
         _ => return String::new(),
     };
     format!(
-        "if `{map_name}` is full (E2BIG), raise `{flag}`; the cap applies only when the pin is \
-         created, so delete the pinned `{map_name}` to resize an existing one"
+        "if `{map_name}` is full (E2BIG), raise `{flag}`; a changed cap recreates the pinned \
+         `{map_name}` on the next loader start"
     )
 }
 
@@ -403,10 +403,10 @@ pub fn capacity_hint(map_name: &str) -> String {
 /// `node_allow_max_entries`/`pod_targets_max_entries`
 /// size the six maps whose entry count scales with cluster/Service state --
 /// a load-time DaemonSet config knob, not a value baked into the eBPF
-/// object -- and only take effect the first time each pin path is created (a
-/// reused pin from a prior run opens the existing map via its live fd and
-/// silently ignores this override; see `EbpfLoader::map_max_entries`'s own
-/// semantics).
+/// object. aya itself silently ignores an override for an already-pinned map
+/// (`EbpfLoader::map_max_entries`'s own semantics), so
+/// `recreate_mismatched_pins` first deletes any pin whose type/key/value
+/// size/max_entries differs from the request, logging each one.
 ///
 /// Shared by the `beep` loader binary and the controller binary (Phase 5's
 /// Service/EndpointSlice watcher) so both embed and load the exact same
@@ -424,22 +424,126 @@ pub fn load_ebpf(
     for name in remove_legacy_map_pins(pin_dir)? {
         eprintln!("beep: removed legacy map pin {name} (replaced by FRONT_META/FRONT_ENDPOINTS)");
     }
+    let max_entries = [
+        ("FWD_PENDING", fwd_pending_max_entries),
+        ("FLOW_TABLE", flow_table_max_entries),
+        ("FRONT_META", front_meta_max_entries),
+        ("FRONT_ENDPOINTS", front_endpoints_max_entries),
+        ("NODE_ALLOW", node_allow_max_entries),
+        ("POD_TARGETS", pod_targets_max_entries),
+    ];
+    recreate_mismatched_pins(pin_dir, &max_entries)?;
+    load_object(pin_dir, &max_entries)
+}
+
+fn load_object(pin_dir: &Path, max_entries: &[(&str, u32)]) -> anyhow::Result<Ebpf> {
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
         loader.map_pin_path(name, pin_dir.join(name));
     }
-    loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
-    loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
-    loader.map_max_entries("FRONT_META", front_meta_max_entries);
-    loader.map_max_entries("FRONT_ENDPOINTS", front_endpoints_max_entries);
-    loader.map_max_entries("NODE_ALLOW", node_allow_max_entries);
-    loader.map_max_entries("POD_TARGETS", pod_targets_max_entries);
+    for &(name, size) in max_entries {
+        loader.map_max_entries(name, size);
+    }
     loader
         .load(include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
             "/beep-ebpf"
         )))
         .context("loading the beep-ebpf object")
+}
+
+/// The kernel-visible definition of a map: what must match for a reused pin
+/// to be interchangeable with a freshly created one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapShape {
+    pub map_type: MapType,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+}
+
+impl MapShape {
+    fn from_info(info: &MapInfo) -> anyhow::Result<Self> {
+        Ok(Self {
+            map_type: info.map_type()?,
+            key_size: info.key_size(),
+            value_size: info.value_size(),
+            max_entries: info.max_entries(),
+        })
+    }
+}
+
+/// One human-readable `field old -> new` entry per differing field; empty
+/// means the existing pin is safe to reuse. aya reuses any pin it finds
+/// without comparing it to the object's definition, so a stale layout or cap
+/// would otherwise be served silently.
+pub fn map_shape_mismatches(existing: &MapShape, requested: &MapShape) -> Vec<String> {
+    let mut diffs = Vec::new();
+    if existing.map_type != requested.map_type {
+        diffs.push(format!(
+            "type {:?} -> {:?}",
+            existing.map_type, requested.map_type
+        ));
+    }
+    for (field, old, new) in [
+        ("key_size", existing.key_size, requested.key_size),
+        ("value_size", existing.value_size, requested.value_size),
+        ("max_entries", existing.max_entries, requested.max_entries),
+    ] {
+        if old != new {
+            diffs.push(format!("{field} {old} -> {new}"));
+        }
+    }
+    diffs
+}
+
+/// Deletes every pinned `MAP_NAMES` map whose shape differs from what this
+/// load would create, so `load_object` recreates it empty. Policy: pre-1.0
+/// recreate-and-log beats refusing to start; conntrack maps (`FWD_PENDING`/
+/// `FLOW_TABLE`) lose their flows, which the log line says. The requested
+/// shape is read back from a throwaway copy of the object pinned under a
+/// scratch dir, so it always reflects the object plus the `max_entries`
+/// overrides rather than a second hand-maintained table.
+fn recreate_mismatched_pins(pin_dir: &Path, max_entries: &[(&str, u32)]) -> anyhow::Result<()> {
+    if !MAP_NAMES.iter().any(|n| pin_dir.join(n).exists()) {
+        return Ok(());
+    }
+    let probe_dir = pin_dir.join(".requested");
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    std::fs::create_dir(&probe_dir).with_context(|| format!("creating {}", probe_dir.display()))?;
+    let result = (|| {
+        let requested = load_object(&probe_dir, max_entries)?;
+        drop(requested);
+        for name in MAP_NAMES {
+            let pin = pin_dir.join(name);
+            if !pin.exists() {
+                continue;
+            }
+            let existing = MapShape::from_info(&MapInfo::from_pin(&pin)?)
+                .with_context(|| format!("reading pinned map {}", pin.display()))?;
+            let wanted = MapShape::from_info(&MapInfo::from_pin(probe_dir.join(name))?)
+                .with_context(|| format!("reading requested shape of {name}"))?;
+            let diffs = map_shape_mismatches(&existing, &wanted);
+            if diffs.is_empty() {
+                continue;
+            }
+            let lossy = if matches!(name, "FWD_PENDING" | "FLOW_TABLE") {
+                "; its conntrack state is dropped"
+            } else {
+                ""
+            };
+            eprintln!(
+                "beep: pinned map {name} differs from the requested definition ({}); \
+                 deleting and recreating it{lossy}",
+                diffs.join(", ")
+            );
+            std::fs::remove_file(&pin)
+                .with_context(|| format!("removing stale pin {}", pin.display()))?;
+        }
+        anyhow::Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    result
 }
 
 /// Reads the uplink's Linux ARPHRD_* hardware type from sysfs -- the no_std
@@ -712,6 +816,49 @@ mod tests {
         for name in MAP_NAMES {
             assert!(name.len() <= 15, "{name} exceeds BPF_OBJ_NAME_LEN - 1");
         }
+    }
+
+    fn shape(max_entries: u32) -> MapShape {
+        MapShape {
+            map_type: MapType::Hash,
+            key_size: 16,
+            value_size: 1,
+            max_entries,
+        }
+    }
+
+    #[test]
+    fn identical_pin_shape_is_reused_so_conntrack_survives_a_restart() {
+        assert!(map_shape_mismatches(&shape(32), &shape(32)).is_empty());
+    }
+
+    #[test]
+    fn smaller_pinned_cap_is_flagged_so_an_upgrade_does_not_keep_the_old_cap() {
+        // The old 16/32 caps silently outliving the raised defaults left the
+        // 17th node unreachable; aya never notices on its own.
+        assert_eq!(
+            map_shape_mismatches(&shape(16), &shape(32)),
+            ["max_entries 16 -> 32"]
+        );
+    }
+
+    #[test]
+    fn key_value_or_type_change_is_flagged_so_a_stale_layout_is_never_served() {
+        let old = shape(32);
+        let new = MapShape {
+            map_type: MapType::LruHash,
+            key_size: 40,
+            value_size: 8,
+            max_entries: 32,
+        };
+        assert_eq!(
+            map_shape_mismatches(&old, &new),
+            [
+                "type Hash -> LruHash",
+                "key_size 16 -> 40",
+                "value_size 1 -> 8"
+            ]
+        );
     }
 
     #[test]
