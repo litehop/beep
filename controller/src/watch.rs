@@ -112,12 +112,12 @@ pub struct WatchState {
     // must be tracked (added/updated/removed) independently, or updating one
     // slice would silently drop every other slice's endpoints.
     slices: HashMap<ServiceKey, HashMap<String, RawEndpointSlice>>,
-    // Every `InternalIP` a Node object reports, not just one -- a
-    // dual-stack node lists both a v4 and a v6 entry, and dropping either
-    // would make that whole family invisible to `front_ips`/`NODE_ALLOW`
-    // below (`desired`'s doc comments) even though the node genuinely
-    // serves it.
-    node_ips: HashMap<String, Vec<IpAddr>>,
+    // Every underlay and front address a Node object reports (`NodeAddrs`),
+    // not just one per node -- a dual-stack node lists both a v4 and a v6
+    // entry, and dropping either would make that whole family invisible to
+    // `front_ips`/`NODE_ALLOW` below (`desired`'s doc comments) even though
+    // the node genuinely serves it.
+    node_ips: HashMap<String, NodeAddrs>,
     // Whether the initial Node LIST has completed at least once. `false`
     // means `node_ips` is empty (or partial) purely because the LIST hasn't
     // delivered its results yet, NOT because the cluster genuinely has no
@@ -269,31 +269,69 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
     Some(RawEndpointSlice { ports, endpoints })
 }
 
-/// Parses EVERY `InternalIP` address a `Node` object reports, not just one
-/// -- a dual-stack node lists a v4 and a v6 entry, and picking only the
-/// first would make that node's other family invisible to `front_ips`/
-/// `NODE_ALLOW` (`desired`'s doc comments), which need to see all of them
-/// (`pick_underlay_ip` below is what narrows a peer's list back down to the
-/// one Geneve tunnel remote a given endpoint resolution needs). An address
-/// that fails to parse is logged and skipped, not silently dropped -- a
-/// malformed apiserver response should be diagnosable, not just quietly
-/// lose a family.
-fn parse_node_internal_ips(obj: &Value) -> Vec<IpAddr> {
-    let Some(addresses) = obj["status"]["addresses"].as_array() else {
-        return Vec::new();
-    };
+/// The two address roles one `Node` object plays, kept strictly separate:
+/// `underlay` is where peers reach this node (Geneve remote, `NODE_ALLOW`),
+/// `fronts` is where clients reach it (front map entries,
+/// `status.loadBalancer.ingress`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NodeAddrs {
+    underlay: Vec<IpAddr>,
+    fronts: Vec<IpAddr>,
+}
+
+/// Parses every `type` address of a `Node` object; an address that fails to
+/// parse is logged and skipped, not silently dropped, so a malformed
+/// apiserver response stays diagnosable.
+fn parse_addresses_of_type(addresses: &[Value], ty: &str) -> Vec<IpAddr> {
     addresses
         .iter()
-        .filter(|a| a["type"] == "InternalIP")
+        .filter(|a| a["type"] == ty)
         .filter_map(|a| a["address"].as_str())
         .filter_map(|s| match s.parse::<IpAddr>() {
             Ok(ip) => Some(ip),
             Err(e) => {
-                eprintln!("controller: Node InternalIP {s:?} failed to parse, dropping: {e}");
+                eprintln!("controller: Node {ty} {s:?} failed to parse, dropping: {e}");
                 None
             }
         })
         .collect()
+}
+
+/// Per address family, `preferred`'s addresses when it has any of that
+/// family, else `fallback`'s.
+fn prefer_per_family(preferred: &[IpAddr], fallback: &[IpAddr]) -> Vec<IpAddr> {
+    let mut out = preferred.to_vec();
+    for fb in fallback {
+        if !preferred.iter().any(|p| p.is_ipv6() == fb.is_ipv6()) {
+            out.push(*fb);
+        }
+    }
+    out
+}
+
+/// Derives a Node's underlay and front addresses from `status.addresses`,
+/// each rule applied independently within each address family so a v4 node
+/// with both and a v6 side with only InternalIP resolve correctly:
+/// - underlay: InternalIP when configured, else ExternalIP (a CCM-managed
+///   node may carry only ExternalIP and must still join the mesh);
+/// - fronts: ExternalIP when configured, else InternalIP (the
+///   internet-facing address is the one clients dial and the one to
+///   publish).
+///
+/// Every address of the chosen type is kept, not one -- a dual-stack node
+/// lists a v4 and a v6 entry (`pick_underlay_ip` narrows a peer's underlay
+/// list back down to the one Geneve remote a given endpoint resolution
+/// needs).
+fn parse_node_addrs(obj: &Value) -> NodeAddrs {
+    let Some(addresses) = obj["status"]["addresses"].as_array() else {
+        return NodeAddrs::default();
+    };
+    let internal = parse_addresses_of_type(addresses, "InternalIP");
+    let external = parse_addresses_of_type(addresses, "ExternalIP");
+    NodeAddrs {
+        underlay: prefer_per_family(&internal, &external),
+        fronts: prefer_per_family(&external, &internal),
+    }
 }
 
 /// "IPv4"/"IPv6", for naming a family in a log line.
@@ -305,8 +343,8 @@ fn family_label(ip: IpAddr) -> &'static str {
     }
 }
 
-/// The outcome of `pick_underlay_ip` narrowing a peer node's `InternalIP`
-/// list down to one Geneve tunnel remote. `shared_family` is `false` only
+/// The outcome of `pick_underlay_ip` narrowing a peer node's underlay
+/// address list down to one Geneve tunnel remote. `shared_family` is `false` only
 /// on the no-common-family fallback (`pick_underlay_ip`'s doc comment) --
 /// callers use this to WARN about a tunnel remote this node may not be able
 /// to route, without needing to capture stderr in a test.
@@ -318,7 +356,7 @@ struct UnderlayPick {
 
 /// Picks the ONE Geneve tunnel remote (`Endpoint.node_ip`, `LbFrontBackend.
 /// backend_node_ip`) to use for a peer node that reports more than one
-/// `InternalIP` family. Prefers the peer address matching `local_node_ip`'s
+/// underlay family. Prefers the peer address matching `local_node_ip`'s
 /// own family (this node's `--node-ip`) -- the common case, where a
 /// same-family front stays same-family end to end -- and falls back to the
 /// peer's other family when there's no match, e.g. a v6-only local node
@@ -375,10 +413,10 @@ impl WatchState {
         }
     }
 
-    /// Every address THIS node's own Node object reports (found by locating
-    /// the Node entry whose `InternalIP` list contains `local_node_ip`) --
-    /// the anchor set `status::merged_ingress` uses to tell this node's own
-    /// `status.loadBalancer.ingress` entries apart from another node's.
+    /// Every FRONT address THIS node's own Node object reports (found by
+    /// locating the Node entry whose underlay list contains `local_node_ip`)
+    /// -- the anchor set `status::merged_ingress` uses to tell this node's
+    /// own `status.loadBalancer.ingress` entries apart from another node's.
     /// Falls back to `[local_node_ip]` alone when this node's own Node
     /// entry hasn't resolved yet (the startup race `desired`'s
     /// `pod_targets_known` doc comment covers for POD_TARGETS): the
@@ -389,8 +427,8 @@ impl WatchState {
     pub fn own_node_ips(&self, local_node_ip: IpAddr) -> Vec<IpAddr> {
         self.node_ips
             .values()
-            .find(|ips| ips.contains(&local_node_ip))
-            .cloned()
+            .find(|addrs| addrs.underlay.contains(&local_node_ip))
+            .map(|addrs| addrs.fronts.clone())
             .unwrap_or_else(|| vec![local_node_ip])
     }
 
@@ -457,14 +495,14 @@ impl WatchState {
                 self.node_ips.remove(&name);
             }
             EventKind::Upsert => {
-                let ips = parse_node_internal_ips(obj);
-                // Only overwrite on a successful parse, same as the
-                // single-`Option` version this replaces -- a Node update
-                // that reports zero parseable InternalIP entries leaves
-                // this node's previously-known address(es) in place rather
-                // than wiping them.
-                if !ips.is_empty() {
-                    self.node_ips.insert(name, ips);
+                let addrs = parse_node_addrs(obj);
+                // Only overwrite on a successful parse -- a Node update
+                // that reports zero parseable Internal/ExternalIP entries
+                // leaves this node's previously-known address(es) in place
+                // rather than wiping them. `fronts` is non-empty exactly
+                // when `underlay` is.
+                if !addrs.underlay.is_empty() {
+                    self.node_ips.insert(name, addrs);
                 }
             }
         }
@@ -515,7 +553,7 @@ impl WatchState {
         let self_node_known = self
             .node_ips
             .values()
-            .any(|ips| ips.contains(&node.node_ip));
+            .any(|addrs| addrs.underlay.contains(&node.node_ip));
         let mut aggregate = DesiredEntries {
             fronts_known: self.nodes_listed,
             pod_targets_known: self_node_known,
@@ -558,24 +596,38 @@ impl WatchState {
         // takes to land -- the same restart bug `fronts_known` exists to
         // prevent, just keyed on this node's own entry instead of the
         // whole list.
-        // Every InternalIP of every known node, not one-per-node: a
-        // dual-stack node's v4 AND v6 address must each become a NODE_ALLOW
-        // peer, and a candidate LB_FRONT_MAP/TARGET_PORTS front -- narrowing the
-        // latter to a specific Service's own `spec.ipFamilies` happens in the
+        // Every front/underlay address of every known node, not
+        // one-per-node: a dual-stack node's v4 AND v6 address must each
+        // become a NODE_ALLOW peer (underlay) and a candidate
+        // LB_FRONT_MAP/TARGET_PORTS front -- narrowing the latter to a
+        // specific Service's own `spec.ipFamilies` happens in the
         // per-Service loop below (`RawService::fronts_family`), not here:
         // NODE_ALLOW's peer set must stay every family regardless of which
-        // families any one Service opts into.
-        let front_ips: Vec<IpAddr> = self.node_ips.values().flatten().copied().collect();
-        // NODE_ALLOW's peer set is the same front_ips this loop feeds
-        // LB_FRONT_MAP/TARGET_PORTS from -- host-native, wrapped in
-        // `tunnel_remote_v6` to match NODE_ALLOW's `[u8; 16]` key, matching
-        // `tkey.remote_ipv4`'s convention (`DesiredEntries::node_allow`'s
-        // doc comment). Unlike LB_FRONT_MAP/TARGET_PORTS, `PinnedMaps::
-        // apply_node_allow` upserts this set every tick regardless of
-        // `fronts_known` (set above) -- only its delete half is latched on
-        // `fronts_known` having been seen true once, the same restart-wipe
-        // reason `front_ips` itself is gated for.
-        aggregate.node_allow = front_ips.iter().copied().map(tunnel_remote_v6).collect();
+        // families any one Service opts into. The two sets are separate
+        // (`NodeAddrs`): a node with both InternalIP and ExternalIP fronts
+        // its ExternalIP but is a tunnel peer on its InternalIP.
+        let front_ips: Vec<IpAddr> = self
+            .node_ips
+            .values()
+            .flat_map(|a| a.fronts.iter())
+            .copied()
+            .collect();
+        // NODE_ALLOW's peer set is every node's underlay addresses --
+        // host-native, wrapped in `tunnel_remote_v6` to match NODE_ALLOW's
+        // `[u8; 16]` key, matching `tkey.remote_ipv4`'s convention
+        // (`DesiredEntries::node_allow`'s doc comment). Unlike
+        // LB_FRONT_MAP/TARGET_PORTS, `PinnedMaps::apply_node_allow` upserts
+        // this set every tick regardless of `fronts_known` (set above) --
+        // only its delete half is latched on `fronts_known` having been seen
+        // true once, the same restart-wipe reason `front_ips` itself is
+        // gated for.
+        aggregate.node_allow = self
+            .node_ips
+            .values()
+            .flat_map(|a| a.underlay.iter())
+            .copied()
+            .map(tunnel_remote_v6)
+            .collect();
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -620,8 +672,8 @@ impl WatchState {
                             // guessed at -- the next Node event re-triggers
                             // a reconcile that picks it up correctly.
                             let node_ip = e.node_name.as_deref().and_then(|peer_name| {
-                                let peer_ips = self.node_ips.get(peer_name)?;
-                                let pick = pick_underlay_ip(peer_ips, node.node_ip)?;
+                                let peer = self.node_ips.get(peer_name)?;
+                                let pick = pick_underlay_ip(&peer.underlay, node.node_ip)?;
                                 if !pick.shared_family {
                                     let peer_family = family_label(pick.ip);
                                     eprintln!(
@@ -1843,6 +1895,172 @@ mod tests {
             desired.node_allow.contains(&tunnel_remote_v6(v6)),
             "the dual-stack node's v6 InternalIP must ALSO reach NODE_ALLOW -- picking only \
              the first-seen family would leave v6 peers unattested on a mixed fleet"
+        );
+    }
+
+    fn node_with(addrs: &[(&str, &str)]) -> Value {
+        let list: Vec<Value> = addrs
+            .iter()
+            .map(|(ty, a)| serde_json::json!({"type": ty, "address": a}))
+            .collect();
+        serde_json::json!({"metadata": {"name": "n"}, "status": {"addresses": list}})
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    // The common no-cloud-provider case: the kubelet only sets InternalIP,
+    // and the node must serve both roles from it.
+    #[test]
+    fn internal_ip_only_node_uses_it_for_underlay_and_fronts() {
+        let got = parse_node_addrs(&node_with(&[("InternalIP", "10.0.0.5")]));
+        assert_eq!(got.underlay, vec![ip("10.0.0.5")]);
+        assert_eq!(
+            got.fronts,
+            vec![ip("10.0.0.5")],
+            "an InternalIP-only node must still be fronted, or it serves no traffic"
+        );
+    }
+
+    // A CCM-managed node can carry only ExternalIP; reading InternalIP alone
+    // dropped it from the mesh entirely.
+    #[test]
+    fn external_ip_only_node_is_not_dropped_from_the_mesh() {
+        let got = parse_node_addrs(&node_with(&[("ExternalIP", "203.0.113.5")]));
+        assert_eq!(
+            got.underlay,
+            vec![ip("203.0.113.5")],
+            "an ExternalIP-only node must still be a tunnel peer (NODE_ALLOW/Geneve remote)"
+        );
+        assert_eq!(got.fronts, vec![ip("203.0.113.5")]);
+    }
+
+    // Operator rules: underlay prefers InternalIP, fronts prefer ExternalIP.
+    #[test]
+    fn node_with_both_tunnels_on_internal_and_fronts_on_external() {
+        let got = parse_node_addrs(&node_with(&[
+            ("InternalIP", "10.0.0.5"),
+            ("ExternalIP", "203.0.113.5"),
+        ]));
+        assert_eq!(
+            got.underlay,
+            vec![ip("10.0.0.5")],
+            "tunnel traffic must stay on the private underlay address"
+        );
+        assert_eq!(
+            got.fronts,
+            vec![ip("203.0.113.5")],
+            "the internet-facing address must be fronted and published, not the private one"
+        );
+    }
+
+    // The rule applies per family, not per node: v4 has both, v6 only
+    // InternalIP, so the v6 side must not be lost or promoted wrongly.
+    #[test]
+    fn mixed_per_family_addresses_resolve_each_family_independently() {
+        let got = parse_node_addrs(&node_with(&[
+            ("InternalIP", "10.0.0.5"),
+            ("InternalIP", "2001:db8::5"),
+            ("ExternalIP", "203.0.113.5"),
+        ]));
+        assert_eq!(got.underlay, vec![ip("10.0.0.5"), ip("2001:db8::5")]);
+        assert_eq!(
+            got.fronts,
+            vec![ip("203.0.113.5"), ip("2001:db8::5")],
+            "v4 fronts on ExternalIP while v6, having no ExternalIP, must still be fronted on \
+             its InternalIP -- otherwise the v6 family goes unserved"
+        );
+    }
+
+    #[test]
+    fn dual_stack_with_both_roles_in_both_families() {
+        let got = parse_node_addrs(&node_with(&[
+            ("InternalIP", "10.0.0.5"),
+            ("InternalIP", "fd00::5"),
+            ("ExternalIP", "203.0.113.5"),
+            ("ExternalIP", "2001:db8::5"),
+        ]));
+        assert_eq!(got.underlay, vec![ip("10.0.0.5"), ip("fd00::5")]);
+        assert_eq!(got.fronts, vec![ip("203.0.113.5"), ip("2001:db8::5")]);
+    }
+
+    #[test]
+    fn dual_stack_external_only_in_v6_falls_back_to_external_for_underlay_v6() {
+        let got = parse_node_addrs(&node_with(&[
+            ("InternalIP", "10.0.0.5"),
+            ("ExternalIP", "2001:db8::5"),
+        ]));
+        assert_eq!(
+            got.underlay,
+            vec![ip("10.0.0.5"), ip("2001:db8::5")],
+            "a v6 family with only ExternalIP must still be a tunnel peer"
+        );
+        assert_eq!(got.fronts, vec![ip("2001:db8::5"), ip("10.0.0.5")]);
+    }
+
+    // End to end: NODE_ALLOW attests the underlay address, while the front
+    // map and the published ingress carry the external one.
+    #[test]
+    fn desired_keeps_underlay_and_front_sets_separate() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "ExternalIP", "address": "203.0.113.5"},
+                ]},
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+            },
+        }));
+        state.mark_nodes_listed();
+
+        let local = node(Ipv4Addr::new(10, 0, 0, 5));
+        let desired = state.desired(&local);
+
+        assert_eq!(
+            desired.node_allow,
+            [tunnel_remote_v6(ip("10.0.0.5"))].into_iter().collect(),
+            "NODE_ALLOW must hold only the underlay address"
+        );
+        let front_ips: Vec<_> = desired.lb_front_map.keys().map(|k| k.vip_ip).collect();
+        assert_eq!(
+            front_ips,
+            vec![wire_ip_v6(ip("203.0.113.5"))],
+            "the front map must serve the ExternalIP, leaving the internet-facing address served"
+        );
+        let key = ServiceKey {
+            namespace: "default".into(),
+            name: "svc-a".into(),
+        };
+        assert_eq!(
+            state.ips_to_publish(&key, local.node_ip),
+            vec![ip("203.0.113.5")],
+            "status.loadBalancer.ingress must advertise the ExternalIP"
         );
     }
 
