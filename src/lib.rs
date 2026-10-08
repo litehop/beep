@@ -664,7 +664,13 @@ pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyh
             .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
         let uplink_arphrd = iface_arphrd_type(uplink_iface)
             .with_context(|| format!("resolving ARPHRD type for {uplink_iface}"))?;
-        let l2_hlen = beep_common::uplink_l2_header_len(uplink_arphrd);
+        let l2_hlen = beep_common::uplink_l2_header_len(uplink_arphrd).ok_or_else(|| {
+            anyhow!(
+                "uplink {uplink_iface} has unsupported ARPHRD type {uplink_arphrd}: only \
+                 Ethernet (1) and L3-only tunnel types ({:?}) are supported",
+                beep_common::L3_ONLY_ARPHRD
+            )
+        })?;
         eprintln!(
             "uplink {uplink_iface}: ifindex {uplink_ifindex}, ARPHRD type {uplink_arphrd}, L2 header skip {l2_hlen} byte(s)"
         );

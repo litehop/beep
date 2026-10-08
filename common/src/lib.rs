@@ -193,22 +193,31 @@ pub fn decode_quic_dcid_key(key: &QuicDcidKey) -> [u8; QUIC_DCID_KEY_LEN] {
 /// carrying a 14-byte L2 header.
 pub const ARPHRD_ETHER: u16 = 1;
 
+/// Linux ARPHRD_* values (`uapi/linux/if_arp.h`) of devices that deliver a
+/// bare IP packet with no L2 header: PPP, RAWIP, IPIP/IP6IP6, SIT, GRE/IP6GRE
+/// and `ARPHRD_NONE` (WireGuard, tun).
+pub const L3_ONLY_ARPHRD: [u16; 8] = [512, 519, 768, 769, 776, 778, 823, 0xFFFE];
+
 /// How many L2 header bytes `beep-ebpf`'s uplink hooks (`try_uplink_ingress`,
-/// `try_uplink_egress_return`) must skip before the IPv4 header starts, given
+/// `try_uplink_egress_return`) must skip before the IP header starts, given
 /// the uplink interface's ARPHRD type -- resolved once by the userspace
 /// loader at load time (the no_std eBPF program has no syscall to query this
-/// itself) and written into the `CONFIG` map. A real NIC/veth (`ARPHRD_ETHER`)
-/// carries a 14-byte Ethernet header; a WireGuard (or any other L3-only/tun)
-/// uplink delivers the raw IP packet with none at all -- treating it as 14
-/// anyway reads 14 bytes into the middle of the real IP header, the
-/// EtherType/version check never matches, and the dataplane silently no-ops
-/// on every packet on that uplink (the bug this function exists to prevent a
-/// regression of).
-pub fn uplink_l2_header_len(arphrd_type: u16) -> u32 {
+/// itself) and written into `UPLINK_CONFIG`. A real NIC/veth (`ARPHRD_ETHER`,
+/// which includes VLAN sub-interfaces) carries a 14-byte Ethernet header; an
+/// `L3_ONLY_ARPHRD` uplink delivers the raw IP packet with none at all --
+/// treating it as 14 anyway reads into the middle of the real IP header and
+/// the dataplane silently no-ops on every packet on that uplink.
+///
+/// `None` for any other type: the eBPF side only parses 0 or 14 (anything
+/// else is passed through untouched), so guessing 0 for e.g. an
+/// FDDI/InfiniBand/IEEE 802 device would silently misparse its frames.
+pub fn uplink_l2_header_len(arphrd_type: u16) -> Option<u32> {
     if arphrd_type == ARPHRD_ETHER {
-        14
+        Some(14)
+    } else if L3_ONLY_ARPHRD.contains(&arphrd_type) {
+        Some(0)
     } else {
-        0
+        None
     }
 }
 
@@ -933,18 +942,40 @@ mod tests {
         // (scripts/smoke.sh) depends on this staying 14 -- a
         // regression here breaks the L2 path this fix must not touch, not
         // just the new WireGuard one.
-        assert_eq!(uplink_l2_header_len(ARPHRD_ETHER), 14);
+        assert_eq!(uplink_l2_header_len(ARPHRD_ETHER), Some(14));
     }
 
     #[test]
-    fn non_ethernet_uplink_skips_no_l2_header() {
+    fn l3_only_uplinks_skip_no_l2_header() {
         // ARPHRD_NONE is WireGuard's (and any other L3-only/tun device's)
         // type -- there is no Ethernet header to skip at all. Reverting to
         // an unconditional 14 here reproduces the exact silent no-op the
         // WireGuard spike found: offset math lands inside the real IP
         // header instead of past a header that was never there.
         const ARPHRD_NONE: u16 = 0xFFFE;
-        assert_eq!(uplink_l2_header_len(ARPHRD_NONE), 0);
+        const ARPHRD_TUNNEL: u16 = 768; // ipip, used by the wg-2node smoke rigs
+        assert_eq!(uplink_l2_header_len(ARPHRD_NONE), Some(0));
+        assert_eq!(uplink_l2_header_len(ARPHRD_TUNNEL), Some(0));
+    }
+
+    #[test]
+    fn unknown_uplink_link_type_is_rejected_not_guessed_as_l3() {
+        // 6 = ARPHRD_IEEE802, 772 = ARPHRD_LOOPBACK (Ethernet-framed): the
+        // eBPF side parses only l2_hlen 0 or 14, so a blanket "0" would
+        // misparse these frames and silently no-op instead of failing at
+        // load time.
+        assert_eq!(uplink_l2_header_len(6), None);
+        assert_eq!(uplink_l2_header_len(772), None);
+    }
+
+    #[test]
+    fn config_value_layout_is_one_u32_and_rewritten_every_load() {
+        // CONFIG is fully rewritten by the loader on every start, so only
+        // its size matters for pin reuse -- and a size change is caught by
+        // the pinned-map value_size check. Growing/reshaping Config must
+        // revisit that: a same-size field swap would be absorbed by the
+        // rewrite, but a field the loader does not rewrite would not.
+        assert_eq!(core::mem::size_of::<Config>(), 4);
     }
 
     // Every checksum update and tunnel-key field the eBPF side touches
