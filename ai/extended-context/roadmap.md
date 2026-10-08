@@ -19,8 +19,8 @@ on it; this file is a snapshot.
 
 | # | Gate | Status | What remains | Tracking |
 | --- | --- | --- | --- | --- |
-| 1 | Multi-interface | Shipped as multi-symmetric-uplink in v0.2.0 (repeatable `--uplink-iface`, per-uplink `l2_hlen`, return via ingress uplink) | Asymmetric relay/egress-interface selection was deferred out of the MVP; no bead (file one only if v1 needs it). `beep-eix` stays open for that. | `beep-eix` (children all closed) |
-| 2 | Dual-stack IPv6, incl. IPv6-only nodes (no NAT64/DNS64) | Dual-stack inner + underlay implemented; controller-driven dual-stack round trip proven on the Lima k3s rig; IPv6-only dataplane gaps (e.g. peer attestation, node identity) closed | Controller-driven IPv6-only-node round trip on the rig (`.18`); rig false-PASS fix (`.19`, in progress); acceptance also needs IPv6-only validated cross-node on a real fleet, which depends on gate 3 | `beep-7qm` |
+| 1 | Multi-interface | Shipped as multi-symmetric-uplink in v0.2.0 (repeatable `--uplink-iface`, per-uplink `l2_hlen`, return via ingress uplink) | Egress-interface selection for the relay leg was deferred out of the MVP; `beep-eix` (open, P3) still owns it. | `beep-eix` |
+| 2 | Dual-stack IPv6, incl. IPv6-only nodes (no NAT64/DNS64) | Dual-stack inner + underlay implemented; controller-driven dual-stack round trip proven on the Lima k3s rig; IPv6-only dataplane gaps (e.g. peer attestation, node identity) closed | Controller-driven IPv6-only-node round trip on the rig (`.18`); `7qm.19` fix merged (#155), full-rig PASS pending, blocked by `beep-nj6` (node-b SSH wedge; likely the pre-#156 egress drop, rerun on main in progress); acceptance also needs IPv6-only validated cross-node on a real fleet, which depends on gate 3 | `beep-7qm` |
 | 3 | Tests on actual VPS / real hardware | Not started; needs operator-provisioned nodes | Real-fleet round trip: genuinely external client IP, provider uRPF/NAT, MTU, IPv6-only, native-v6 registry pull, documented k3s+u7s real-hardware deploy | `beep-903` |
 | 4 | Performance + code-quality audit | Not started | Includes the `unsafe` reduction audit; perf follow-ons are queued below | `beep-uqn`, `beep-xfa.5`, `beep-7qm.15`, `beep-xvw` |
 | 5 | Red-team security audit | Not started | No bead yet; file when gate 3 is underway | none |
@@ -65,8 +65,9 @@ Tags: `v0.1.0` (2026-09-14, single-backend delivery), `v0.2.0`
 (multi-interface), `v0.3.0` (dual-stack inner services over an IPv4 Geneve
 underlay; see `CHANGELOG.md`). Operator 2026-10-08: cutting a release is NOT
 a priority; show progress against the gates first. Scheme and scope:
-`docs/decisions/versioning.md`. u7s consumability (image pullable from Docker
-Hub, `docker.io/valerauko/beep-lb`) is met and not a v1.0 gate on its own.
+`docs/decisions/versioning.md`. The image is published to Docker Hub
+(`docker.io/valerauko/beep-lb`); IPv6-native pull is unverified and tracked
+under gate 3.
 
 ## Firm principles
 
