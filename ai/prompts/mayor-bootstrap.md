@@ -190,6 +190,10 @@ a redundant CI cycle per PR.
      never auto-drain until fixed or removed by hand.
    - **30** — `worktree_anomalies` lists a worker branch with no PR at
      all; investigate whether that dispatch stalled or crashed.
+   - **40** — the mayor checkout is detached or off `main`
+     (`mayor_checkout_anomaly`); the tick skipped its pull/cleanup. Do NOT
+     pull. Confirm nothing is lost, restore with `git checkout main`, then
+     use `git reflog` to find who moved it.
 3. If you ever merge a PR by hand instead of letting the script queue it
    (e.g. resolving a gate exception), stay queue-native: bare `gh pr merge
    <N>` only — `--merge`/`--delete-branch` are rejected by the queue, and
@@ -240,7 +244,11 @@ flag, or if both are passed together, since the destructive steps cannot
 tell a live worker's branch/worktree apart from a stale one on
 dir-existence or merge-state alone. A worktree/branch whose agent-id is in
 the `--live-agents` set is protected from every destructive step
-unconditionally, regardless of dir existence or merge state. See the script
+unconditionally, regardless of dir existence or merge state. A non-live
+`ai/worktrees/agent-*` worktree is reaped only when clean and its HEAD is an
+ancestor of `origin/main` (squash-merged branches are kept); a merged but
+dirty one is kept and the script exits 1 with a `dirty-worktree:` line —
+inspect it by hand. See the script
 for the step-by-step implementation and its design rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script

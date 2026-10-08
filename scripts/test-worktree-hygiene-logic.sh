@@ -428,6 +428,38 @@ LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH
 assert "worktree-hygiene exits non-zero while a merged-but-dirty non-live worktree remains -- the mayor must notice it" \
   "$([ "$C2_MAIN_RC" -ne 0 ] && echo 1 || echo 0)"
 
+# A worktree whose only unpushed work is a merge commit (main merged into the
+# branch, e.g. a conflict resolution): `git cherry` skips merge commits and
+# calls it merged, but the commit is not on origin/main and reaping loses it.
+BARE_C3="$SANDBOX_ROOT/origin-c3.git"
+git init -q --bare "$BARE_C3"
+
+C3="$SANDBOX_ROOT/step-c3-repo"
+new_sandbox "$C3"
+printf 'line one\n' > "$C3/file.txt"
+git -C "$C3" add -A
+git -C "$C3" commit -q -m initial
+git -C "$C3" remote add origin "$BARE_C3"
+git -C "$C3" push -q origin main
+mkdir -p "$C3/ai/worktrees"
+git -C "$C3" worktree add -q -b fix-mergeonly "$C3/ai/worktrees/agent-mergeonly" origin/main
+git -C "$C3" worktree add -q -b fix-livemain "$C3/ai/worktrees/agent-livemain" origin/main
+printf 'advance\n' > "$C3/other.txt"
+git -C "$C3" add other.txt
+git -C "$C3" commit -q -m 'main advances'
+git -C "$C3" push -q origin main
+git -C "$C3" fetch -q origin
+git -C "$C3/ai/worktrees/agent-mergeonly" merge -q --no-ff -m 'merge main into branch' origin/main
+
+C3_OUT=$(LIVE_AGENTS="livemain" WORKTREE_HYGIENE_REPO_ROOT="$C3" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  call step_c2_stale_agent_worktrees 2>&1)
+assert "a worktree whose sole unpushed work is a merge commit is kept -- patch-id comparison skips merge commits and would reap it, losing the commit" \
+  "$([ -d "$C3/ai/worktrees/agent-mergeonly" ] && git -C "$C3" branch --list fix-mergeonly | grep -q fix-mergeonly && echo 1 || echo 0)"
+assert "...and the keep is logged as not-ancestor, not skipped silently" \
+  "$(printf '%s' "$C3_OUT" | grep -q 'keep-worktree: .*agent-mergeonly.*not-ancestor' && echo 1 || echo 0)"
+assert "a live agent's clean worktree whose HEAD is an ancestor of origin/main (fresh worker, nothing committed yet) is kept -- it looks merged but --live-agents must protect it" \
+  "$([ -d "$C3/ai/worktrees/agent-livemain" ] && git -C "$C3" branch --list fix-livemain | grep -q fix-livemain && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # 5. run_cmd dry-run gate -- the mechanism that keeps THIS test suite (and
 #    any manual dry-run) from ever killing a real process or deleting a

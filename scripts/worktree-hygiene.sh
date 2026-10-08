@@ -231,10 +231,13 @@ worktree_is_dirty() {
   [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]
 }
 
-# True (exit 0) iff every commit of the worktree's HEAD is already in
-# origin/main by patch-id (covers squash-merges).
+# True (exit 0) iff the worktree's HEAD is an ancestor of origin/main. Strictly
+# ancestry, not patch-id: `git cherry` skips merge commits, so a worktree whose
+# only unpushed work is a merge/conflict-resolution commit would look merged.
+# The merge queue uses merge commits, so a merged PR head is an ancestor;
+# squash-merged branches are kept.
 worktree_head_is_merged() {
-  [ -z "$(git -C "$REPO_ROOT" cherry origin/main "$(git -C "$1" rev-parse HEAD)" 2>/dev/null)" ]
+  git -C "$REPO_ROOT" merge-base --is-ancestor "$(git -C "$1" rev-parse HEAD)" origin/main 2>/dev/null
 }
 
 HYGIENE_ANOMALIES=0
@@ -247,7 +250,7 @@ step_c2_stale_agent_worktrees() {
   run_cmd git -C "$REPO_ROOT" fetch origin main
   local porcelain open_pr_branches self wt_path branch agent_id
   porcelain=$(git -C "$REPO_ROOT" worktree list --porcelain)
-  open_pr_branches=$(gh pr list -R litehop/beep --state open --json headRefName --jq '.[].headRefName')
+  open_pr_branches=$(gh pr list -R litehop/beep --state open --limit 500 --json headRefName --jq '.[].headRefName')
   self=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
   while IFS=$'\t' read -r wt_path branch; do
     [ -n "$wt_path" ] || continue
@@ -257,7 +260,7 @@ step_c2_stale_agent_worktrees() {
       continue
     fi
     if ! worktree_head_is_merged "$wt_path"; then
-      echo "[hygiene] keep-worktree: $wt_path (branch ${branch:-detached}) has commits not in origin/main -- not reaping"
+      echo "[hygiene] keep-worktree: $wt_path (branch ${branch:-detached}) not-ancestor of origin/main -- not reaping"
       continue
     fi
     if [ -n "$branch" ] && has_open_pr "$branch" "$open_pr_branches"; then
@@ -286,7 +289,7 @@ step_c_stale_worker_branches() {
   # failure here aborts the whole tick via this script's own `set -e`
   # (see file header) rather than silently deleting branches without the
   # PR check that motivated this guard in the first place.
-  open_pr_branches=$(gh pr list -R litehop/beep --state open --json headRefName --jq '.[].headRefName')
+  open_pr_branches=$(gh pr list -R litehop/beep --state open --limit 500 --json headRefName --jq '.[].headRefName')
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     case "$branch" in
