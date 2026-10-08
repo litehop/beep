@@ -127,23 +127,53 @@ k3s_teardown_controller() { # k3s_teardown_controller <repo-root> <secret-name> 
   kube delete secret "$secret_name" -n kube-system --ignore-not-found >/dev/null 2>&1 || true
 }
 
-k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR
-  local vm_a="$1" vm_b="$2" pin_dir="$3"
+kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+  kill -9 "$1" 2>/dev/null || true
+}
+
+bounded_run() { # bounded_run <seconds> <cmd...> -- runs cmd with the caller's stdout/stderr; exit status is cmd's, or 124 after SIGKILLing its whole process tree once <seconds> elapse. A loaded node's SSH session can wedge indefinitely, which would otherwise hang the whole gate instead of failing loud (macOS has no `timeout` builtin, so this polls a backgrounded call).
+  local limit="$1" waited=0 bg_pid
+  shift
+  "$@" &
+  bg_pid=$!
+  while kill -0 "$bg_pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$bg_pid" 2>/dev/null; then
+    kill_tree "$bg_pid"
+    wait "$bg_pid" 2>/dev/null || true
+    return 124
+  fi
+  wait "$bg_pid"
+}
+
+k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR. Every call is bounded to ${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}s; a call that times out prints a loud EVIDENCE TIMEOUT line and the dump continues, so a wedged node yields partial evidence rather than a hang.
+  local vm_a="$1" vm_b="$2" pin_dir="$3" limit="${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}" vm m
+  ev() { # ev <label> <cmd...>
+    local label="$1" rc=0
+    shift
+    bounded_run "$limit" "$@" 2>&1 || rc=$?
+    [ "$rc" -ne 124 ] || echo "EVIDENCE TIMEOUT: '$label' did not complete within ${limit}s (node wedged?)"
+  }
   for vm in "$vm_a" "$vm_b"; do
     echo "---- $vm evidence ----"
     for m in LB_FRONT_MAP TARGET_PORTS POD_TARGETS FLOW_TABLE; do
       echo "== bpftool map dump: $m =="
-      limactl shell "$vm" -- sudo bpftool map dump pinned "$pin_dir/$m" 2>&1 || true
+      ev "$vm bpftool $m" limactl shell "$vm" -- sudo bpftool map dump pinned "$pin_dir/$m"
     done
     echo "== ip -s link (eth0, geneve0) =="
-    limactl shell "$vm" -- ip -s link show eth0 2>&1 || true
-    limactl shell "$vm" -- ip -s link show geneve0 2>&1 || true
+    ev "$vm eth0 stats" limactl shell "$vm" -- ip -s link show eth0
+    ev "$vm geneve0 stats" limactl shell "$vm" -- ip -s link show geneve0
     echo "== dmesg (tail) =="
-    limactl shell "$vm" -- sudo dmesg 2>&1 | tail -30 || true
+    ev "$vm dmesg" limactl shell "$vm" -- bash -c 'sudo dmesg | tail -30'
   done
   echo "---- controller pod describe (events) ----"
-  kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR" 2>&1 || true
+  ev "controller describe" kube -n kube-system describe pods -l "$CONTROLLER_SELECTOR"
   echo "---- controller pod logs (current + previous, i.e. pre-crash) ----"
-  kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 2>&1 || true
-  kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous 2>&1 || true
+  ev "controller logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100
+  ev "controller previous logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous
 }
+

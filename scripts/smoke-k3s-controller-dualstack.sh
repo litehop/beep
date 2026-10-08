@@ -39,6 +39,8 @@
 # Test hook: BEEP_SMOKE_MAP_DUMP_TIMEOUT=<seconds> (default 20) bounds each
 # bpftool map dump; 0 forces every dump to time out, which must FAIL the gate
 # at the first map check (an unreadable map is never treated as empty).
+# BEEP_SMOKE_EVIDENCE_TIMEOUT=<seconds> (default 20) likewise bounds each call
+# of the FAIL-path evidence dump; 0 forces every call to report EVIDENCE TIMEOUT.
 set -euo pipefail
 
 VM_A="beep-node-a"
@@ -86,29 +88,15 @@ rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src (inst
   exit 1
 }
 
-kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
-  kill -9 "$1" 2>/dev/null || true
-}
-
 map_dump() { # map_dump <vm> <map-name> -- raw bpftool JSON dump of a pinned map on stdout, exit 0 (a genuinely empty map prints "[]"); exit 1 with the reason on stderr if the pin is missing/unreadable, bpftool/limactl fails, or the call times out. Callers MUST treat non-zero as a gate FAIL, never as "empty": an absence check must not pass on a dump that never happened. Bounded to ${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}s rather than a bare `limactl shell` call: observed live, a loaded node's SSH session can wedge indefinitely under this rig's load, which would otherwise hang the whole gate rather than failing loud (macOS has no `timeout` builtin, so this polls a backgrounded call).
-  local vm="$1" name="$2" out_file err_file waited limit="${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}" rc=0
+  local vm="$1" name="$2" out_file err_file limit="${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}" rc=0 run_rc=0
   out_file="$(mktemp)"
   err_file="$(mktemp)"
-  ( limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>"$err_file" > "$out_file" ) &
-  local bg_pid=$!
-  waited=0
-  while kill -0 "$bg_pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if kill -0 "$bg_pid" 2>/dev/null; then
-    kill_tree "$bg_pid"
-    wait "$bg_pid" 2>/dev/null || true
+  bounded_run "$limit" limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>"$err_file" > "$out_file" || run_rc=$?
+  if [ "$run_rc" -eq 124 ]; then
     echo "map_dump $vm/$name timed out after ${limit}s" >&2
     rc=1
-  elif ! wait "$bg_pid"; then
+  elif [ "$run_rc" -ne 0 ]; then
     echo "map_dump $vm/$name failed: $(tr '\n' ' ' < "$err_file")" >&2
     rc=1
   elif [ ! -s "$out_file" ]; then
