@@ -274,13 +274,18 @@ wait_for_attach() {
 # concurrent instances would both attach_to_link-swap the same pinned links,
 # racing each other instead of cleanly simulating a single rollout/eviction/
 # OOM-kill restart.
+#
+# Targets $loader_pid, not `pkill -f "$BIN"`: a cmdline match also hits any
+# process whose arguments merely contain the binary's path as a prefix --
+# e.g. the restart fixture's client, whose `> /tmp/beep-smoke-restart-client.out`
+# redirect is part of its `bash -c` cmdline -- killing it mid-flow.
 stop_loader() {
-  pkill -f "$BIN" 2>/dev/null || true
+  kill "$loader_pid" 2>/dev/null || true
   for _ in $(seq 1 20); do
-    pgrep -f "$BIN" >/dev/null || break
+    kill -0 "$loader_pid" 2>/dev/null || break
     sleep 0.2
   done
-  pgrep -f "$BIN" >/dev/null && {
+  kill -0 "$loader_pid" 2>/dev/null && {
     echo "FAIL: old loader process did not exit before the restart" >&2
     exit 1
   }
@@ -496,8 +501,9 @@ disown
 disown
 
 ip netns exec smoke-client bash -c "timeout 30 nc ${VIP_IP} ${VIP_PORT} > ${RESTART_CLIENT_OUT}" &
+# Not disowned: `wait` on a disowned pid returns 0 immediately without
+# waiting, which would read the body below before chunk 2 has been delivered.
 restart_client_pid=$!
-disown
 
 for _ in $(seq 1 30); do
   fwd_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
@@ -536,6 +542,10 @@ echo "RESTART MAP PRESERVATION: PASS (FLOW_TABLE=$fwd_after entries, unchanged o
 release_restart_signal
 
 wait "$restart_client_pid" || true
+kill -0 "$restart_client_pid" 2>/dev/null && {
+  echo "FAIL: restart client (pid $restart_client_pid) still running after wait -- the body below would be read before the flow finished" >&2
+  exit 1
+}
 restart_body="$(cat "$RESTART_CLIENT_OUT" 2>/dev/null || true)"
 [ "$restart_body" = "${RESTART_CHUNK1}${RESTART_CHUNK2}" ] || {
   echo "FAIL: the flow held open across the loader restart stopped routing -- expected '${RESTART_CHUNK1}${RESTART_CHUNK2}', got '$restart_body'. Lost conntrack means the return leg is dropped/misrouted, even though the connection never closed." >&2
