@@ -392,12 +392,6 @@ GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
 GENEVE_B_BEFORE="$(geneve_pkts "$VM_B")"
 
 echo "==> [10/12] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
-host_port() { # host_port <addr> <port> -- addr:port, bracketing IPv6 literals (URL authority and the backend's RemoteAddr both use this form)
-  case "$1" in
-    *:*) echo "[$1]:$2" ;;
-    *) echo "$1:$2" ;;
-  esac
-}
 http_url() { # http_url <addr> <port>
   echo "http://$(host_port "$1" "$2")/"
 }
@@ -424,11 +418,11 @@ round_trip -6 "$ULA_A" "$PORT_DUAL" "$ULA_CLIENT" >/dev/null || { echo "ROUND-TR
 echo "ROUND-TRIP-DUAL-V6: PASS (client $ULA_CLIENT -> $SVC_DUAL v6 front [$ULA_A]:$PORT_DUAL -> backend on $VM_B, client IP preserved)"
 
 echo "==> [11/12] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
-expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
+expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family (an RST proves only that no front serves it; the FRONT_META absence check in step 8 covers "beep never programmed one"). LC_ALL=C pins curl's English errno text. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
   local flag="$1" addr="$2" port="$3" out rc url
   url="$(http_url "$addr" "$port")"
   set +e
-  out="$(limactl shell "$VM_CLIENT" -- curl -sSv "$flag" -m 5 "$url" 2>&1)"
+  out="$(limactl shell "$VM_CLIENT" -- env LC_ALL=C curl -sSv "$flag" -m 5 "$url" 2>&1)"
   rc=$?
   set -e
   if [ "$rc" -eq 7 ] && grep -qF "failed: Connection refused" <<<"$out"; then
