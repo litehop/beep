@@ -224,10 +224,9 @@ pub fn wire_port(port: u16) -> u16 {
     port.to_be()
 }
 
-/// Loader-populated LB-front-IP:PORT(+proto) front-tuple key -- shared by
-/// `beep-ebpf`'s `LB_FRONT_MAP` and `TARGET_PORTS`, which key on the same
-/// front tuple for two different roles (ingress backend selection, backend
-/// target-port selection). `#[repr(C)]`, byte-identical on both sides of the
+/// Loader-populated LB-front-IP:PORT(+proto) front-tuple key -- the key of
+/// `beep-ebpf`'s `FRONT_META` and the front part of `FrontEndpointKey`.
+/// `#[repr(C)]`, byte-identical on both sides of the
 /// kernel boundary is the whole point: aya's userspace `HashMap<K, V>`
 /// requires `K: Pod`, and the kernel's `BPF_MAP_TYPE_HASH` hashes/compares
 /// this struct's raw bytes.
@@ -237,7 +236,7 @@ pub fn wire_port(port: u16) -> u16 {
 /// proved, so a v4 front (stored as v4-mapped-v6) and a genuine v6 front
 /// share this one key type instead of two disjoint map layouts.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LbFrontKey {
     pub vip_ip: [u8; 16],
     pub vip_port: u16,
@@ -245,7 +244,7 @@ pub struct LbFrontKey {
     pub _pad: u8,
 }
 
-/// `LB_FRONT_MAP`/`FWD_PENDING` value: the backend identity a `LbFrontKey`
+/// `FrontEndpoint`/`FWD_PENDING` value part: the backend identity a front
 /// resolves to. Both address fields are `[u8; 16]` for the same dual-stack
 /// reason as `LbFrontKey.vip_ip` above -- a v4 value is stored as
 /// v4-mapped-v6 via `ipv4_mapped_v6`.
@@ -256,6 +255,75 @@ pub struct LbFrontBackend {
     pub backend_node_ip: [u8; 16],
     /// Pod-identifier stamped as the forward-leg Geneve option.
     pub pod_ip: [u8; 16],
+}
+
+/// `FRONT_META` value: which endpoint generation of a front is live, and how
+/// many endpoints it holds. `FRONT_META` is a `BPF_MAP_TYPE_HASH`, not an
+/// array, on purpose: replacing one element is atomic for concurrent
+/// readers, so a single `FRONT_META` update is the commit point of the
+/// generation-swap write protocol. A reader looks `FRONT_META` up once per
+/// packet and then reads `(front, generation, slot)` from `FRONT_ENDPOINTS`,
+/// so it can never observe a half-written endpoint set.
+///
+/// Write protocol (controller, per front): a new generation is minted only
+/// when the front's endpoint set changes. With `g` the live generation:
+/// (1) delete every endpoint generation other than `g`, (2) write every slot
+/// under `g+1`, (3) replace this value with `{g+1, count, flags}`. At most
+/// two generations of a front's endpoints exist at any time; a reader that
+/// loaded generation `g` just before step 3 still finds it. Deleting a front
+/// drops its `FRONT_META` entry first, then its endpoints. An unchanged front
+/// keeps `g` and `g-1`; anything older (e.g. crash leftovers) is deleted.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontMeta {
+    pub generation: u32,
+    /// Number of live endpoints under `generation` (slots `0..count`).
+    pub count: u16,
+    /// `FRONT_FLAG_*` bits.
+    pub flags: u16,
+}
+
+/// `FRONT_ENDPOINTS` key: one endpoint slot of one generation of a front.
+/// `_pad` keeps the struct free of compiler-inserted bytes: the kernel
+/// hashes the raw key bytes, so every byte must be deterministic.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FrontEndpointKey {
+    pub front: LbFrontKey,
+    pub generation: u32,
+    pub slot: u16,
+    pub _pad: u16,
+}
+
+/// `FRONT_ENDPOINTS` value: where one slot of a front sends traffic.
+/// `target_port` is wire-order (`wire_port`) and is what the backend node's
+/// decap DNATs to; it lives with the endpoint because a named port can
+/// resolve to a different number per backend.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontEndpoint {
+    pub backend: LbFrontBackend,
+    pub target_port: u16,
+    pub _pad: [u8; 6],
+}
+
+/// The only slot a front has until multi-endpoint selection exists.
+pub const FRONT_SLOT_FIRST: u16 = 0;
+
+/// The `FRONT_ENDPOINTS` key to read for a packet whose front resolved to
+/// `meta`: slot 0 of the live generation. `None` when `count == 0`, so a
+/// front with no endpoints fails closed instead of reading a slot that
+/// belongs to no generation.
+pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEndpointKey> {
+    if meta.count == 0 {
+        return None;
+    }
+    Some(FrontEndpointKey {
+        front,
+        generation: meta.generation,
+        slot: FRONT_SLOT_FIRST,
+        _pad: 0,
+    })
 }
 
 /// Host-specific runtime config the loader fills in after attach (an
@@ -285,13 +353,13 @@ pub struct UplinkConfig {
 }
 
 /// `FWD_PENDING`/`FLOW_TABLE`'s forward-tagged value: the backend identity
-/// `LB_FRONT_MAP` resolved for this flow, plus which physical uplink
+/// `FRONT_ENDPOINTS` resolved for this flow, plus which physical uplink
 /// admitted it. The multi-uplink symmetric-return redirect
 /// (`try_geneve_decap_return`) needs this to send the reply back out the
 /// SAME uplink the client's packet arrived on -- `CONFIG` no longer names a
 /// single uplink to fall back on (`docs/decisions/
 /// servicelb-multi-symmetric-uplink.md`). Deliberately NOT a field added
-/// onto `LbFrontBackend` itself: that type is also `LB_FRONT_MAP`'s value,
+/// onto `LbFrontBackend` itself: that type is also part of `FrontEndpoint`,
 /// a Service->Pod mapping the controller reconciles with no notion of which
 /// uplink admitted any given packet, so folding a per-packet runtime field
 /// into it would force the controller's Service-watching code to carry and
@@ -370,6 +438,12 @@ unsafe impl aya::Pod for LbFrontKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for LbFrontBackend {}
 #[cfg(feature = "user")]
+unsafe impl aya::Pod for FrontMeta {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FrontEndpointKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FrontEndpoint {}
+#[cfg(feature = "user")]
 unsafe impl aya::Pod for ForwardFlowValue {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Config {}
@@ -436,7 +510,7 @@ pub fn forward_admission(in_main: bool) -> ForwardAdmission {
 
 /// FWD_PENDING affinity-pin decision (`beep-ebpf`'s
 /// `try_uplink_ingress_headers`, inside the `ForwardAdmission::MintPending`
-/// branch). `LB_FRONT_MAP` is re-resolved on every pre-promotion packet, so
+/// branch). The front's endpoint is re-resolved on every pre-promotion packet, so
 /// without this guard a later packet of the same not-yet-promoted flow could
 /// silently re-pin a different backend before promotion copies the PENDING
 /// value into FLOW_TABLE -- once a flow is established, that would mean
@@ -453,7 +527,7 @@ pub enum FwdPendingPin {
 }
 
 /// `existing`: result of a `FWD_PENDING.get(flow_key)` lookup. `candidate`:
-/// the backend `LB_FRONT_MAP` resolved for the current packet, plus the
+/// the backend `FRONT_ENDPOINTS` resolved for the current packet, plus the
 /// ifindex it was admitted on.
 pub fn fwd_pending_affinity_pin(
     existing: Option<ForwardFlowValue>,
@@ -580,7 +654,7 @@ pub fn is_redirected_return_mark(mark: u32) -> bool {
 /// Inbound decap-forward pod-membership gate (`beep-ebpf`'s
 /// `try_geneve_decap_forward`, hook 4) -- the egress-side analogue of
 /// `EgressReturnAdmission` above, mirrored onto the opposite hook.
-/// `TARGET_PORTS.get(front tuple)` only confirms this node hosts SOME
+/// The front's `FRONT_ENDPOINTS` entry only confirms this node hosts SOME
 /// backend for the front; it never confirms the specific `pod_ip` the
 /// ingress node stamped into the Geneve option is still one of this node's
 /// own pods. Under cross-node convergence drift a lagging ingress can replay
@@ -1052,6 +1126,84 @@ mod tests {
         assert_eq!(core::mem::size_of::<LbFrontBackend>(), 32);
     }
 
+    // The kernel hashes/compares map keys as raw bytes and aya reads values
+    // as raw bytes, so a compiler-inserted gap in any of these would make
+    // lookups miss (key) or leak uninitialised bytes (value). Sizes and
+    // offsets are pinned so a field reorder or widening fails here, not as a
+    // silent front outage.
+
+    #[test]
+    fn front_meta_layout_is_eight_bytes_with_no_padding() {
+        assert_eq!(core::mem::size_of::<FrontMeta>(), 8);
+        assert_eq!(core::mem::align_of::<FrontMeta>(), 4);
+        assert_eq!(core::mem::offset_of!(FrontMeta, generation), 0);
+        assert_eq!(core::mem::offset_of!(FrontMeta, count), 4);
+        assert_eq!(core::mem::offset_of!(FrontMeta, flags), 6);
+    }
+
+    #[test]
+    fn front_endpoint_key_layout_has_no_compiler_padding() {
+        // LbFrontKey (20) + generation (4) + slot (2) + _pad (2). The key is
+        // hashed as raw bytes, so any implicit gap would make the loader's
+        // and the dataplane's keys for the same endpoint differ.
+        assert_eq!(core::mem::size_of::<FrontEndpointKey>(), 28);
+        assert_eq!(core::mem::align_of::<FrontEndpointKey>(), 4);
+        assert_eq!(core::mem::offset_of!(FrontEndpointKey, front), 0);
+        assert_eq!(core::mem::offset_of!(FrontEndpointKey, generation), 20);
+        assert_eq!(core::mem::offset_of!(FrontEndpointKey, slot), 24);
+        assert_eq!(core::mem::offset_of!(FrontEndpointKey, _pad), 26);
+    }
+
+    #[test]
+    fn front_endpoint_layout_has_explicit_trailing_padding_only() {
+        assert_eq!(core::mem::size_of::<FrontEndpoint>(), 40);
+        assert_eq!(core::mem::offset_of!(FrontEndpoint, backend), 0);
+        assert_eq!(core::mem::offset_of!(FrontEndpoint, target_port), 32);
+        assert_eq!(core::mem::offset_of!(FrontEndpoint, _pad), 34);
+    }
+
+    fn sample_front() -> LbFrontKey {
+        LbFrontKey {
+            vip_ip: ipv4_mapped_v6(wire_ip(u32::from_be_bytes([203, 0, 113, 1]))),
+            vip_port: wire_port(443),
+            proto: 6,
+            _pad: 0,
+        }
+    }
+
+    #[test]
+    fn front_endpoint_key_follows_the_live_generation_slot_zero() {
+        // After a generation swap the very next lookup must read the new
+        // generation's endpoint, or traffic keeps flowing to the replaced pod.
+        let meta = FrontMeta {
+            generation: 7,
+            count: 1,
+            flags: 0,
+        };
+        let key = front_endpoint_key(sample_front(), meta).expect("count 1 has slot 0");
+        assert_eq!(key.generation, 7);
+        assert_eq!(key.slot, FRONT_SLOT_FIRST);
+        assert!(key.front == sample_front());
+        assert_eq!(
+            key._pad, 0,
+            "padding must be zero for byte-equal key hashing"
+        );
+    }
+
+    #[test]
+    fn front_with_no_endpoints_resolves_to_no_key_so_it_fails_closed() {
+        let meta = FrontMeta {
+            generation: 3,
+            count: 0,
+            flags: 0,
+        };
+        assert!(
+            front_endpoint_key(sample_front(), meta).is_none(),
+            "a front advertising zero endpoints must not read a slot: it would forward to an \
+             endpoint that belongs to no live generation"
+        );
+    }
+
     // LbFrontKey/LbFrontBackend/RevFlowValue's address fields widened from
     // bare u32 to [u8; 16] so a v6 front/backend can share the same map
     // shape later -- but a v4 fixture must still round-trip bit-identical
@@ -1071,7 +1223,7 @@ mod tests {
             unmap_ipv4(&key.vip_ip),
             Some(vip_wire),
             "a v4 VIP stored via ipv4_mapped_v6 must unmap back to the exact wire bytes \
-             LB_FRONT_MAP was populated with, or the widened key silently corrupts every v4 \
+             FRONT_META was populated with, or the widened key silently corrupts every v4 \
              front"
         );
     }

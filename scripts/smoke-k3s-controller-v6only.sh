@@ -293,18 +293,25 @@ v6_bytes() { # v6_bytes <fd00:beef:98::N> -- jq array literal of the address's 1
 
 echo "==> [8/12] confirming the controller programmed the v6 front on $VM_A and the backend's admission on $VM_B"
 # bpftool's --json dump has no BTF for these structs, so key/value are flat
-# arrays of "0xNN" byte strings: LB_FRONT_MAP key = vip_ip[0..16) + vip_port
-# BE [16..18); value = backend_node_ip[0..16) + pod_ip[16..32).
+# arrays of "0xNN" byte strings: FRONT_META key = vip_ip[0..16) + vip_port
+# BE [16..18) + proto + pad; value = generation u32 LE [0..4) + count u16 +
+# flags u16. FRONT_ENDPOINTS key = that same 20-byte front key + generation
+# u32 LE [20..24) + slot u16 [24..26) + pad; value = backend_node_ip[0..16) +
+# pod_ip[16..32). The endpoint must sit under the generation FRONT_META names.
 port_hi="$(printf '0x%02x' $(( (PORT_V6 >> 8) & 0xff )))"
 port_lo="$(printf '0x%02x' $(( PORT_V6 & 0xff )))"
-dump="$(map_dump "$VM_A" LB_FRONT_MAP)" || { echo "FAIL: cannot read $VM_A LB_FRONT_MAP" >&2; dump_evidence; exit 1; }
+meta_dump="$(map_dump "$VM_A" FRONT_META)" || { echo "FAIL: cannot read $VM_A FRONT_META" >&2; dump_evidence; exit 1; }
+ep_dump="$(map_dump "$VM_A" FRONT_ENDPOINTS)" || { echo "FAIL: cannot read $VM_A FRONT_ENDPOINTS" >&2; dump_evidence; exit 1; }
 rc=0
-jq -e --argjson a "$(v6_bytes "$ULA_A")" --argjson b "$(v6_bytes "$ULA_B")" --arg hi "$port_hi" --arg lo "$port_lo" '
+jq -e --argjson a "$(v6_bytes "$ULA_A")" --argjson b "$(v6_bytes "$ULA_B")" --arg hi "$port_hi" --arg lo "$port_lo" --argjson eps "$ep_dump" '
   any(.[]; (.key[0:16] == $a) and .key[16] == $hi and .key[17] == $lo
-           and (.value[0:16] == $b) and (.value[16:32] == $b))
-' <<<"$dump" >/dev/null 2>&1 || rc=$?
+           and (. as $m | any($eps[]; (.key[0:20] == $m.key[0:20])
+                and (.key[20:24] == $m.value[0:4])
+                and (.key[24:26] == ["0x00","0x00"])
+                and (.value[0:16] == $b) and (.value[16:32] == $b))))
+' <<<"$meta_dump" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 0 ] || {
-  echo "FAIL: $VM_A LB_FRONT_MAP has no entry front=[$ULA_A]:$PORT_V6 -> backend_node_ip=$ULA_B pod_ip=$ULA_B (jq rc=$rc)" >&2
+  echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no live front=[$ULA_A]:$PORT_V6 -> backend_node_ip=$ULA_B pod_ip=$ULA_B (jq rc=$rc)" >&2
   dump_evidence
   exit 1
 }
@@ -316,7 +323,7 @@ jq -e --argjson b "$(v6_bytes "$ULA_B")" 'any(.[]; .key == $b)' <<<"$dump" >/dev
   dump_evidence
   exit 1
 }
-echo "MAP-PROGRAMMING: PASS ($VM_A LB_FRONT_MAP [$ULA_A]:$PORT_V6 -> v6 underlay remote $ULA_B / pod $ULA_B; $VM_B POD_TARGETS admits $ULA_B)"
+echo "MAP-PROGRAMMING: PASS ($VM_A FRONT_META/FRONT_ENDPOINTS [$ULA_A]:$PORT_V6 -> v6 underlay remote $ULA_B / pod $ULA_B; $VM_B POD_TARGETS admits $ULA_B)"
 
 echo "==> [9/12] snapshotting geneve0 counters and starting an eth0 Geneve capture on both nodes"
 geneve_pkts() { limactl shell "$1" -- bash -c "ip -s -j link show geneve0 | jq '.[0].stats64.rx.packets + .[0].stats64.tx.packets'"; }

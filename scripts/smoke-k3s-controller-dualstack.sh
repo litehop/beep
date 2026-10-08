@@ -352,11 +352,11 @@ echo "==> [8/12] confirming $VM_A's own dataplane front is programmed for each f
 # (network) representation, so compare against that directly). vip_ip's v4
 # case is stored as v4-mapped-v6 (bytes[10..12] == ff,ff -- LbFrontKey's own
 # doc comment).
-front_has_family() { # front_has_family <vm> <port> <family: v4|v6> -- true if LB_FRONT_MAP has a key at this port whose vip_ip byte pattern matches the requested family
+front_has_family() { # front_has_family <vm> <port> <family: v4|v6> -- true if FRONT_META has a key at this port whose vip_ip byte pattern matches the requested family
   local vm="$1" port="$2" family="$3" hi lo dump
   hi="$(printf '0x%02x' $(( (port >> 8) & 0xff )))"
   lo="$(printf '0x%02x' $(( port & 0xff )))"
-  dump="$(map_dump "$vm" LB_FRONT_MAP)" || { echo "FAIL: cannot read $vm LB_FRONT_MAP -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
+  dump="$(map_dump "$vm" FRONT_META)" || { echo "FAIL: cannot read $vm FRONT_META -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
   local rc=0
   jq -e --arg hi "$hi" --arg lo "$lo" --arg fam "$family" '
     map(.key) | any(.[]; . as $k |
@@ -365,26 +365,26 @@ front_has_family() { # front_has_family <vm> <port> <family: v4|v6> -- true if L
        else ($k[10] != "0xff" or $k[11] != "0xff") end))
   ' <<<"$dump" >/dev/null 2>&1 || rc=$?
   # jq -e: 1 = filter false/null (a real answer); >1 = jq itself failed (unparseable dump).
-  [ "$rc" -le 1 ] || { echo "FAIL: $vm LB_FRONT_MAP dump is not parseable JSON -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
+  [ "$rc" -le 1 ] || { echo "FAIL: $vm FRONT_META dump is not parseable JSON -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
   return "$rc"
 }
-front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A LB_FRONT_MAP has no v4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
-front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A LB_FRONT_MAP has no v6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
-front_has_family "$VM_A" "$PORT_V4" v4 || { echo "FAIL: $VM_A LB_FRONT_MAP has no v4 front for $SVC_V4 (port $PORT_V4)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A FRONT_META has no v4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A FRONT_META has no v6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_V4" v4 || { echo "FAIL: $VM_A FRONT_META has no v4 front for $SVC_V4 (port $PORT_V4)" >&2; dump_evidence; exit 1; }
 if front_has_family "$VM_A" "$PORT_V4" v6; then
-  echo "FAIL: $VM_A LB_FRONT_MAP has a v6 front for SingleStack-IPv4 $SVC_V4 (port $PORT_V4) -- should be v4-only" >&2
+  echo "FAIL: $VM_A FRONT_META has a v6 front for SingleStack-IPv4 $SVC_V4 (port $PORT_V4) -- should be v4-only" >&2
   dump_evidence
   exit 1
 fi
-front_has_family "$VM_A" "$PORT_V6" v6 || { echo "FAIL: $VM_A LB_FRONT_MAP has no v6 front for $SVC_V6 (port $PORT_V6)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_V6" v6 || { echo "FAIL: $VM_A FRONT_META has no v6 front for $SVC_V6 (port $PORT_V6)" >&2; dump_evidence; exit 1; }
 if front_has_family "$VM_A" "$PORT_V6" v4; then
-  echo "FAIL: $VM_A LB_FRONT_MAP has a v4 front for SingleStack-IPv6 $SVC_V6 (port $PORT_V6) -- should be v6-only" >&2
+  echo "FAIL: $VM_A FRONT_META has a v4 front for SingleStack-IPv6 $SVC_V6 (port $PORT_V6) -- should be v6-only" >&2
   dump_evidence
   exit 1
 fi
 pod_targets_b=$(map_dump "$VM_B" POD_TARGETS | jq 'length') || { echo "FAIL: cannot read $VM_B POD_TARGETS" >&2; dump_evidence; exit 1; }
 [ "$pod_targets_b" -ge 1 ] || { echo "FAIL: $VM_B's POD_TARGETS has no entries -- the backend Pod was never admitted" >&2; dump_evidence; exit 1; }
-echo "MAP-PROGRAMMING: PASS ($VM_A LB_FRONT_MAP has v4+v6 fronts for $SVC_DUAL, v4-only for $SVC_V4, v6-only for $SVC_V6; $VM_B POD_TARGETS=$pod_targets_b entries)"
+echo "MAP-PROGRAMMING: PASS ($VM_A FRONT_META has v4+v6 fronts for $SVC_DUAL, v4-only for $SVC_V4, v6-only for $SVC_V6; $VM_B POD_TARGETS=$pod_targets_b entries)"
 
 echo "==> [9/12] snapshotting geneve0 packet counters on both nodes before the round trips"
 geneve_pkts() { limactl shell "$1" -- bash -c "ip -s -j link show geneve0 | jq '.[0].stats64.rx.packets + .[0].stats64.tx.packets'"; }

@@ -22,7 +22,7 @@ POD_IP="198.51.100.53"
 POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18080"
 # A second Service port on the SAME Pod (multi-port Service, e.g. 80->8080
-# alongside 443->8443) -- proves the backend's TARGET_PORTS lookup resolves
+# alongside 443->8443) -- proves the backend's FRONT_ENDPOINTS lookup resolves
 # each front independently instead of collapsing both onto whichever
 # target port was written last (the bug this fixture guards against: a
 # pod-IP-only key can't tell these two fronts apart at all).
@@ -294,7 +294,7 @@ stop_loader() {
 
 echo "==> loading beep-ebpf -- this is the verifier-accept gate"
 # Two --fixture entries sharing one Pod IP but different VIP/target ports:
-# the multi-port-Service scenario TARGET_PORTS' front-tuple keying exists
+# the multi-port-Service scenario FRONT_ENDPOINTS' front-tuple keying exists
 # to disambiguate.
 start_loader "$LOADER_LOG"
 wait_for_attach "$LOADER_LOG"

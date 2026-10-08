@@ -6,6 +6,8 @@
 //! reuse across a loader restart, the dot-in-filename EPERM avoidance in
 //! link pin paths, and map-reopen-from-pin.
 
+pub mod front_swap;
+
 use std::{net::IpAddr, path::Path};
 
 use anyhow::{anyhow, Context};
@@ -33,16 +35,39 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-pub const MAP_NAMES: [&str; 8] = [
+pub const MAP_NAMES: [&str; 9] = [
     "CONFIG",
     "UPLINK_CONFIG",
-    "LB_FRONT_MAP",
-    "TARGET_PORTS",
+    "FRONT_META",
+    "FRONT_ENDPOINTS",
+    "FRONT_MISSES",
     "POD_TARGETS",
     "NODE_ALLOW",
     "FWD_PENDING",
     "FLOW_TABLE",
 ];
+
+/// Pins an earlier release created for maps that no longer exist. aya
+/// silently reuses any pin it finds, so a stale pin would sit in the pin
+/// dir forever (and a later map reusing the name would inherit its layout).
+const LEGACY_MAP_PINS: [&str; 2] = ["LB_FRONT_MAP", "TARGET_PORTS"];
+
+/// Removes `LEGACY_MAP_PINS` under `pin_dir`; returns the names it removed.
+pub fn remove_legacy_map_pins(pin_dir: &Path) -> anyhow::Result<Vec<&'static str>> {
+    let mut removed = Vec::new();
+    for name in LEGACY_MAP_PINS {
+        let path = pin_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(name),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("removing legacy map pin {}", path.display()))
+            }
+        }
+    }
+    Ok(removed)
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Proto {
@@ -171,8 +196,8 @@ pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
 }
 
 /// Wire-form pod_ips of fixtures THIS node itself backs (`backend_node_ip
-/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `LB_FRONT_MAP`/
-/// `TARGET_PORTS` which every node populates identically from the full
+/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `FRONT_META`/
+/// `FRONT_ENDPOINTS` which every node populates identically from the full
 /// fixture set since any node can be ingress for any VIP. `node_ip`'s family
 /// need not match every fixture's `backend_node_ip`; `IpAddr`'s `PartialEq`
 /// already treats a v4 and a v6 address as unequal regardless of numeric
@@ -331,6 +356,14 @@ pub fn bump_memlock_rlimit() {
     }
 }
 
+/// `FRONT_META` holds one entry per front address x Service port, which
+/// scales with nodes x Service ports under the every-node-is-a-front model;
+/// 4096 covers e.g. 100 nodes x 40 Service ports.
+pub const DEFAULT_FRONT_META_MAX_ENTRIES: u32 = 4096;
+/// `FRONT_ENDPOINTS` holds one row per front x endpoint, and up to two
+/// generations of a front coexist during a swap, so the default is twice
+/// `FRONT_META`'s at one endpoint per front.
+pub const DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES: u32 = 2 * DEFAULT_FRONT_META_MAX_ENTRIES;
 /// `NODE_ALLOW` holds one entry per node underlay address, so a dual-stack
 /// node costs two; 32 covers 16 dual-stack nodes.
 pub const DEFAULT_NODE_ALLOW_MAX_ENTRIES: u32 = 32;
@@ -338,15 +371,19 @@ pub const DEFAULT_NODE_ALLOW_MAX_ENTRIES: u32 = 32;
 /// costs two; 128 covers 64 dual-stack pods per node.
 pub const DEFAULT_POD_TARGETS_MAX_ENTRIES: u32 = 128;
 
-/// Operator-facing advice appended to a failed `NODE_ALLOW`/`POD_TARGETS`
-/// write: these two maps are capped by `--node-allow-max-entries`/
-/// `--pod-targets-max-entries`, and an insert past the cap would otherwise
+/// Operator-facing advice appended to a failed `NODE_ALLOW`/`POD_TARGETS`/
+/// `FRONT_META`/`FRONT_ENDPOINTS`
+/// write: these maps are capped by `--node-allow-max-entries`/
+/// `--pod-targets-max-entries`/`--front-meta-max-entries`/
+/// `--front-endpoints-max-entries`, and an insert past the cap would otherwise
 /// surface only the kernel's bare `E2BIG`, leaving a node or pod silently
 /// unreachable with no hint which knob to turn. Empty for any other map.
 pub fn capacity_hint(map_name: &str) -> String {
     let flag = match map_name {
         "NODE_ALLOW" => "--node-allow-max-entries",
         "POD_TARGETS" => "--pod-targets-max-entries",
+        "FRONT_META" => "--front-meta-max-entries",
+        "FRONT_ENDPOINTS" => "--front-endpoints-max-entries",
         _ => return String::new(),
     };
     format!(
@@ -361,7 +398,7 @@ pub fn capacity_hint(map_name: &str) -> String {
 /// build script), pinning each of `MAP_NAMES` under `pin_dir` so a loader
 /// restart reuses the existing map set instead of `Ebpf::load` creating an
 /// empty one (`MAP_NAMES`'s own doc comment). `fwd_pending_max_entries`/
-/// `flow_table_max_entries`/`lb_front_map_max_entries`/`target_ports_max_entries`/
+/// `flow_table_max_entries`/`front_meta_max_entries`/`front_endpoints_max_entries`/
 /// `node_allow_max_entries`/`pod_targets_max_entries`
 /// size the six maps whose entry count scales with cluster/Service state --
 /// a load-time DaemonSet config knob, not a value baked into the eBPF
@@ -378,19 +415,22 @@ pub fn load_ebpf(
     pin_dir: &Path,
     fwd_pending_max_entries: u32,
     flow_table_max_entries: u32,
-    lb_front_map_max_entries: u32,
-    target_ports_max_entries: u32,
+    front_meta_max_entries: u32,
+    front_endpoints_max_entries: u32,
     node_allow_max_entries: u32,
     pod_targets_max_entries: u32,
 ) -> anyhow::Result<Ebpf> {
+    for name in remove_legacy_map_pins(pin_dir)? {
+        eprintln!("beep: removed legacy map pin {name} (replaced by FRONT_META/FRONT_ENDPOINTS)");
+    }
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
         loader.map_pin_path(name, pin_dir.join(name));
     }
     loader.map_max_entries("FWD_PENDING", fwd_pending_max_entries);
     loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
-    loader.map_max_entries("LB_FRONT_MAP", lb_front_map_max_entries);
-    loader.map_max_entries("TARGET_PORTS", target_ports_max_entries);
+    loader.map_max_entries("FRONT_META", front_meta_max_entries);
+    loader.map_max_entries("FRONT_ENDPOINTS", front_endpoints_max_entries);
     loader.map_max_entries("NODE_ALLOW", node_allow_max_entries);
     loader.map_max_entries("POD_TARGETS", pod_targets_max_entries);
     loader
@@ -629,7 +669,70 @@ mod tests {
             pod.contains("POD_TARGETS") && pod.contains("--pod-targets-max-entries"),
             "a full POD_TARGETS must tell the operator which flag to raise, got {pod:?}"
         );
+        for (map, flag) in [
+            ("FRONT_META", "--front-meta-max-entries"),
+            ("FRONT_ENDPOINTS", "--front-endpoints-max-entries"),
+        ] {
+            let hint = capacity_hint(map);
+            assert!(
+                hint.contains(map) && hint.contains(flag),
+                "a full {map} leaves fronts unrouted; the error must name {flag}, got {hint:?}"
+            );
+        }
         assert!(capacity_hint("FLOW_TABLE").is_empty());
+    }
+
+    #[test]
+    fn map_names_match_the_memory_assertion_script_expected_set() {
+        // The memory-regression gate fails on any map set it does not know.
+        // If MAP_NAMES drifts from its `expected=(...)` list, CI's memory
+        // smoke fails only after a full cluster boot instead of here.
+        let script = include_str!("../scripts/assert-ebpf-map-memory.sh");
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("expected=("))
+            .expect("assert-ebpf-map-memory.sh must declare `expected=(...)`");
+        let mut expected: Vec<&str> = line
+            .trim_start_matches("expected=(")
+            .trim_end_matches(')')
+            .split_whitespace()
+            .collect();
+        let mut actual: Vec<&str> = MAP_NAMES.to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_names_fit_the_kernel_name_limit() {
+        // The kernel truncates map names to 15 bytes; a longer name shows up
+        // truncated in `bpftool` and fails the memory assertion's exact-name
+        // match.
+        for name in MAP_NAMES {
+            assert!(name.len() <= 15, "{name} exceeds BPF_OBJ_NAME_LEN - 1");
+        }
+    }
+
+    #[test]
+    fn legacy_map_pins_are_removed_so_a_stale_layout_is_never_reused() {
+        // aya reuses whatever pin exists; a leftover LB_FRONT_MAP/TARGET_PORTS
+        // would linger and pin kernel memory after an upgrade.
+        let dir = std::env::temp_dir().join(format!("beep-legacy-pins-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("LB_FRONT_MAP"), b"").unwrap();
+        std::fs::write(dir.join("TARGET_PORTS"), b"").unwrap();
+        std::fs::write(dir.join("POD_TARGETS"), b"").unwrap();
+
+        let removed = remove_legacy_map_pins(&dir).unwrap();
+
+        assert_eq!(removed, vec!["LB_FRONT_MAP", "TARGET_PORTS"]);
+        assert!(!dir.join("LB_FRONT_MAP").exists() && !dir.join("TARGET_PORTS").exists());
+        assert!(
+            dir.join("POD_TARGETS").exists(),
+            "current pins must survive: removing them would drop live state on every restart"
+        );
+        assert!(remove_legacy_map_pins(&dir).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

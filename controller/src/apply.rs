@@ -1,33 +1,40 @@
 //! Applies a `reconcile::DesiredEntries` to the dataplane's pinned
-//! `LB_FRONT_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` maps. Opens them from their bpffs
+//! `FRONT_META`/`FRONT_ENDPOINTS`/`POD_TARGETS`/`NODE_ALLOW` maps. Opens them
+//! from their bpffs
 //! pins (`beep::attach_and_pin`'s loader already created them at load time)
 //! rather than holding an `Ebpf` handle. Also opens `FWD_PENDING`/`FLOW_TABLE`
 //! -- narrowed from "never touches" to "touches only via one targeted,
 //! per-departed-pod conntrack eviction" (`apply_pod_targets`/
 //! `beep::evict_pod_flows`): the kernel-written rows for every OTHER flow
 //! must still survive every controller reconcile untouched.
+//!
+//! The front maps are written with the generation-swap protocol of
+//! `beep::front_swap`, per front and only when its endpoint set changes: (1)
+//! delete endpoint generation `g-1`, (2) write all slots under `g+1`, (3) one
+//! `FRONT_META` update to `{g+1, count, flags}`. `FRONT_META` is a HASH map so
+//! that single update is an atomic element replace for concurrent readers;
+//! deleting a front drops its `FRONT_META` entry first, then its endpoints.
+//! Every tick also deletes endpoint generations other than current and `g-1`,
+//! which is what cleans up after a crashed predecessor on startup.
 
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-    net::Ipv4Addr,
-    path::Path,
-};
+use std::{collections::HashSet, net::Ipv4Addr, path::Path};
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
+use beep::front_swap::apply_fronts;
 use beep_common::{
-    unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, LbFrontBackend, LbFrontKey, TcpFlowKey,
+    unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
+    LbFrontKey, TcpFlowKey,
 };
 
-use crate::reconcile::{self, DesiredEntries, MapOp};
+use crate::reconcile::DesiredEntries;
 
-/// The six controller-written/-swept maps, opened once from their pins and
+/// The controller-written/-swept maps, opened once from their pins and
 /// kept open across every reconcile tick (avoids a `MapData::from_pin`
 /// syscall round trip per event).
 pub struct PinnedMaps {
-    lb_front_map: AyaHashMap<MapData, LbFrontKey, LbFrontBackend>,
-    target_ports: AyaHashMap<MapData, LbFrontKey, u16>,
+    front_meta: AyaHashMap<MapData, LbFrontKey, FrontMeta>,
+    front_endpoints: AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
     pod_targets: AyaHashMap<MapData, [u8; 16], u8>,
     node_allow: AyaHashMap<MapData, [u8; 16], u8>,
     /// Opened for the eviction sweep only (`apply_pod_targets`) -- never
@@ -57,8 +64,8 @@ fn open_hash_map<K: aya::Pod, V: aya::Pod>(
 impl PinnedMaps {
     pub fn open(pin_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
-            lb_front_map: open_hash_map(pin_dir, "LB_FRONT_MAP")?,
-            target_ports: open_hash_map(pin_dir, "TARGET_PORTS")?,
+            front_meta: open_hash_map(pin_dir, "FRONT_META")?,
+            front_endpoints: open_hash_map(pin_dir, "FRONT_ENDPOINTS")?,
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
             node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
             // Both `FWD_PENDING`/`FLOW_TABLE` are `BPF_MAP_TYPE_LRU_HASH`
@@ -75,18 +82,17 @@ impl PinnedMaps {
         })
     }
 
-    /// Diffs each map's live contents against `desired` and applies the
-    /// minimal set of writes/deletes -- an unchanged reconcile costs no
-    /// syscalls (`reconcile::diff`'s doc comment). Runs all four maps'
-    /// diffs to completion before propagating any error: a capacity failure
-    /// on LB_FRONT_MAP must never suppress the TARGET_PORTS/POD_TARGETS/
-    /// NODE_ALLOW writes for OTHER, unrelated Services in the same
-    /// reconcile tick -- a bare `?` chain here previously left every later
-    /// Service unrouted with no attempt at all.
+    /// Brings each map's live contents to `desired` with the minimal writes --
+    /// an unchanged reconcile costs only the read-back (`beep::front_swap`'s
+    /// module doc for the front maps' generation-swap order). Runs every
+    /// map to completion before propagating any error: a capacity failure
+    /// on the front maps must never suppress the POD_TARGETS/NODE_ALLOW
+    /// writes, nor one front's failure the writes of OTHER, unrelated
+    /// Services in the same reconcile tick.
     ///
-    /// Skips the LB_FRONT_MAP/TARGET_PORTS diffs entirely while
+    /// Skips the front maps entirely while
     /// `desired.fronts_known` is `false` (`DesiredEntries`'s doc comment):
-    /// diffing an empty `lb_front_map`/`target_ports` against these maps'
+    /// syncing an empty `fronts` against these maps'
     /// actual contents would delete every front, even ones a previous run
     /// already programmed and pinned -- `desired.fronts_known == false`
     /// means "not known yet", not "no fronts should exist". NODE_ALLOW runs
@@ -95,32 +101,15 @@ impl PinnedMaps {
     /// first becomes true this process, narrowing the cold-start Geneve
     /// blackout without reopening the restart-wipe window `fronts_known`
     /// exists to prevent. Skips the POD_TARGETS full-sync the same way as
-    /// LB_FRONT_MAP/TARGET_PORTS while `desired.pod_targets_known` is
+    /// the front maps while `desired.pod_targets_known` is
     /// `false` -- same reasoning, keyed on this node's own Node LIST/watch
     /// entry instead of the whole list (`DesiredEntries::pod_targets_known`'s
     /// doc comment).
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
-        let (lb_front_map_result, target_ports_result) = if desired.fronts_known {
-            (
-                apply_ops(
-                    &mut self.lb_front_map,
-                    &desired.lb_front_map,
-                    reconcile::lb_front_backend_eq,
-                    "LB_FRONT_MAP",
-                    describe_lb_front_key,
-                )
-                .context("applying LB_FRONT_MAP"),
-                apply_ops(
-                    &mut self.target_ports,
-                    &desired.target_ports,
-                    |a: &u16, b: &u16| a == b,
-                    "TARGET_PORTS",
-                    describe_lb_front_key,
-                )
-                .context("applying TARGET_PORTS"),
-            )
+        let fronts_result = if desired.fronts_known {
+            apply_front_maps(&mut self.front_meta, &mut self.front_endpoints, desired)
         } else {
-            (Ok(()), Ok(()))
+            Ok(())
         };
         self.fronts_ever_known =
             node_allow_may_delete(desired.fronts_known, self.fronts_ever_known);
@@ -142,12 +131,38 @@ impl PinnedMaps {
             Ok(())
         };
 
-        lb_front_map_result?;
-        target_ports_result?;
+        fronts_result?;
         node_allow_result?;
         pod_targets_result?;
         Ok(())
     }
+}
+
+/// Runs `beep::front_swap::apply_fronts` and turns its per-front failures
+/// into logged lines plus one loud reconcile-level error.
+fn apply_front_maps(
+    front_meta: &mut AyaHashMap<MapData, LbFrontKey, FrontMeta>,
+    front_endpoints: &mut AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
+    desired: &DesiredEntries,
+) -> anyhow::Result<()> {
+    let failures = apply_fronts(front_meta, front_endpoints, &desired.fronts, true)
+        .context("reading FRONT_META/FRONT_ENDPOINTS")?;
+    for (front, message) in &failures {
+        eprintln!(
+            "controller: front {} {message} (front left on its previous endpoints -- map may be \
+             at capacity)",
+            describe_lb_front_key(front)
+        );
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} front write(s) failed -- see per-front errors above; {} / {}",
+            failures.len(),
+            beep::capacity_hint("FRONT_META"),
+            beep::capacity_hint("FRONT_ENDPOINTS")
+        );
+    }
+    Ok(())
 }
 
 fn describe_lb_front_key(key: &LbFrontKey) -> String {
@@ -161,72 +176,11 @@ fn describe_lb_front_key(key: &LbFrontKey) -> String {
     format!("{vip}:{}/proto={}", u16::from_be(key.vip_port), key.proto)
 }
 
-/// Attempts every op against `write`, loudly logging (never silently
-/// dropping) each individual failure by name instead of aborting the rest of
-/// the diff on the first one -- a capacity failure on one entry must not
-/// leave every entry AFTER it in the same map unattempted. Returns the
-/// number of ops that failed so the caller can turn that into a loud
-/// `anyhow::Error` for the reconcile as a whole. A free function (not a
-/// method) taking `write` as a closure so this loop is testable without a
-/// real pinned bpf map (`aya::maps::HashMap` needs a live kernel fd).
-fn apply_diff_ops<K, V, E>(
-    ops: Vec<MapOp<K, V>>,
-    map_name: &str,
-    describe_key: impl Fn(&K) -> String,
-    mut write: impl FnMut(MapOp<K, V>) -> Result<(), E>,
-) -> usize
-where
-    K: Copy,
-    E: std::fmt::Display,
-{
-    let mut failed = 0;
-    for op in ops {
-        let key = match &op {
-            MapOp::Upsert(k, _) => *k,
-            MapOp::Delete(k) => *k,
-        };
-        let is_delete = matches!(op, MapOp::Delete(_));
-        if let Err(e) = write(op) {
-            failed += 1;
-            let verb = if is_delete { "delete" } else { "upsert" };
-            eprintln!(
-                "controller: {map_name} {verb} for {} failed (entry left unrouted -- map may \
-                 be at capacity): {e:#}",
-                describe_key(&key)
-            );
-        }
-    }
-    failed
-}
-
-fn apply_ops<K, V>(
-    map: &mut AyaHashMap<MapData, K, V>,
-    desired: &HashMap<K, V>,
-    values_equal: impl Fn(&V, &V) -> bool,
-    map_name: &str,
-    describe_key: impl Fn(&K) -> String,
-) -> anyhow::Result<()>
-where
-    K: aya::Pod + Eq + Hash,
-    V: aya::Pod,
-{
-    let current: HashMap<K, V> = map.iter().collect::<Result<_, _>>()?;
-    let ops = reconcile::diff(&current, desired, values_equal);
-    let failed = apply_diff_ops(ops, map_name, describe_key, |op| match op {
-        MapOp::Upsert(k, v) => map.insert(k, v, 0),
-        MapOp::Delete(k) => map.remove(&k),
-    });
-    if failed > 0 {
-        anyhow::bail!("{failed} write(s) to `{map_name}` failed -- see per-entry errors above");
-    }
-    Ok(())
-}
-
-/// `POD_TARGETS` isn't map-shaped like `LB_FRONT_MAP`/`TARGET_PORTS`
+/// `POD_TARGETS` isn't map-shaped like the front maps
 /// (`reconcile::DesiredEntries::pod_targets` is a set, not a map), so it's a
 /// full membership sync -- same prune-then-insert pattern as the loader's
 /// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
-/// Same continue-past-a-failure contract as `apply_ops` above.
+/// Continues past an individual write failure, like the front writes.
 ///
 /// Each stale (departed) pod IP also runs `beep::evict_pod_flows` against
 /// `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
@@ -391,50 +345,6 @@ fn node_allow_stale_peers(
 mod tests {
     use super::*;
     use beep_common::ipv4_mapped_v6;
-
-    #[test]
-    fn apply_diff_ops_continues_past_a_write_failure_so_later_entries_still_get_applied() {
-        // Regression test: the old code used a bare `?` per op, so ONE
-        // LB_FRONT_MAP capacity failure aborted every LATER Service's write in
-        // the same reconcile -- those Services went silently unrouted with
-        // no attempt made and no error naming them.
-        let ops = vec![
-            MapOp::Upsert(1u32, 10u8),
-            MapOp::Upsert(2u32, 20u8), // simulated capacity failure
-            MapOp::Upsert(3u32, 30u8),
-            MapOp::Delete(4u32),
-        ];
-        let mut attempted = Vec::new();
-        let failed = apply_diff_ops(
-            ops,
-            "TEST_MAP",
-            |k: &u32| k.to_string(),
-            |op| {
-                let key = match op {
-                    MapOp::Upsert(k, _) => k,
-                    MapOp::Delete(k) => k,
-                };
-                attempted.push(key);
-                if key == 2 {
-                    Err("E2BIG: map at capacity")
-                } else {
-                    Ok(())
-                }
-            },
-        );
-
-        assert_eq!(
-            attempted,
-            vec![1, 2, 3, 4],
-            "a write failure on entry 2 must not skip attempting entries 3/4 -- that's exactly \
-             how a LB_FRONT_MAP overflow silently left later Services unrouted"
-        );
-        assert_eq!(
-            failed, 1,
-            "the one simulated failure must be counted, not swallowed, so the caller can turn \
-             it into a loud reconcile-level error"
-        );
-    }
 
     #[test]
     fn node_allow_stale_peers_never_deletes_before_fronts_known_first_seen() {

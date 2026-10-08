@@ -10,7 +10,7 @@
 # Covers the failure modes PR #1568's review flagged as untested:
 #
 #   1. map-id union/dedup — a map pinned by two different progs (a real
-#      shape: LB_FRONT_MAP/CONFIG are referenced by more than one hook) must
+#      shape: FRONT_META/CONFIG are referenced by more than one hook) must
 #      appear exactly once in the tick's CSV rows, not once per prog.
 #   2. skip-on-broken-prog-pin — one prog whose pin is broken (unpinned
 #      between glob and query, or a bpftool bug) must not abort the whole
@@ -24,8 +24,8 @@
 #      data row each, never a second header line (a repeated snapshot must
 #      stay parseable by a single-header CSV reader).
 #   5. assert-ebpf-map-memory.sh — the CI gate this whole family of scripts
-#      feeds: a single-tick CSV with the exact 8 known maps passes; one that
-#      silently dropped a map (an "7 of 8 found" discovery regression) is
+#      feeds: a single-tick CSV with the exact 9 known maps passes; one that
+#      silently dropped a map (an "8 of 9 found" discovery regression) is
 #      caught, not averaged into a smaller-but-still-passing byte sum. This
 #      directly replicates PR #1568's critical-review repro (a constructed
 #      multi-tick CSV that the OLD tick-count-inference logic silently
@@ -95,9 +95,9 @@ case "$1 $2 $3" in
     ;;
   "map show id")
     case "$4" in
-      10) echo '{"name":"LB_FRONT_MAP","type":"hash","max_entries":16,"bytes_memlock":4096}' ;;
+      10) echo '{"name":"FRONT_META","type":"hash","max_entries":16,"bytes_memlock":4096}' ;;
       11) echo '{"name":"CONFIG","type":"array","max_entries":1,"bytes_memlock":512}' ;;
-      12) echo '{"name":"TARGET_PORTS","type":"hash","max_entries":32,"bytes_memlock":8192}' ;;
+      12) echo '{"name":"FRONT_ENDPOINTS","type":"hash","max_entries":32,"bytes_memlock":8192}' ;;
       *) exit 1 ;;
     esac
     ;;
@@ -197,9 +197,9 @@ RSS_HEADER_COUNT4="$(grep -c '^ts,pid,rss_kb$' "$OUT4/loader-rss.csv")"
 assert_eq "loader-rss.csv also writes its header exactly once across two once calls" "1" "$RSS_HEADER_COUNT4"
 
 # ===========================================================================
-# 5. assert-ebpf-map-memory.sh: the CI gate. A correct single-tick 8-map CSV
+# 5. assert-ebpf-map-memory.sh: the CI gate. A correct single-tick 9-map CSV
 #    passes; a single-tick CSV missing one map (the real-world shape of "map
-#    discovery silently breaks and finds 7 of 8 maps") is caught. This is
+#    discovery silently breaks and finds 8 of 9 maps") is caught. This is
 #    fix (2)'s actual mechanism: the CI job now feeds this script a FRESH,
 #    single-`once`-call CSV instead of extracting "the latest tick" out of a
 #    multi-tick file, so the ambiguity PR #1568's review found (a
@@ -212,43 +212,45 @@ assert_eq "loader-rss.csv also writes its header exactly once across two once ca
 GOOD_CSV="$TMPDIR_TEST/good.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,LB_FRONT_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
+  echo "2026-09-05T00:00:00Z,192,FRONT_ENDPOINTS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
   echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
+  echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
 } > "$GOOD_CSV"
 set +e
 bash "$ASSERT_SCRIPT" "$GOOD_CSV" >/dev/null 2>&1
 GOOD_EXIT=$?
 set -e
-assert_true "a correct single-tick CSV with all 8 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
+assert_true "a correct single-tick CSV with all 9 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
 
-# A single tick that dropped TARGET_PORTS — the actual shape an "7 of 8 maps
+# A single tick that dropped FRONT_ENDPOINTS — the actual shape an "8 of 9 maps
 # found" discovery regression produces against the fixed CI invocation.
 DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,LB_FRONT_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
   echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
   echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
+  echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
 } > "$DROPPED_CSV"
 set +e
 DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" 2>&1)"
 DROPPED_EXIT=$?
 set -e
 if [ "$DROPPED_EXIT" -ne 0 ]; then
-  echo "PASS: a single-tick CSV missing one map (7 of 8) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
+  echo "PASS: a single-tick CSV missing one map (8 of 9) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
   PASS=$(( PASS + 1 ))
 else
-  echo "FAIL: an 7-of-8-map CSV must not pass — got exit 0: $DROPPED_OUT"
+  echo "FAIL: an 8-of-9-map CSV must not pass — got exit 0: $DROPPED_OUT"
   FAIL=$(( FAIL + 1 ))
 fi
 
@@ -257,22 +259,22 @@ fi
 # design produced). assert-ebpf-map-memory.sh takes no tick-index argument
 # and applies no tick-selection heuristic at all — it treats every NR>1 row
 # as one tick's data, so this misuse shape (15 rows, name counts that can't
-# match the 8-map expected set) must still fail loudly rather than
+# match the 9-map expected set) must still fail loudly rather than
 # reproduce the old silent-blend bug.
 LEGACY_8_THEN_7_CSV="$TMPDIR_TEST/legacy-8-then-7.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,LB_FRONT_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,16,4096"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:00Z,192,TARGET_PORTS,hash,32,4096"
+  echo "2026-09-05T00:00:00Z,192,FRONT_ENDPOINTS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
   echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
-  echo "2026-09-05T00:00:01Z,189,LB_FRONT_MAP,hash,16,4096"
+  echo "2026-09-05T00:00:01Z,189,FRONT_META,hash,16,4096"
   echo "2026-09-05T00:00:01Z,190,CONFIG,array,1,512"
   echo "2026-09-05T00:00:01Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:01Z,192,TARGET_PORTS,hash,32,4096"
+  echo "2026-09-05T00:00:01Z,192,FRONT_ENDPOINTS,hash,32,4096"
   echo "2026-09-05T00:00:01Z,193,FWD_PENDING,hash,64,4096"
   echo "2026-09-05T00:00:01Z,195,POD_TARGETS,hash,32,4096"
 } > "$LEGACY_8_THEN_7_CSV"

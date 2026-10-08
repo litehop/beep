@@ -1,5 +1,5 @@
 //! Pure (Service, EndpointSlices, NodeContext) -> desired-map-entries
-//! reconciliation, plus a pure map diff. No I/O, no k8s client, no aya --
+//! reconciliation. No I/O, no k8s client, no aya --
 //! `ServiceView`/`EndpointSliceView` are plain parsed views the eventual
 //! watch layer fills in from real API objects. Kept pure so a wrong
 //! map-population decision (stale entry, missed update, wrong backend) is
@@ -7,11 +7,11 @@
 //! silent misrouting against a live cluster.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use beep::front_swap::DesiredFront;
 use beep::{tunnel_remote_v6, wire_ip_v6};
-use beep_common::{wire_port, LbFrontBackend, LbFrontKey};
+use beep_common::{wire_port, FrontEndpoint, LbFrontBackend, LbFrontKey};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -179,12 +179,9 @@ pub struct NodeContext {
 }
 
 /// One `Service.spec.ports[]` entry: `port` is the VIP-facing front port,
-/// `target_port` the numeric container port. `TARGET_PORTS` (`beep-common`)
-/// keys on the front tuple alone, so this dataplane assumes one numeric
-/// target port per front regardless of which backend answers it -- a
-/// container-port-by-name Service would need to be resolved to a number
-/// before reaching this type, same as `beep-ebpf`'s existing map shape
-/// requires.
+/// `target_port` the numeric container port, stored on the front's endpoint
+/// (`FrontEndpoint::target_port`). A container-port-by-name Service must be
+/// resolved to a number before reaching this type.
 #[derive(Clone, Copy, Debug)]
 pub struct ServicePort {
     pub port: u16,
@@ -244,14 +241,14 @@ pub struct RejectedEndpoint {
     pub reason: &'static str,
 }
 
-/// Desired `LB_FRONT_MAP`/`TARGET_PORTS`/`POD_TARGETS`/`NODE_ALLOW` contents for
-/// one Service, keyed exactly like the maps themselves so `diff` can compare
-/// this against a previous reconcile's output (or the maps' actual current
-/// contents) with no extra translation.
+/// Desired `FRONT_META`/`FRONT_ENDPOINTS`/`POD_TARGETS`/`NODE_ALLOW` contents
+/// for one Service, keyed exactly like the maps themselves.
 #[derive(Default)]
 pub struct DesiredEntries {
-    pub lb_front_map: HashMap<LbFrontKey, LbFrontBackend>,
-    pub target_ports: HashMap<LbFrontKey, u16>,
+    /// Per front: the endpoint set (`FRONT_ENDPOINTS` slots) and `FRONT_META`
+    /// flags. `PinnedMaps::apply` turns this into generation-swap writes
+    /// (`beep::front_swap`).
+    pub fronts: HashMap<LbFrontKey, DesiredFront>,
     pub pod_targets: HashSet<[u8; 16]>,
     /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
     /// `tunnel_remote_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
@@ -259,12 +256,12 @@ pub struct DesiredEntries {
     /// backend_node_ip` uses, since `beep-ebpf`'s `geneve_ingress` checks
     /// this set against `tkey.remote_ipv4`, a kernel-tunnel-key field the
     /// kernel itself converts host<->network internally, never a raw wire
-    /// byte load (`beep-ebpf`'s module doc). Same source as `lb_front_map`/
-    /// `target_ports`'s per-Service front-IP loop (`WatchState::desired`'s
+    /// byte load (`beep-ebpf`'s module doc). Same source as `fronts`'s
+    /// per-Service front-IP loop (`WatchState::desired`'s
     /// `front_ips`), NOT the narrower `pod_targets_known` the
     /// pre-existing `try_geneve_decap_forward` admission check (POD_TARGETS)
     /// alone used to bound: `node_allow`'s content is the WHOLE known-node
-    /// set (like `lb_front_map`/`target_ports`), not this node's own entry alone
+    /// set (like `fronts`), not this node's own entry alone
     /// (like `pod_targets`), so a restart's partially-caught-up `node_ips`
     /// must never DELETE already-pinned peer entries before the full Node
     /// LIST (`fronts_known` below) is known-complete. `PinnedMaps::
@@ -279,11 +276,11 @@ pub struct DesiredEntries {
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
     /// nothing here changes `pod_targets` itself.
     pub rejected: Vec<RejectedEndpoint>,
-    /// Whether `lb_front_map`/`target_ports`/`node_allow` were computed from a
+    /// Whether `fronts`/`node_allow` were computed from a
     /// fully-known node set. `WatchState::desired` (the only real producer
     /// of an aggregate `DesiredEntries`) sets this to `false` while the
     /// initial Node LIST hasn't completed yet, so `PinnedMaps::apply` knows
-    /// an empty `lb_front_map`/`target_ports` here means "node set not known
+    /// an empty `fronts` here means "node set not known
     /// yet", not "no fronts should exist" -- diffing against the latter
     /// would delete every already-programmed front that survived a
     /// controller restart. `node_allow` is upserted every tick regardless
@@ -305,6 +302,32 @@ pub struct DesiredEntries {
     pub pod_targets_known: bool,
 }
 
+#[cfg(test)]
+impl DesiredEntries {
+    /// Slot-0 backend per front (every front has exactly one endpoint today).
+    pub(crate) fn backends(&self) -> HashMap<LbFrontKey, LbFrontBackend> {
+        self.fronts
+            .iter()
+            .map(|(k, f)| {
+                assert_eq!(
+                    f.endpoints.len(),
+                    1,
+                    "count is 1 until multi-endpoint lands"
+                );
+                (*k, f.endpoints[0].backend)
+            })
+            .collect()
+    }
+
+    /// Slot-0 wire-order target port per front.
+    pub(crate) fn target_ports(&self) -> HashMap<LbFrontKey, u16> {
+        self.fronts
+            .iter()
+            .map(|(k, f)| (*k, f.endpoints[0].target_port))
+            .collect()
+    }
+}
+
 fn front_key(vip_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
     LbFrontKey {
         vip_ip: wire_ip_v6(vip_ip),
@@ -318,8 +341,9 @@ fn front_key(vip_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
 /// and `rejected_endpoints_for_node`: an endpoint is admitted if its pod_ip
 /// is in this node's pod_cidr OR it carries the hostNetwork signature
 /// (pod_ip is one of the endpoint's own node's addresses, in any family --
-/// not `ep.node_ip`, which is coerced to the reconciling node's family). In bare metal (no cloud LB, no BGP -- beep fronts
-/// the node's physical IP) a hostNetwork pod's IP IS the node IP, so
+/// not `ep.node_ip`, which is coerced to the reconciling node's family). In
+/// bare metal (no cloud LB, no BGP -- beep fronts the node's physical IP) a
+/// hostNetwork pod's IP IS the node IP, so
 /// without the second disjunct a Service backed by a hostNetwork pod would
 /// be silently excluded and every forward packet dropped at decap
 /// admission. Guarding which control-plane ports (6443/10250/2379/...) may
@@ -337,7 +361,7 @@ fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
 /// membership must never depend on which front port an endpoint answers,
 /// only on whether THIS node hosts it and is ready to serve it. Deliberately
 /// independent of `ServiceView` (no `vip_ip`/`ports` input): unlike
-/// `LB_FRONT_MAP`/`TARGET_PORTS`, POD_TARGETS is EndpointSlice/local-node-derived,
+/// `FRONT_META`/`FRONT_ENDPOINTS`, POD_TARGETS is EndpointSlice/local-node-derived,
 /// not front-derived, so `WatchState::desired` can (and must) call this even
 /// while the front set is still unknown (`nodes_listed == false`) -- see its
 /// call site's comment for the restart-blackhole this independence avoids.
@@ -397,12 +421,12 @@ pub fn reconcile_service(
     desired.pod_targets = pod_targets_for_node(slices, node);
     desired.rejected = rejected_endpoints_for_node(slices, node);
 
-    // LB_FRONT_MAP/TARGET_PORTS are NOT node-scoped (any node can be ingress for
-    // any VIP, mirroring the loader's fixture population), so backend
-    // candidates are drawn from every endpoint across every slice --
-    // regardless of which node hosts them -- not just this node's own. Only
-    // endpoints of the front's own address family qualify: the Geneve inner
-    // packet keeps the client's family, so a cross-family pod can never answer.
+    // Fronts are NOT node-scoped (any node can be ingress for any front,
+    // mirroring the loader's fixture population), so backend candidates are
+    // drawn from every endpoint across every slice -- regardless of which
+    // node hosts them -- not just this node's own. Only endpoints of the
+    // front's own address family qualify: the Geneve inner packet keeps the
+    // client's family, so a cross-family pod can never answer.
     for port in &svc.ports {
         let mut candidates: Vec<&Endpoint> = endpoints
             .iter()
@@ -413,92 +437,61 @@ pub fn reconcile_service(
                     && e.pod_ip.is_ipv4() == svc.vip_ip.is_ipv4()
             })
             .collect();
-        // Decision #5 (single backend per front): today's LB_FRONT_MAP schema
-        // holds exactly one backend per front, so pick deterministically --
+        // One endpoint per front (slot 0) for now: pick deterministically --
         // lowest pod IP -- rather than arbitrarily (e.g. HashMap iteration
         // order), so two reconciles over the same input always agree and a
-        // fixture-driven test can assert a specific outcome. This is a
-        // placeholder for real multi-endpoint selection, tracked separately;
-        // it does not attempt to spread load across endpoints.
+        // fixture-driven test can assert a specific outcome. It does not
+        // spread load across endpoints.
         candidates.sort_by_key(|e| e.pod_ip);
         let Some(backend) = candidates.first() else {
             continue;
         };
 
-        let key = front_key(svc.vip_ip, port);
-        desired.lb_front_map.insert(
-            key,
-            LbFrontBackend {
-                // Host-native, not wire_ip: the kernel's own
-                // bpf_tunnel_key.remote_ipv4 set/get converts this field
-                // itself (`src/main.rs`'s `populate_fixtures` comment) --
-                // `tunnel_remote_v6` is that convention's dual-stack widening
-                // (`src/lib.rs`).
-                backend_node_ip: tunnel_remote_v6(backend.node_ip),
-                pod_ip: wire_ip_v6(backend.pod_ip),
+        desired.fronts.insert(
+            front_key(svc.vip_ip, port),
+            DesiredFront {
+                flags: 0,
+                endpoints: vec![FrontEndpoint {
+                    backend: LbFrontBackend {
+                        // Host-native, not wire_ip: the kernel's own
+                        // bpf_tunnel_key.remote_ipv4 set/get converts this
+                        // field itself (`src/main.rs`'s `fixture_fronts`
+                        // comment) -- `tunnel_remote_v6` is that
+                        // convention's dual-stack widening (`src/lib.rs`).
+                        backend_node_ip: tunnel_remote_v6(backend.node_ip),
+                        pod_ip: wire_ip_v6(backend.pod_ip),
+                    },
+                    target_port: wire_port(port.target_port),
+                    _pad: [0; 6],
+                }],
             },
         );
-        desired
-            .target_ports
-            .insert(key, wire_port(port.target_port));
     }
 
     desired
 }
 
-/// A single map mutation `diff` decides is needed to move `current` to
-/// `desired`. Left generic over `K`/`V` so the same logic serves `LB_FRONT_MAP`
-/// (`LbFrontKey` -> `LbFrontBackend`), `TARGET_PORTS` (`LbFrontKey` -> `u16`), and any
-/// `HashMap`-shaped map this dataplane grows later.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MapOp<K, V> {
-    Upsert(K, V),
-    Delete(K),
-}
-
-/// Diffs `current` (a map's actual live contents) against `desired` (a fresh
-/// `reconcile_service` result) into the minimal set of writes/deletes that
-/// gets `current` to match `desired` -- an unchanged entry produces no op,
-/// so a reconcile tick that changes nothing costs no syscalls once a caller
-/// applies these.
-///
-/// Takes an explicit `values_equal` closure rather than requiring
-/// `V: PartialEq`: `LbFrontBackend` (`LB_FRONT_MAP`'s value type) doesn't implement
-/// it, and adding it is a `beep-common` type-definition change out of this
-/// crate's scope -- pinning `diff` to that bound would make it unusable for
-/// the very map this reconciliation exists to keep correct. See
-/// `lb_front_backend_eq` for `LB_FRONT_MAP`'s comparison; plain types (`u16`, `u8`,
-/// ...) can pass `|a, b| a == b`.
-pub fn diff<K, V>(
-    current: &HashMap<K, V>,
-    desired: &HashMap<K, V>,
-    values_equal: impl Fn(&V, &V) -> bool,
-) -> Vec<MapOp<K, V>>
-where
-    K: Hash + Eq + Clone,
-    V: Clone,
-{
-    let mut ops = Vec::new();
-    for (k, v) in desired {
-        let unchanged = current
-            .get(k)
-            .is_some_and(|existing| values_equal(existing, v));
-        if !unchanged {
-            ops.push(MapOp::Upsert(k.clone(), v.clone()));
-        }
-    }
-    for k in current.keys() {
-        if !desired.contains_key(k) {
-            ops.push(MapOp::Delete(k.clone()));
-        }
-    }
-    ops
-}
-
-/// `LbFrontBackend` equality for `diff`'s `values_equal` closure -- field-wise,
-/// since the type itself doesn't derive `PartialEq` (see `diff`'s doc).
-pub fn lb_front_backend_eq(a: &LbFrontBackend, b: &LbFrontBackend) -> bool {
-    a.backend_node_ip == b.backend_node_ip && a.pod_ip == b.pod_ip
+/// The service ports `reconcile_service` left without a front because no
+/// ready endpoint of the front's own address family serves them, while ready
+/// endpoints of the OTHER family do: a v6 front with only v4 pods (or the
+/// reverse) is a misconfiguration worth naming, unlike a Service that simply
+/// has no ready endpoints yet.
+pub fn ports_without_same_family_endpoint(
+    svc: &ServiceView,
+    slices: &[EndpointSliceView],
+) -> Vec<ServicePort> {
+    let serving = |port: &ServicePort, same_family: bool| {
+        slices.iter().flat_map(|s| s.endpoints.iter()).any(|e| {
+            e.ready
+                && e.ports.contains(&port.target_port)
+                && (e.pod_ip.is_ipv4() == svc.vip_ip.is_ipv4()) == same_family
+        })
+    };
+    svc.ports
+        .iter()
+        .filter(|p| !serving(p, true) && serving(p, false))
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]
@@ -568,7 +561,7 @@ mod tests {
 
     // A conntrack keying bug corrupts routing silently instead of failing
     // loudly (beep-common's own module doc), so the exact wire bytes this
-    // reconcile fn hands to LB_FRONT_MAP/TARGET_PORTS are pinned here the same
+    // reconcile fn hands to FRONT_META/FRONT_ENDPOINTS are pinned here the same
     // way beep-common pins `wire_ip`/`wire_port` themselves.
     #[test]
     fn reconcile_wire_encodes_addresses_exactly_like_the_loader() {
@@ -585,11 +578,11 @@ mod tests {
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
         assert_eq!(
-            desired.lb_front_map.len(),
+            desired.fronts.len(),
             1,
-            "exactly one front port was configured, so exactly one LB_FRONT_MAP entry is expected"
+            "exactly one front port was configured, so exactly one front is expected"
         );
-        let (key, backend) = desired.lb_front_map.iter().next().unwrap();
+        let (key, backend) = desired.backends().into_iter().next().unwrap();
         let vip_wire = unmap_ipv4(&key.vip_ip)
             .expect("a v4 VIP stored via ipv4_mapped_v6 must unmap back to a wire value");
         assert_eq!(
@@ -622,8 +615,9 @@ mod tests {
              double-flip the byte order and misdirect the Geneve tunnel"
         );
         let target_port = desired
-            .target_ports
-            .get(key)
+            .target_ports()
+            .get(&key)
+            .copied()
             .expect("target port must be recorded");
         assert_eq!(
             target_port.to_le_bytes(),
@@ -632,12 +626,41 @@ mod tests {
         );
     }
 
-    // "add": a Service's first-ever reconcile, diffed against an empty
-    // (never-before-populated) map -- this is what a freshly created
-    // type=LoadBalancer Service must produce, or new Services silently never
-    // get routed to.
+    fn plan_for(
+        current: &DesiredEntries,
+        next: &DesiredEntries,
+    ) -> Vec<beep::front_swap::FrontPlan> {
+        // Replays `current` through the planner into an in-memory pair of
+        // maps, then plans `next` against them -- the same read-back-and-plan
+        // loop `PinnedMaps::apply` runs against the pinned maps.
+        let mut meta = HashMap::new();
+        let mut endpoints = HashMap::new();
+        for plan in beep::front_swap::plan_front_writes(&meta, &endpoints, &current.fronts, true) {
+            for step in plan.steps {
+                match step {
+                    beep::front_swap::FrontWrite::PutEndpoint(k, v) => {
+                        endpoints.insert(k, v);
+                    }
+                    beep::front_swap::FrontWrite::PutMeta(k, v) => {
+                        meta.insert(k, v);
+                    }
+                    beep::front_swap::FrontWrite::DeleteEndpoint(k) => {
+                        endpoints.remove(&k);
+                    }
+                    beep::front_swap::FrontWrite::DeleteMeta(k) => {
+                        meta.remove(&k);
+                    }
+                }
+            }
+        }
+        beep::front_swap::plan_front_writes(&meta, &endpoints, &next.fronts, true)
+    }
+
+    // A Service's first-ever reconcile against empty maps: this is what a
+    // freshly created type=LoadBalancer Service must produce, or new
+    // Services silently never get routed to.
     #[test]
-    fn new_service_diffs_to_upsert_ops_against_an_empty_map() {
+    fn new_service_programs_one_endpoint_and_publishes_meta_with_count_one() {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         let slices = vec![EndpointSliceView {
@@ -649,23 +672,26 @@ mod tests {
         }];
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
-        let ops = diff(&HashMap::new(), &desired.target_ports, |a, b| a == b);
-        assert_eq!(
-            ops.len(),
-            1,
-            "a brand-new front must produce exactly one TARGET_PORTS write"
+        let plans = plan_for(&DesiredEntries::default(), &desired);
+
+        assert_eq!(plans.len(), 1, "one new front is one plan");
+        let steps = &plans[0].steps;
+        assert!(
+            matches!(&steps[0], beep::front_swap::FrontWrite::PutEndpoint(k, ep)
+                if k.slot == 0 && ep.target_port == wire_port(8080)),
+            "a new Service must write its slot-0 endpoint with the wire-order target port"
         );
         assert!(
-            matches!(&ops[0], MapOp::Upsert(_, port) if *port == wire_port(8080)),
-            "a new Service's first reconcile must upsert its target port, not skip it"
+            matches!(&steps[1], beep::front_swap::FrontWrite::PutMeta(_, m) if m.count == 1),
+            "FRONT_META is published last, with exactly one endpoint"
         );
     }
 
-    // "update": the resolved backend changes (e.g. a rolling deploy replaces
-    // the previously-picked pod) -- the SAME front key must get an Upsert to
-    // the new backend, not silently keep pointing at the old (now-gone) pod.
+    // The resolved backend changes (e.g. a rolling deploy replaces the
+    // previously-picked pod) -- the SAME front must move to the new backend
+    // through a new generation, not keep pointing at the old (now-gone) pod.
     #[test]
-    fn backend_change_diffs_to_an_upsert_with_the_new_backend() {
+    fn backend_change_swaps_the_front_to_a_new_generation_with_the_new_backend() {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         let before = reconcile_service(
@@ -695,37 +721,35 @@ mod tests {
             &node(node_ip),
         );
 
-        let ops = diff(
-            &before.lb_front_map,
-            &after.lb_front_map,
-            lb_front_backend_eq,
-        );
+        let plans = plan_for(&before, &after);
+
+        assert_eq!(plans.len(), 1);
+        let steps = &plans[0].steps;
+        let new_endpoint = steps
+            .iter()
+            .find_map(|s| match s {
+                beep::front_swap::FrontWrite::PutEndpoint(k, ep) if k.generation == 2 => Some(ep),
+                _ => None,
+            })
+            .expect("the replacement must be written under the next generation");
         assert_eq!(
-            ops.len(),
-            1,
-            "the front key is unchanged, so this must be a single Upsert, not a Delete+Upsert \
-             pair -- a stale LB_FRONT_MAP entry between the two would blackhole traffic"
+            unmap_ipv4(&new_endpoint.backend.backend_node_ip),
+            Some(u32::from(other_node_ip)),
+            "the swap must point at the NEW backend's node, or traffic keeps going to the pod \
+             that no longer exists"
         );
-        match &ops[0] {
-            MapOp::Upsert(_, backend) => {
-                assert_eq!(
-                    unmap_ipv4(&backend.backend_node_ip),
-                    Some(u32::from(other_node_ip)),
-                    "the diff must point at the NEW backend's node, or traffic keeps going to \
-                     the pod that no longer exists"
-                );
-            }
-            MapOp::Delete(_) => panic!("backend replacement must upsert, not delete, the front"),
-        }
+        let Some(beep::front_swap::FrontWrite::PutMeta(_, meta)) = steps.last() else {
+            panic!("the meta flip must be the commit point and come last; got {steps:?}");
+        };
+        assert_eq!((meta.generation, meta.count), (2, 1));
     }
 
-    // "delete (Service gone)": once a Service is removed, the caller diffs
-    // its last-known desired map against an empty one. A stale LB_FRONT_MAP/
-    // TARGET_PORTS entry surviving Service deletion would keep routing
-    // client traffic at a backend that's since been reassigned to something
-    // else entirely.
+    // Once a Service is removed, its last-known desired set is replaced by
+    // an empty one. A stale front surviving Service deletion would keep
+    // routing client traffic at a backend that's since been reassigned to
+    // something else entirely.
     #[test]
-    fn removed_service_diffs_to_delete_ops_for_every_front() {
+    fn removed_service_deletes_its_meta_before_its_endpoints() {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         let desired = reconcile_service(
@@ -740,25 +764,25 @@ mod tests {
             &node(node_ip),
         );
 
-        let vip_ops = diff(&desired.lb_front_map, &HashMap::new(), lb_front_backend_eq);
-        assert_eq!(vip_ops.len(), 1);
-        assert!(
-            matches!(&vip_ops[0], MapOp::Delete(_)),
-            "a removed Service's front must be deleted from LB_FRONT_MAP, not left resolving to a \
-             now-meaningless backend"
-        );
+        let plans = plan_for(&desired, &DesiredEntries::default());
 
-        let port_ops = diff(&desired.target_ports, &HashMap::new(), |a, b| a == b);
-        assert_eq!(port_ops.len(), 1);
+        assert_eq!(plans.len(), 1);
         assert!(
-            matches!(&port_ops[0], MapOp::Delete(_)),
-            "the matching TARGET_PORTS entry must be deleted too, or a future front reusing \
-             this VIP:port would inherit a stale target port"
+            matches!(
+                plans[0].steps.as_slice(),
+                [
+                    beep::front_swap::FrontWrite::DeleteMeta(_),
+                    beep::front_swap::FrontWrite::DeleteEndpoint(_)
+                ]
+            ),
+            "a removed Service's front must stop resolving (meta first) before its endpoint \
+             disappears; got {:?}",
+            plans[0].steps
         );
     }
 
     // A multi-port Service (e.g. HTTP + metrics on one Pod) must resolve
-    // each exposed port independently -- collapsing to one LB_FRONT_MAP entry
+    // each exposed port independently -- collapsing to one front
     // would silently drop routing for every port after the first.
     #[test]
     fn multi_port_service_gets_one_front_per_port_from_the_same_pod() {
@@ -786,13 +810,13 @@ mod tests {
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
         assert_eq!(
-            desired.lb_front_map.len(),
+            desired.fronts.len(),
             2,
-            "each Service port must resolve to its own LB_FRONT_MAP entry, not one that shadows \
+            "each Service port must resolve to its own front, not one that shadows \
              the other"
         );
-        assert_eq!(desired.target_ports.len(), 2);
-        for backend in desired.lb_front_map.values() {
+        assert_eq!(desired.fronts.len(), 2);
+        for backend in desired.backends().into_values() {
             assert_eq!(
                 unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
                 [10, 244, 0, 9],
@@ -830,7 +854,7 @@ mod tests {
 
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
-        let (_, backend) = desired.lb_front_map.iter().next().unwrap();
+        let (_, backend) = desired.backends().into_iter().next().unwrap();
         assert_eq!(
             unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
             [10, 244, 0, 2],
@@ -910,7 +934,7 @@ mod tests {
     // by construction. Before this fix that meant a hostNetwork Service
     // backend was silently excluded from POD_TARGETS on every node, and its
     // forward packets were dropped at decap admission -- reverting the
-    // `|| ep.pod_ip == ep.node_ip` relaxation reintroduces that black hole.
+    // `|| ep.node_addrs.contains(&ep.pod_ip)` relaxation reintroduces that black hole.
     #[test]
     fn hostnetwork_endpoint_with_pod_ip_equal_to_node_ip_is_admitted_into_pod_targets() {
         let this_node = Ipv4Addr::new(10, 0, 0, 5);
@@ -1033,11 +1057,11 @@ mod tests {
         let desired = reconcile_service(&svc, &slices, &node);
 
         assert_eq!(
-            desired.lb_front_map.len(),
+            desired.fronts.len(),
             1,
-            "exactly one front port was configured, so exactly one LB_FRONT_MAP entry is expected"
+            "exactly one front port was configured, so exactly one front is expected"
         );
-        let (key, backend) = desired.lb_front_map.iter().next().unwrap();
+        let (key, backend) = desired.backends().into_iter().next().unwrap();
         assert_eq!(
             key.vip_ip,
             vip_ip.octets(),
@@ -1134,7 +1158,7 @@ mod tests {
     }
 
     // A Service scaled to zero, or mid-rollout with no ready pods yet, must
-    // not resolve to a stale backend -- LB_FRONT_MAP keeping a PREVIOUS entry
+    // not resolve to a stale backend -- FRONT_META keeping a PREVIOUS entry
     // here would misroute client traffic to a pod that's no longer healthy.
     #[test]
     fn service_with_no_ready_endpoints_produces_no_entries() {
@@ -1149,11 +1173,11 @@ mod tests {
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
         assert!(
-            desired.lb_front_map.is_empty(),
-            "no ready endpoint exists, so LB_FRONT_MAP must get no entry for this front -- \
+            desired.fronts.is_empty(),
+            "no ready endpoint exists, so FRONT_META must get no entry for this front -- \
              fabricating one would route to an unready pod"
         );
-        assert!(desired.target_ports.is_empty());
+        assert!(desired.fronts.is_empty());
         assert!(desired.pod_targets.is_empty());
     }
 
@@ -1182,8 +1206,16 @@ mod tests {
         let d4 = reconcile_service(&v4_front, &slices, &node_ctx);
         let d6 = reconcile_service(&v6_front, &slices, &node_ctx);
 
-        let b4 = d4.lb_front_map.values().next().expect("v4 front backend");
-        let b6 = d6.lb_front_map.values().next().expect("v6 front backend");
+        let b4 = d4
+            .backends()
+            .into_values()
+            .next()
+            .expect("v4 front backend");
+        let b6 = d6
+            .backends()
+            .into_values()
+            .next()
+            .expect("v6 front backend");
         assert_eq!(
             b4.pod_ip,
             wire_ip_v6(IpAddr::V4(v4_pod)),
@@ -1211,39 +1243,59 @@ mod tests {
         let desired = reconcile_service(&v6_front, &slices, &node(node_v4));
 
         assert!(
-            desired.lb_front_map.is_empty() && desired.target_ports.is_empty(),
+            desired.fronts.is_empty(),
             "a v6 front with no v6 endpoint must fail closed; a cross-family backend would \
              silently time out every v6 client"
         );
+        assert_eq!(
+            ports_without_same_family_endpoint(&v6_front, &slices).len(),
+            1,
+            "this front is unprogrammed because of a family mismatch, so the caller must be \
+             told to WARN -- otherwise a v6 front silently never routes"
+        );
     }
 
-    // diff() is the exact machinery translating two successive reconcile
-    // passes into the actual map writes/deletes Phase B applies -- a bug
-    // here (missing a delete, or reissuing an unchanged upsert) either
-    // leaves stale routes alive or wastes a syscall on every reconcile tick.
     #[test]
-    fn diff_upserts_added_and_changed_entries_deletes_removed_ones_and_skips_unchanged() {
-        let mut current = HashMap::new();
-        current.insert(1u32, 10u8); // unchanged below
-        current.insert(2u32, 20u8); // changed below
-        current.insert(3u32, 30u8); // removed below
+    fn a_front_with_no_ready_endpoints_at_all_is_not_reported_as_a_family_mismatch() {
+        // A Service still rolling out has no endpoints in either family; a
+        // WARN there would fire on every normal deploy and bury the real one.
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView { endpoints: vec![] }];
 
-        let mut desired = HashMap::new();
-        desired.insert(1u32, 10u8); // unchanged
-        desired.insert(2u32, 99u8); // changed value
-        desired.insert(4u32, 40u8); // newly added
+        assert!(ports_without_same_family_endpoint(&svc, &slices).is_empty());
+    }
 
-        let mut ops = diff(&current, &desired, |a, b| a == b);
-        ops.sort_by_key(|op| match op {
-            MapOp::Upsert(k, _) => (*k, 0),
-            MapOp::Delete(k) => (*k, 1),
-        });
+    #[test]
+    fn dual_stack_fronts_each_get_one_endpoint_with_their_own_target_port() {
+        // Both families of one Service programmed from one slice set: each
+        // front must carry exactly one endpoint of its own family and the
+        // resolved wire-order target port.
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6: Ipv6Addr = "fd00::5".parse().unwrap();
+        let v4_pod = Ipv4Addr::new(10, 244, 0, 9);
+        let v6_pod: Ipv6Addr = "fd00:244::9".parse().unwrap();
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                ready_endpoint(v4_pod, node_v4, vec![8080]),
+                ready_endpoint_v6(v6_pod, node_v6, vec![8080]),
+            ],
+        }];
+        let v4_front = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let v6_front = single_port_service_v6("fd00:beef::1".parse().unwrap(), 80, 8080);
 
-        assert_eq!(
-            ops,
-            vec![MapOp::Upsert(2, 99), MapOp::Delete(3), MapOp::Upsert(4, 40),],
-            "key 1 is unchanged and must produce no op; key 2 changed value and must upsert; \
-             key 3 is gone and must delete; key 4 is new and must upsert"
-        );
+        for (front, expected_pod) in [
+            (&v4_front, IpAddr::V4(v4_pod)),
+            (&v6_front, IpAddr::V6(v6_pod)),
+        ] {
+            let desired = reconcile_service(front, &slices, &node(node_v4));
+            let f = desired.fronts.values().next().expect("one front");
+            assert_eq!(
+                f.endpoints.len(),
+                1,
+                "count must be 1 until selection exists"
+            );
+            assert_eq!(f.endpoints[0].target_port, wire_port(8080));
+            assert_eq!(f.endpoints[0].backend.pod_ip, wire_ip_v6(expected_pod));
+        }
     }
 }

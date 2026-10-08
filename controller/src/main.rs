@@ -3,7 +3,7 @@
 //! Loads, attaches, and pins the three tc-bpf classifiers via the `beep`
 //! lib (the same load/attach/pin invariants the standalone loader uses),
 //! sets `CONFIG`, then watches `Service`(type=LoadBalancer)/`EndpointSlice`/
-//! `Node` and programs `LB_FRONT_MAP`/`TARGET_PORTS`/`POD_TARGETS` on every
+//! `Node` and programs `FRONT_META`/`FRONT_ENDPOINTS`/`POD_TARGETS` on every
 //! change. No persistent proxy loop -- the kernel forwards packets; this
 //! process idles between watch events.
 
@@ -18,7 +18,8 @@ use anyhow::Context;
 use aya::programs::TcAttachType;
 use beep::{
     attach_and_pin, bump_memlock_rlimit, disable_rp_filter, ensure_geneve_iface, load_ebpf,
-    populate_config, populate_uplink_config, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
+    populate_config, populate_uplink_config, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
+    DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
     DEFAULT_POD_TARGETS_MAX_ENTRIES,
 };
 use beep_controller::{
@@ -41,11 +42,6 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
-/// See `src/main.rs`'s identical constants: `LB_FRONT_MAP`/`TARGET_PORTS` scale
-/// with nodes x Service ports under the every-node-is-a-front model, not a
-/// fixed Service count.
-const DEFAULT_LB_FRONT_MAP_MAX_ENTRIES: u32 = 4096;
-const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -110,13 +106,13 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
 
-    /// `LB_FRONT_MAP` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_LB_FRONT_MAP_MAX_ENTRIES)]
-    lb_front_map_max_entries: u32,
+    /// `FRONT_META` max_entries (see `beep-ebpf`'s doc comment).
+    #[arg(long, default_value_t = DEFAULT_FRONT_META_MAX_ENTRIES)]
+    front_meta_max_entries: u32,
 
-    /// `TARGET_PORTS` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
-    target_ports_max_entries: u32,
+    /// `FRONT_ENDPOINTS` max_entries (see `beep-ebpf`'s doc comment).
+    #[arg(long, default_value_t = DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES)]
+    front_endpoints_max_entries: u32,
 
     /// `NODE_ALLOW` max_entries: one entry per node underlay address, so a
     /// dual-stack node costs two (see `beep-ebpf`'s doc comment).
@@ -379,8 +375,8 @@ async fn main() -> anyhow::Result<()> {
         &args.pin_dir,
         args.fwd_pending_max_entries,
         args.flow_table_max_entries,
-        args.lb_front_map_max_entries,
-        args.target_ports_max_entries,
+        args.front_meta_max_entries,
+        args.front_endpoints_max_entries,
         args.node_allow_max_entries,
         args.pod_targets_max_entries,
     )

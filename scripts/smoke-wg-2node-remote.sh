@@ -353,7 +353,7 @@ start_loader() {
   # `src/main.rs`'s `Vec<Fixture>`/`Vec<String>`): collected into arrays
   # here too, not scalars, or a 2nd occurrence would silently overwrite the
   # 1st instead of adding a 2nd front/uplink (confirmed empirically: a
-  # dual-stack fixture set's v4 entry vanished from LB_FRONT_MAP with a
+  # dual-stack fixture set's v4 entry vanished from FRONT_META with a
   # scalar `fixture=`, since only the last `--fixture` given ever
   # survived -- the same failure mode bit a dual-stack (v4+v6 tunnel)
   # `--uplink-iface` pair here, silently dropping the v4 uplink's own
@@ -570,8 +570,8 @@ flow_table_count() {
 # never set up on THIS node just adds "Cannot open network namespace"
 # noise to that script's own failure dumps.
 dump_evidence() {
-  echo "== bpftool map dump: LB_FRONT_MAP =="
-  bpftool map dump pinned "$PIN_DIR/LB_FRONT_MAP" 2>&1 || true
+  echo "== bpftool map dump: FRONT_META =="
+  bpftool map dump pinned "$PIN_DIR/FRONT_META" 2>&1 || true
   echo "== bpftool map dump: FWD_PENDING =="
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
   echo "== bpftool map dump: FLOW_TABLE =="

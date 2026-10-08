@@ -152,7 +152,7 @@ bounded_run() { # bounded_run <seconds> <cmd...> -- runs cmd with the caller's s
   wait "$bg_pid"
 }
 
-k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR. Every call is bounded to ${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}s; a call that times out prints a loud EVIDENCE TIMEOUT line and the dump continues, so a wedged node yields partial evidence rather than a hang.
+k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL path: bpftool dumps of FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/FLOW_TABLE, eth0/geneve0 link stats and dmesg tail on both nodes, then the controller pod's describe (Events, e.g. scheduling/OOM/image-pull) and current+previous logs via the caller's kube() and CONTROLLER_SELECTOR. Every call is bounded to ${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}s; a call that times out prints a loud EVIDENCE TIMEOUT line and the dump continues, so a wedged node yields partial evidence rather than a hang.
   local vm_a="$1" vm_b="$2" pin_dir="$3" limit="${BEEP_SMOKE_EVIDENCE_TIMEOUT:-20}" vm m
   ev() { # ev <label> <cmd...>
     local label="$1" rc=0
@@ -162,7 +162,7 @@ k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL
   }
   for vm in "$vm_a" "$vm_b"; do
     echo "---- $vm evidence ----"
-    for m in LB_FRONT_MAP TARGET_PORTS POD_TARGETS FLOW_TABLE; do
+    for m in FRONT_META FRONT_ENDPOINTS POD_TARGETS FLOW_TABLE; do
       echo "== bpftool map dump: $m =="
       ev "$vm bpftool $m" limactl shell "$vm" -- sudo bpftool map dump pinned "$pin_dir/$m"
     done

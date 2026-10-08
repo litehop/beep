@@ -57,19 +57,20 @@ use aya_ebpf::{
         bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use beep_common::{
     address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
     egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
-    forward_admission, fwd_pending_affinity_pin, ipv4_mapped_v6, is_redirected_return_mark,
-    occupant_conflicts, peer_node_admission, resolve_backend_src_port, return_authorization,
-    tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums, BackendPortDecision,
-    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
-    EgressReturnOutcome, FlowDirection, FlowKey, FlowValue, ForwardAdmission, ForwardFlowValue,
-    FwdPendingPin, LbFrontBackend, LbFrontKey, PeerNodeAdmission, PortMemoValue,
-    ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig, REDIRECTED_RETURN_MARK,
+    forward_admission, front_endpoint_key, fwd_pending_affinity_pin, ipv4_mapped_v6,
+    is_redirected_return_mark, occupant_conflicts, peer_node_admission, resolve_backend_src_port,
+    return_authorization, tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums,
+    BackendPortDecision, BackendPortResolution, Config, DecapForwardPodAdmission,
+    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, FlowValue,
+    ForwardAdmission, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta, FwdPendingPin,
+    LbFrontKey, PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey,
+    UplinkConfig, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -143,41 +144,49 @@ const L4_DPORT_V6: usize = L4_OFF_V6 + 2;
 const TCP_CSUM_V6: usize = L4_OFF_V6 + 16;
 const UDP_CSUM_V6: usize = L4_OFF_V6 + 6;
 
-/// One static LB-front-IP:PORT -> backend mapping (fixture, populated once
-/// by the userspace loader). Same `LbFrontKey` (`beep_common`) shape as
-/// `TARGET_PORTS` below, but a separate map -- the two never interact, just
-/// key on the same front tuple for the two different roles that need it
-/// (ingress backend selection here, backend target-port selection there).
+/// Per-front live-generation pointer: front tuple -> `{generation, count,
+/// flags}` (`beep_common::FrontMeta`). A `BPF_MAP_TYPE_HASH` (not an array)
+/// so the controller's single-element replace is the atomic commit of a new
+/// endpoint generation; ingress and decap read this once per packet, then
+/// read `FRONT_ENDPOINTS` at `(front, generation, slot 0)`.
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
 /// userspace loader overrides it via `EbpfLoader::map_max_entries`
 /// (`src/lib.rs`'s `load_ebpf`), same pattern as `FWD_PENDING`/`FLOW_TABLE`.
 /// The controller's every-node-is-a-front keying (`ebpf-lb-dataplane.md`'s
 /// "Packet flow" step 1) makes this map's entry count nodes x Service ports,
-/// not just Service ports, so the old fixture-era 16 overflows at modest
-/// cluster scale.
+/// not just Service ports.
 #[map]
-static LB_FRONT_MAP: HashMap<LbFrontKey, LbFrontBackend> = HashMap::with_max_entries(4096, 0);
+static FRONT_META: HashMap<LbFrontKey, FrontMeta> = HashMap::with_max_entries(4096, 0);
 
-/// Backend-local: which target port a decap'd, DNAT'd packet should land on
-/// for a given front (LB front IP:PORT:proto) -- keyed the same way as
-/// `LB_FRONT_MAP` above, deliberately NOT on pod IP alone. A pod IP alone
-/// cannot disambiguate a multi-port Service, a pod backing two Services, or
-/// TCP/UDP on different ports; the forward Geneve option only ever carries
-/// the raw pod IP (`ebpf-lb-dataplane.md`'s settled wire-format decision), so
-/// the front tuple this map keys on -- still present on the packet's own
-/// untouched inner dst at decap time -- is what disambiguates instead.
+/// Endpoint table: `(front, generation, slot)` -> `{backend_node_ip, pod_ip,
+/// target_port}` (`beep_common::FrontEndpoint`). Ingress takes the Geneve
+/// remote and pod option from it; the backend node's decap takes the DNAT
+/// target port from it, keyed on the front tuple the packet still carries
+/// (the forward Geneve option only carries the raw pod IP, so the front
+/// tuple is what disambiguates 80->8080 from 443->8443 on the same pod).
+/// A front has exactly one endpoint (slot 0) today; at most two generations
+/// per front are present (`FrontMeta`'s write protocol).
 ///
-/// `max_entries` below is a load-time DEFAULT, not the enforced ceiling,
-/// same override path and same nodes x Service-ports sizing pressure as
-/// `LB_FRONT_MAP` above (every front_ip x Service-port pair -- `watch.rs`'s
-/// `desired()` -- inserts into both maps 1:1, so the two share one default).
+/// `max_entries` below is a load-time DEFAULT, ceiling set by
+/// `--front-endpoints-max-entries`. Two generations per front can coexist
+/// transiently, so the default is twice `FRONT_META`'s.
 #[map]
-static TARGET_PORTS: HashMap<LbFrontKey, u16> = HashMap::with_max_entries(4096, 0);
+static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
+    HashMap::with_max_entries(8192, 0);
+
+/// Single-slot per-CPU counter: lookups where `FRONT_META` named a front
+/// but its endpoint was missing (or the count was zero). Traffic for that
+/// front is not load-balanced: an ingress miss passes the packet to the host
+/// (`TC_ACT_OK`), a decap miss drops it. A non-zero value means the
+/// controller's generation-swap protocol was violated or an endpoint write
+/// failed.
+#[map]
+static FRONT_MISSES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Backend-local: which pod IPs are this node's own beep backend Pods,
 /// keyed on pod IP alone -- deliberately NOT on target port, unlike
-/// `TARGET_PORTS` above. `try_uplink_egress_return` (hook 3) sees ALL
+/// `FRONT_ENDPOINTS` above. `try_uplink_egress_return` (hook 3) sees ALL
 /// uplink egress traffic, not just beep's, so it probes this cheap
 /// membership table BEFORE building the ~38-byte FLOW_TABLE key, to reject
 /// unrelated traffic without ever touching the conntrack table.
@@ -189,7 +198,7 @@ static TARGET_PORTS: HashMap<LbFrontKey, u16> = HashMap::with_max_entries(4096, 
 /// existence marker, never read.
 ///
 /// Keyed on `[u8; 16]`, not a bare `u32`: same dual-stack union-key shape as
-/// `NODE_ALLOW`/`LB_FRONT_MAP` -- a v4 pod IP is stored `ipv4_mapped_v6`-
+/// `NODE_ALLOW`/`FRONT_META` -- a v4 pod IP is stored `ipv4_mapped_v6`-
 /// embedded, a genuine v6 one as-is. A bare `u32` key could never represent
 /// a real v6 backend Pod at all, so that Pod's traffic would silently miss
 /// every membership check below and hook 3/4's decap+DNAT would drop it.
@@ -369,6 +378,24 @@ fn flow_table_get_reverse(key: FlowKey) -> Option<RevFlowValue> {
 #[inline(always)]
 fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
     unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.port_memo })
+}
+
+/// Resolves a front to its slot-0 endpoint: one `FRONT_META` read, then one
+/// `FRONT_ENDPOINTS` read at the generation it names. A front absent from
+/// `FRONT_META` is simply not a front (`None`, uncounted). A front present
+/// but without a readable endpoint is a protocol violation: counted in
+/// `FRONT_MISSES` and yields `None` (ingress passes to host, decap drops).
+#[inline(always)]
+fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
+    let meta = *unsafe { FRONT_META.get(front) }?;
+    let endpoint = front_endpoint_key(front, meta)
+        .and_then(|key| unsafe { FRONT_ENDPOINTS.get(key) }.copied());
+    if endpoint.is_none() {
+        if let Some(misses) = FRONT_MISSES.get_ptr_mut(0) {
+            unsafe { *misses += 1 };
+        }
+    }
+    endpoint
 }
 
 /// Host-specific runtime config the loader fills in after attach (an
@@ -608,7 +635,7 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
         proto,
         _pad: 0,
     };
-    let backend = *unsafe { LB_FRONT_MAP.get(key) }?;
+    let backend = front_endpoint(key)?.backend;
 
     let src_ip: u32 = load_direct(ctx, ip_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
@@ -750,7 +777,7 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
         proto,
         _pad: 0,
     };
-    let backend = *unsafe { LB_FRONT_MAP.get(key) }?;
+    let backend = front_endpoint(key)?.backend;
 
     let client_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
@@ -904,13 +931,13 @@ fn try_geneve_decap_forward(
     }
     let pod_ip_v6: [u8; 16] = opt[4..20].try_into().ok()?;
 
-    // Membership gate: TARGET_PORTS below only confirms this node hosts
+    // Membership gate: the front's endpoint lookup below only confirms this node hosts
     // SOME backend for the front, never that this specific pod_ip -- as
     // stamped by the ingress node, possibly stale under cross-node
     // convergence drift -- is still one of this node's own pods. Same
     // pod-IP-only POD_TARGETS membership `try_uplink_egress_return` gates
     // its own direction on (`egress_return_admission`'s doc comment),
-    // checked here before the front-tuple TARGET_PORTS lookup so a
+    // checked here before the front-tuple endpoint lookup so a
     // not-our-pod packet is rejected off the cheaper key first.
     let is_local_pod = unsafe { POD_TARGETS.get(pod_ip_v6) }.is_some();
     if let DecapForwardPodAdmission::Drop = decap_forward_pod_admission(is_local_pod) {
@@ -946,15 +973,14 @@ fn try_geneve_decap_forward_v4(
 
     // Re-keyed off the front the packet still carries at decap time, not the
     // Geneve option's pod IP: the pod IP alone can't tell 80->8080 apart from
-    // 443->8443 on the same pod (`TARGET_PORTS`' doc comment).
-    let target_port = *unsafe {
-        TARGET_PORTS.get(LbFrontKey {
-            vip_ip: ipv4_mapped_v6(vip_ip),
-            vip_port,
-            proto,
-            _pad: 0,
-        })
-    }?;
+    // 443->8443 on the same pod (`FRONT_ENDPOINTS`' doc comment).
+    let target_port = front_endpoint(LbFrontKey {
+        vip_ip: ipv4_mapped_v6(vip_ip),
+        vip_port,
+        proto,
+        _pad: 0,
+    })?
+    .target_port;
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     let vip_ip_v6 = ipv4_mapped_v6(vip_ip);
@@ -1159,14 +1185,13 @@ fn try_geneve_decap_forward_v6(
     let vip_ip_v6: [u8; 16] = ctx.load(IP6_DST).ok()?; // captured before rewrite
     let vip_port: u16 = ctx.load(L4_DPORT_V6).ok()?; // captured before rewrite
 
-    let target_port = *unsafe {
-        TARGET_PORTS.get(LbFrontKey {
-            vip_ip: vip_ip_v6,
-            vip_port,
-            proto,
-            _pad: 0,
-        })
-    }?;
+    let target_port = front_endpoint(LbFrontKey {
+        vip_ip: vip_ip_v6,
+        vip_port,
+        proto,
+        _pad: 0,
+    })?
+    .target_port;
 
     let natural_rev_key = encode_flow_key(
         client_ip_v6,

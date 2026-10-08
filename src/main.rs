@@ -6,7 +6,7 @@
 //! (`docs/design/ebpf-lb-dataplane.md`), populates one or more static
 //! VIP:PORT -> backend fixture entries this phase proves the mechanism
 //! against (repeatable so one Pod behind more than one Service port is
-//! expressible -- `beep-ebpf`'s `TARGET_PORTS` keys on the front tuple,
+//! expressible -- `beep-ebpf`'s `FRONT_META` keys on the front tuple,
 //! not pod IP alone, precisely so this doesn't collide), and pins the
 //! resulting links AND maps under a bpffs directory so a loader restart
 //! re-adopts the existing attachment instead of leaving the interface
@@ -16,12 +16,13 @@
 //! would silently drop every established flow on each DaemonSet rollout,
 //! eviction, or OOM kill. Real Service/EndpointSlice watching is Phase 5.
 //!
-//! `FWD_PENDING`/`FLOW_TABLE`/`LB_FRONT_MAP`/`TARGET_PORTS` sizes are a load-time
+//! `FWD_PENDING`/`FLOW_TABLE`/`FRONT_META`/`FRONT_ENDPOINTS` sizes are a load-time
 //! DaemonSet config knob, not a value baked into the eBPF object
 //! (`beep-ebpf`'s admission-control doc comment) -- overridden here via
 //! `EbpfLoader::map_max_entries` before `load()`.
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::Duration,
@@ -34,13 +35,16 @@ use aya::{
     Ebpf,
 };
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows, load_ebpf, local_pod_ips,
-    parse_fixture, populate_config, populate_uplink_config, stale_pod_targets, tunnel_remote_v6,
-    wire_ip_v6, Fixture, DEFAULT_NODE_ALLOW_MAX_ENTRIES, DEFAULT_POD_TARGETS_MAX_ENTRIES,
-    MAP_NAMES,
+    attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
+    front_swap::{apply_fronts, DesiredFront},
+    load_ebpf, local_pod_ips, parse_fixture, populate_config, populate_uplink_config,
+    stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
+    DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
+    DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
 };
 use beep_common::{
-    wire_port, FlowKey, FlowValue, ForwardFlowValue, LbFrontBackend, LbFrontKey, TcpFlowKey,
+    wire_port, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
+    LbFrontBackend, LbFrontKey, TcpFlowKey,
 };
 use clap::Parser;
 
@@ -112,15 +116,6 @@ fn run_evict_pod(args: EvictPodArgs) -> anyhow::Result<()> {
 /// admission control keeps that role unreachable by a flood.
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
-/// `LB_FRONT_MAP`/`TARGET_PORTS` scale with nodes x Service ports under the
-/// every-node-is-a-front model (`beep-ebpf`'s doc comments on both maps), not
-/// a fixed Service count -- 4096 covers a realistic cluster (e.g. 100 nodes x
-/// 40 Service ports) with headroom, and stays well under
-/// `assert-ebpf-map-memory.sh`'s 4 MiB gross-regression ceiling alongside
-/// FWD_PENDING/FLOW_TABLE's existing footprint (verified via
-/// `scripts/sample-ebpf-memory.sh`).
-const DEFAULT_LB_FRONT_MAP_MAX_ENTRIES: u32 = 4096;
-const DEFAULT_TARGET_PORTS_MAX_ENTRIES: u32 = 4096;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -147,7 +142,7 @@ struct Args {
     /// One VIP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
     /// to cover one Pod behind more than one Service port (a plain multi-port
     /// Service, or one Pod backing two distinct Services) -- each repetition
-    /// becomes its own `LB_FRONT_MAP`/`TARGET_PORTS` entry. VIP address is this
+    /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). VIP address is this
     /// node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
     /// Format: `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`
     /// (`proto` is `tcp` or `udp`).
@@ -185,7 +180,7 @@ struct Args {
     /// per-node EndpointSlice watch): scopes `POD_TARGETS`, the LOCAL
     /// backend-membership map the decap and egress-return admission gates
     /// check, to fixtures whose `backend_node_ip` matches this address.
-    /// `LB_FRONT_MAP`/`TARGET_PORTS` (the forwarding tables) stay unfiltered --
+    /// `FRONT_META`/`FRONT_ENDPOINTS` (the forwarding tables) stay unfiltered --
     /// any node can be ingress for any VIP, so they need every fixture
     /// regardless of which node hosts the backend.
     #[arg(long = "node-ip")]
@@ -207,14 +202,14 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
 
-    /// `LB_FRONT_MAP` max_entries -- see `beep-ebpf`'s doc comment. A load-time
+    /// `FRONT_META` max_entries -- see `beep-ebpf`'s doc comment. A load-time
     /// DaemonSet config knob, not a value baked into the eBPF object.
-    #[arg(long, default_value_t = DEFAULT_LB_FRONT_MAP_MAX_ENTRIES)]
-    lb_front_map_max_entries: u32,
+    #[arg(long, default_value_t = DEFAULT_FRONT_META_MAX_ENTRIES)]
+    front_meta_max_entries: u32,
 
-    /// `TARGET_PORTS` max_entries -- see `beep-ebpf`'s doc comment.
-    #[arg(long, default_value_t = DEFAULT_TARGET_PORTS_MAX_ENTRIES)]
-    target_ports_max_entries: u32,
+    /// `FRONT_ENDPOINTS` max_entries -- see `beep-ebpf`'s doc comment.
+    #[arg(long, default_value_t = DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES)]
+    front_endpoints_max_entries: u32,
 
     /// `NODE_ALLOW` max_entries -- one entry per node underlay address, so a
     /// dual-stack node costs two. See `beep-ebpf`'s doc comment.
@@ -429,8 +424,8 @@ fn main() -> anyhow::Result<()> {
         node_ip,
         fwd_pending_max_entries,
         flow_table_max_entries,
-        lb_front_map_max_entries,
-        target_ports_max_entries,
+        front_meta_max_entries,
+        front_endpoints_max_entries,
         node_allow_max_entries,
         pod_targets_max_entries,
     } = Args::parse();
@@ -454,8 +449,8 @@ fn main() -> anyhow::Result<()> {
         &pin_dir,
         fwd_pending_max_entries,
         flow_table_max_entries,
-        lb_front_map_max_entries,
-        target_ports_max_entries,
+        front_meta_max_entries,
+        front_endpoints_max_entries,
         node_allow_max_entries,
         pod_targets_max_entries,
     )
@@ -463,8 +458,8 @@ fn main() -> anyhow::Result<()> {
 
     populate_config(&mut ebpf, &geneve_iface).context("populating CONFIG map")?;
     populate_uplink_config(&mut ebpf, &uplink_ifaces).context("populating UPLINK_CONFIG map")?;
-    populate_fixtures(&mut ebpf, &fixtures, node_ip)
-        .context("populating LB_FRONT_MAP/TARGET_PORTS/POD_TARGETS/NODE_ALLOW fixture")?;
+    populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
+        .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
 
     let uplink_iface_refs: Vec<&str> = uplink_ifaces.iter().map(String::as_str).collect();
     let geneve_iface_refs = [geneve_iface.as_str()];
@@ -546,11 +541,10 @@ fn main() -> anyhow::Result<()> {
 /// (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`'s node-owned-address
 /// model).
 ///
-/// `TARGET_PORTS` is keyed on the same (VIP:PORT:proto) front as
-/// `LB_FRONT_MAP`, not on pod IP alone: one `--fixture` per Service port,
-/// even when several share a backend Pod IP, so a multi-port Service
-/// resolves each port to its own target port instead of the last-written
-/// one silently winning.
+/// Fronts are keyed on the (VIP:PORT:proto) tuple, not on pod IP alone: one
+/// `--fixture` per Service port, even when several share a backend Pod IP, so
+/// a multi-port Service resolves each port to its own target port instead of
+/// the last-written one silently winning.
 fn fixture_key(fixture: &Fixture) -> LbFrontKey {
     LbFrontKey {
         vip_ip: wire_ip_v6(fixture.vip_ip),
@@ -560,16 +554,14 @@ fn fixture_key(fixture: &Fixture) -> LbFrontKey {
     }
 }
 
-fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture], node_ip: IpAddr) -> anyhow::Result<()> {
-    {
-        let mut lb_front_map: AyaHashMap<_, LbFrontKey, LbFrontBackend> = AyaHashMap::try_from(
-            ebpf.map_mut("LB_FRONT_MAP")
-                .ok_or_else(|| anyhow!("no map named `LB_FRONT_MAP` in the eBPF object"))?,
-        )?;
-        for fixture in fixtures {
-            lb_front_map.insert(
-                fixture_key(fixture),
-                LbFrontBackend {
+/// One front per `--fixture`, slot 0 only. A repeated front tuple keeps the
+/// last fixture, as the pre-consolidation maps did.
+fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
+    fixtures
+        .iter()
+        .map(|fixture| {
+            let endpoint = FrontEndpoint {
+                backend: LbFrontBackend {
                     // bpf_tunnel_key.remote_ipv4 is the one field the kernel
                     // itself converts host<->network internally on set/get --
                     // confirmed empirically (a wire-token value here came out
@@ -581,30 +573,67 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture], node_ip: IpAddr) -> 
                     backend_node_ip: tunnel_remote_v6(fixture.backend_node_ip),
                     pod_ip: wire_ip_v6(fixture.pod_ip),
                 },
-                0,
-            )?;
+                target_port: wire_port(fixture.target_port),
+                _pad: [0; 6],
+            };
+            (
+                fixture_key(fixture),
+                DesiredFront {
+                    flags: 0,
+                    endpoints: vec![endpoint],
+                },
+            )
+        })
+        .collect()
+}
+
+fn populate_fixtures(
+    ebpf: &mut Ebpf,
+    fixtures: &[Fixture],
+    node_ip: IpAddr,
+    pin_dir: &Path,
+) -> anyhow::Result<()> {
+    {
+        // Opened from the pins `load_ebpf` just created: both maps are needed
+        // at once, and taking them out of `ebpf` would close the fds the
+        // programs still have to relocate against.
+        let open = |name: &str| -> anyhow::Result<MapData> {
+            let path = pin_dir.join(name);
+            MapData::from_pin(&path)
+                .with_context(|| format!("opening pinned map `{name}` from {}", path.display()))
+        };
+        let mut front_meta: AyaHashMap<_, LbFrontKey, FrontMeta> =
+            AyaHashMap::try_from(Map::HashMap(open("FRONT_META")?))?;
+        let mut front_endpoints: AyaHashMap<_, FrontEndpointKey, FrontEndpoint> =
+            AyaHashMap::try_from(Map::HashMap(open("FRONT_ENDPOINTS")?))?;
+        let failures = apply_fronts(
+            &mut front_meta,
+            &mut front_endpoints,
+            &fixture_fronts(fixtures),
+            false,
+        )
+        .context("reading FRONT_META/FRONT_ENDPOINTS")?;
+        if !failures.is_empty() {
+            let detail: Vec<String> = failures.into_iter().map(|(_, e)| e).collect();
+            anyhow::bail!(
+                "{} front write(s) failed: {}; {} / {}",
+                detail.len(),
+                detail.join("; "),
+                capacity_hint("FRONT_META"),
+                capacity_hint("FRONT_ENDPOINTS"),
+            );
         }
     }
 
     {
-        let mut target_ports: AyaHashMap<_, LbFrontKey, u16> = AyaHashMap::try_from(
-            ebpf.map_mut("TARGET_PORTS")
-                .ok_or_else(|| anyhow!("no map named `TARGET_PORTS` in the eBPF object"))?,
-        )?;
-        for fixture in fixtures {
-            target_ports.insert(fixture_key(fixture), wire_port(fixture.target_port), 0)?;
-        }
-    }
-
-    {
-        // Keyed on pod IP alone, unlike TARGET_PORTS above -- the egress-return
+        // Keyed on pod IP alone, unlike the front tables above -- the egress-return
         // gate this feeds (`beep_common::egress_return_admission`), and the
         // decap gate (`beep_common::decap_forward_pod_admission`), check only
         // that a pod is one of THIS node's own backends, deliberately not
         // which port it's replying from. Two fixtures sharing a pod IP (a
         // multi-port Service) collapse to one entry here on purpose:
-        // membership doesn't need per-port granularity. Unlike LB_FRONT_MAP/
-        // TARGET_PORTS above, this map is scoped to `node_ip` via
+        // membership doesn't need per-port granularity. Unlike the front
+        // tables above, this map is scoped to `node_ip` via
         // `local_pod_ips`: any node can be ingress for any VIP, but only
         // the node actually running a pod may claim it as a local backend --
         // otherwise both gates' "is this still one of MY pods" check always
@@ -950,8 +979,6 @@ mod tests {
         // whichever `--fixture` was populated last silently won, and the
         // other Service port's traffic got mis-DNATed to the wrong
         // container port.
-        use std::collections::HashMap;
-
         let pod_ip = IpAddr::V4(Ipv4Addr::new(10, 244, 1, 7));
         let fixtures = [
             parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap(),
@@ -963,21 +990,18 @@ mod tests {
             "fixture invariant: both entries must share one Pod IP to exercise the bug"
         );
 
-        // Simulates `TARGET_PORTS`: keyed on the front tuple, exactly like
-        // `populate_fixtures`/`try_geneve_decap_forward`.
-        let mut target_ports: HashMap<LbFrontKey, u16> = HashMap::new();
-        for f in &fixtures {
-            target_ports.insert(fixture_key(f), wire_port(f.target_port));
-        }
+        let fronts = fixture_fronts(&fixtures);
         assert_eq!(
-            target_ports.len(),
+            fronts.len(),
             2,
             "two distinct Service ports on one Pod must produce two distinct \
-             TARGET_PORTS entries, not collapse into one"
+             fronts, not collapse into one"
         );
         for f in &fixtures {
+            let front = &fronts[&fixture_key(f)];
+            assert_eq!(front.endpoints.len(), 1, "one endpoint per front today");
             assert_eq!(
-                target_ports.get(&fixture_key(f)).copied(),
+                Some(front.endpoints[0].target_port),
                 Some(wire_port(f.target_port)),
                 "VIP port {} must resolve to its own target port {}, not the \
                  other Service port's",
@@ -1001,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn a_v6_fixture_populates_lb_front_map_target_ports_and_pod_targets() {
+    fn a_v6_fixture_populates_front_tables_and_pod_targets() {
         // .6's core acceptance criterion: a v6 Service/Pod must populate the
         // same maps a v4 fixture does, at the same wire-encode boundary --
         // if a v6 fixture silently failed to land in any of these, a v6
@@ -1020,8 +1044,14 @@ mod tests {
         assert_eq!(
             key.vip_ip,
             wire_ip_v6(vip_ip),
-            "LB_FRONT_MAP/TARGET_PORTS' shared front key must carry the v6 VIP's raw octets, \
+            "the front key must carry the v6 VIP's raw octets, \
              the same wire-encode boundary a v4 VIP's ipv4_mapped_v6 embedding uses"
+        );
+        let fronts = fixture_fronts(std::slice::from_ref(&fixture));
+        assert_eq!(
+            fronts[&key].endpoints[0].backend.pod_ip,
+            wire_ip_v6(pod_ip),
+            "a v6 fixture must land its pod in the front's slot-0 endpoint"
         );
 
         assert_eq!(
