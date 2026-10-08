@@ -201,9 +201,13 @@ static TARGET_PORTS: HashMap<LbFrontKey, u16> = HashMap::with_max_entries(4096, 
 /// this node's own regardless of which front named it in the packet --
 /// giving both directions of a flow one authoritative membership check
 /// instead of two that could disagree.
-/// <20 entries per `ebpf-lb-dataplane.md`'s sizing table, same as `TARGET_PORTS`.
+///
+/// One entry per local backend pod IP, so a dual-stack pod costs two: the
+/// default 128 covers 64 dual-stack pods per node. `max_entries` below is a
+/// load-time DEFAULT, not the enforced ceiling: the userspace loader
+/// overrides it via `EbpfLoader::map_max_entries` (`--pod-targets-max-entries`).
 #[map]
-static POD_TARGETS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(32, 0);
+static POD_TARGETS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(128, 0);
 
 /// Peer-node attestation for the outer Geneve tunnel source
 /// (`beep_common::peer_node_admission`'s doc comment for the threat this
@@ -216,8 +220,12 @@ static POD_TARGETS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(32, 0);
 /// node's own -- a node that is both ingress and backend for the same flow
 /// legitimately sees its own address as the outer source) or, in fixture/
 /// smoke mode with no controller, by the loader seeding `--node-ip` alone.
-/// Same bare-existence-marker value as `POD_TARGETS` above; sized an order
-/// of magnitude smaller (cluster node count, not Service count). Keyed on
+/// Same bare-existence-marker value as `POD_TARGETS` above; sized by cluster
+/// node count, not Service count: one entry per node underlay address, so a
+/// dual-stack node costs two and the default 32 covers 16 dual-stack nodes.
+/// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
+/// userspace loader overrides it via `EbpfLoader::map_max_entries`
+/// (`--node-allow-max-entries`). Keyed on
 /// `[u8; 16]`, not a bare `u32`: a v4 outer source is embedded via
 /// `ipv4_mapped_v6`, a genuine v6 one read as-is, so this map shares
 /// `FLOW_TABLE`'s dual-stack union-key shape and admits either underlay
@@ -229,7 +237,7 @@ static POD_TARGETS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(32, 0);
 /// single-IP-per-node addressing is the deployment beep v1 targets; admitting
 /// every address a Node reports is tracked separately.
 #[map]
-static NODE_ALLOW: HashMap<[u8; 16], u8> = HashMap::with_max_entries(16, 0);
+static NODE_ALLOW: HashMap<[u8; 16], u8> = HashMap::with_max_entries(32, 0);
 
 /// Ingress-side forward-flow ADMISSION tier, written at stamp time (step
 /// 2): every new flow mints here, and ONLY here (`try_uplink_ingress`, on a

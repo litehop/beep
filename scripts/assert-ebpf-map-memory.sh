@@ -26,9 +26,9 @@
 # merged the former separate FWD_MAIN+REV_FLOW maps into one 16384-entry
 # table, measured at ~1.88 MiB (1,966,976 bytes) preallocated per node;
 # FWD_PENDING adds a smaller tier on top (2048 entries by default, ~+240
-# KiB). NODE_ALLOW (16-entry HashMap<u32,u8>, half POD_TARGETS' 32 entries)
-# adds a few more KiB -- 4 MiB still leaves comfortable headroom over that
-# real, near-constant footprint.
+# KiB). NODE_ALLOW (32 entries) and POD_TARGETS (128 entries), both
+# HashMap<[u8;16],u8>, add a few more KiB -- 4 MiB still leaves comfortable
+# headroom over that real, near-constant footprint.
 set -euo pipefail
 
 csv="${1:?usage: $0 <ebpf-map-memory.csv>}"

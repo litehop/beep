@@ -331,14 +331,39 @@ pub fn bump_memlock_rlimit() {
     }
 }
 
+/// `NODE_ALLOW` holds one entry per node underlay address, so a dual-stack
+/// node costs two; 32 covers 16 dual-stack nodes.
+pub const DEFAULT_NODE_ALLOW_MAX_ENTRIES: u32 = 32;
+/// `POD_TARGETS` holds one entry per local backend pod IP, so a dual-stack pod
+/// costs two; 128 covers 64 dual-stack pods per node.
+pub const DEFAULT_POD_TARGETS_MAX_ENTRIES: u32 = 128;
+
+/// Operator-facing advice appended to a failed `NODE_ALLOW`/`POD_TARGETS`
+/// write: these two maps are capped by `--node-allow-max-entries`/
+/// `--pod-targets-max-entries`, and an insert past the cap would otherwise
+/// surface only the kernel's bare `E2BIG`, leaving a node or pod silently
+/// unreachable with no hint which knob to turn. Empty for any other map.
+pub fn capacity_hint(map_name: &str) -> String {
+    let flag = match map_name {
+        "NODE_ALLOW" => "--node-allow-max-entries",
+        "POD_TARGETS" => "--pod-targets-max-entries",
+        _ => return String::new(),
+    };
+    format!(
+        "if `{map_name}` is full (E2BIG), raise `{flag}`; the cap applies only when the pin is \
+         created, so delete the pinned `{map_name}` to resize an existing one"
+    )
+}
+
 /// Loads the `beep-ebpf` object embedded at build time (`build.rs`'s
 /// aya-build cross-build, embedded here via `OUT_DIR`, which Cargo sets
 /// identically for every target in this package -- lib or bin -- that has a
 /// build script), pinning each of `MAP_NAMES` under `pin_dir` so a loader
 /// restart reuses the existing map set instead of `Ebpf::load` creating an
 /// empty one (`MAP_NAMES`'s own doc comment). `fwd_pending_max_entries`/
-/// `flow_table_max_entries`/`lb_front_map_max_entries`/`target_ports_max_entries`
-/// size the four maps whose entry count scales with cluster/Service state --
+/// `flow_table_max_entries`/`lb_front_map_max_entries`/`target_ports_max_entries`/
+/// `node_allow_max_entries`/`pod_targets_max_entries`
+/// size the six maps whose entry count scales with cluster/Service state --
 /// a load-time DaemonSet config knob, not a value baked into the eBPF
 /// object -- and only take effect the first time each pin path is created (a
 /// reused pin from a prior run opens the existing map via its live fd and
@@ -355,6 +380,8 @@ pub fn load_ebpf(
     flow_table_max_entries: u32,
     lb_front_map_max_entries: u32,
     target_ports_max_entries: u32,
+    node_allow_max_entries: u32,
+    pod_targets_max_entries: u32,
 ) -> anyhow::Result<Ebpf> {
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
@@ -364,6 +391,8 @@ pub fn load_ebpf(
     loader.map_max_entries("FLOW_TABLE", flow_table_max_entries);
     loader.map_max_entries("LB_FRONT_MAP", lb_front_map_max_entries);
     loader.map_max_entries("TARGET_PORTS", target_ports_max_entries);
+    loader.map_max_entries("NODE_ALLOW", node_allow_max_entries);
+    loader.map_max_entries("POD_TARGETS", pod_targets_max_entries);
     loader
         .load(include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
@@ -578,6 +607,30 @@ mod tests {
     use super::*;
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
+
+    const _: () = assert!(
+        DEFAULT_NODE_ALLOW_MAX_ENTRIES >= 16 * 2,
+        "the 17th dual-stack node would be silently unreachable"
+    );
+    const _: () = assert!(
+        DEFAULT_POD_TARGETS_MAX_ENTRIES >= 64 * 2,
+        "the 65th dual-stack pod on a node would be silently undeliverable"
+    );
+
+    #[test]
+    fn capacity_hint_names_the_map_and_the_flag_to_raise() {
+        let node = capacity_hint("NODE_ALLOW");
+        assert!(
+            node.contains("NODE_ALLOW") && node.contains("--node-allow-max-entries"),
+            "a full NODE_ALLOW must tell the operator which flag to raise, got {node:?}"
+        );
+        let pod = capacity_hint("POD_TARGETS");
+        assert!(
+            pod.contains("POD_TARGETS") && pod.contains("--pod-targets-max-entries"),
+            "a full POD_TARGETS must tell the operator which flag to raise, got {pod:?}"
+        );
+        assert!(capacity_hint("FLOW_TABLE").is_empty());
+    }
 
     #[test]
     fn pod_targets_excludes_pods_backed_by_a_different_node() {

@@ -263,14 +263,17 @@ fn apply_pod_targets(
         if let Err(e) = map.insert(ip, 1u8, 0) {
             failed += 1;
             eprintln!(
-                "controller: POD_TARGETS upsert for pod {} failed (entry left unrouted -- map \
-                 may be at capacity): {e:#}",
+                "controller: POD_TARGETS upsert for pod {} failed (pod left undeliverable): \
+                 {e:#}",
                 describe_pod_target_ip(*ip)
             );
         }
     }
     if failed > 0 {
-        anyhow::bail!("{failed} write(s) to `POD_TARGETS` failed -- see per-entry errors above");
+        anyhow::bail!(
+            "{failed} write(s) to `POD_TARGETS` failed -- see per-entry errors above; {}",
+            beep::capacity_hint("POD_TARGETS")
+        );
     }
     Ok(())
 }
@@ -348,14 +351,17 @@ fn apply_node_allow(
         if let Err(e) = map.insert(ip, 1u8, 0) {
             failed += 1;
             eprintln!(
-                "controller: NODE_ALLOW upsert for peer {} failed (entry left unrouted -- map \
-                 may be at capacity): {e:#}",
+                "controller: NODE_ALLOW upsert for peer {} failed (node left unreachable): \
+                 {e:#}",
                 describe_node_allow_peer(*ip)
             );
         }
     }
     if failed > 0 {
-        anyhow::bail!("{failed} write(s) to `NODE_ALLOW` failed -- see per-entry errors above");
+        anyhow::bail!(
+            "{failed} write(s) to `NODE_ALLOW` failed -- see per-entry errors above; {}",
+            beep::capacity_hint("NODE_ALLOW")
+        );
     }
     Ok(())
 }
