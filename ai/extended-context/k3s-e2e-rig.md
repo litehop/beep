@@ -17,7 +17,7 @@ fixtures instead of a real Service/EndpointSlice/Node reconcile loop.
 Three named VMs:
 
 - **`beep-node-a`** -- k3s server. Owns the local apiserver and is the e2e
-  rig's ingress node: the VIP the client hits is node-a's own address.
+  rig's ingress node: the front the client hits is node-a's own address.
 - **`beep-node-b`** -- k3s agent. Hosts the backend Pod. The cross-node round
   trip depends on beep's `uplink_egress_return` hook firing on node-b's own
   client-facing NIC (`eth0`), not a tunnel device, to un-DNAT the reply
@@ -107,8 +107,8 @@ Deployment + Service instead of the full upstream conformance suite. It
 asserts every step of the controller-driven path end to end -- cluster up,
 `geneve0`, kubeconfig Secret, DaemonSet/RBAC apply with zero controller
 restarts, `status.loadBalancer.ingress` populated with both node IPs,
-`VIP_MAP`/`POD_TARGETS` map entries actually programmed, beep-controller's
-RSS growth bounded (`scripts/controller-rss.sh`), a real client -> VIP ->
+`FRONT_META`/`FRONT_ENDPOINTS`/`POD_TARGETS` map entries actually programmed, beep-controller's
+RSS growth bounded (`scripts/controller-rss.sh`), a real client -> front ->
 cross-node backend round trip with the client IP preserved at the pod, and
 a `FLOW_TABLE` conntrack entry for the flow. Use this to check the rig
 itself (or a controller change) is healthy before spending the e2e suite's
@@ -132,7 +132,7 @@ scripts/e2e-lb-bidirectional-k3s.sh [--vm-a beep-node-a] [--vm-b beep-node-b] \
 `smoke-k3s-controller.sh` and `e2e-lb-k3s.sh`'s specs only ever pin the
 backend Pod to `beep-node-b` (the k3s agent) and dial in via `beep-node-a`
 (the k3s server) -- one direction. This script proves the reverse
-orientation too, in one cluster bring-up: two Services on distinct VIP
+orientation too, in one cluster bring-up: two Services on distinct front
 ports, one backend pinned to node-a dialed via node-b's address, the other
 pinned to node-b dialed via node-a's address. Both assert the round trip
 succeeds and the backend's own `RemoteAddr` still shows the real client
@@ -150,7 +150,7 @@ shown above rather than reimplementing their steps by hand.
 For read-only inspection once a run is underway or has failed, use the
 `mcp__beep-node-a`/`mcp__beep-node-b` MCP tools (`limactl mcp serve <vm>`,
 wired in `.mcp.json`) instead of an ad hoc shell: `bpftool map dump pinned
-/sys/fs/bpf/beep/<VIP_MAP|TARGET_PORTS|POD_TARGETS|FLOW_TABLE>` for
+/sys/fs/bpf/beep/<FRONT_META|FRONT_ENDPOINTS|POD_TARGETS|FLOW_TABLE>` for
 dataplane map contents, `ip -s link show eth0`/`geneve0` for interface
 counters, and `dmesg` for verifier/kernel log output. There is no
 `mcp__beep-client` server (only `beep-smoke`/`beep-node-a`/`beep-node-b`

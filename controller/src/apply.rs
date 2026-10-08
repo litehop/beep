@@ -166,14 +166,18 @@ fn apply_front_maps(
 }
 
 fn describe_lb_front_key(key: &LbFrontKey) -> String {
-    // vip_ip is [u8; 16]; every value in play today is v4-mapped-v6, so this
+    // front_ip is [u8; 16]; every value in play today is v4-mapped-v6, so this
     // always takes the Some arm -- the None arm is just a legible fallback
     // for a genuine v6 front, not yet reachable.
-    let vip = match unmap_ipv4(&key.vip_ip) {
+    let front = match unmap_ipv4(&key.front_ip) {
         Some(v4) => Ipv4Addr::from(u32::from_be(v4)).to_string(),
-        None => format!("{:x?}", key.vip_ip),
+        None => format!("{:x?}", key.front_ip),
     };
-    format!("{vip}:{}/proto={}", u16::from_be(key.vip_port), key.proto)
+    format!(
+        "{front}:{}/proto={}",
+        u16::from_be(key.front_port),
+        key.proto
+    )
 }
 
 /// `POD_TARGETS` isn't map-shaped like the front maps

@@ -98,10 +98,10 @@ const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
 /// Return-leg option: `LB_FRONT_IP:LB_FRONT_PORT` echo, captured by the
 /// backend before it DNATs and echoed back so the ingress can un-DNAT
 /// without its own state lookup racing the encap. Widened the same way as
-/// `GENEVE_OPT_TYPE_POD_ID`: vip_ip is the full 16 bytes (opt[4..20]), plus
-/// vip_port (2 bytes, opt[20..22]) and 2 bytes of padding to round the
+/// `GENEVE_OPT_TYPE_POD_ID`: front_ip is the full 16 bytes (opt[4..20]), plus
+/// front_port (2 bytes, opt[20..22]) and 2 bytes of padding to round the
 /// option's data length up to a 4-byte-word multiple (RFC 8926 SS3.4).
-const GENEVE_OPT_TYPE_VIP_ECHO: u8 = 0x02;
+const GENEVE_OPT_TYPE_FRONT_ECHO: u8 = 0x02;
 
 const ETH_HLEN: usize = 14;
 const ETH_P_IPV4: u16 = 0x0800u16.to_be();
@@ -310,10 +310,10 @@ static FWD_PENDING: LruHashMap<TcpFlowKey, ForwardFlowValue> =
 /// former separate `FWD_MAIN`/`REV_FLOW` maps. Both roles key on the
 /// identical 5-tuple shape for a given flow -- front tuple for forward,
 /// backend tuple for reverse -- so `beep_common::FlowKey`'s explicit
-/// `FlowDirection` tag byte, NOT VIP-vs-pod-CIDR address disjointness, is
+/// `FlowDirection` tag byte, NOT front-vs-pod-CIDR address disjointness, is
 /// what keeps the two from aliasing the same slot (that disjointness
 /// invariant does not hold for a hostNetwork Pod, whose IP can equal a
-/// VIP -- the tag is the fix for that exact misdelivery class). Value is
+/// front -- the tag is the fix for that exact misdelivery class). Value is
 /// `FlowValue`, sized to the larger of the two prior maps (12 bytes,
 /// `RevFlowValue`'s shape) -- see its own doc comment.
 ///
@@ -628,10 +628,10 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
 
     let dst_ip: u32 = load_direct(ctx, ip_dst)?;
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
-    let vip_ip_v6 = ipv4_mapped_v6(dst_ip);
+    let front_ip_v6 = ipv4_mapped_v6(dst_ip);
     let key = LbFrontKey {
-        vip_ip: vip_ip_v6,
-        vip_port: dst_port,
+        front_ip: front_ip_v6,
+        front_port: dst_port,
         proto,
         _pad: 0,
     };
@@ -642,11 +642,11 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
     let client_ip_v6 = ipv4_mapped_v6(src_ip);
     // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
     // comment) uses this shape.
-    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, vip_ip_v6, dst_port, proto);
+    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, front_ip_v6, dst_port, proto);
     let fwd_key = encode_flow_key(
         client_ip_v6,
         src_port,
-        vip_ip_v6,
+        front_ip_v6,
         dst_port,
         proto,
         FlowDirection::Forward,
@@ -741,7 +741,7 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
 /// IPv6 sibling of `try_uplink_ingress_headers_v4` -- same steps, IPv6
 /// header shape (module doc): a 16-byte address at a different offset, no
 /// IHL/options check (v6's base header is always exactly `IP6_HLEN`), Next
-/// Header instead of Protocol. `vip_ip_v6`/`client_ip_v6` need no
+/// Header instead of Protocol. `front_ip_v6`/`client_ip_v6` need no
 /// `ipv4_mapped_v6` embedding -- a genuine v6 address's own octets already
 /// are the dual-stack `[u8; 16]` shape every map below keys on.
 #[inline(always)]
@@ -769,11 +769,11 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
         return Some(TC_ACT_OK);
     }
 
-    let vip_ip_v6: [u8; 16] = load_direct(ctx, ip6_dst)?;
+    let front_ip_v6: [u8; 16] = load_direct(ctx, ip6_dst)?;
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
     let key = LbFrontKey {
-        vip_ip: vip_ip_v6,
-        vip_port: dst_port,
+        front_ip: front_ip_v6,
+        front_port: dst_port,
         proto,
         _pad: 0,
     };
@@ -783,11 +783,11 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
     let src_port: u16 = load_direct(ctx, l4_sport)?;
     // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
     // comment) uses this shape.
-    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, vip_ip_v6, dst_port, proto);
+    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, front_ip_v6, dst_port, proto);
     let fwd_key = encode_flow_key(
         client_ip_v6,
         src_port,
-        vip_ip_v6,
+        front_ip_v6,
         dst_port,
         proto,
         FlowDirection::Forward,
@@ -968,22 +968,22 @@ fn try_geneve_decap_forward_v4(
 
     let client_ip: u32 = ctx.load(IP_SRC).ok()?;
     let client_port: u16 = ctx.load(L4_SPORT).ok()?;
-    let vip_ip: u32 = ctx.load(IP_DST).ok()?; // captured before rewrite
-    let vip_port: u16 = ctx.load(L4_DPORT).ok()?; // captured before rewrite
+    let front_ip: u32 = ctx.load(IP_DST).ok()?; // captured before rewrite
+    let front_port: u16 = ctx.load(L4_DPORT).ok()?; // captured before rewrite
 
     // Re-keyed off the front the packet still carries at decap time, not the
     // Geneve option's pod IP: the pod IP alone can't tell 80->8080 apart from
     // 443->8443 on the same pod (`FRONT_ENDPOINTS`' doc comment).
     let target_port = front_endpoint(LbFrontKey {
-        vip_ip: ipv4_mapped_v6(vip_ip),
-        vip_port,
+        front_ip: ipv4_mapped_v6(front_ip),
+        front_port,
         proto,
         _pad: 0,
     })?
     .target_port;
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
-    let vip_ip_v6 = ipv4_mapped_v6(vip_ip);
+    let front_ip_v6 = ipv4_mapped_v6(front_ip);
     let natural_rev_key = encode_flow_key(
         client_ip_v6,
         client_port,
@@ -1031,14 +1031,14 @@ fn try_geneve_decap_forward_v4(
             // flow through this same front whose real source port happens to equal
             // another flow's already-committed synthetic port would otherwise be
             // misread as that flow's own state and clobber its reverse-tagged entry.
-            // `RevFlowValue::vip_ip` and `resolve_backend_src_port`'s `new_front` are
+            // `RevFlowValue::front_ip` and `resolve_backend_src_port`'s `new_front` are
             // both `[u8; 16]`, so this compares the full dual-stack shape directly --
             // no `unmap_ipv4` round-trip needed (that round-trip used to be required
             // because this probe was `u32`-only; widened once a genuine, non-mapped
             // v6 front became possible to parse at all).
             let existing_occupant = flow_table_get_reverse(natural_rev_key)
-                .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
-            let new_front = (vip_ip_v6, vip_port);
+                .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
+            let new_front = (front_ip_v6, front_port);
             // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
             // the source of truth for which candidate ports are actually free, not
             // a derived guess -- a single low-entropy hash of the front address only
@@ -1067,7 +1067,7 @@ fn try_geneve_decap_forward_v4(
             let is_reverse_key_taken = |candidate_port: u16| {
                 candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
                 let occupant = flow_table_get_reverse(candidate_key)
-                    .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
+                    .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
                 occupant_conflicts(occupant, new_front, client_port)
             };
             match resolve_backend_src_port(
@@ -1109,8 +1109,8 @@ fn try_geneve_decap_forward_v4(
 
     let rev_value = RevFlowValue {
         ingress_node_ip: tunnel_remote(tkey, used_ipv6),
-        vip_ip: vip_ip_v6,
-        vip_port,
+        front_ip: front_ip_v6,
+        front_port,
         original_client_port: client_port,
     };
     // Unlike FWD_PENDING's value, this one can legitimately change under the
@@ -1131,15 +1131,15 @@ fn try_geneve_decap_forward_v4(
 
     // `?`, not a fallback: this front is v4 (dispatched here on ETH_P_IPV4),
     // so its Service must pair a v4 pod_ip too, or there is no v4 IP_DST
-    // width to DNAT into at all -- a v6-pod-behind-a-v4-VIP fixture is a
+    // width to DNAT into at all -- a v6-pod-behind-a-v4-front fixture is a
     // misconfiguration this drops rather than corrupts.
     rewrite_ip_port(
         ctx,
         IP_DST,
-        vip_ip,
+        front_ip,
         unmap_ipv4(&pod_ip_v6)?,
         L4_DPORT,
-        vip_port,
+        front_port,
         target_port,
         proto,
     )?;
@@ -1182,12 +1182,12 @@ fn try_geneve_decap_forward_v6(
 
     let client_ip_v6: [u8; 16] = ctx.load(IP6_SRC).ok()?;
     let client_port: u16 = ctx.load(L4_SPORT_V6).ok()?;
-    let vip_ip_v6: [u8; 16] = ctx.load(IP6_DST).ok()?; // captured before rewrite
-    let vip_port: u16 = ctx.load(L4_DPORT_V6).ok()?; // captured before rewrite
+    let front_ip_v6: [u8; 16] = ctx.load(IP6_DST).ok()?; // captured before rewrite
+    let front_port: u16 = ctx.load(L4_DPORT_V6).ok()?; // captured before rewrite
 
     let target_port = front_endpoint(LbFrontKey {
-        vip_ip: vip_ip_v6,
-        vip_port,
+        front_ip: front_ip_v6,
+        front_port,
         proto,
         _pad: 0,
     })?
@@ -1225,8 +1225,8 @@ fn try_geneve_decap_forward_v6(
         ),
         BackendPortResolution::Probe => {
             let existing_occupant = flow_table_get_reverse(natural_rev_key)
-                .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
-            let new_front = (vip_ip_v6, vip_port);
+                .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
+            let new_front = (front_ip_v6, front_port);
             let mut candidate_key = encode_flow_key(
                 client_ip_v6,
                 0,
@@ -1238,7 +1238,7 @@ fn try_geneve_decap_forward_v6(
             let is_reverse_key_taken = |candidate_port: u16| {
                 candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
                 let occupant = flow_table_get_reverse(candidate_key)
-                    .map(|v| ((v.vip_ip, v.vip_port), v.original_client_port));
+                    .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
                 occupant_conflicts(occupant, new_front, client_port)
             };
             match resolve_backend_src_port(
@@ -1269,8 +1269,8 @@ fn try_geneve_decap_forward_v6(
 
     let rev_value = RevFlowValue {
         ingress_node_ip: tunnel_remote(tkey, used_ipv6),
-        vip_ip: vip_ip_v6,
-        vip_port,
+        front_ip: front_ip_v6,
+        front_port,
         original_client_port: client_port,
     };
     if flow_table_get_reverse(rev_key) != Some(rev_value) {
@@ -1291,10 +1291,10 @@ fn try_geneve_decap_forward_v6(
     rewrite_ipv6_port(
         ctx,
         IP6_DST,
-        vip_ip_v6,
+        front_ip_v6,
         pod_ip_v6,
         L4_DPORT_V6,
-        vip_port,
+        front_port,
         target_port,
         proto,
         if proto == IPPROTO_TCP {
@@ -1315,7 +1315,7 @@ fn try_geneve_decap_forward_v6(
 /// Ingress role (step 7): read `CLIENT_IP:SRC_PORT` off the inner dst and
 /// `LB_FRONT_IP:LB_FRONT_PORT` off the Geneve echo, confirm this return answers a flow
 /// this node actually forwarded (drop otherwise -- an echo with no matching
-/// forward entry is stale or spoofed), then un-DNAT src back to the VIP and
+/// forward entry is stale or spoofed), then un-DNAT src back to the front and
 /// let normal routing carry it out to the client.
 #[inline(always)]
 fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bool) -> Option<i32> {
@@ -1327,7 +1327,7 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
         return Some(TC_ACT_SHOT);
     }
 
-    // The Geneve VIP-echo option is family-agnostic (module doc's option-
+    // The Geneve front-echo option is family-agnostic (module doc's option-
     // widening), same as forward-decap's pod-id option -- read it once here
     // before the inner packet's own family is known.
     let mut opt = [0u8; 24];
@@ -1335,15 +1335,15 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
     {
         return Some(TC_ACT_SHOT);
     }
-    if opt[0..2] != GENEVE_OPT_CLASS.to_ne_bytes() || opt[2] != GENEVE_OPT_TYPE_VIP_ECHO {
+    if opt[0..2] != GENEVE_OPT_CLASS.to_ne_bytes() || opt[2] != GENEVE_OPT_TYPE_FRONT_ECHO {
         return Some(TC_ACT_SHOT);
     }
-    let vip_ip_v6: [u8; 16] = opt[4..20].try_into().ok()?;
-    let vip_port = u16::from_ne_bytes(opt[20..22].try_into().ok()?);
+    let front_ip_v6: [u8; 16] = opt[4..20].try_into().ok()?;
+    let front_port = u16::from_ne_bytes(opt[20..22].try_into().ok()?);
 
     match ctx.load::<u16>(12).ok()? {
-        ETH_P_IPV4 => try_geneve_decap_return_v4(ctx, vip_ip_v6, vip_port),
-        ETH_P_IPV6 => try_geneve_decap_return_v6(ctx, vip_ip_v6, vip_port),
+        ETH_P_IPV4 => try_geneve_decap_return_v4(ctx, front_ip_v6, front_port),
+        ETH_P_IPV6 => try_geneve_decap_return_v6(ctx, front_ip_v6, front_port),
         _ => Some(TC_ACT_OK),
     }
 }
@@ -1378,7 +1378,11 @@ fn redirect_client_bound(ingress_ifindex: u32) -> Option<i32> {
 }
 
 #[inline(always)]
-fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u16) -> Option<i32> {
+fn try_geneve_decap_return_v4(
+    ctx: &TcContext,
+    front_ip_v6: [u8; 16],
+    front_port: u16,
+) -> Option<i32> {
     if ctx.load::<u8>(IP_VER_IHL).ok()? & 0x0f != 5 {
         return Some(TC_ACT_OK);
     }
@@ -1395,12 +1399,12 @@ fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
     // comment) uses this shape.
-    let key = encode_tcp_flow_key(client_ip_v6, client_port, vip_ip_v6, vip_port, proto);
+    let key = encode_tcp_flow_key(client_ip_v6, client_port, front_ip_v6, front_port, proto);
     let fwd_key = encode_flow_key(
         client_ip_v6,
         client_port,
-        vip_ip_v6,
-        vip_port,
+        front_ip_v6,
+        front_port,
         proto,
         FlowDirection::Forward,
     );
@@ -1445,21 +1449,21 @@ fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
     let ingress_ifindex = forward_value?.ingress_ifindex;
 
     // `?`: this front is v4 (dispatched here on ETH_P_IPV4), so the echoed
-    // vip_ip must unmap to a v4 wire token -- see
+    // front_ip must unmap to a v4 wire token -- see
     // `try_geneve_decap_forward_v4`'s matching comment.
     rewrite_ip_port(
         ctx,
         IP_SRC,
         pod_ip,
-        unmap_ipv4(&vip_ip_v6)?,
+        unmap_ipv4(&front_ip_v6)?,
         L4_SPORT,
         target_port,
-        vip_port,
+        front_port,
         proto,
     )?;
 
     // Unlike the forward decap, this can't hand off with TC_ACT_OK: `src` is
-    // now the VIP -- an address THIS node genuinely owns -- and the kernel's
+    // now the front -- an address THIS node genuinely owns -- and the kernel's
     // normal receive-side routing decision (`ip_rcv_finish_core`) unconditionally
     // martian-drops any packet whose source is one of the node's own local
     // addresses arriving for forwarding rather than local origination
@@ -1473,9 +1477,9 @@ fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
     //
     // That same redirect re-enters the uplink's OWN egress pipeline, so
     // `try_uplink_egress_return` (hook 3) sees this already-un-DNAT'd,
-    // client-bound packet a second time with src == vip_ip. Stamp it before
+    // client-bound packet a second time with src == front_ip. Stamp it before
     // redirecting so hook 3 can recognize and skip its own redirected-back
-    // packet: without this, vip_ip == pod_ip -- a hostNetwork Service
+    // packet: without this, front_ip == pod_ip -- a hostNetwork Service
     // fronted by a same-node backend's own address -- fools hook 3's
     // POD_TARGETS admission into misreading this packet as the pod's raw
     // reply and dropping it.
@@ -1491,7 +1495,11 @@ fn try_geneve_decap_return_v4(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
 
 /// IPv6 sibling of `try_geneve_decap_return_v4`.
 #[inline(always)]
-fn try_geneve_decap_return_v6(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u16) -> Option<i32> {
+fn try_geneve_decap_return_v6(
+    ctx: &TcContext,
+    front_ip_v6: [u8; 16],
+    front_port: u16,
+) -> Option<i32> {
     let proto: u8 = ctx.load(IP6_NEXT_HDR).ok()?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
         return Some(TC_ACT_OK);
@@ -1502,12 +1510,12 @@ fn try_geneve_decap_return_v6(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
     let client_ip_v6: [u8; 16] = ctx.load(IP6_DST).ok()?;
     let client_port: u16 = ctx.load(L4_DPORT_V6).ok()?;
 
-    let key = encode_tcp_flow_key(client_ip_v6, client_port, vip_ip_v6, vip_port, proto);
+    let key = encode_tcp_flow_key(client_ip_v6, client_port, front_ip_v6, front_port, proto);
     let fwd_key = encode_flow_key(
         client_ip_v6,
         client_port,
-        vip_ip_v6,
-        vip_port,
+        front_ip_v6,
+        front_port,
         proto,
         FlowDirection::Forward,
     );
@@ -1535,10 +1543,10 @@ fn try_geneve_decap_return_v6(ctx: &TcContext, vip_ip_v6: [u8; 16], vip_port: u1
         ctx,
         IP6_SRC,
         pod_ip_v6,
-        vip_ip_v6,
+        front_ip_v6,
         L4_SPORT_V6,
         target_port,
-        vip_port,
+        front_port,
         proto,
         if proto == IPPROTO_TCP {
             TCP_CSUM_V6
@@ -1566,7 +1574,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // `try_geneve_decap_return`'s final redirect re-enters this same uplink's
     // egress pipeline, so this hook sees that already-processed,
     // already-un-DNAT'd client-bound packet a SECOND time before the
-    // POD_TARGETS admission below ever runs. When vip_ip == pod_ip -- a
+    // POD_TARGETS admission below ever runs. When front_ip == pod_ip -- a
     // hostNetwork Service fronted by a same-node backend's own address --
     // that second pass spuriously matches POD_TARGETS and gets misread as
     // the pod's raw reply, then dropped. Recognize and pass it through
@@ -1710,10 +1718,10 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let mut opt = [0u8; 24];
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
-    opt[2] = GENEVE_OPT_TYPE_VIP_ECHO;
+    opt[2] = GENEVE_OPT_TYPE_FRONT_ECHO;
     opt[3] = 5; // opt_data length in 4-byte words (16 + 2 + 2 padding bytes).
-    opt[4..20].copy_from_slice(&rev.vip_ip);
-    opt[20..22].copy_from_slice(&rev.vip_port.to_ne_bytes());
+    opt[4..20].copy_from_slice(&rev.front_ip);
+    opt[20..22].copy_from_slice(&rev.front_port.to_ne_bytes());
     if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
         != 0
     {
@@ -1819,10 +1827,10 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let mut opt = [0u8; 24];
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
-    opt[2] = GENEVE_OPT_TYPE_VIP_ECHO;
+    opt[2] = GENEVE_OPT_TYPE_FRONT_ECHO;
     opt[3] = 5; // opt_data length in 4-byte words (16 + 2 + 2 padding bytes).
-    opt[4..20].copy_from_slice(&rev.vip_ip);
-    opt[20..22].copy_from_slice(&rev.vip_port.to_ne_bytes());
+    opt[4..20].copy_from_slice(&rev.front_ip);
+    opt[20..22].copy_from_slice(&rev.front_port.to_ne_bytes());
     if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
         != 0
     {

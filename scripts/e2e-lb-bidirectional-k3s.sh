@@ -14,9 +14,9 @@
 # deploy/{rbac,daemonset}.yaml, same as smoke-k3s-controller.sh -- does not
 # re-assert RSS/FLOW_TABLE/FRONT_META population already covered there.
 #
-# Each direction uses a distinct VIP port (80 vs 8081): a type=LoadBalancer
+# Each direction uses a distinct front port (80 vs 8081): a type=LoadBalancer
 # Service's status.loadBalancer.ingress lists ALL node IPs regardless of
-# which node its backend Pod is pinned to, so two Services sharing one VIP
+# which node its backend Pod is pinned to, so two Services sharing one front
 # port would race for the same (node-ip, port) dataplane map key on
 # whichever node isn't hosting either one's backend.
 #
@@ -238,14 +238,14 @@ wait_for_service whoami-a
 wait_for_service whoami-b
 
 assert_round_trip() { # assert_round_trip <direction-label> <dial-ip> <dial-port>
-  local label="$1" vip="$2" port="$3" body rc
+  local label="$1" front="$2" port="$3" body rc
   set +e
-  body="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${vip}:${port}/" 2>&1)"
+  body="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${front}:${port}/" 2>&1)"
   rc=$?
   set -e
   echo "$body"
   if [ "$rc" -ne 0 ]; then
-    echo "ROUND-TRIP ($label): FAIL (curl rc=$rc dialing $vip:$port)" >&2
+    echo "ROUND-TRIP ($label): FAIL (curl rc=$rc dialing $front:$port)" >&2
     dump_evidence
     exit 1
   fi
@@ -254,7 +254,7 @@ assert_round_trip() { # assert_round_trip <direction-label> <dial-ip> <dial-port
     dump_evidence
     exit 1
   fi
-  echo "ROUND-TRIP ($label): PASS (client IP $IP_CLIENT preserved end-to-end via $vip:$port)"
+  echo "ROUND-TRIP ($label): PASS (client IP $IP_CLIENT preserved end-to-end via $front:$port)"
 }
 
 echo "==> [7/8] direction 1: svc-on-node-a, dialed via node-b's ingress ($IP_B:$PORT_SVC_A)"

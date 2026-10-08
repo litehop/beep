@@ -117,7 +117,7 @@ AND touches **only doc/config surfaces** — `docs/`, `*.md`, `.claude/agents/*.
 `ai/dashboard.md`, CI YAML, `Cargo.toml` version/dependency bumps with no
 code behind them, `scripts/*.sh`, non-`src/` test dirs — with **no changes
 to code or any public-API surface** (eBPF map key/value layouts shared via
-`common/`, packet-parsing or redirect logic in `ebpf/src/**/*.rs`, VIP/backend
+`common/`, packet-parsing or redirect logic in `ebpf/src/**/*.rs`, front/backend
 map population in `src/**/*.rs`, or any other `**/*.rs` logic) qualifies for
 the low-effort tier: dispatch critical-reviewer with `model="haiku"`. Every
 other PR — larger diff, or any diff touching code or a public-API surface,
@@ -429,7 +429,7 @@ VMs**:
 | VM name | Role | Driven by |
 |---|---|---|
 | `beep-smoke` | single-node smoke gate — a local veth-pair fixture stands in for a client | `scripts/smoke.sh --vm beep-smoke` |
-| `beep-node-a` | cross-node WireGuard rig, ingress side (owns the VIP) | `scripts/smoke-wg-2node.sh --vm-a beep-node-a --vm-b beep-node-b` |
+| `beep-node-a` | cross-node WireGuard rig, ingress side (owns the front) | `scripts/smoke-wg-2node.sh --vm-a beep-node-a --vm-b beep-node-b` |
 | `beep-node-b` | cross-node WireGuard rig, backend side (backend Pod + "client") | same as above |
 
 No port table and no per-worker port flags exist for these scripts

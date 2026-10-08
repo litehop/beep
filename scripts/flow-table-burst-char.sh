@@ -50,7 +50,7 @@ set -euo pipefail
 # RFC 5737 documentation ranges, disjoint from smoke-remote.sh's own fixture
 # addresses/ifnames so both can coexist (this script tears its own down
 # before and after every run regardless).
-VIP_IP="203.0.113.211"
+FRONT_IP="203.0.113.211"
 CLIENT_IP="203.0.113.212"
 POD_IP="198.51.100.213"
 FWD_PORT="19400"
@@ -99,7 +99,7 @@ ip link set geneve0 up
 ip link add fbveth0 type veth peer name fbveth1
 ip netns add fbclient
 ip link set fbveth1 netns fbclient
-ip addr add "${VIP_IP}/24" dev fbveth0
+ip addr add "${FRONT_IP}/24" dev fbveth0
 ip link set fbveth0 up
 ip netns exec fbclient ip addr add "${CLIENT_IP}/24" dev fbveth1
 ip netns exec fbclient ip link set fbveth1 up
@@ -108,11 +108,11 @@ ip addr add "${POD_IP}/32" dev lo
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
 sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
 
-echo "==> loading beep-ebpf: forward-establishing front ${VIP_IP}:${FWD_PORT}/tcp, reverse-role burst front ${VIP_IP}:${REV_PORT}/udp (both node-ip=self, so both round trip through this node's own decap step)"
+echo "==> loading beep-ebpf: forward-establishing front ${FRONT_IP}:${FWD_PORT}/tcp, reverse-role burst front ${FRONT_IP}:${REV_PORT}/udp (both node-ip=self, so both round trip through this node's own decap step)"
 nohup "$BIN" --uplink-iface fbveth0 --geneve-iface geneve0 --pin-dir "$PIN_DIR" \
-  --pod-cidr "198.51.100.0/24" --node-ip "$VIP_IP" \
-  --fixture "${VIP_IP}:${FWD_PORT}:tcp:${VIP_IP}:${POD_IP}:${FWD_TARGET_PORT}" \
-  --fixture "${VIP_IP}:${REV_PORT}:udp:${VIP_IP}:${POD_IP}:${REV_TARGET_PORT}" \
+  --pod-cidr "198.51.100.0/24" --node-ip "$FRONT_IP" \
+  --fixture "${FRONT_IP}:${FWD_PORT}:tcp:${FRONT_IP}:${POD_IP}:${FWD_TARGET_PORT}" \
+  --fixture "${FRONT_IP}:${REV_PORT}:udp:${FRONT_IP}:${POD_IP}:${REV_TARGET_PORT}" \
   >"$LOADER_LOG" 2>&1 &
 loader_pid=$!
 disown
@@ -138,7 +138,7 @@ for i in $(seq 1 "$NUM_FORWARD"); do
   nohup nc -l -N "$POD_IP" "$FWD_TARGET_PORT" </tmp/flow-table-burst-resp.http >"/tmp/flow-table-burst-backend-$i.log" 2>&1 &
   disown
   sleep 0.1
-  ip netns exec fbclient curl -sS -m 5 "http://${VIP_IP}:${FWD_PORT}/" >/dev/null || echo "WARN: forward round trip $i failed" >&2
+  ip netns exec fbclient curl -sS -m 5 "http://${FRONT_IP}:${FWD_PORT}/" >/dev/null || echo "WARN: forward round trip $i failed" >&2
 done
 
 map_dump() {
@@ -171,7 +171,7 @@ send_burst() {
   local count="$1"
   ip netns exec fbclient bash -c "
     for ((i=0; i<${count}; i++)); do
-      exec {fd}<>\"/dev/udp/${VIP_IP}/${REV_PORT}\" 2>/dev/null || continue
+      exec {fd}<>\"/dev/udp/${FRONT_IP}/${REV_PORT}\" 2>/dev/null || continue
       printf x >&\$fd 2>/dev/null || true
       exec {fd}>&- 2>/dev/null || true
     done

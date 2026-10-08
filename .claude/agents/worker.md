@@ -116,7 +116,7 @@ cargo test -p beep-common 2>&1 | tail -30
 # For a bead that touches the dataplane (ebpf/, common/, or the loader's
 # map/attach code), also run scripts/smoke.sh against your assigned VM
 # before opening the PR:
-bash scripts/smoke.sh --vm <ASSIGNED_VM>   # VIP -> Geneve -> backend round trip
+bash scripts/smoke.sh --vm <ASSIGNED_VM>   # front -> Geneve -> backend round trip
 
 # 6. Commit — pre-commit re-checks `cargo fmt --check` plus the bead/
 # findings-ref guards (not just fmt). Draft the message from your own diff,

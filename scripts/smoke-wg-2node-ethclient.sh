@@ -46,7 +46,7 @@ BIN_NAME="beep-wg2node"
 WG_SUBNET_A="10.99.0.2"
 WG_SUBNET_B="10.99.0.4"
 WG_PORT="51820"
-VIP_PORT="19100"
+FRONT_PORT="19100"
 POD_IP="198.51.100.60"
 POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18090"
@@ -65,7 +65,7 @@ CLIENT_ADDR_V6="fd00:beef:60::2"
 CLIENT_PREFIX_V6="64"
 CLIENT_NETNS="smoke-wg2node-client"
 
-FIXTURE="${WG_SUBNET_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
+FIXTURE="${WG_SUBNET_A}:${FRONT_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 
 command -v limactl >/dev/null || { echo "FAIL: limactl not found on PATH" >&2; exit 1; }
 command -v cargo-zigbuild >/dev/null || { echo "FAIL: cargo-zigbuild not found on PATH" >&2; exit 1; }
@@ -169,13 +169,13 @@ remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
 WG_A_BEFORE="$(remote "$VM_A" wg-packet-count)"
 WG_B_BEFORE="$(remote "$VM_B" wg-packet-count)"
 
-echo "==> [8/8] driving a client round trip: netns $CLIENT_NETNS ($CLIENT_ADDR) -> VIP ${WG_SUBNET_A}:${VIP_PORT} -- return leg redirects onto real Ethernet $CLIENT_UPLINK_IFACE"
+echo "==> [8/8] driving a client round trip: netns $CLIENT_NETNS ($CLIENT_ADDR) -> front ${WG_SUBNET_A}:${FRONT_PORT} -- return leg redirects onto real Ethernet $CLIENT_UPLINK_IFACE"
 set +e
-BODY="$(limactl shell "$VM_A" -- sudo ip netns exec "$CLIENT_NETNS" curl -sS -4 -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+BODY="$(limactl shell "$VM_A" -- sudo ip netns exec "$CLIENT_NETNS" curl -sS -4 -m 20 "http://${WG_SUBNET_A}:${FRONT_PORT}/" 2>&1)"
 RC=$?
 set -e
 if [ "$RC" -eq 0 ] && [ "$BODY" = "OK" ]; then
-  echo "ROUND-TRIP: PASS (client ${CLIENT_ADDR} -> VIP ${WG_SUBNET_A}:${VIP_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
+  echo "ROUND-TRIP: PASS (client ${CLIENT_ADDR} -> front ${WG_SUBNET_A}:${FRONT_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
 else
   echo "ROUND-TRIP: FAIL (curl rc=$RC, body='$BODY')" >&2
 fi

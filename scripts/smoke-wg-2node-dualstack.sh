@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Dual-stack sibling of scripts/smoke-wg-2node.sh: proves ONE fixture set --
-# a v4 front and a v6 front on the same VIP_PORT, same backend node -- serves
+# a v4 front and a v6 front on the same FRONT_PORT, same backend node -- serves
 # BOTH a v4 client AND a v6 client concurrently on the beep-node-a/
 # beep-node-b rig, over a GENUINE cross-node round trip.
 #
 # Uses ONLY beep-node-a/beep-node-b, no 3rd client VM. The client for BOTH
-# families runs in its own isolated netns on node-a (the VIP-owning ingress
+# families runs in its own isolated netns on node-a (the front-owning ingress
 # node) -- a veth pair, one end in node-a's default netns, the other in
 # $CLIENT_NETNS -- the same isolation technique scripts/smoke-remote.sh's
 # single-VM smoke-client netns already uses, chosen here so this node's own
@@ -13,7 +13,7 @@
 # drops a co-located client.
 #
 # GENUINE cross-node, not a same-node self-loop: the client dials node-a's
-# VIP, node-a's own loader Geneve-encapsulates and hands off to the KERNEL's
+# front, node-a's own loader Geneve-encapsulates and hands off to the KERNEL's
 # wg0 route to node-b (a real WireGuard-encrypted hop over the real
 # underlay), node-b decaps + DNATs + delivers to its local backend, and the
 # backend's reply re-encaps and crosses wg0 right back. `--vm-a`/`--vm-b`
@@ -37,7 +37,7 @@
 # The outer Geneve/underlay stays v4-only for BOTH fronts (`NODE_ALLOW`/
 # `bpf_tunnel_key.remote_ipv4` module doc in ebpf/src/main.rs: "every
 # fixture/smoke deployment today runs a v4-only underlay regardless of the
-# inner packet's own family") -- only the VIP/pod_ip pair's own family
+# inner packet's own family") -- only the front/pod_ip pair's own family
 # varies per front. This lets one `--node-ip` (node-b's v4 wg0 address)
 # correctly scope POD_TARGETS to BOTH fixtures' pod_ip (`--node-ip`'s doc
 # comment in src/main.rs: matched by exact `backend_node_ip` equality).
@@ -70,7 +70,7 @@ WG_SUBNET_B="10.99.0.4"
 WG_ULA_A="fd00:beef:99::2"
 WG_ULA_B="fd00:beef:99::4"
 WG_PORT="51820"
-VIP_PORT="19100"
+FRONT_PORT="19100"
 POD_CIDR="198.51.100.0/24"
 POD_IP_V4="198.51.100.60"
 POD_IP_V6="2001:db8:60::10"
@@ -99,8 +99,8 @@ CLIENT_TUNNEL_V6="fd00:beef:62::2"
 CLIENT_TUNNEL_V6_PREFIX="64"
 CLIENT_NETNS="smoke-wg2node-client"
 
-FIXTURE_V4="${WG_SUBNET_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP_V4}:${TARGET_PORT_V4}"
-FIXTURE_V6="[${WG_ULA_A}]:${VIP_PORT}:tcp:${WG_SUBNET_B}:[${POD_IP_V6}]:${TARGET_PORT_V6}"
+FIXTURE_V4="${WG_SUBNET_A}:${FRONT_PORT}:tcp:${WG_SUBNET_B}:${POD_IP_V4}:${TARGET_PORT_V4}"
+FIXTURE_V6="[${WG_ULA_A}]:${FRONT_PORT}:tcp:${WG_SUBNET_B}:[${POD_IP_V6}]:${TARGET_PORT_V6}"
 
 command -v limactl >/dev/null || { echo "FAIL: limactl not found on PATH" >&2; exit 1; }
 command -v cargo-zigbuild >/dev/null || { echo "FAIL: cargo-zigbuild not found on PATH" >&2; exit 1; }
@@ -249,24 +249,24 @@ remote "$VM_B" start-backend-responder --pod-ip "$POD_IP_V6" --port "$TARGET_POR
 WG_A_BEFORE="$(remote "$VM_A" wg-packet-count)"
 WG_B_BEFORE="$(remote "$VM_B" wg-packet-count)"
 
-echo "==> [8/9] driving a v4 client round trip: netns $CLIENT_NETNS ($CLIENT_TUNNEL_V4) -> VIP ${WG_SUBNET_A}:${VIP_PORT}"
+echo "==> [8/9] driving a v4 client round trip: netns $CLIENT_NETNS ($CLIENT_TUNNEL_V4) -> front ${WG_SUBNET_A}:${FRONT_PORT}"
 set +e
-V4_BODY="$(limactl shell "$VM_A" -- sudo ip netns exec "$CLIENT_NETNS" curl -sS -4 -m 20 "http://${WG_SUBNET_A}:${VIP_PORT}/" 2>&1)"
+V4_BODY="$(limactl shell "$VM_A" -- sudo ip netns exec "$CLIENT_NETNS" curl -sS -4 -m 20 "http://${WG_SUBNET_A}:${FRONT_PORT}/" 2>&1)"
 V4_RC=$?
 set -e
 if [ "$V4_RC" -eq 0 ] && [ "$V4_BODY" = "OK4" ]; then
-  echo "ROUND-TRIP-V4: PASS (client ${CLIENT_TUNNEL_V4} -> VIP ${WG_SUBNET_A}:${VIP_PORT} -> backend ${POD_IP_V4}:${TARGET_PORT_V4} -> response 'OK4')"
+  echo "ROUND-TRIP-V4: PASS (client ${CLIENT_TUNNEL_V4} -> front ${WG_SUBNET_A}:${FRONT_PORT} -> backend ${POD_IP_V4}:${TARGET_PORT_V4} -> response 'OK4')"
 else
   echo "ROUND-TRIP-V4: FAIL (curl rc=$V4_RC, body='$V4_BODY')" >&2
 fi
 
-echo "==> [9/9] driving a v6 client round trip: netns $CLIENT_NETNS ($CLIENT_TUNNEL_V6) -> VIP [${WG_ULA_A}]:${VIP_PORT}"
+echo "==> [9/9] driving a v6 client round trip: netns $CLIENT_NETNS ($CLIENT_TUNNEL_V6) -> front [${WG_ULA_A}]:${FRONT_PORT}"
 set +e
-V6_BODY="$(limactl shell "$VM_A" -- sudo ip netns exec "$CLIENT_NETNS" curl -sS -6 -m 20 "http://[${WG_ULA_A}]:${VIP_PORT}/" 2>&1)"
+V6_BODY="$(limactl shell "$VM_A" -- sudo ip netns exec "$CLIENT_NETNS" curl -sS -6 -m 20 "http://[${WG_ULA_A}]:${FRONT_PORT}/" 2>&1)"
 V6_RC=$?
 set -e
 if [ "$V6_RC" -eq 0 ] && [ "$V6_BODY" = "OK6" ]; then
-  echo "ROUND-TRIP-V6: PASS (client ${CLIENT_TUNNEL_V6} -> VIP [${WG_ULA_A}]:${VIP_PORT} -> backend [${POD_IP_V6}]:${TARGET_PORT_V6} -> response 'OK6')"
+  echo "ROUND-TRIP-V6: PASS (client ${CLIENT_TUNNEL_V6} -> front [${WG_ULA_A}]:${FRONT_PORT} -> backend [${POD_IP_V6}]:${TARGET_PORT_V6} -> response 'OK6')"
 else
   echo "ROUND-TRIP-V6: FAIL (curl rc=$V6_RC, body='$V6_BODY')" >&2
 fi
@@ -302,7 +302,7 @@ fi
 if [ "$V4_RC" -eq 0 ] && [ "$V4_BODY" = "OK4" ] && [ "$V6_RC" -eq 0 ] && [ "$V6_BODY" = "OK6" ] \
   && [ "$WG_A_AFTER" -gt "$WG_A_BEFORE" ] && [ "$WG_B_AFTER" -gt "$WG_B_BEFORE" ] \
   && [ "$V4_CLIENT_IP_SEEN" = true ] && [ "$V6_CLIENT_IP_SEEN" = true ]; then
-  echo "GATE DUAL-STACK GENUINE CROSS-NODE ROUND TRIP: PASS (v4 and v6 clients both reached the same VIP_PORT ${VIP_PORT} off one fixture set, over a real wg0 hop, with client-IP preserved end to end)"
+  echo "GATE DUAL-STACK GENUINE CROSS-NODE ROUND TRIP: PASS (v4 and v6 clients both reached the same FRONT_PORT ${FRONT_PORT} off one fixture set, over a real wg0 hop, with client-IP preserved end to end)"
   exit 0
 fi
 

@@ -60,7 +60,7 @@ cross-builds on the host instead of building inside the VM:
    `scripts/smoke-remote.sh`, into the VM with `limactl copy`.
 3. `smoke-remote.sh` runs *inside* the VM as root: it builds a self-contained
    veth-pair + netns fixture, loads the three tc-bpf classifiers, asserts
-   the verifier accepted them, and drives client → VIP → backend TCP round
+   the verifier accepted them, and drives client → front → backend TCP round
    trips through the real dataplane.
 
 Nightly and `bpf-linker` stay host-side only — never installed or invoked
@@ -75,7 +75,7 @@ Each pool VM is also exposed as an MCP server (`beep-smoke`, `beep-node-a`,
 as `mcp__beep-<vm>__*` tools. Use these for read-only inspection of live VM
 state without opening a shell:
 
-- `bpftool map dump` — read conntrack / VIP→backend map contents while the
+- `bpftool map dump` — read conntrack / front→backend map contents while the
   dataplane is loaded.
 - `ip -s link` — check veth/interface counters on the smoke fixture.
 - `dmesg` — check kernel/verifier log output after a load.

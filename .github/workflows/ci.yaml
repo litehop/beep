@@ -221,7 +221,7 @@ jobs:
       - name: Cross-compile beep-controller for aarch64-gnu
         run: cargo +nightly zigbuild -p beep-controller --target aarch64-unknown-linux-gnu.2.36
 
-  # Loads the real programs and drives one client->VIP->backend round trip
+  # Loads the real programs and drives one client->front->backend round trip
   # natively on ubuntu-latest (no Lima/cross-build), then asserts the discovered
   # map set is EXACTLY the 7 known maps (catches partial-discovery regressions a
   # byte-sum-only check would miss) under a gross-regression bytes_memlock ceiling.

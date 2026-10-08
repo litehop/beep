@@ -116,7 +116,7 @@ impl std::fmt::Display for Ipv6Cidr {
 }
 
 /// `NodeContext::pod_cidr`'s dual-stack shape, mirroring the loader's own
-/// `Ipv4Cidr`/`IpCidr` split (`src/main.rs`): a Service's VIP and its
+/// `Ipv4Cidr`/`IpCidr` split (`src/main.rs`): a Service's front and its
 /// backend Pod can each independently be v4 or v6, so `is_admitted` must
 /// compare a dual-stack `Endpoint.pod_ip` against a CIDR of either family
 /// without assuming one. `main.rs`'s CLI parser (`parse_ip_cidr`) picks
@@ -178,7 +178,7 @@ pub struct NodeContext {
     pub pod_cidr: IpCidr,
 }
 
-/// One `Service.spec.ports[]` entry: `port` is the VIP-facing front port,
+/// One `Service.spec.ports[]` entry: `port` is the front-facing front port,
 /// `target_port` the numeric container port, stored on the front's endpoint
 /// (`FrontEndpoint::target_port`). A container-port-by-name Service must be
 /// resolved to a number before reaching this type.
@@ -189,10 +189,10 @@ pub struct ServicePort {
     pub target_port: u16,
 }
 
-/// A `type=LoadBalancer` Service's parsed view: front VIP plus its ports.
+/// A `type=LoadBalancer` Service's parsed view: front address plus its ports.
 #[derive(Clone, Debug)]
 pub struct ServiceView {
-    pub vip_ip: IpAddr,
+    pub front_ip: IpAddr,
     pub ports: Vec<ServicePort>,
 }
 
@@ -328,10 +328,10 @@ impl DesiredEntries {
     }
 }
 
-fn front_key(vip_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
+fn front_key(front_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
     LbFrontKey {
-        vip_ip: wire_ip_v6(vip_ip),
-        vip_port: wire_port(port.port),
+        front_ip: wire_ip_v6(front_ip),
+        front_port: wire_port(port.port),
         proto: port.protocol.as_ip_proto(),
         _pad: 0,
     }
@@ -360,7 +360,7 @@ fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
 /// design (`beep_common::egress_return_admission`'s doc comment) --
 /// membership must never depend on which front port an endpoint answers,
 /// only on whether THIS node hosts it and is ready to serve it. Deliberately
-/// independent of `ServiceView` (no `vip_ip`/`ports` input): unlike
+/// independent of `ServiceView` (no `front_ip`/`ports` input): unlike
 /// `FRONT_META`/`FRONT_ENDPOINTS`, POD_TARGETS is EndpointSlice/local-node-derived,
 /// not front-derived, so `WatchState::desired` can (and must) call this even
 /// while the front set is still unknown (`nodes_listed == false`) -- see its
@@ -434,7 +434,7 @@ pub fn reconcile_service(
             .filter(|e| {
                 e.ready
                     && e.ports.contains(&port.target_port)
-                    && e.pod_ip.is_ipv4() == svc.vip_ip.is_ipv4()
+                    && e.pod_ip.is_ipv4() == svc.front_ip.is_ipv4()
             })
             .collect();
         // One endpoint per front (slot 0) for now: pick deterministically --
@@ -448,7 +448,7 @@ pub fn reconcile_service(
         };
 
         desired.fronts.insert(
-            front_key(svc.vip_ip, port),
+            front_key(svc.front_ip, port),
             DesiredFront {
                 flags: 0,
                 endpoints: vec![FrontEndpoint {
@@ -484,7 +484,7 @@ pub fn ports_without_same_family_endpoint(
         slices.iter().flat_map(|s| s.endpoints.iter()).any(|e| {
             e.ready
                 && e.ports.contains(&port.target_port)
-                && (e.pod_ip.is_ipv4() == svc.vip_ip.is_ipv4()) == same_family
+                && (e.pod_ip.is_ipv4() == svc.front_ip.is_ipv4()) == same_family
         })
     };
     svc.ports
@@ -517,9 +517,9 @@ mod tests {
         }
     }
 
-    fn single_port_service(vip_ip: Ipv4Addr, port: u16, target_port: u16) -> ServiceView {
+    fn single_port_service(front_ip: Ipv4Addr, port: u16, target_port: u16) -> ServiceView {
         ServiceView {
-            vip_ip: IpAddr::V4(vip_ip),
+            front_ip: IpAddr::V4(front_ip),
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -528,9 +528,9 @@ mod tests {
         }
     }
 
-    fn single_port_service_v6(vip_ip: Ipv6Addr, port: u16, target_port: u16) -> ServiceView {
+    fn single_port_service_v6(front_ip: Ipv6Addr, port: u16, target_port: u16) -> ServiceView {
         ServiceView {
-            vip_ip: IpAddr::V6(vip_ip),
+            front_ip: IpAddr::V6(front_ip),
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -583,18 +583,18 @@ mod tests {
             "exactly one front port was configured, so exactly one front is expected"
         );
         let (key, backend) = desired.backends().into_iter().next().unwrap();
-        let vip_wire = unmap_ipv4(&key.vip_ip)
-            .expect("a v4 VIP stored via ipv4_mapped_v6 must unmap back to a wire value");
+        let front_wire = unmap_ipv4(&key.front_ip)
+            .expect("a v4 front stored via ipv4_mapped_v6 must unmap back to a wire value");
         assert_eq!(
-            vip_wire.to_le_bytes(),
+            front_wire.to_le_bytes(),
             [10, 0, 0, 1],
-            "VIP wire encoding regressed vs beep_common::wire_ip's dotted-octet pin -- a \
+            "front wire encoding regressed vs beep_common::wire_ip's dotted-octet pin -- a \
              regression here corrupts every packet matched against this front"
         );
         assert_eq!(
-            key.vip_port.to_le_bytes(),
+            key.front_port.to_le_bytes(),
             [0, 80],
-            "VIP port wire encoding regressed vs beep_common::wire_port's network-byte-order pin"
+            "front port wire encoding regressed vs beep_common::wire_port's network-byte-order pin"
         );
         let pod_wire = unmap_ipv4(&backend.pod_ip)
             .expect("a v4 pod IP stored via ipv4_mapped_v6 must unmap back to a wire value");
@@ -789,7 +789,7 @@ mod tests {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let pod_ip = Ipv4Addr::new(10, 244, 0, 9);
         let svc = ServiceView {
-            vip_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            front_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             ports: vec![
                 ServicePort {
                     port: 80,
@@ -1036,7 +1036,7 @@ mod tests {
         );
     }
 
-    // A v6 Service's VIP/backend must be stored as raw v6 octets, not passed
+    // A v6 Service's front/backend must be stored as raw v6 octets, not passed
     // through the v4-mapped-v6 embedding a v4 address needs -- reusing that
     // embedding for a genuine v6 address would silently corrupt every field
     // into a bogus `::ffff:`-prefixed value the dataplane can't route. Also
@@ -1047,9 +1047,9 @@ mod tests {
         let node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
         let pod_cidr = Ipv6Cidr::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0), 64);
         let node = node_v6(node_ip, IpCidr::V6(pod_cidr));
-        let vip_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let front_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let pod_ip = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9);
-        let svc = single_port_service_v6(vip_ip, 80, 8080);
+        let svc = single_port_service_v6(front_ip, 80, 8080);
         let slices = vec![EndpointSliceView {
             endpoints: vec![ready_endpoint_v6(pod_ip, node_ip, vec![8080])],
         }];
@@ -1063,14 +1063,14 @@ mod tests {
         );
         let (key, backend) = desired.backends().into_iter().next().unwrap();
         assert_eq!(
-            key.vip_ip,
-            vip_ip.octets(),
-            "a v6 VIP must be stored as its own raw octets, not re-embedded via \
+            key.front_ip,
+            front_ip.octets(),
+            "a v6 front must be stored as its own raw octets, not re-embedded via \
              ipv4_mapped_v6 -- a v6-only front would otherwise resolve to a bogus address"
         );
         assert!(
-            unmap_ipv4(&key.vip_ip).is_none(),
-            "a genuine v6 VIP must never unmap as if it were a v4-mapped one, or it would \
+            unmap_ipv4(&key.front_ip).is_none(),
+            "a genuine v6 front must never unmap as if it were a v4-mapped one, or it would \
              collide with a v4 front that maps to the same 32 low bits"
         );
         assert_eq!(

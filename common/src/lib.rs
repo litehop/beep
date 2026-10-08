@@ -74,7 +74,7 @@ pub fn tunnel_remote_addr(used_ipv6: bool, remote_ipv4: u32, remote_ipv6: [u32; 
 }
 
 /// Packs a TCP/UDP flow key. `client_port`/`other_port` are wire tokens
-/// (see module doc); `other` is the VIP on the forward/ingress role or the
+/// (see module doc); `other` is the front on the forward/ingress role or the
 /// backend Pod on the reverse/backend role (`ebpf-lb-dataplane.md`).
 pub fn encode_tcp_flow_key(
     client_ip: [u8; 16],
@@ -108,9 +108,9 @@ pub fn decode_tcp_flow_key(key: &TcpFlowKey) -> ([u8; 16], u16, [u8; 16], u16, u
 /// (backend-node, persisted backend-src-port remap decision) entries share
 /// one physical `LRU_HASH` keyed on the same 5-tuple shape for a given flow,
 /// so this explicit tag byte is the only thing keeping the roles from
-/// colliding -- deliberately NOT VIP-vs-pod-CIDR address disjointness, which
+/// colliding -- deliberately NOT front-vs-pod-CIDR address disjointness, which
 /// does not hold for a hostNetwork Pod (`docs/design/ebpf-lb-dataplane.md`'s
-/// disjointness correction; a hostNetwork Pod's IP can equal a VIP, which is
+/// disjointness correction; a hostNetwork Pod's IP can equal a front, which is
 /// the exact misdelivery this tag exists to prevent). The same disjointness
 /// gap is why `PortMemo` needs its own tag rather than reusing `Reverse`'s:
 /// address-based aliasing avoidance was never sound, and the port-memo key
@@ -231,22 +231,22 @@ pub fn wire_port(port: u16) -> u16 {
 /// requires `K: Pod`, and the kernel's `BPF_MAP_TYPE_HASH` hashes/compares
 /// this struct's raw bytes.
 ///
-/// `vip_ip` is `[u8; 16]`, not a bare `u32`: dual-stack support reuses the
+/// `front_ip` is `[u8; 16]`, not a bare `u32`: dual-stack support reuses the
 /// same `ipv4_mapped_v6` union shape `FLOW_TABLE`'s conntrack key already
 /// proved, so a v4 front (stored as v4-mapped-v6) and a genuine v6 front
 /// share this one key type instead of two disjoint map layouts.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LbFrontKey {
-    pub vip_ip: [u8; 16],
-    pub vip_port: u16,
+    pub front_ip: [u8; 16],
+    pub front_port: u16,
     pub proto: u8,
     pub _pad: u8,
 }
 
 /// `FrontEndpoint`/`FWD_PENDING` value part: the backend identity a front
 /// resolves to. Both address fields are `[u8; 16]` for the same dual-stack
-/// reason as `LbFrontKey.vip_ip` above -- a v4 value is stored as
+/// reason as `LbFrontKey.front_ip` above -- a v4 value is stored as
 /// v4-mapped-v6 via `ipv4_mapped_v6`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,8 +390,8 @@ pub union FlowValue {
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
-/// ingress node and the original VIP to echo, since by the time it runs the
-/// packet's own header no longer carries the VIP -- DNAT already overwrote
+/// ingress node and the original front to echo, since by the time it runs the
+/// packet's own header no longer carries the front -- DNAT already overwrote
 /// it (`ebpf-lb-dataplane.md`, Conntrack & affinity).
 ///
 /// `original_client_port` backs Decision 3's un-remap: when the forward
@@ -402,9 +402,9 @@ pub union FlowValue {
 /// ingress node's own return-decap step has no knowledge of any backend-
 /// local remap and must see the true client port in the inner dst.
 ///
-/// `ingress_node_ip`/`vip_ip` are `[u8; 16]`, not bare `u32`: `ingress_node_ip`
+/// `ingress_node_ip`/`front_ip` are `[u8; 16]`, not bare `u32`: `ingress_node_ip`
 /// is `set_tunnel_remote`'s dual-stack node address (v4-mapped or genuine v6);
-/// `vip_ip` is the inner packet's own front address, genuine v6 for a v6 flow,
+/// `front_ip` is the inner packet's own front address, genuine v6 for a v6 flow,
 /// `ipv4_mapped_v6`-embedded for a v4 one -- both share `FLOW_TABLE`'s
 /// dual-stack key/value shape throughout, unmapped back with `unmap_ipv4`
 /// only at the specific sites that need the v4 wire-token form (e.g. a v4
@@ -413,8 +413,8 @@ pub union FlowValue {
 #[derive(Clone, Copy, PartialEq)]
 pub struct RevFlowValue {
     pub ingress_node_ip: [u8; 16],
-    pub vip_ip: [u8; 16],
-    pub vip_port: u16,
+    pub front_ip: [u8; 16],
+    pub front_port: u16,
     pub original_client_port: u16,
 }
 
@@ -632,7 +632,7 @@ pub fn egress_return_outcome(has_rev_flow_entry: bool) -> EgressReturnOutcome {
 /// already-un-DNAT'd, client-bound packet just before its `bpf_redirect`
 /// back onto the physical uplink. That redirect re-enters the SAME uplink's
 /// egress pipeline, so `try_uplink_egress_return` (hook 3) sees this packet
-/// a second time with `src == vip_ip`; when a Service's front VIP equals a
+/// a second time with `src == front_ip`; when a Service's front address equals a
 /// hostNetwork backend Pod's own IP (same-node ingress+backend), that
 /// second pass also matches `POD_TARGETS.get(ip_src)` and hook 3
 /// misinterprets the client-bound packet as the pod's own raw reply,
@@ -750,7 +750,7 @@ pub fn address_rewrite_checksums(is_ipv6: bool) -> AddressRewriteChecksums {
 /// Backend source-port remap, on-conflict-only (Decision 3,
 /// `ai/extended-context/ebpf-lb-dataplane.md`). The backend's naive
 /// reverse-flow key `(CLIENT_IP, SRC_PORT, PodIP, TargetPort, proto)`
-/// collides when two Services with different front addresses (VIPs) share
+/// collides when two Services with different front addresses (fronts) share
 /// a backend Pod:targetPort and the client reuses one ephemeral source
 /// port across both -- legal, since the two connections differ by remote
 /// (front) address even though local port matches. Remapping the backend-
@@ -893,7 +893,7 @@ fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
 /// and reusing it makes every later packet's outcome independent of any
 /// other flow's occupancy in the table -- a structural guarantee, not one
 /// that depends on address disjointness (round-1 of this fix, a second
-/// REV_FLOW key keyed on VIP+client, relied on exactly that and broke for a
+/// REV_FLOW key keyed on front+client, relied on exactly that and broke for a
 /// hostNetwork Pod).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendPortResolution {
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn flow_key_is_38_bytes_the_tcp_key_plus_one_tag_byte() {
-        // Adding a tag byte instead of relying on VIP-vs-pod-CIDR
+        // Adding a tag byte instead of relying on front-vs-pod-CIDR
         // disjointness is only justified because it's free (BPF rounds key
         // size up to a multiple of 8 regardless) -- a length regression here
         // would silently make that trade-off no longer hold.
@@ -1077,8 +1077,8 @@ mod tests {
 
     #[test]
     fn rev_flow_value_has_no_padding() {
-        // ingress_node_ip + vip_ip (2x [u8; 16], align 1, offsets 0/16) +
-        // vip_port + original_client_port (2x u16, align 2, offsets 32/34,
+        // ingress_node_ip + front_ip (2x [u8; 16], align 1, offsets 0/16) +
+        // front_port + original_client_port (2x u16, align 2, offsets 32/34,
         // both already even) -- no compiler-inserted gap. A regression here
         // would silently change FLOW_TABLE's reverse-tagged value layout,
         // desyncing the kernel-side write from a userspace reader of the
@@ -1112,9 +1112,9 @@ mod tests {
 
     #[test]
     fn lb_front_key_has_no_padding() {
-        // vip_ip ([u8; 16]) + vip_port (u16) + proto (u8) + _pad (u8) = 20
+        // front_ip ([u8; 16]) + front_port (u16) + proto (u8) + _pad (u8) = 20
         // bytes: the widened byte-array field has no alignment requirement
-        // above 1, so vip_port's u16 alignment is the only constraint, and it
+        // above 1, so front_port's u16 alignment is the only constraint, and it
         // already falls on offset 16 (even) -- no compiler-inserted gap.
         assert_eq!(core::mem::size_of::<LbFrontKey>(), 20);
     }
@@ -1164,8 +1164,8 @@ mod tests {
 
     fn sample_front() -> LbFrontKey {
         LbFrontKey {
-            vip_ip: ipv4_mapped_v6(wire_ip(u32::from_be_bytes([203, 0, 113, 1]))),
-            vip_port: wire_port(443),
+            front_ip: ipv4_mapped_v6(wire_ip(u32::from_be_bytes([203, 0, 113, 1]))),
+            front_port: wire_port(443),
             proto: 6,
             _pad: 0,
         }
@@ -1211,18 +1211,18 @@ mod tests {
     // misroutes.
 
     #[test]
-    fn lb_front_key_vip_ip_round_trips_a_v4_fixture() {
-        let vip_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
+    fn lb_front_key_front_ip_round_trips_a_v4_fixture() {
+        let front_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
         let key = LbFrontKey {
-            vip_ip: ipv4_mapped_v6(vip_wire),
-            vip_port: wire_port(80),
+            front_ip: ipv4_mapped_v6(front_wire),
+            front_port: wire_port(80),
             proto: 6,
             _pad: 0,
         };
         assert_eq!(
-            unmap_ipv4(&key.vip_ip),
-            Some(vip_wire),
-            "a v4 VIP stored via ipv4_mapped_v6 must unmap back to the exact wire bytes \
+            unmap_ipv4(&key.front_ip),
+            Some(front_wire),
+            "a v4 front stored via ipv4_mapped_v6 must unmap back to the exact wire bytes \
              FRONT_META was populated with, or the widened key silently corrupts every v4 \
              front"
         );
@@ -1250,28 +1250,28 @@ mod tests {
     #[test]
     fn rev_flow_value_shaped_addresses_round_trip_a_v4_fixture() {
         // ingress_node_ip is host-native (bpf_tunnel_key.remote_ipv4's own
-        // convention, `beep-ebpf`'s module doc), vip_ip is wire-token --
+        // convention, `beep-ebpf`'s module doc), front_ip is wire-token --
         // both must round-trip through RevFlowValue's actual fields, or a
         // v4-flow's reverse-tagged FLOW_TABLE entry silently corrupts the
         // ingress echo on the return leg.
         let ingress_node_native = u32::from_be_bytes([10, 0, 0, 5]);
-        let vip_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
+        let front_wire = wire_ip(u32::from_be_bytes([203, 0, 113, 1]));
         let value = RevFlowValue {
             ingress_node_ip: ipv4_mapped_v6(ingress_node_native),
-            vip_ip: ipv4_mapped_v6(vip_wire),
-            vip_port: wire_port(80),
+            front_ip: ipv4_mapped_v6(front_wire),
+            front_port: wire_port(80),
             original_client_port: wire_port(443),
         };
         assert_eq!(
             unmap_ipv4(&value.ingress_node_ip),
             Some(ingress_node_native)
         );
-        assert_eq!(unmap_ipv4(&value.vip_ip), Some(vip_wire));
+        assert_eq!(unmap_ipv4(&value.front_ip), Some(front_wire));
     }
 
     #[test]
     fn same_5_tuple_forward_and_reverse_tagged_keys_never_collide() {
-        // A hostNetwork Pod's IP can equal a VIP, so the forward, reverse,
+        // A hostNetwork Pod's IP can equal a front, so the forward, reverse,
         // and port-memo roles can all share the identical (client_ip,
         // client_port, other_ip, other_port, proto) 5-tuple. Without the
         // explicit tag, entries for two of these roles on that shared tuple
@@ -1331,13 +1331,13 @@ mod tests {
         // The happy path (first writer, or the same flow's later packets)
         // must never remap -- doing so on every packet would break the
         // client's real connection identity for the common case.
-        let vip_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
+        let front_a = (ipv4_mapped_v6(0x0100_000a), 0x5000u16);
         assert_eq!(
-            resolve_backend_src_port(None, vip_a, 0x9999, |_| false),
+            resolve_backend_src_port(None, front_a, 0x9999, |_| false),
             BackendPortDecision::NoRemap
         );
         assert_eq!(
-            resolve_backend_src_port(Some((vip_a, 0x9999)), vip_a, 0x9999, |_| false),
+            resolve_backend_src_port(Some((front_a, 0x9999)), front_a, 0x9999, |_| false),
             BackendPortDecision::NoRemap
         );
     }
@@ -1394,8 +1394,8 @@ mod tests {
         // conflicting fronts -- a THIRD
         // Service sharing this backend Pod:targetPort with a reused client
         // source port could derive the SAME synthetic port as the second
-        // and silently clobber it. Concretely, these four front VIPs (IP
-        // octets 30/94/158/222, all on VIP port 31000 -- a stride of 64
+        // and silently clobber it. Concretely, these four fronts (IP
+        // octets 30/94/158/222, all on front port 31000 -- a stride of 64
         // that resonates with the old formula's `rotate_right(16)` mixing)
         // all hash to the identical seed:
         let colliding_fronts: [([u8; 16], u16); 4] = [
@@ -1482,7 +1482,7 @@ mod tests {
 
     #[test]
     fn many_fronts_sharing_a_backend_pod_never_produce_a_duplicate_reverse_key() {
-        // Sweep many front VIP:port pairs that all resolve to the same
+        // Sweep many front address:port pairs that all resolve to the same
         // backend Pod:targetPort with one reused client source port
         // (75008/91392 realistic front pairs collided under the pre-fix
         // derive-only formula). Every resulting reverse key this dataplane
@@ -2090,7 +2090,7 @@ mod tests {
     fn is_redirected_return_mark_recognizes_the_decap_return_stamp() {
         // Without recognizing its own stamp, hook 3 treats the
         // redirected-back, already-un-DNAT'd client packet as a backend
-        // Pod's raw reply whenever vip_ip == pod_ip (hostNetwork same-node),
+        // Pod's raw reply whenever front_ip == pod_ip (hostNetwork same-node),
         // builds a wrong FLOW_TABLE key, and drops it -- silent client
         // timeout on an otherwise-healthy connection.
         assert!(

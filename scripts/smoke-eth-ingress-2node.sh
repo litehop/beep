@@ -15,14 +15,14 @@
 # (lima/beep-client.yaml, default name beep-client) on the same user-v2
 # network as node-a/node-b, but non-local to both. This replaces an
 # earlier version of this rig that used node-b's own root netns as the
-# client -- that could only prove the FORWARD leg (client SYN -> VIP ->
+# client -- that could only prove the FORWARD leg (client SYN -> front ->
 # decap+DNAT -> backend), because a reply destined to node-b's own address
 # resolves to `local ... dev lo` on node-b, so the kernel never selects
 # the Geneve-transport uplink as egress and beep's return hook never
 # fires.
 #
 # RESULT: with a genuinely foreign client, the full symmetric-return round
-# trip is PROVEN cross-node (client -> VIP -> decap+DNAT -> backend nc ->
+# trip is PROVEN cross-node (client -> front -> decap+DNAT -> backend nc ->
 # un-DNAT+re-encap -> ingress node -> client, real HTTP response
 # received) -- PROVIDED node-b's uplink-iface is set to the SAME real NIC
 # as node-a's (both below), not left at the wg0 default. wg0 here is pure
@@ -36,7 +36,7 @@
 #
 # Usage: scripts/smoke-eth-ingress-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
 # Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the
-# VIP), beep-node-b (backend Pod), beep-client (client). All three VMs
+# front), beep-node-b (backend Pod), beep-client (client). All three VMs
 # must be on the SAME Lima network (directly reachable over their real
 # eth0/underlay).
 #
@@ -72,7 +72,7 @@ BIN_NAME="beep-ethingress2node"
 WG_SUBNET_A="10.99.0.2"
 WG_SUBNET_B="10.99.0.4"
 WG_PORT="51820"
-VIP_PORT="19100"
+FRONT_PORT="19100"
 POD_IP="198.51.100.60"
 POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18090"
@@ -172,7 +172,7 @@ remote "$VM_B" setup-geneve
 remote "$VM_A" check-uplink "$UPLINK_IFACE_A"
 
 echo "==> [6/7] loading beep-ebpf: $VM_A and $VM_B both uplink=$UPLINK_IFACE_A (their shared real underlay NIC; wg0 is pure Geneve transport substrate on top of it, not either node's client/return-facing device)"
-FIXTURE="${IP_A}:${VIP_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
+FIXTURE="${IP_A}:${FRONT_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$IP_A"
 # --uplink-iface must match $VM_A's (not the wg0 default): the backend
 # node's kernel routes a reply to a client on the shared user-v2 subnet
@@ -188,7 +188,7 @@ remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE
 remote "$VM_B" setup-backend --pod-ip "$POD_IP"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
 
-echo "==> [7/7] driving one client ($VM_CLIENT) -> node-a's real Ethernet VIP -> cross-node backend round trip"
+echo "==> [7/7] driving one client ($VM_CLIENT) -> node-a's real Ethernet front -> cross-node backend round trip"
 # Client = the genuinely separate beep-client VM dialing vm-a's REAL eth0
 # address -- driven directly via limactl, not the remote.sh subcommand
 # protocol (beep-client has no /tmp/${BIN_NAME}-remote.sh copy and no MCP
@@ -198,11 +198,11 @@ echo "==> [7/7] driving one client ($VM_CLIENT) -> node-a's real Ethernet VIP ->
 # can take several seconds -- confirmed empirically, a 5s cap flakes on a
 # cold rig even though the dataplane mechanism itself is correct.
 set +e
-CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${VIP_PORT}/" 2>&1)"
+CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${FRONT_PORT}/" 2>&1)"
 CLIENT_RC=$?
 set -e
 if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
-  echo "ROUND-TRIP: PASS (client $VM_CLIENT -> VIP ${IP_A}:${VIP_PORT} -> cross-node backend -> response 'OK')"
+  echo "ROUND-TRIP: PASS (client $VM_CLIENT -> front ${IP_A}:${FRONT_PORT} -> cross-node backend -> response 'OK')"
   echo "GATE 1 TIER-1 MECHANISM: PASS (eth0-ingress, wg0-transport, symmetric return proven from a genuinely foreign client)"
   exit 0
 fi
