@@ -27,7 +27,7 @@
 # programs, map programming, the cross-node round trip, and FLOW_TABLE
 # promotion -- is a genuine, asserted PASS.
 #
-# TOPOLOGY: ingress VIP = node-a's own address, backend Pod pinned
+# TOPOLOGY: ingress front = node-a's own address, backend Pod pinned
 # (`nodeName`) to node-b -- a genuinely cross-node round trip: the backend
 # node's `uplink_egress_return` hook must fire on its own client-facing NIC
 # (eth0), not a tunnel device, to un-DNAT the reply straight back to the
@@ -91,7 +91,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 NAMESPACE="beep-controller-e2e"
 SERVICE_NAME="whoami"
 DEPLOY_NAME="whoami"
-VIP_PORT="80"
+FRONT_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
 KUBECONFIG_SECRET="beep-controller-kubeconfig"
 IMAGE_TMPDIR=""
@@ -276,7 +276,7 @@ spec:
   type: LoadBalancer
   selector: {app: $DEPLOY_NAME}
   ports:
-    - port: $VIP_PORT
+    - port: $FRONT_PORT
       targetPort: 80
       protocol: TCP
 EOF
@@ -321,17 +321,17 @@ esac
 echo "SERVICE STATUS: PASS (status.loadBalancer.ingress = $ingress_ips)"
 
 echo "==> [8/11] confirming the dataplane maps are programmed"
-vip_a=$(map_entry_count "$VM_A" FRONT_META)
-vip_b=$(map_entry_count "$VM_B" FRONT_META)
+front_a=$(map_entry_count "$VM_A" FRONT_META)
+front_b=$(map_entry_count "$VM_B" FRONT_META)
 pod_targets_b=$(map_entry_count "$VM_B" POD_TARGETS)
-[ -n "$vip_a" ] && [ "$vip_a" -ge 1 ] || { echo "FAIL: $VM_A's FRONT_META has no entries ($vip_a)" >&2; dump_evidence; exit 1; }
-[ -n "$vip_b" ] && [ "$vip_b" -ge 1 ] || { echo "FAIL: $VM_B's FRONT_META has no entries ($vip_b)" >&2; dump_evidence; exit 1; }
+[ -n "$front_a" ] && [ "$front_a" -ge 1 ] || { echo "FAIL: $VM_A's FRONT_META has no entries ($front_a)" >&2; dump_evidence; exit 1; }
+[ -n "$front_b" ] && [ "$front_b" -ge 1 ] || { echo "FAIL: $VM_B's FRONT_META has no entries ($front_b)" >&2; dump_evidence; exit 1; }
 [ -n "$pod_targets_b" ] && [ "$pod_targets_b" -ge 1 ] || {
   echo "FAIL: $VM_B's POD_TARGETS has no entries ($pod_targets_b) -- the backend Pod it hosts was never admitted" >&2
   dump_evidence
   exit 1
 }
-echo "MAP-PROGRAMMING: PASS (FRONT_META: $VM_A=$vip_a $VM_B=$vip_b entries, $VM_B POD_TARGETS=$pod_targets_b entries)"
+echo "MAP-PROGRAMMING: PASS (FRONT_META: $VM_A=$front_a $VM_B=$front_b entries, $VM_B POD_TARGETS=$pod_targets_b entries)"
 
 echo "==> [9/11] sampling beep-controller RSS after real reconcile load and asserting growth stays bounded"
 rss_a_peak=$(controller_rss limactl shell "$VM_A" --)
@@ -339,9 +339,9 @@ rss_b_peak=$(controller_rss limactl shell "$VM_B" --)
 assert_controller_rss_growth "$rss_a_baseline" "$rss_a_peak" "$VM_A" || { dump_evidence; exit 1; }
 assert_controller_rss_growth "$rss_b_baseline" "$rss_b_peak" "$VM_B" || { dump_evidence; exit 1; }
 
-echo "==> [10/11] driving client ($VM_CLIENT, $IP_CLIENT) -> VIP $IP_A:$VIP_PORT -> cross-node backend on $VM_B"
+echo "==> [10/11] driving client ($VM_CLIENT, $IP_CLIENT) -> front $IP_A:$FRONT_PORT -> cross-node backend on $VM_B"
 set +e
-CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${VIP_PORT}/" 2>&1)"
+CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${FRONT_PORT}/" 2>&1)"
 CLIENT_RC=$?
 set -e
 echo "$CLIENT_BODY"

@@ -768,7 +768,7 @@ impl WatchState {
                 .filter(|ip| svc.fronts_family(Family::of(**ip)))
             {
                 let view = ServiceView {
-                    vip_ip: *front_ip,
+                    front_ip: *front_ip,
                     ports: ports.clone(),
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
@@ -1444,7 +1444,7 @@ mod tests {
         let fronts: HashSet<[u8; 4]> = desired
             .fronts
             .keys()
-            .map(|k| unmap_ipv4(&k.vip_ip).unwrap().to_le_bytes())
+            .map(|k| unmap_ipv4(&k.front_ip).unwrap().to_le_bytes())
             .collect();
         assert_eq!(
             fronts,
@@ -1932,9 +1932,9 @@ mod tests {
         );
         let front_key = desired.fronts.keys().next().unwrap();
         assert_eq!(
-            front_key.vip_ip,
+            front_key.front_ip,
             wire_ip_v6(IpAddr::V6(v6_node_ip)),
-            "the front's vip_ip must be the v6-only node's own address, not silently dropped \
+            "the front's front_ip must be the v6-only node's own address, not silently dropped \
              or truncated"
         );
     }
@@ -2133,7 +2133,7 @@ mod tests {
             [tunnel_remote_v6(ip("10.0.0.5"))].into_iter().collect(),
             "NODE_ALLOW must hold only the underlay address"
         );
-        let front_ips: Vec<_> = desired.fronts.keys().map(|k| k.vip_ip).collect();
+        let front_ips: Vec<_> = desired.fronts.keys().map(|k| k.front_ip).collect();
         assert_eq!(
             front_ips,
             vec![wire_ip_v6(ip("203.0.113.5"))],
@@ -2343,7 +2343,7 @@ mod tests {
         );
         let front_key = desired.fronts.keys().next().unwrap();
         assert_eq!(
-            unmap_ipv4(&front_key.vip_ip).unwrap().to_le_bytes(),
+            unmap_ipv4(&front_key.front_ip).unwrap().to_le_bytes(),
             [10, 0, 0, 5],
             "the sole front that exists must be this node's v4 address, not its v6 one"
         );
@@ -2400,7 +2400,7 @@ mod tests {
         );
         let front_key = desired.fronts.keys().next().unwrap();
         assert_eq!(
-            front_key.vip_ip,
+            front_key.front_ip,
             wire_ip_v6(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5))),
             "the sole front that exists must be this node's v6 address, not its v4 one"
         );

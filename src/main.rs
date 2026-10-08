@@ -4,7 +4,7 @@
 //! `geneve_ingress_return` merged into one, see that program's doc comment),
 //! attaches each at its hook point
 //! (`docs/design/ebpf-lb-dataplane.md`), populates one or more static
-//! VIP:PORT -> backend fixture entries this phase proves the mechanism
+//! FRONT_IP:PORT -> backend fixture entries this phase proves the mechanism
 //! against (repeatable so one Pod behind more than one Service port is
 //! expressible -- `beep-ebpf`'s `FRONT_META` keys on the front tuple,
 //! not pod IP alone, precisely so this doesn't collide), and pins the
@@ -139,23 +139,23 @@ struct Args {
     #[arg(long, default_value = "/sys/fs/bpf/beep")]
     pin_dir: PathBuf,
 
-    /// One VIP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
+    /// One FRONT_IP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
     /// to cover one Pod behind more than one Service port (a plain multi-port
     /// Service, or one Pod backing two distinct Services) -- each repetition
-    /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). VIP address is this
-    /// node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
-    /// Format: `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`
+    /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). The front address is
+    /// this node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
+    /// Format: `front_ip:front_port:proto:backend_node_ip:pod_ip:target_port`
     /// (`proto` is `tcp` or `udp`).
     #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
     fixtures: Vec<Fixture>,
 
     /// Cluster pod CIDR (e.g. `10.244.0.0/16` or a v6 range). Every
-    /// `--fixture` vip_ip is rejected at startup if it falls inside this
+    /// `--fixture` front_ip is rejected at startup if it falls inside this
     /// range AND shares its family: a hostNetwork Pod's IP equals its
-    /// node's IP, i.e. front-IP (VIP) space, so a same-family VIP inside the
+    /// node's IP, i.e. front-IP space, so a same-family front inside the
     /// pod CIDR is not disjoint from pod-IP space by construction and can
     /// byte-collide a forward and reverse flow key (the
-    /// `ebpf-lb-dataplane.md` disjointness correction). A cross-family VIP
+    /// `ebpf-lb-dataplane.md` disjointness correction). A cross-family front
     /// can never collide this way -- `beep_common::ipv4_mapped_v6`'s
     /// embedding keeps a v4-mapped and a genuine v6 address structurally
     /// disjoint -- so this check is a no-op across families.
@@ -163,10 +163,10 @@ struct Args {
     pod_cidr: IpCidr,
 
     /// Cluster Service CIDR / ClusterIP range (e.g. `10.96.0.0/12` or a v6
-    /// range). Optional: only enforced when given. Every `--fixture` vip_ip
+    /// range). Optional: only enforced when given. Every `--fixture` front_ip
     /// is rejected at startup if it falls inside this range AND shares its
     /// family: tc runs before netfilter on ingress
-    /// (`docs/design/kube-proxy-coexistence.md`), so a same-family VIP
+    /// (`docs/design/kube-proxy-coexistence.md`), so a same-family front
     /// inside the Service CIDR would let beep's classifier shadow that
     /// ClusterIP Service's east-west traffic instead of falling through to
     /// kube-proxy.
@@ -181,7 +181,7 @@ struct Args {
     /// backend-membership map the decap and egress-return admission gates
     /// check, to fixtures whose `backend_node_ip` matches this address.
     /// `FRONT_META`/`FRONT_ENDPOINTS` (the forwarding tables) stay unfiltered --
-    /// any node can be ingress for any VIP, so they need every fixture
+    /// any node can be ingress for any front, so they need every fixture
     /// regardless of which node hosts the backend.
     #[arg(long = "node-ip")]
     node_ip: IpAddr,
@@ -313,9 +313,9 @@ impl std::fmt::Display for Ipv6Cidr {
 /// `--pod-cidr`/`--service-cidr`'s parsed shape: a Service and its backend
 /// Pod can independently be v4 or v6, so these CIDRs must accept either
 /// family too, without forcing an operator to configure a range for a
-/// family they don't use. A VIP's own family picks which side of this enum
-/// (if either) the disjointness check in `vip_outside_pod_cidr`/
-/// `vip_outside_service_cidr` actually compares against.
+/// family they don't use. A front's own family picks which side of this enum
+/// (if either) the disjointness check in `front_outside_pod_cidr`/
+/// `front_outside_service_cidr` actually compares against.
 #[derive(Clone, Copy, Debug)]
 enum IpCidr {
     V4(Ipv4Cidr),
@@ -355,25 +355,25 @@ fn parse_ip_cidr(s: &str) -> Result<IpCidr, String> {
     }
 }
 
-/// A hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP) space,
+/// A hostNetwork Pod's IP equals its node's IP, i.e. front-IP space,
 /// so front-IP space and pod CIDR are disjoint only by configuration, not
 /// by construction (the `ebpf-lb-dataplane.md` disjointness correction) --
-/// a VIP placed inside the pod CIDR lets a forward flow key (keyed on VIP)
+/// a front placed inside the pod CIDR lets a forward flow key (keyed on front)
 /// and a reverse flow key (keyed on a Pod's source IP) byte-collide.
 /// Rejecting at startup is the only way to guarantee the two stay disjoint.
-/// A `vip`/`pod_cidr` family mismatch can never collide this way (a
+/// A `front`/`pod_cidr` family mismatch can never collide this way (a
 /// v4-mapped and a genuine v6 address are structurally disjoint), so that
 /// pairing is always accepted.
-fn vip_outside_pod_cidr(vip: IpAddr, pod_cidr: IpCidr) -> Result<(), String> {
-    let inside = match (vip, pod_cidr) {
-        (IpAddr::V4(vip), IpCidr::V4(cidr)) => cidr.contains(vip),
-        (IpAddr::V6(vip), IpCidr::V6(cidr)) => cidr.contains(vip),
+fn front_outside_pod_cidr(front: IpAddr, pod_cidr: IpCidr) -> Result<(), String> {
+    let inside = match (front, pod_cidr) {
+        (IpAddr::V4(front), IpCidr::V4(cidr)) => cidr.contains(front),
+        (IpAddr::V6(front), IpCidr::V6(cidr)) => cidr.contains(front),
         _ => false,
     };
     if inside {
         Err(format!(
-            "vip_ip `{vip}` falls inside pod CIDR `{pod_cidr}`: a hostNetwork Pod's IP equals \
-             its node's IP (front-IP space), so this VIP can byte-collide a forward and \
+            "front_ip `{front}` falls inside pod CIDR `{pod_cidr}`: a hostNetwork Pod's IP equals \
+             its node's IP (front-IP space), so this front can byte-collide a forward and \
              reverse flow key"
         ))
     } else {
@@ -382,21 +382,21 @@ fn vip_outside_pod_cidr(vip: IpAddr, pod_cidr: IpCidr) -> Result<(), String> {
 }
 
 /// tc runs before netfilter on ingress
-/// (`docs/design/kube-proxy-coexistence.md`), so a VIP inside the Service
+/// (`docs/design/kube-proxy-coexistence.md`), so a front inside the Service
 /// CIDR is not disjoint from ClusterIP space by construction, only by
 /// configuration -- beep's classifier would shadow that ClusterIP Service's
 /// east-west traffic instead of letting it fall through to kube-proxy's
 /// chains. Rejecting at startup is the only way to guarantee the two stay
-/// disjoint. Same cross-family no-op as `vip_outside_pod_cidr` above.
-fn vip_outside_service_cidr(vip: IpAddr, service_cidr: IpCidr) -> Result<(), String> {
-    let inside = match (vip, service_cidr) {
-        (IpAddr::V4(vip), IpCidr::V4(cidr)) => cidr.contains(vip),
-        (IpAddr::V6(vip), IpCidr::V6(cidr)) => cidr.contains(vip),
+/// disjoint. Same cross-family no-op as `front_outside_pod_cidr` above.
+fn front_outside_service_cidr(front: IpAddr, service_cidr: IpCidr) -> Result<(), String> {
+    let inside = match (front, service_cidr) {
+        (IpAddr::V4(front), IpCidr::V4(cidr)) => cidr.contains(front),
+        (IpAddr::V6(front), IpCidr::V6(cidr)) => cidr.contains(front),
         _ => false,
     };
     if inside {
         Err(format!(
-            "vip_ip `{vip}` falls inside Service CIDR `{service_cidr}`: beep's classifier \
+            "front_ip `{front}` falls inside Service CIDR `{service_cidr}`: beep's classifier \
              would shadow that ClusterIP Service's east-west traffic instead of falling \
              through to kube-proxy"
         ))
@@ -431,9 +431,9 @@ fn main() -> anyhow::Result<()> {
     } = Args::parse();
 
     for fixture in &fixtures {
-        vip_outside_pod_cidr(fixture.vip_ip, pod_cidr).map_err(|e| anyhow!(e))?;
+        front_outside_pod_cidr(fixture.front_ip, pod_cidr).map_err(|e| anyhow!(e))?;
         if let Some(service_cidr) = service_cidr {
-            vip_outside_service_cidr(fixture.vip_ip, service_cidr).map_err(|e| anyhow!(e))?;
+            front_outside_service_cidr(fixture.front_ip, service_cidr).map_err(|e| anyhow!(e))?;
         }
     }
 
@@ -532,7 +532,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Writes one or more static VIP:PORT -> backend-node/PodIP:TargetPort
+/// Writes one or more static FRONT_IP:PORT -> backend-node/PodIP:TargetPort
 /// mappings this phase proves the mechanism against (`ebpf-lb-dataplane.md`;
 /// real Service/EndpointSlice watching is Phase 5). Every node runs this same
 /// loader with the same fixture set: which node ends up playing "ingress" vs
@@ -541,14 +541,14 @@ fn main() -> anyhow::Result<()> {
 /// (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`'s node-owned-address
 /// model).
 ///
-/// Fronts are keyed on the (VIP:PORT:proto) tuple, not on pod IP alone: one
+/// Fronts are keyed on the (FRONT_IP:PORT:proto) tuple, not on pod IP alone: one
 /// `--fixture` per Service port, even when several share a backend Pod IP, so
 /// a multi-port Service resolves each port to its own target port instead of
 /// the last-written one silently winning.
 fn fixture_key(fixture: &Fixture) -> LbFrontKey {
     LbFrontKey {
-        vip_ip: wire_ip_v6(fixture.vip_ip),
-        vip_port: wire_port(fixture.vip_port),
+        front_ip: wire_ip_v6(fixture.front_ip),
+        front_port: wire_port(fixture.front_port),
         proto: fixture.proto.as_ip_proto(),
         _pad: 0,
     }
@@ -634,7 +634,7 @@ fn populate_fixtures(
         // multi-port Service) collapse to one entry here on purpose:
         // membership doesn't need per-port granularity. Unlike the front
         // tables above, this map is scoped to `node_ip` via
-        // `local_pod_ips`: any node can be ingress for any VIP, but only
+        // `local_pod_ips`: any node can be ingress for any front, but only
         // the node actually running a pod may claim it as a local backend --
         // otherwise both gates' "is this still one of MY pods" check always
         // passes cluster-wide and never drops a misdelivered/drifted packet.
@@ -696,67 +696,67 @@ fn populate_fixtures(
 mod tests {
     use super::*;
 
-    // A hostNetwork Pod's IP equals its node's IP, i.e. front-IP (VIP)
-    // space -- so a VIP placed inside the pod CIDR is not disjoint from
+    // A hostNetwork Pod's IP equals its node's IP, i.e. front-IP
+    // space -- so a front placed inside the pod CIDR is not disjoint from
     // pod-IP space by construction, only by configuration, and lets a
-    // forward flow key (keyed on the VIP) and a reverse flow key (keyed on
+    // forward flow key (keyed on the front) and a reverse flow key (keyed on
     // a Pod's source IP) byte-collide. These four cases pin the boundary
     // of that rejection exactly at the CIDR's own edges.
     #[test]
-    fn vip_inside_pod_cidr_is_rejected() {
+    fn front_inside_pod_cidr_is_rejected() {
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("10.244.0.0/16").unwrap());
-        let vip = IpAddr::V4(Ipv4Addr::new(10, 244, 5, 9));
+        let front = IpAddr::V4(Ipv4Addr::new(10, 244, 5, 9));
 
-        let err = vip_outside_pod_cidr(vip, pod_cidr)
-            .expect_err("a VIP inside the pod CIDR must be rejected, or it can byte-collide a forward and reverse flow key");
+        let err = front_outside_pod_cidr(front, pod_cidr)
+            .expect_err("a front inside the pod CIDR must be rejected, or it can byte-collide a forward and reverse flow key");
         assert!(
             err.contains("10.244.5.9") && err.contains("10.244.0.0/16"),
-            "rejection must name both the offending VIP and the pod CIDR so an operator can fix the config: got `{err}`"
+            "rejection must name both the offending front and the pod CIDR so an operator can fix the config: got `{err}`"
         );
     }
 
     #[test]
-    fn vip_outside_pod_cidr_is_accepted() {
+    fn front_outside_pod_cidr_is_accepted() {
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("10.244.0.0/16").unwrap());
-        // Matches scripts/smoke-remote.sh's RFC 5737 VIP, deliberately
+        // Matches scripts/smoke-remote.sh's RFC 5737 front, deliberately
         // disjoint from the pod range -- this is the legitimate-config path
         // that must keep loading.
-        let vip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let front = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
 
         assert!(
-            vip_outside_pod_cidr(vip, pod_cidr).is_ok(),
-            "a VIP outside the pod CIDR is a legitimate config and must not be rejected"
+            front_outside_pod_cidr(front, pod_cidr).is_ok(),
+            "a front outside the pod CIDR is a legitimate config and must not be rejected"
         );
     }
 
     #[test]
-    fn vip_at_pod_cidr_network_or_broadcast_address_is_rejected() {
+    fn front_at_pod_cidr_network_or_broadcast_address_is_rejected() {
         // The network and broadcast addresses are still member addresses of
         // the block (a Pod CAN be assigned either, depending on the CNI),
-        // so both boundary values must reject exactly like an interior VIP.
+        // so both boundary values must reject exactly like an interior front.
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("10.244.0.0/16").unwrap());
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 0, 0)), pod_cidr).is_err(),
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 0, 0)), pod_cidr).is_err(),
             "the pod CIDR's network address is still inside the block and must be rejected"
         );
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 255, 255)), pod_cidr).is_err(),
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 255, 255)), pod_cidr).is_err(),
             "the pod CIDR's broadcast address is still inside the block and must be rejected"
         );
     }
 
     #[test]
-    fn vip_one_address_outside_pod_cidr_boundary_is_accepted() {
+    fn front_one_address_outside_pod_cidr_boundary_is_accepted() {
         // The addresses immediately below the network address and above the
-        // broadcast address are the tightest legitimate VIPs possible --
+        // broadcast address are the tightest legitimate fronts possible --
         // an off-by-one in the mask calculation would reject these.
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("10.244.0.0/16").unwrap());
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 243, 255, 255)), pod_cidr).is_ok(),
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 243, 255, 255)), pod_cidr).is_ok(),
             "one address below the pod CIDR's network address must be accepted"
         );
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 245, 0, 0)), pod_cidr).is_ok(),
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 245, 0, 0)), pod_cidr).is_ok(),
             "one address above the pod CIDR's broadcast address must be accepted"
         );
     }
@@ -769,79 +769,79 @@ mod tests {
     }
 
     #[test]
-    fn pod_cidr_slash_zero_rejects_every_vip_as_inside() {
+    fn pod_cidr_slash_zero_rejects_every_front_as_inside() {
         // A /0 pod CIDR must be treated as "contains every address", so
-        // every VIP is rejected. Rust's `<<` masks its shift amount mod 32,
+        // every front is rejected. Rust's `<<` masks its shift amount mod 32,
         // so deleting the `prefix_len == 0` special case in `Ipv4Cidr::mask`
         // would make `u32::MAX << 32` silently wrap to `u32::MAX << 0`,
         // turning "match everything" into "match only the exact network
-        // address" -- this VIP (not equal to the network address) would then
+        // address" -- this front (not equal to the network address) would then
         // wrongly be accepted instead of rejected.
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("0.0.0.0/0").unwrap());
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), pod_cidr).is_err(),
-            "a /0 pod CIDR spans the entire address space, so every VIP must be rejected"
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), pod_cidr).is_err(),
+            "a /0 pod CIDR spans the entire address space, so every front must be rejected"
         );
     }
 
     #[test]
     fn pod_cidr_slash_32_rejects_only_the_exact_address() {
-        // A /32 pod CIDR is a single host route: it must reject a VIP equal
+        // A /32 pod CIDR is a single host route: it must reject a front equal
         // to that address, but accept every other address. An off-by-one in
         // the mask shift (e.g. treating 32 like 0, or vice versa) would
         // either widen this to reject everything or narrow it to reject
         // nothing.
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("10.244.5.9/32").unwrap());
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 5, 9)), pod_cidr).is_err(),
-            "a VIP equal to the /32 pod CIDR's single address must be rejected"
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 5, 9)), pod_cidr).is_err(),
+            "a front equal to the /32 pod CIDR's single address must be rejected"
         );
         assert!(
-            vip_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 5, 10)), pod_cidr).is_ok(),
-            "a VIP one address away from a /32 pod CIDR must be accepted"
+            front_outside_pod_cidr(IpAddr::V4(Ipv4Addr::new(10, 244, 5, 10)), pod_cidr).is_ok(),
+            "a front one address away from a /32 pod CIDR must be accepted"
         );
     }
 
     #[test]
-    fn vip_inside_pod_cidr_of_a_different_family_is_never_rejected() {
+    fn front_inside_pod_cidr_of_a_different_family_is_never_rejected() {
         // A v4-mapped and a genuine v6 address are structurally disjoint
-        // (`beep_common::ipv4_mapped_v6`'s embedding) -- a v6 VIP can never
+        // (`beep_common::ipv4_mapped_v6`'s embedding) -- a v6 front can never
         // byte-collide with a v4 pod CIDR's address space, so cross-family
         // must always pass regardless of the numeric range.
         let pod_cidr = IpCidr::V4(parse_ipv4_cidr("0.0.0.0/0").unwrap());
-        let vip: IpAddr = "2001:db8::1".parse().unwrap();
+        let front: IpAddr = "2001:db8::1".parse().unwrap();
         assert!(
-            vip_outside_pod_cidr(vip, pod_cidr).is_ok(),
-            "a v6 VIP must never be rejected against a v4 pod CIDR, even a /0 spanning the \
+            front_outside_pod_cidr(front, pod_cidr).is_ok(),
+            "a v6 front must never be rejected against a v4 pod CIDR, even a /0 spanning the \
              entire v4 address space -- the two families can't collide"
         );
     }
 
     #[test]
-    fn vip_inside_a_v6_pod_cidr_is_rejected() {
-        // v6 mirror of `vip_inside_pod_cidr_is_rejected`: a genuine v6
-        // hostNetwork Pod's IP equally collides with a v6 VIP inside the
+    fn front_inside_a_v6_pod_cidr_is_rejected() {
+        // v6 mirror of `front_inside_pod_cidr_is_rejected`: a genuine v6
+        // hostNetwork Pod's IP equally collides with a v6 front inside the
         // same v6 pod CIDR, so this bead's widening must reject it exactly
         // like the v4 case, not silently allow it because `Ipv4Cidr`'s
         // checks don't apply.
         let pod_cidr = parse_ip_cidr("2001:db8::/32").unwrap();
-        let vip: IpAddr = "2001:db8::5".parse().unwrap();
+        let front: IpAddr = "2001:db8::5".parse().unwrap();
 
-        let err = vip_outside_pod_cidr(vip, pod_cidr)
-            .expect_err("a v6 VIP inside the v6 pod CIDR must be rejected, or it can byte-collide a forward and reverse flow key");
+        let err = front_outside_pod_cidr(front, pod_cidr)
+            .expect_err("a v6 front inside the v6 pod CIDR must be rejected, or it can byte-collide a forward and reverse flow key");
         assert!(
             err.contains("2001:db8::5") && err.contains("2001:db8::/32"),
-            "rejection must name both the offending VIP and the pod CIDR so an operator can fix the config: got `{err}`"
+            "rejection must name both the offending front and the pod CIDR so an operator can fix the config: got `{err}`"
         );
     }
 
     #[test]
-    fn vip_outside_a_v6_pod_cidr_is_accepted() {
+    fn front_outside_a_v6_pod_cidr_is_accepted() {
         let pod_cidr = parse_ip_cidr("2001:db8::/32").unwrap();
-        let vip: IpAddr = "2001:db9::1".parse().unwrap();
+        let front: IpAddr = "2001:db9::1".parse().unwrap();
         assert!(
-            vip_outside_pod_cidr(vip, pod_cidr).is_ok(),
-            "a v6 VIP outside the v6 pod CIDR is a legitimate config and must not be rejected"
+            front_outside_pod_cidr(front, pod_cidr).is_ok(),
+            "a v6 front outside the v6 pod CIDR is a legitimate config and must not be rejected"
         );
     }
 
@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn parse_ipv4_cidr_stores_canonical_network_address() {
         // Operators read this address back out of error/Display text when a
-        // VIP is rejected; if host bits leak through unmasked, that message
+        // front is rejected; if host bits leak through unmasked, that message
         // shows a misleading, non-canonical network (e.g. `10.244.1.7/16`
         // instead of `10.244.0.0/16`), even though matching itself is
         // unaffected (`contains` masks both operands).
@@ -895,78 +895,78 @@ mod tests {
         );
     }
 
-    // `vip_outside_service_cidr` mirrors `vip_outside_pod_cidr` above: same
+    // `front_outside_service_cidr` mirrors `front_outside_pod_cidr` above: same
     // boundary math (`Ipv4Cidr::contains`), same rejection shape, guarding
     // against beep's classifier shadowing a ClusterIP Service instead of
     // the flow-key collision the pod-CIDR guard prevents.
     #[test]
-    fn vip_inside_service_cidr_is_rejected() {
+    fn front_inside_service_cidr_is_rejected() {
         let service_cidr = IpCidr::V4(parse_ipv4_cidr("10.96.0.0/12").unwrap());
-        let vip = IpAddr::V4(Ipv4Addr::new(10, 96, 5, 9));
+        let front = IpAddr::V4(Ipv4Addr::new(10, 96, 5, 9));
 
-        let err = vip_outside_service_cidr(vip, service_cidr)
-            .expect_err("a VIP inside the Service CIDR must be rejected, or beep's classifier can shadow a ClusterIP Service");
+        let err = front_outside_service_cidr(front, service_cidr)
+            .expect_err("a front inside the Service CIDR must be rejected, or beep's classifier can shadow a ClusterIP Service");
         assert!(
             err.contains("10.96.5.9") && err.contains("10.96.0.0/12"),
-            "rejection must name both the offending VIP and the Service CIDR so an operator can fix the config: got `{err}`"
+            "rejection must name both the offending front and the Service CIDR so an operator can fix the config: got `{err}`"
         );
     }
 
     #[test]
-    fn vip_outside_service_cidr_is_accepted() {
+    fn front_outside_service_cidr_is_accepted() {
         let service_cidr = IpCidr::V4(parse_ipv4_cidr("10.96.0.0/12").unwrap());
-        // Matches scripts/smoke-remote.sh's RFC 5737 VIP, deliberately
+        // Matches scripts/smoke-remote.sh's RFC 5737 front, deliberately
         // disjoint from the Service range -- this is the legitimate-config
         // path that must keep loading.
-        let vip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let front = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
 
         assert!(
-            vip_outside_service_cidr(vip, service_cidr).is_ok(),
-            "a VIP outside the Service CIDR is a legitimate config and must not be rejected"
+            front_outside_service_cidr(front, service_cidr).is_ok(),
+            "a front outside the Service CIDR is a legitimate config and must not be rejected"
         );
     }
 
     #[test]
-    fn vip_at_service_cidr_network_or_broadcast_address_is_rejected() {
+    fn front_at_service_cidr_network_or_broadcast_address_is_rejected() {
         let service_cidr = IpCidr::V4(parse_ipv4_cidr("10.96.0.0/12").unwrap());
         assert!(
-            vip_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 96, 0, 0)), service_cidr)
+            front_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 96, 0, 0)), service_cidr)
                 .is_err(),
             "the Service CIDR's network address is still inside the block and must be rejected"
         );
         assert!(
-            vip_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 111, 255, 255)), service_cidr)
+            front_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 111, 255, 255)), service_cidr)
                 .is_err(),
             "the Service CIDR's broadcast address is still inside the block and must be rejected"
         );
     }
 
     #[test]
-    fn vip_one_address_outside_service_cidr_boundary_is_accepted() {
+    fn front_one_address_outside_service_cidr_boundary_is_accepted() {
         let service_cidr = IpCidr::V4(parse_ipv4_cidr("10.96.0.0/12").unwrap());
         assert!(
-            vip_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 95, 255, 255)), service_cidr)
+            front_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 95, 255, 255)), service_cidr)
                 .is_ok(),
             "one address below the Service CIDR's network address must be accepted"
         );
         assert!(
-            vip_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 112, 0, 0)), service_cidr)
+            front_outside_service_cidr(IpAddr::V4(Ipv4Addr::new(10, 112, 0, 0)), service_cidr)
                 .is_ok(),
             "one address above the Service CIDR's broadcast address must be accepted"
         );
     }
 
     #[test]
-    fn vip_inside_a_v6_service_cidr_is_rejected() {
-        // v6 mirror of `vip_inside_service_cidr_is_rejected`.
+    fn front_inside_a_v6_service_cidr_is_rejected() {
+        // v6 mirror of `front_inside_service_cidr_is_rejected`.
         let service_cidr = parse_ip_cidr("fd00::/16").unwrap();
-        let vip: IpAddr = "fd00::5".parse().unwrap();
+        let front: IpAddr = "fd00::5".parse().unwrap();
 
-        let err = vip_outside_service_cidr(vip, service_cidr)
-            .expect_err("a v6 VIP inside the v6 Service CIDR must be rejected, or beep's classifier can shadow a ClusterIP Service");
+        let err = front_outside_service_cidr(front, service_cidr)
+            .expect_err("a v6 front inside the v6 Service CIDR must be rejected, or beep's classifier can shadow a ClusterIP Service");
         assert!(
             err.contains("fd00::5") && err.contains("fd00::/16"),
-            "rejection must name both the offending VIP and the Service CIDR so an operator can fix the config: got `{err}`"
+            "rejection must name both the offending front and the Service CIDR so an operator can fix the config: got `{err}`"
         );
     }
 
@@ -1003,9 +1003,9 @@ mod tests {
             assert_eq!(
                 Some(front.endpoints[0].target_port),
                 Some(wire_port(f.target_port)),
-                "VIP port {} must resolve to its own target port {}, not the \
+                "front port {} must resolve to its own target port {}, not the \
                  other Service port's",
-                f.vip_port,
+                f.front_port,
                 f.target_port
             );
         }
@@ -1034,18 +1034,18 @@ mod tests {
         let node_ip: IpAddr = "2001:db8::1".parse().unwrap();
         let fixture =
             parse_fixture("[2001:db8::10]:80:tcp:[2001:db8::1]:[2001:db8::2]:8080").unwrap();
-        let vip_ip: IpAddr = "2001:db8::10".parse().unwrap();
+        let front_ip: IpAddr = "2001:db8::10".parse().unwrap();
         let pod_ip: IpAddr = "2001:db8::2".parse().unwrap();
-        assert_eq!(fixture.vip_ip, vip_ip);
+        assert_eq!(fixture.front_ip, front_ip);
         assert_eq!(fixture.backend_node_ip, node_ip);
         assert_eq!(fixture.pod_ip, pod_ip);
 
         let key = fixture_key(&fixture);
         assert_eq!(
-            key.vip_ip,
-            wire_ip_v6(vip_ip),
-            "the front key must carry the v6 VIP's raw octets, \
-             the same wire-encode boundary a v4 VIP's ipv4_mapped_v6 embedding uses"
+            key.front_ip,
+            wire_ip_v6(front_ip),
+            "the front key must carry the v6 front's raw octets, \
+             the same wire-encode boundary a v4 front's ipv4_mapped_v6 embedding uses"
         );
         let fronts = fixture_fronts(std::slice::from_ref(&fixture));
         assert_eq!(

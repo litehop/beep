@@ -171,7 +171,7 @@ beep is an eBPF service load balancer (Geneve encap/decap, full-tuple conntrack)
 built on aya. Three crates:
 
 - **`beep`** (repo root, `src/main.rs`) — userspace loader: attaches the tc-bpf
-  classifiers, pins them under a bpffs dir, and populates VIP→backend maps.
+  classifiers, pins them under a bpffs dir, and populates front→backend maps.
 - **`beep-ebpf`** (`ebpf/`) — the `#![no_std]`, `bpfel-unknown-none` dataplane
   program.
 - **`beep-common`** (`common/`) — shared `no_std` types (conntrack keys,

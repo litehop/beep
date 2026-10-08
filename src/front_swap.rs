@@ -226,8 +226,8 @@ mod tests {
 
     fn front(last_octet: u8, port: u16) -> LbFrontKey {
         LbFrontKey {
-            vip_ip: ipv4_mapped_v6(wire_ip(u32::from_be_bytes([203, 0, 113, last_octet]))),
-            vip_port: wire_port(port),
+            front_ip: ipv4_mapped_v6(wire_ip(u32::from_be_bytes([203, 0, 113, last_octet]))),
+            front_port: wire_port(port),
             proto: 6,
             _pad: 0,
         }

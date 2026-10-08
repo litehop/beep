@@ -84,7 +84,7 @@ impl Proto {
     }
 }
 
-/// One VIP:PORT -> backend-node/PodIP:TargetPort fixture entry (see the
+/// One FRONT_IP:PORT -> backend-node/PodIP:TargetPort fixture entry (see the
 /// `--fixture` CLI flag's doc comment in `src/main.rs` for the full field
 /// semantics). Lives here, not in the binary, because `local_pod_ips`'s
 /// signature and its tests need the type.
@@ -97,15 +97,15 @@ impl Proto {
 /// vs. `bpf_tunnel_key`-native) that field's map actually uses.
 #[derive(Clone, Copy, Debug)]
 pub struct Fixture {
-    pub vip_ip: IpAddr,
-    pub vip_port: u16,
+    pub front_ip: IpAddr,
+    pub front_port: u16,
     pub proto: Proto,
     pub backend_node_ip: IpAddr,
     pub pod_ip: IpAddr,
     pub target_port: u16,
 }
 
-/// Widens a *wire-token* address field (`Fixture::vip_ip`/`pod_ip`) into
+/// Widens a *wire-token* address field (`Fixture::front_ip`/`pod_ip`) into
 /// `beep_common`'s dual-stack `[u8; 16]` shape: a v4 address goes through
 /// `wire_ip` + `ipv4_mapped_v6`, exactly the embedding `beep-ebpf`'s inner-
 /// packet parsing produces for a real v4 packet; a v6 address's own octets
@@ -165,19 +165,20 @@ fn split_fixture_fields(s: &str) -> Vec<&str> {
 
 pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
     let parts = split_fixture_fields(s);
-    let [vip_ip, vip_port, proto, backend_node_ip, pod_ip, target_port] = parts.as_slice() else {
+    let [front_ip, front_port, proto, backend_node_ip, pod_ip, target_port] = parts.as_slice()
+    else {
         return Err(format!(
-            "expected vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port (bracket an IPv6 \
+            "expected front_ip:front_port:proto:backend_node_ip:pod_ip:target_port (bracket an IPv6 \
              address, e.g. `[2001:db8::1]`), got `{s}`"
         ));
     };
     Ok(Fixture {
-        vip_ip: vip_ip
+        front_ip: front_ip
             .parse()
-            .map_err(|e| format!("vip_ip `{vip_ip}`: {e}"))?,
-        vip_port: vip_port
+            .map_err(|e| format!("front_ip `{front_ip}`: {e}"))?,
+        front_port: front_port
             .parse()
-            .map_err(|e| format!("vip_port `{vip_port}`: {e}"))?,
+            .map_err(|e| format!("front_port `{front_port}`: {e}"))?,
         proto: match *proto {
             "tcp" => Proto::Tcp,
             "udp" => Proto::Udp,
@@ -198,7 +199,7 @@ pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
 /// Wire-form pod_ips of fixtures THIS node itself backs (`backend_node_ip
 /// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `FRONT_META`/
 /// `FRONT_ENDPOINTS` which every node populates identically from the full
-/// fixture set since any node can be ingress for any VIP. `node_ip`'s family
+/// fixture set since any node can be ingress for any front. `node_ip`'s family
 /// need not match every fixture's `backend_node_ip`; `IpAddr`'s `PartialEq`
 /// already treats a v4 and a v6 address as unequal regardless of numeric
 /// value, so a cross-family fixture is correctly excluded rather than
@@ -248,7 +249,7 @@ pub fn flow_key_direction(key: &FlowKey) -> Option<FlowDirection> {
 /// `flow_key_direction` and read with `FlowValue::as_forward`) whose backend
 /// points at `departed_pod` -- the eviction sweep's Forward case. Forward is
 /// the ONLY role where pod identity lives in the VALUE rather than the key: the
-/// key is `(client, VIP, proto)`, which never carries pod identity at all.
+/// key is `(client, front, proto)`, which never carries pod identity at all.
 /// Generic over `K` so the identical filter serves both `FWD_PENDING`'s
 /// `TcpFlowKey` and `FLOW_TABLE`'s wider `FlowKey`.
 pub fn stale_forward_entries<K: Copy>(
@@ -811,7 +812,7 @@ mod tests {
 
     #[test]
     fn stale_forward_entries_selects_fwd_pending_rows_for_the_departed_pod_only() {
-        // FWD_PENDING's key ((client, VIP, proto)) never carries pod
+        // FWD_PENDING's key ((client, front, proto)) never carries pod
         // identity -- only the value does. If this filter is reverted to a
         // no-op (e.g. always `true`), a departed pod's pre-promotion
         // FWD_PENDING rows survive eviction and can still be promoted into
@@ -857,11 +858,11 @@ mod tests {
         let departed_pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9)));
         let other_pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 10)));
         let client_ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)));
-        let vip_ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        let front_ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
         let departed_key: FlowKey =
-            encode_flow_key(client_ip, 1, vip_ip, 80, 6, FlowDirection::Forward);
+            encode_flow_key(client_ip, 1, front_ip, 80, 6, FlowDirection::Forward);
         let other_key: FlowKey =
-            encode_flow_key(client_ip, 2, vip_ip, 81, 6, FlowDirection::Forward);
+            encode_flow_key(client_ip, 2, front_ip, 81, 6, FlowDirection::Forward);
         let entries = [
             (departed_key, forward_flow_value_for(departed_pod)),
             (other_key, forward_flow_value_for(other_pod)),
@@ -882,7 +883,7 @@ mod tests {
         // match. If this filter is reverted to a no-op, a departed pod's
         // reverse (un-DNAT) conntrack entry survives, and a FUTURE, unrelated
         // owner of that reused pod IP has its return traffic un-DNATed using
-        // the departed flow's stale VIP/ingress-node state.
+        // the departed flow's stale front/ingress-node state.
         let departed_pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9)));
         let other_pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 10)));
         let client_ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)));

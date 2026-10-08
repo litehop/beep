@@ -19,7 +19,7 @@
 #      loads the 3 tc-bpf classifiers, and asserts the verifier ACCEPTED
 #      them (a rejection surfaces as a loader load error, checked
 #      explicitly, plus an independent `bpftool prog list` confirmation);
-#   4. drives three client -> VIP -> backend TCP round trips through the
+#   4. drives three client -> front -> backend TCP round trips through the
 #      real Geneve encap/decap dataplane: two Service ports on the SAME
 #      backend Pod via the first configured uplink (asserting each lands on
 #      its own distinct target port), plus a third through a SECOND
@@ -34,7 +34,7 @@
 #      reachable, and that reusing the evicted pod's IP for a fresh flow
 #      doesn't resurrect stale reverse/port-memo state;
 #   6. removes this fixture's own peer-node entry from NODE_ALLOW and
-#      asserts a further round trip through the same VIP is DROPPED --
+#      asserts a further round trip through the same front is DROPPED --
 #      proves geneve_ingress's outer-tunnel-source attestation gate actually
 #      rejects an unattested source rather than merely compiling.
 #

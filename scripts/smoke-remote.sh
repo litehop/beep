@@ -2,7 +2,7 @@
 # VM-side half of scripts/smoke.sh. Copied into the Lima VM and
 # run there as root by smoke.sh -- not meant to be invoked directly by a
 # human. Builds a self-contained veth-pair + netns fixture so the whole
-# client->VIP->backend round trip happens on ONE VM (the original
+# client->front->backend round trip happens on ONE VM (the original
 # hand-verification used a second physical Lima VM as the client; a
 # reproducible harness can't depend on a peer machine being available).
 # Owns geneve0 and the smoke-veth0/smoke-client fixture
@@ -12,12 +12,12 @@ set -euo pipefail
 
 # RFC 5737 documentation ranges: deliberately disjoint from any real subnet
 # a given VM's CNI/pod network happens to be using.
-VIP_IP="203.0.113.1"
+FRONT_IP="203.0.113.1"
 CLIENT_IP="203.0.113.2"
-VIP_PORT="19100"
+FRONT_PORT="19100"
 POD_IP="198.51.100.53"
-# Covers POD_IP (TEST-NET-2) while staying disjoint from VIP_IP/CLIENT_IP
-# (TEST-NET-3) -- exercises the vip-outside-pod-cidr startup check against a
+# Covers POD_IP (TEST-NET-2) while staying disjoint from FRONT_IP/CLIENT_IP
+# (TEST-NET-3) -- exercises the front-outside-pod-cidr startup check against a
 # legitimate config, which must load, not reject.
 POD_CIDR="198.51.100.0/24"
 TARGET_PORT="18080"
@@ -26,7 +26,7 @@ TARGET_PORT="18080"
 # each front independently instead of collapsing both onto whichever
 # target port was written last (the bug this fixture guards against: a
 # pod-IP-only key can't tell these two fronts apart at all).
-VIP_PORT2="19101"
+FRONT_PORT2="19101"
 TARGET_PORT2="18081"
 # A third front for the anti-flush (FWD_PENDING-churn-vs-FLOW_TABLE-survival)
 # demonstration below: UDP, so a burst never needs a real handshake, and
@@ -36,7 +36,7 @@ TARGET_PORT2="18081"
 # into FLOW_TABLE (admission control's only mint site is the forward path;
 # promotion requires an observed return leg, which this front can never
 # produce).
-VIP_PORT3="19102"
+FRONT_PORT3="19102"
 TARGET_PORT3="18082"
 FLOOD_BACKEND_NODE_IP="203.0.113.250"
 # A SECOND configured uplink -- proves the multi-symmetric-uplink design
@@ -45,14 +45,14 @@ FLOOD_BACKEND_NODE_IP="203.0.113.250"
 # arrived on. TEST-NET-1, deliberately disjoint from the first uplink's
 # TEST-NET-3 subnet above and from POD_CIDR's TEST-NET-2 -- a genuinely
 # separate physical path, not just a second cable on the same wire.
-# `backend_node_ip` for this uplink's fixture is still VIP_IP (this node's
+# `backend_node_ip` for this uplink's fixture is still FRONT_IP (this node's
 # own self-loop identity, unaffected by which uplink admitted the packet).
 UPLINK2_IFACE="smoke-veth2"
 UPLINK2_PEER_IFACE="smoke-veth3"
 UPLINK2_NETNS="smoke-client2"
-UPLINK2_VIP_IP="192.0.2.1"
+UPLINK2_FRONT_IP="192.0.2.1"
 UPLINK2_CLIENT_IP="192.0.2.2"
-UPLINK2_VIP_PORT="19103"
+UPLINK2_FRONT_PORT="19103"
 UPLINK2_TARGET_PORT="18083"
 UPLINK2_BACKEND_LOG="/tmp/beep-smoke-backend-uplink2.log"
 UPLINK2_RESPONSE_FILE="/tmp/beep-smoke-response-uplink2.http"
@@ -69,7 +69,7 @@ BACKEND_LOG2="/tmp/beep-smoke-backend2.log"
 RESPONSE_FILE="/tmp/beep-smoke-response.http"
 RESPONSE_FILE2="/tmp/beep-smoke-response2.http"
 RPFILTER_SAVE_FILE="/tmp/beep-smoke-rpfilter-all.saved"
-# Restart-preservation fixture: reuses the first VIP:PORT ->
+# Restart-preservation fixture: reuses the first FRONT_IP:PORT ->
 # backend pair above, held open across a loader restart instead of a plain
 # request/response, so the SECOND chunk's return leg depends on the
 # FLOW_TABLE conntrack entries (both forward- and reverse-tagged) the FIRST
@@ -90,7 +90,7 @@ RESTART_LOADER_LOG="/tmp/beep-smoke-loader-restart.log"
 # POD_IP. `EVICT_FRONT_POD_IP` is mutated across this section's own loader
 # restarts (evicted-pod -> replacement pod -> the same pod IP reused) --
 # `start_loader` below reads it at call time, not at definition time.
-EVICT_VIP_PORT="19104"
+EVICT_FRONT_PORT="19104"
 EVICT_TARGET_PORT="18084"
 EVICT_FRONT_POD_IP="$POD_IP"
 EVICT_RESPONSE_FILE="/tmp/beep-smoke-response-evict.http"
@@ -134,7 +134,7 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
-  pkill -f "nc ${VIP_IP} ${VIP_PORT}" 2>/dev/null || true
+  pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
   # netns: deleting the netns first can orphan smoke-veth1's namespace --
@@ -185,7 +185,7 @@ echo "==> creating smoke-veth0/smoke-veth1 + smoke-client netns (stands in for a
 ip link add smoke-veth0 type veth peer name smoke-veth1
 ip netns add smoke-client
 ip link set smoke-veth1 netns smoke-client
-ip addr add "${VIP_IP}/24" dev smoke-veth0
+ip addr add "${FRONT_IP}/24" dev smoke-veth0
 ip link set smoke-veth0 up
 ip netns exec smoke-client ip addr add "${CLIENT_IP}/24" dev smoke-veth1
 ip netns exec smoke-client ip link set smoke-veth1 up
@@ -200,7 +200,7 @@ echo "==> creating $UPLINK2_IFACE/$UPLINK2_PEER_IFACE + $UPLINK2_NETNS netns (se
 ip link add "$UPLINK2_IFACE" type veth peer name "$UPLINK2_PEER_IFACE"
 ip netns add "$UPLINK2_NETNS"
 ip link set "$UPLINK2_PEER_IFACE" netns "$UPLINK2_NETNS"
-ip addr add "${UPLINK2_VIP_IP}/24" dev "$UPLINK2_IFACE"
+ip addr add "${UPLINK2_FRONT_IP}/24" dev "$UPLINK2_IFACE"
 ip link set "$UPLINK2_IFACE" up
 ip netns exec "$UPLINK2_NETNS" ip addr add "${UPLINK2_CLIENT_IP}/24" dev "$UPLINK2_PEER_IFACE"
 ip netns exec "$UPLINK2_NETNS" ip link set "$UPLINK2_PEER_IFACE" up
@@ -230,12 +230,12 @@ start_loader() {
   nohup "$BIN" \
     --uplink-iface smoke-veth0 --uplink-iface "$UPLINK2_IFACE" --geneve-iface geneve0 \
     --pin-dir "$PIN_DIR" \
-    --pod-cidr "$POD_CIDR" --node-ip "$VIP_IP" \
-    --fixture "${VIP_IP}:${VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT}" \
-    --fixture "${VIP_IP}:${VIP_PORT2}:tcp:${VIP_IP}:${POD_IP}:${TARGET_PORT2}" \
-    --fixture "${VIP_IP}:${VIP_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
-    --fixture "${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT}:tcp:${VIP_IP}:${POD_IP}:${UPLINK2_TARGET_PORT}" \
-    --fixture "${VIP_IP}:${EVICT_VIP_PORT}:tcp:${VIP_IP}:${EVICT_FRONT_POD_IP}:${EVICT_TARGET_PORT}" \
+    --pod-cidr "$POD_CIDR" --node-ip "$FRONT_IP" \
+    --fixture "${FRONT_IP}:${FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${FRONT_PORT2}:tcp:${FRONT_IP}:${POD_IP}:${TARGET_PORT2}" \
+    --fixture "${FRONT_IP}:${FRONT_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
+    --fixture "${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${UPLINK2_TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${EVICT_FRONT_PORT}:tcp:${FRONT_IP}:${EVICT_FRONT_POD_IP}:${EVICT_TARGET_PORT}" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -293,7 +293,7 @@ stop_loader() {
 }
 
 echo "==> loading beep-ebpf -- this is the verifier-accept gate"
-# Two --fixture entries sharing one Pod IP but different VIP/target ports:
+# Two --fixture entries sharing one Pod IP but different front/target ports:
 # the multi-port-Service scenario FRONT_ENDPOINTS' front-tuple keying exists
 # to disambiguate.
 start_loader "$LOADER_LOG"
@@ -314,7 +314,7 @@ verifier_accept_check "$loaded" "$LOADER_LOG" "$MEMORY_SCRIPT" "$PIN_DIR" "$MEMO
 
 echo "==> starting backend responders on ${POD_IP}:${TARGET_PORT} and ${POD_IP}:${TARGET_PORT2}"
 # Distinct bodies, not just "both connections succeed": the bug this
-# fixture guards against is the backend DNAT-ing BOTH VIP ports to
+# fixture guards against is the backend DNAT-ing BOTH front ports to
 # whichever target port a pod-IP-only key last happened to remember, which
 # a same-body response would not catch.
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' > "$RESPONSE_FILE"
@@ -325,21 +325,21 @@ nohup nc -l -N "$POD_IP" "$TARGET_PORT2" < "$RESPONSE_FILE2" >"$BACKEND_LOG2" 2>
 disown
 sleep 0.5
 
-echo "==> driving one client -> VIP -> backend round trip"
-body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT}/")
+echo "==> driving one client -> front -> backend round trip"
+body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_PORT}/")
 [ "$body" = "OK" ] || {
   echo "FAIL: expected response body 'OK', got: $body" >&2
   exit 1
 }
-echo "ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
+echo "ROUND-TRIP: PASS (client ${CLIENT_IP} -> front ${FRONT_IP}:${FRONT_PORT} -> backend ${POD_IP}:${TARGET_PORT} -> response 'OK')"
 
 echo "==> driving a second round trip through the SAME Pod's other Service port"
-body2=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${VIP_PORT2}/")
+body2=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_PORT2}/")
 [ "$body2" = "OK2" ] || {
   echo "FAIL: expected response body 'OK2' from the second Service port, got: $body2 -- a pod-IP-only backend key would DNAT this to the FIRST port's target instead" >&2
   exit 1
 }
-echo "MULTI-PORT ROUND-TRIP: PASS (client ${CLIENT_IP} -> VIP ${VIP_IP}:${VIP_PORT2} -> backend ${POD_IP}:${TARGET_PORT2} -> response 'OK2', distinct from the first Service port's target)"
+echo "MULTI-PORT ROUND-TRIP: PASS (client ${CLIENT_IP} -> front ${FRONT_IP}:${FRONT_PORT2} -> backend ${POD_IP}:${TARGET_PORT2} -> response 'OK2', distinct from the first Service port's target)"
 
 echo "==> starting a backend responder for the second uplink's front on ${POD_IP}:${UPLINK2_TARGET_PORT}"
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK3' > "$UPLINK2_RESPONSE_FILE"
@@ -356,12 +356,12 @@ echo "==> driving a round trip through the SECOND configured uplink ($UPLINK2_IF
 # The client here would then simply time out rather than see a wrong body,
 # so a plain success/failure check on THIS specific netns is enough to prove
 # symmetric per-uplink return, with no extra ifindex introspection needed.
-body3=$(ip netns exec "$UPLINK2_NETNS" curl -sS -m 5 "http://${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT}/")
+body3=$(ip netns exec "$UPLINK2_NETNS" curl -sS -m 5 "http://${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT}/")
 [ "$body3" = "OK3" ] || {
   echo "FAIL: expected response body 'OK3' via the second uplink ($UPLINK2_IFACE), got: $body3 -- either this uplink was never admitted (UPLINK_CONFIG miss), or its return leg redirected out the wrong uplink's ifindex" >&2
   exit 1
 }
-echo "SECOND-UPLINK ROUND-TRIP: PASS (client ${UPLINK2_CLIENT_IP} via ${UPLINK2_IFACE} -> VIP ${UPLINK2_VIP_IP}:${UPLINK2_VIP_PORT} -> backend ${POD_IP}:${UPLINK2_TARGET_PORT} -> response 'OK3', returned via the SAME uplink it arrived on)"
+echo "SECOND-UPLINK ROUND-TRIP: PASS (client ${UPLINK2_CLIENT_IP} via ${UPLINK2_IFACE} -> front ${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT} -> backend ${POD_IP}:${UPLINK2_TARGET_PORT} -> response 'OK3', returned via the SAME uplink it arrived on)"
 
 # bpftool exits nonzero AND still prints a JSON error object to stdout for a
 # missing pin (`{"error": "..."}`) -- piping that straight into `jq length`
@@ -431,7 +431,7 @@ echo "==> demonstrating the anti-flush property: a burst of new-flow-only packet
 # The three round trips above (two fronts on the first uplink, one on the
 # second) already promoted their flows into FLOW_TABLE (forward-tagged) and
 # wrote their reverse-tagged counterparts. Flood a FOURTH, never-returning
-# front (VIP_PORT3, see its definition above for why the flood can never
+# front (FRONT_PORT3, see its definition above for why the flood can never
 # produce a return leg, and therefore never reaches FLOW_TABLE at all --
 # FLOOD_BACKEND_NODE_IP answers to nothing) from many distinct client
 # source ports -- a stand-in for an off-path spoofed-source flood -- and
@@ -448,7 +448,7 @@ echo "before flood: FLOW_TABLE=$flow_before entries, FWD_PENDING=$pending_before
 FLOOD_COUNT=200
 ip netns exec smoke-client bash -c "
   for i in \$(seq 1 $FLOOD_COUNT); do
-    printf 'flood' | nc -u -q0 '$VIP_IP' '$VIP_PORT3' 2>/dev/null
+    printf 'flood' | nc -u -q0 '$FRONT_IP' '$FRONT_PORT3' 2>/dev/null
   done
   true
 "
@@ -500,7 +500,7 @@ disown
 ( printf '%s' "$RESTART_CHUNK1"; read -r _ < "$RESTART_SIGNAL_FIFO"; printf '%s' "$RESTART_CHUNK2" ) > "$RESTART_FIFO" &
 disown
 
-ip netns exec smoke-client bash -c "timeout 30 nc ${VIP_IP} ${VIP_PORT} > ${RESTART_CLIENT_OUT}" &
+ip netns exec smoke-client bash -c "timeout 30 nc ${FRONT_IP} ${FRONT_PORT} > ${RESTART_CLIENT_OUT}" &
 # Not disowned: `wait` on a disowned pid returns 0 immediately without
 # waiting, which would read the body below before chunk 2 has been delivered.
 restart_client_pid=$!
@@ -554,14 +554,14 @@ restart_body="$(cat "$RESTART_CLIENT_OUT" 2>/dev/null || true)"
 echo "RESTART FLOW CONTINUITY: PASS (client received both chunks across the loader restart: '$restart_body')"
 
 echo "==> selective conntrack eviction: establishing a flow on a DEDICATED front to evict"
-# A front of its own (EVICT_VIP_PORT/EVICT_TARGET_PORT), not reused from the
+# A front of its own (EVICT_FRONT_PORT/EVICT_TARGET_PORT), not reused from the
 # round trips above, so this section's before/after assertions aren't
 # confounded by conntrack rows those other flows already wrote for POD_IP.
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nEVICT1' > "$EVICT_RESPONSE_FILE"
 nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" < "$EVICT_RESPONSE_FILE" >"$EVICT_BACKEND_LOG" 2>&1 &
 disown
 sleep 0.5
-evict_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${EVICT_VIP_PORT}/")
+evict_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
 [ "$evict_body" = "EVICT1" ] || {
   echo "FAIL: expected response body 'EVICT1' from the dedicated eviction-test front, got: $evict_body" >&2
   exit 1
@@ -599,7 +599,7 @@ printf 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nREPLAC
 nohup nc -l -N "$REPLACEMENT_POD_IP" "$EVICT_TARGET_PORT" < "$REPLACEMENT_RESPONSE_FILE" >"$REPLACEMENT_BACKEND_LOG" 2>&1 &
 disown
 sleep 0.5
-replacement_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${EVICT_VIP_PORT}/")
+replacement_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
 [ "$replacement_body" = "REPLACEMENT" ] || {
   echo "FAIL: expected response body 'REPLACEMENT' after re-pointing the front at a new backend pod, got: $replacement_body -- the eviction sweep must not wedge the front against a replacement endpoint" >&2
   exit 1
@@ -615,7 +615,7 @@ printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nREUSE' 
 nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" < "$REUSE_RESPONSE_FILE" >"$REUSE_BACKEND_LOG" 2>&1 &
 disown
 sleep 0.5
-reuse_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${VIP_IP}:${EVICT_VIP_PORT}/")
+reuse_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
 [ "$reuse_body" = "REUSE" ] || {
   echo "FAIL: expected response body 'REUSE' from the reused pod IP, got: $reuse_body" >&2
   exit 1
@@ -633,29 +633,29 @@ echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hos
 # (bpftool) rather than via --fixture so no other phase's state changes.
 NODE_EGRESS_PORT="19200"
 NODE_EGRESS_OUT="/tmp/beep-smoke-node-egress.out"
-NODE_EGRESS_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${VIP_IP}" | tr . ' ')"
+NODE_EGRESS_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ')"
 bpftool map update pinned "$PIN_DIR/POD_TARGETS" key $NODE_EGRESS_KEY value 1 || {
-  echo "FAIL: could not insert node address ${VIP_IP} into POD_TARGETS (key bytes: $NODE_EGRESS_KEY)" >&2
+  echo "FAIL: could not insert node address ${FRONT_IP} into POD_TARGETS (key bytes: $NODE_EGRESS_KEY)" >&2
   exit 1
 }
 rm -f "$NODE_EGRESS_OUT"
 nohup ip netns exec smoke-client timeout 6 nc -l -N "$CLIENT_IP" "$NODE_EGRESS_PORT" >"$NODE_EGRESS_OUT" 2>&1 &
 disown
 sleep 0.5
-echo "node-egress-payload" | nc -s "$VIP_IP" -w 3 "$CLIENT_IP" "$NODE_EGRESS_PORT" >/dev/null 2>&1 || true
+echo "node-egress-payload" | nc -s "$FRONT_IP" -w 3 "$CLIENT_IP" "$NODE_EGRESS_PORT" >/dev/null 2>&1 || true
 sleep 0.5
 bpftool map delete pinned "$PIN_DIR/POD_TARGETS" key $NODE_EGRESS_KEY || true
 grep -q "node-egress-payload" "$NODE_EGRESS_OUT" || {
-  echo "FAIL: a fresh connection from the node's own address ${VIP_IP} (present in POD_TARGETS like a hostNetwork backend) never reached ${CLIENT_IP}:${NODE_EGRESS_PORT} -- hook 3 must pass anything that is not a FLOW_TABLE reverse hit, otherwise the node's own SSH/kubelet egress dies on a hostNetwork-backend node" >&2
+  echo "FAIL: a fresh connection from the node's own address ${FRONT_IP} (present in POD_TARGETS like a hostNetwork backend) never reached ${CLIENT_IP}:${NODE_EGRESS_PORT} -- hook 3 must pass anything that is not a FLOW_TABLE reverse hit, otherwise the node's own SSH/kubelet egress dies on a hostNetwork-backend node" >&2
   exit 1
 }
-echo "NODE-EGRESS: PASS (fresh connection from ${VIP_IP}, a POD_TARGETS member, passed hook 3 with no FLOW_TABLE reverse entry)"
+echo "NODE-EGRESS: PASS (fresh connection from ${FRONT_IP}, a POD_TARGETS member, passed hook 3 with no FLOW_TABLE reverse entry)"
 
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
-# This fixture is a self-loop (VIP_IP is also this node's own address, and
-# `--node-ip $VIP_IP` seeded NODE_ALLOW with it), so every Geneve packet
-# geneve_ingress decaps here genuinely arrives with outer source == VIP_IP.
-# Deleting VIP_IP's NODE_ALLOW entry directly (bpftool, not a loader
+# This fixture is a self-loop (FRONT_IP is also this node's own address, and
+# `--node-ip $FRONT_IP` seeded NODE_ALLOW with it), so every Geneve packet
+# geneve_ingress decaps here genuinely arrives with outer source == FRONT_IP.
+# Deleting FRONT_IP's NODE_ALLOW entry directly (bpftool, not a loader
 # restart) changes ONLY the peer-attestation gate under test -- a restart
 # with a different --node-ip would ALSO re-prune POD_TARGETS (scoped to
 # node_ip too), confounding which gate caused a subsequent drop.
@@ -674,19 +674,19 @@ node_allow_key_bytes() {
   local octets=($1)
   echo "0 0 0 0 0 0 0 0 0 0 255 255 ${octets[3]} ${octets[2]} ${octets[1]} ${octets[0]}"
 }
-VIP_NODE_ALLOW_KEY=$(node_allow_key_bytes "$VIP_IP")
-bpftool map delete pinned "$PIN_DIR/NODE_ALLOW" key $VIP_NODE_ALLOW_KEY || {
-  echo "FAIL: could not delete VIP_IP's NODE_ALLOW entry (key bytes: $VIP_NODE_ALLOW_KEY) -- either bpftool's key syntax is wrong or NODE_ALLOW never contained this fixture's own outer tunnel source in the first place" >&2
+FRONT_NODE_ALLOW_KEY=$(node_allow_key_bytes "$FRONT_IP")
+bpftool map delete pinned "$PIN_DIR/NODE_ALLOW" key $FRONT_NODE_ALLOW_KEY || {
+  echo "FAIL: could not delete FRONT_IP's NODE_ALLOW entry (key bytes: $FRONT_NODE_ALLOW_KEY) -- either bpftool's key syntax is wrong or NODE_ALLOW never contained this fixture's own outer tunnel source in the first place" >&2
   exit 1
 }
 
 spoof_rc=0
-spoof_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${VIP_IP}:${VIP_PORT}/" 2>/dev/null) || spoof_rc=$?
+spoof_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${FRONT_IP}:${FRONT_PORT}/" 2>/dev/null) || spoof_rc=$?
 [ "$spoof_rc" -ne 0 ] && [ "$spoof_body" != "OK" ] || {
-  echo "FAIL: client round trip through VIP ${VIP_IP}:${VIP_PORT} unexpectedly SUCCEEDED (body '$spoof_body', curl rc $spoof_rc) after this fixture's real outer tunnel source (${VIP_IP}) was removed from NODE_ALLOW -- geneve_ingress must drop a decap whose outer source (tkey.remote_ipv4) has no NODE_ALLOW entry, not decap and deliver it" >&2
+  echo "FAIL: client round trip through front ${FRONT_IP}:${FRONT_PORT} unexpectedly SUCCEEDED (body '$spoof_body', curl rc $spoof_rc) after this fixture's real outer tunnel source (${FRONT_IP}) was removed from NODE_ALLOW -- geneve_ingress must drop a decap whose outer source (tkey.remote_ipv4) has no NODE_ALLOW entry, not decap and deliver it" >&2
   exit 1
 }
-echo "ANTI-SPOOF: PASS (round trip through VIP ${VIP_IP}:${VIP_PORT} correctly dropped once its own NODE_ALLOW entry was removed -- curl rc=$spoof_rc)"
+echo "ANTI-SPOOF: PASS (round trip through front ${FRONT_IP}:${FRONT_PORT} correctly dropped once its own NODE_ALLOW entry was removed -- curl rc=$spoof_rc)"
 
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2

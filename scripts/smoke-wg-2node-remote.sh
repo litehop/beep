@@ -198,7 +198,7 @@ setup_backend() {
   # from the pod's own address (`ip rule ... from`), fixes this: the pod's
   # own raw reply (src=pod_ip) takes this table's wg0 route and hits
   # uplink_egress_return, while the ingress node's relayed reply (src=the
-  # VIP, rewritten by its own un-DNAT step) falls through to the main
+  # front, rewritten by its own un-DNAT step) falls through to the main
   # table's ordinary connected route out eth0, as it must.
   local rt_table=100
   for cidr in "${return_routes[@]}"; do
@@ -221,7 +221,7 @@ setup_backend() {
 
   # This node is also the client's WireGuard relay (see setup_wg's
   # --extra-allowed comment): the client's SYN arrives on eth0 destined for
-  # the VIP on node-a's wg0 subnet, which is a genuine inter-device forward,
+  # the front on node-a's wg0 subnet, which is a genuine inter-device forward,
   # not local delivery -- the kernel drops it unless ip_forward is on.
   if [ ! -f "$IPFORWARD_SAVE_FILE" ]; then
     sysctl -n net.ipv4.ip_forward > "$IPFORWARD_SAVE_FILE"

@@ -20,8 +20,8 @@ structure.
 
 1. **Second person.** Write "you attach the tc-bpf classifier," not "the
    operator attaches the tc-bpf classifier" or "developers can attach."
-2. **Active voice.** "The loader programs the VIP-to-backend map," not
-   "the VIP-to-backend map is programmed by the loader."
+2. **Active voice.** "The loader programs the front-to-backend map," not
+   "the front-to-backend map is programmed by the loader."
 3. **Present tense.** Describe what the system does now, not what it
    will or would do. Reserve "will" for ADR consequences, not
    how-to docs.

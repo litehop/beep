@@ -10,7 +10,7 @@ This crate is beep's userspace loader. See `docs/design/ebpf-lb-dataplane.md` an
 
 The loader attaches three tc-bpf classifiers and pins them under a bpffs directory.
 
-For now, you supply the loader with static VIP:PORT -> backend-node/PodIP:TargetPort mappings via `--fixture`, to prove the mechanism works. Repeat `--fixture` if one Pod sits behind more than one Service port.
+For now, you supply the loader with static FRONT_IP:PORT -> backend-node/PodIP:TargetPort mappings via `--fixture`, to prove the mechanism works. Repeat `--fixture` if one Pod sits behind more than one Service port.
 
 `beep-ebpf` is this crate's no_std sibling — the actual dataplane program. This loader links Linux-only syscalls (`bpf(2)`, netlink), so it only builds and runs on Linux.
 
@@ -60,7 +60,7 @@ interface's hardware type, not something you configure. A single
 `--uplink-iface`, as in the first example above, remains the common N=1
 case. Design rationale: `docs/decisions/servicelb-multi-symmetric-uplink.md`.
 
-`--fixture` takes `vip_ip:vip_port:proto:backend_node_ip:pod_ip:target_port`, and you can repeat the flag. For example, one Pod behind two Service ports (80->8080 and 443->8443) needs two `--fixture` entries that share the same `pod_ip`:
+`--fixture` takes `front_ip:front_port:proto:backend_node_ip:pod_ip:target_port`, and you can repeat the flag. For example, one Pod behind two Service ports (80->8080 and 443->8443) needs two `--fixture` entries that share the same `pod_ip`:
 
 ```console
 $ sudo ./target/release/beep \
@@ -70,7 +70,7 @@ $ sudo ./target/release/beep \
     --fixture 10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443
 ```
 
-`--pod-cidr` guards against a real collision: a hostNetwork Pod's IP equals its node's IP, so that IP lives in front-IP (VIP) space, not pod-IP space. If a `--fixture`'s vip_ip falls inside `--pod-cidr`, the two spaces overlap, and a forward flow key can byte-collide with a reverse one. The loader checks this at startup and refuses to run if it happens.
+`--pod-cidr` guards against a real collision: a hostNetwork Pod's IP equals its node's IP, so that IP lives in front-IP space, not pod-IP space. If a `--fixture`'s front_ip falls inside `--pod-cidr`, the two spaces overlap, and a forward flow key can byte-collide with a reverse one. The loader checks this at startup and refuses to run if it happens.
 
 `geneve0` must exist before you run the loader, as a "collect metadata" external Geneve device:
 
@@ -102,7 +102,7 @@ $ scripts/smoke.sh                    # uses the default VM: beep-smoke
 $ scripts/smoke.sh --vm beep-node-a   # or target another Lima VM
 ```
 
-It cross-builds this crate, loads the three tc-bpf classifiers into a real kernel on an already-provisioned Lima VM, and confirms the verifier accepts them. Then it drives two client -> VIP -> backend TCP round trips (two Service ports on one backend Pod) through a self-contained veth/netns fixture. See the script's own header comment for prerequisites and what each step does.
+It cross-builds this crate, loads the three tc-bpf classifiers into a real kernel on an already-provisioned Lima VM, and confirms the verifier accepts them. Then it drives two client -> front -> backend TCP round trips (two Service ports on one backend Pod) through a self-contained veth/netns fixture. See the script's own header comment for prerequisites and what each step does.
 
 ## Memory observability
 

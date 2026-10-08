@@ -2,7 +2,7 @@
 //! Service's `status.loadBalancer.ingress` -- the field every
 //! `jig.WaitForLoadBalancer`-style e2e spec (and any real client) polls
 //! before it will attempt a connection. Per beep's node-owned-address model
-//! (`docs/design/ebpf-lb-dataplane.md`) there is no single floating VIP to
+//! (`docs/design/ebpf-lb-dataplane.md`) there is no single floating front to
 //! elect one writer for: every node running this DaemonSet independently
 //! advertises its OWN address for every `LoadBalancer` Service it fronts, so
 //! this is an N-writer field and the writer here must add-if-absent and
@@ -11,7 +11,7 @@
 //! edited to a narrower `spec.ipFamilies`) -- see `merged_ingress`.
 //!
 //! `ip` is the only field ever set on the entry this node writes.
-//! `ipMode` is deliberately left unset -- it defaults to `VIP` semantics,
+//! `ipMode` is deliberately left unset -- it defaults to the Kubernetes `ipMode: VIP` semantics,
 //! while explicit `Proxy` makes the upstream ESIPP e2e spec self-skip
 //! (`test/e2e/network/loadbalancer.go:1054`, tracking
 //! https://issues.k8s.io/123714).

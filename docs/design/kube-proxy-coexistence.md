@@ -14,9 +14,9 @@ Verified live on a k3s cluster running real kube-proxy and flannel
 and kube-proxy's netfilter chains run on disjoint kernel subsystems, in a
 fixed order: tc runs before netfilter on ingress, so beep's classifier
 sees a packet first. `ClusterIP`/`NodePort` (east-west) traffic is never
-written to beep's VIP map, so it never matches in beep's classifier and
+written to beep's front map, so it never matches in beep's classifier and
 falls through to kube-proxy's chains untouched — beep owns only
-north-south `LoadBalancer` VIP:port traffic. There is no double-processing
+north-south `LoadBalancer` front:port traffic. There is no double-processing
 between the two (`docs/decisions/servicelb-ebpf-geneve-dataplane.md:46`).
 `geneve0` (Geneve/UDP 6081, beep's tunnel device) and `flannel.1`
 (VXLAN/UDP 8472, flannel's) are separate devices with no shared routes —
@@ -29,20 +29,20 @@ packet to flannel's pod-CIDR routing for the last hop
 ## Why IPVS mode is unsupported
 
 **Not** the originally hypothesized failure: kube-proxy's IPVS reconciler
-binds every Service VIP to the `kube-ipvs0` dummy device as a local
-address, and a naive kube-ipvs0-hijack theory says a node's own VIP gets
+binds every Service front to the `kube-ipvs0` dummy device as a local
+address, and a naive kube-ipvs0-hijack theory says a node's own front gets
 REJECTed at that dummy device before beep ever sees it. That's refuted —
 `kube-ipvs0` skips binding an IP equal to the node's own real interface
-address, so a node's own VIP is never hijacked locally, and beep's
+address, so a node's own front is never hijacked locally, and beep's
 tc-ingress classifier fronts that traffic regardless of proxy mode.
 
-The actual failure is different and comes from how beep publishes VIP
+The actual failure is different and comes from how beep publishes front
 ownership. beep's controller writes every DaemonSet node's own physical IP
 into the LoadBalancer Service's `status.loadBalancer.ingress[]`
 (`controller/src/status.rs:75`, `ensure_node_ingress`) — one entry per
-node, because beep runs as a DaemonSet and each node fronts the VIP
+node, because beep runs as a DaemonSet and each node serves the front
 locally. Under IPVS mode, kube-proxy's reconciler treats every address in
-that list as a Service VIP to bind onto its own `kube-ipvs0`, including
+that list as a Service front to bind onto its own `kube-ipvs0`, including
 the *other* nodes' addresses it now sees via that shared status field. The
 result is a reciprocal duplicate-IP conflict: each node ends up binding
 every other node's real IP as a local NOARP address on a flat L2 network,
@@ -56,23 +56,23 @@ before and after this testing; only IPVS mode exhibits the conflict.
 - kube-proxy MUST run in **iptables or nftables** mode. Do not deploy
   beep onto a cluster with `--proxy-mode ipvs` set.
 - beep MUST run as a **DaemonSet on every node** (`deploy/daemonset.yaml`)
-  so each node's tc-ingress intercepts its own VIP traffic locally. This
+  so each node's tc-ingress intercepts its own front traffic locally. This
   is also *why* IPVS breaks: every node ends up publishing its own address
   into the same shared ingress list.
-- The LB VIP / front-IP range MUST be disjoint from the **pod CIDR** — a
-  hostNetwork Pod's IP equals its node's IP (front-IP space), so a VIP
+- The LB front-IP range MUST be disjoint from the **pod CIDR** — a
+  hostNetwork Pod's IP equals its node's IP (front-IP space), so a front
   inside the pod CIDR can byte-collide a forward and reverse flow key.
   This is **enforced at startup by the standalone `beep` loader's
-  `--fixture` path**: `vip_outside_pod_cidr` (`src/main.rs:195`) rejects a
-  `--pod-cidr` that contains any configured VIP. The shipped
-  `beep-controller` DaemonSet binary does not call this guard — its VIP is
+  `--fixture` path**: `front_outside_pod_cidr` (`src/main.rs:195`) rejects a
+  `--pod-cidr` that contains any configured front. The shipped
+  `beep-controller` DaemonSet binary does not call this guard — its front is
   always the node's own physical address, disjoint from the pod CIDR by
   construction, so the check doesn't apply there.
-- The VIP range MUST also be disjoint from the **Service CIDR**
+- The front range MUST also be disjoint from the **Service CIDR**
   (ClusterIP range), or beep's classifier can shadow a ClusterIP Service's
   east-west traffic instead of falling through to kube-proxy. Same scope
   as above: the standalone loader enforces this when `--service-cidr` is
-  given (`vip_outside_service_cidr`, `src/main.rs`); it's optional and, like
+  given (`front_outside_service_cidr`, `src/main.rs`); it's optional and, like
   `--pod-cidr`, not called by `beep-controller`.
 
 ## Verifying this (agent-facing)
@@ -87,7 +87,7 @@ scripts/smoke-k3s-controller.sh
 `k3s-up.sh --proxy-mode` (default `iptables`) passes
 `--kube-proxy-arg=proxy-mode=<mode>` to the k3s server and agent install. A
 green run shows `smoke-k3s-controller.sh`'s full sequence passing: cluster
-bring-up, the controller loading and pinning its eBPF programs, VIP map
+bring-up, the controller loading and pinning its eBPF programs, front map
 programming from watch events, and a genuine cross-node client round trip.
 
 **Unsupported (IPVS) observation** — `smoke-k3s-controller.sh` forwards
@@ -119,9 +119,9 @@ Before deploying beep onto an existing cluster:
    or inspect the `kube-proxy` process's `--proxy-mode` flag directly on a
    node. If it reports `ipvs`, do not deploy beep until the cluster is
    reconfigured to `iptables` or `nftables`.
-2. Confirm the LB VIP range does not overlap the cluster's pod CIDR (beep
+2. Confirm the LB front range does not overlap the cluster's pod CIDR (beep
    will refuse to start otherwise) or its Service CIDR (checked manually
    today — `kubectl cluster-info dump | grep -i cidr` or the CNI/cluster
    config).
 3. Deploy `deploy/daemonset.yaml` on every node, not a subset — a partial
-   rollout leaves nodes without local VIP interception.
+   rollout leaves nodes without local front interception.
