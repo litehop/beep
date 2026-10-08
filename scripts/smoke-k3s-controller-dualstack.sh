@@ -143,7 +143,7 @@ trap cleanup EXIT
 
 echo "==> [1/12] bringing up the DUAL-STACK k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
 k3s_bring_up_cluster "$VM_A" "$VM_B" "$VM_CLIENT" "iptables" "1"
-k3s_seed_lan_v6 "$VM_CLIENT" "$K3S_LAN_ULA_CLIENT"
+k3s_seed_lan_v6 "$VM_A" "$K3S_LAN_ULA_A" "$VM_B" "$K3S_LAN_ULA_B" "$VM_CLIENT" "$K3S_LAN_ULA_CLIENT"
 
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"
@@ -404,18 +404,25 @@ GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
 GENEVE_B_BEFORE="$(geneve_pkts "$VM_B")"
 
 echo "==> [10/12] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
+http_url() { # http_url <addr> <port> -- brackets IPv6 literals so the URL authority parses
+  case "$1" in
+    *:*) echo "http://[$1]:$2/" ;;
+    *) echo "http://$1:$2/" ;;
+  esac
+}
 round_trip() { # round_trip <curl-family-flag> <dial-addr> <port> <expect-client-addr> -- returns the body on success, prints ROUND-TRIP FAIL and returns 1 otherwise
-  local flag="$1" addr="$2" port="$3" expect="$4" body rc
+  local flag="$1" addr="$2" port="$3" expect="$4" body rc url
+  url="$(http_url "$addr" "$port")"
   set +e
-  body="$(limactl shell "$VM_CLIENT" -- curl -sS "$flag" -m 20 "http://${addr}:${port}/" 2>&1)"
+  body="$(limactl shell "$VM_CLIENT" -- curl -sS "$flag" -m 20 "$url" 2>&1)"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
-    echo "FAIL: curl $flag http://${addr}:${port}/ rc=$rc" >&2
+    echo "FAIL: curl $flag $url rc=$rc" >&2
     return 1
   fi
   if ! grep -q "RemoteAddr: ${expect}:" <<<"$body"; then
-    echo "FAIL: http://${addr}:${port}/ did not report RemoteAddr: ${expect}:* -- got: $body" >&2
+    echo "FAIL: $url did not report RemoteAddr: ${expect}:* -- got: $body" >&2
     return 1
   fi
   echo "$body"
@@ -427,9 +434,9 @@ echo "ROUND-TRIP-DUAL-V6: PASS (client $ULA_CLIENT -> $SVC_DUAL v6 front [$ULA_A
 
 echo "==> [11/12] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
 set +e
-V6_TO_V4ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -6 -m 5 "http://[${ULA_A}]:${PORT_V4}/" 2>&1)"
+V6_TO_V4ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -6 -m 5 "$(http_url "$ULA_A" "$PORT_V4")" 2>&1)"
 V6_TO_V4ONLY_RC=$?
-V4_TO_V6ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -4 -m 5 "http://${IP_A}:${PORT_V6}/" 2>&1)"
+V4_TO_V6ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -4 -m 5 "$(http_url "$IP_A" "$PORT_V6")" 2>&1)"
 V4_TO_V6ONLY_RC=$?
 set -e
 if [ "$V6_TO_V4ONLY_RC" -eq 0 ]; then
