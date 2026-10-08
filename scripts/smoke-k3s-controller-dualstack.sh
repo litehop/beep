@@ -404,11 +404,14 @@ GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
 GENEVE_B_BEFORE="$(geneve_pkts "$VM_B")"
 
 echo "==> [10/12] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
-http_url() { # http_url <addr> <port> -- brackets IPv6 literals so the URL authority parses
+host_port() { # host_port <addr> <port> -- addr:port, bracketing IPv6 literals (URL authority and the backend's RemoteAddr both use this form)
   case "$1" in
-    *:*) echo "http://[$1]:$2/" ;;
-    *) echo "http://$1:$2/" ;;
+    *:*) echo "[$1]:$2" ;;
+    *) echo "$1:$2" ;;
   esac
+}
+http_url() { # http_url <addr> <port>
+  echo "http://$(host_port "$1" "$2")/"
 }
 round_trip() { # round_trip <curl-family-flag> <dial-addr> <port> <expect-client-addr> -- returns the body on success, prints ROUND-TRIP FAIL and returns 1 otherwise
   local flag="$1" addr="$2" port="$3" expect="$4" body rc url
@@ -421,8 +424,8 @@ round_trip() { # round_trip <curl-family-flag> <dial-addr> <port> <expect-client
     echo "FAIL: curl $flag $url rc=$rc" >&2
     return 1
   fi
-  if ! grep -q "RemoteAddr: ${expect}:" <<<"$body"; then
-    echo "FAIL: $url did not report RemoteAddr: ${expect}:* -- got: $body" >&2
+  if ! grep -qF "RemoteAddr: $(host_port "$expect" "")" <<<"$body"; then
+    echo "FAIL: $url did not report RemoteAddr: $(host_port "$expect" "")* -- got: $body" >&2
     return 1
   fi
   echo "$body"
