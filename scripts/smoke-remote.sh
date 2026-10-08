@@ -616,6 +616,31 @@ flow_table_has_pod "$POD_IP" || {
 }
 echo "POD-IP-REUSE ROUND-TRIP: PASS (fresh flow through reused pod IP ${POD_IP} routes correctly; provably NOT a resurrected stale entry, since the EVICTION ASSERTION above already proved zero rows for this pod survived before this new flow was ever established)"
 
+echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hostNetwork backend), a fresh outbound connection from it must still leave the uplink"
+# A hostNetwork backend's pod IP IS the node's address, so POD_TARGETS holds
+# it; the node's own SSH/kubelet/apiserver connections then pass the hook-3
+# source gate yet never have a Reverse FLOW_TABLE entry. Inserted directly
+# (bpftool) rather than via --fixture so no other phase's state changes.
+NODE_EGRESS_PORT="19200"
+NODE_EGRESS_OUT="/tmp/beep-smoke-node-egress.out"
+NODE_EGRESS_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${VIP_IP}" | tr . ' ')"
+bpftool map update pinned "$PIN_DIR/POD_TARGETS" key $NODE_EGRESS_KEY value 1 || {
+  echo "FAIL: could not insert node address ${VIP_IP} into POD_TARGETS (key bytes: $NODE_EGRESS_KEY)" >&2
+  exit 1
+}
+rm -f "$NODE_EGRESS_OUT"
+nohup ip netns exec smoke-client timeout 6 nc -l -N "$CLIENT_IP" "$NODE_EGRESS_PORT" >"$NODE_EGRESS_OUT" 2>&1 &
+disown
+sleep 0.5
+echo "node-egress-payload" | nc -s "$VIP_IP" -w 3 "$CLIENT_IP" "$NODE_EGRESS_PORT" >/dev/null 2>&1 || true
+sleep 0.5
+bpftool map delete pinned "$PIN_DIR/POD_TARGETS" key $NODE_EGRESS_KEY || true
+grep -q "node-egress-payload" "$NODE_EGRESS_OUT" || {
+  echo "FAIL: a fresh connection from the node's own address ${VIP_IP} (present in POD_TARGETS like a hostNetwork backend) never reached ${CLIENT_IP}:${NODE_EGRESS_PORT} -- hook 3 must pass anything that is not a FLOW_TABLE reverse hit, otherwise the node's own SSH/kubelet egress dies on a hostNetwork-backend node" >&2
+  exit 1
+}
+echo "NODE-EGRESS: PASS (fresh connection from ${VIP_IP}, a POD_TARGETS member, passed hook 3 with no FLOW_TABLE reverse entry)"
+
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
 # This fixture is a self-loop (VIP_IP is also this node's own address, and
 # `--node-ip $VIP_IP` seeded NODE_ALLOW with it), so every Geneve packet

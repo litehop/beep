@@ -604,12 +604,12 @@ fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture], node_ip: IpAddr) -> 
         // set: a Pod that departed since the last run otherwise leaves a
         // stale entry here forever. That used to be harmless (this map was
         // read-only membership metadata), but it now gates
-        // `uplink_egress_return`'s drop-on-FLOW_TABLE-reverse-tagged-miss
-        // decision -- a stale entry for a departed/reused Pod IP would
-        // misclassify unrelated future traffic on that address as "ours"
-        // and drop it. Pruned against the same local set this block writes,
-        // not the full fixture list, or a pod that moved OFF this node
-        // would never be pruned from its former host's POD_TARGETS.
+        // `uplink_egress_return`'s FLOW_TABLE-reverse lookup -- a stale
+        // entry for a departed/reused Pod IP would make unrelated future
+        // traffic on that address pay for that lookup. Pruned against the
+        // same local set this block writes, not the full fixture list, or a
+        // pod that moved OFF this node would never be pruned from its former
+        // host's POD_TARGETS.
         let existing_ips: Vec<[u8; 16]> = pod_targets.keys().collect::<Result<_, _>>()?;
         for ip in stale_pod_targets(&existing_ips, &local_ips) {
             pod_targets.remove(&ip)?;

@@ -57,7 +57,7 @@ use aya_ebpf::{
         bpf_skb_set_tunnel_opt,
     },
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap, PerCpuArray},
+    maps::{Array, HashMap, LruHashMap},
     programs::TcContext,
 };
 use beep_common::{
@@ -362,15 +362,6 @@ fn flow_table_get_reverse(key: FlowKey) -> Option<RevFlowValue> {
 fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
     unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.port_memo })
 }
-
-/// Counts packets dropped by `try_uplink_egress_return` on a FLOW_TABLE
-/// reverse-tagged miss for already-identified backend Pod traffic
-/// (`EgressReturnOutcome::Drop`) -- almost always an LRU eviction,
-/// observable from userspace via `bpftool map dump` without needing a
-/// kernel tracepoint. Single entry, per-CPU to avoid a shared-counter atomic
-/// on this hot path.
-#[map]
-static EGRESS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Host-specific runtime config the loader fills in after attach (an
 /// ifindex isn't known until then). Single entry, `Config` (`beep_common`).
@@ -1646,17 +1637,10 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
         FlowDirection::Reverse,
     );
     let rev_lookup = flow_table_get_reverse(key);
-    if let EgressReturnOutcome::Drop = egress_return_outcome(rev_lookup.is_some()) {
-        // Positively identified backend Pod traffic with no live
-        // FLOW_TABLE reverse-tagged entry (an LRU eviction, almost always)
-        // -- letting it through unencapsulated leaks a pod-CIDR source
-        // address onto the underlay while still stalling the connection, so
-        // drop instead. Consistent with the forward decap path's equivalent
-        // miss (`geneve_ingress`'s `unwrap_or(TC_ACT_SHOT)`).
-        if let Some(count) = EGRESS_DROPS.get_ptr_mut(0) {
-            unsafe { *count += 1 };
-        }
-        return Some(TC_ACT_SHOT);
+    if let EgressReturnOutcome::PassThrough = egress_return_outcome(rev_lookup.is_some()) {
+        // Not provably a beep reply (a hostNetwork backend's own address is
+        // in POD_TARGETS, so the node's own egress lands here too).
+        return Some(TC_ACT_OK);
     }
     let rev = rev_lookup?;
 
@@ -1768,11 +1752,8 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
         FlowDirection::Reverse,
     );
     let rev_lookup = flow_table_get_reverse(key);
-    if let EgressReturnOutcome::Drop = egress_return_outcome(rev_lookup.is_some()) {
-        if let Some(count) = EGRESS_DROPS.get_ptr_mut(0) {
-            unsafe { *count += 1 };
-        }
-        return Some(TC_ACT_SHOT);
+    if let EgressReturnOutcome::PassThrough = egress_return_outcome(rev_lookup.is_some()) {
+        return Some(TC_ACT_OK);
     }
     let rev = rev_lookup?;
 
