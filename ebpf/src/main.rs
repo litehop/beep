@@ -177,9 +177,10 @@ static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
 
 /// Single-slot per-CPU counter: lookups where `FRONT_META` named a front
 /// but its endpoint was missing (or the count was zero). Traffic for that
-/// front is dropped from the load balancer's path (fail closed); a
-/// non-zero value means the controller's generation-swap protocol was
-/// violated or an endpoint write failed.
+/// front is not load-balanced: an ingress miss passes the packet to the host
+/// (`TC_ACT_OK`), a decap miss drops it. A non-zero value means the
+/// controller's generation-swap protocol was violated or an endpoint write
+/// failed.
 #[map]
 static FRONT_MISSES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
@@ -383,7 +384,7 @@ fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
 /// `FRONT_ENDPOINTS` read at the generation it names. A front absent from
 /// `FRONT_META` is simply not a front (`None`, uncounted). A front present
 /// but without a readable endpoint is a protocol violation: counted in
-/// `FRONT_MISSES` and failed closed (`None`).
+/// `FRONT_MISSES` and yields `None` (ingress passes to host, decap drops).
 #[inline(always)]
 fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
     let meta = *unsafe { FRONT_META.get(front) }?;

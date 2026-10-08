@@ -44,7 +44,7 @@ use beep::{
 };
 use beep_common::{
     wire_port, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
-    LbFrontBackend, LbFrontKey, TcpFlowKey, FRONT_FLAG_IS_LOCAL,
+    LbFrontBackend, LbFrontKey, TcpFlowKey,
 };
 use clap::Parser;
 
@@ -556,7 +556,7 @@ fn fixture_key(fixture: &Fixture) -> LbFrontKey {
 
 /// One front per `--fixture`, slot 0 only. A repeated front tuple keeps the
 /// last fixture, as the pre-consolidation maps did.
-fn fixture_fronts(fixtures: &[Fixture], node_ip: IpAddr) -> HashMap<LbFrontKey, DesiredFront> {
+fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
     fixtures
         .iter()
         .map(|fixture| {
@@ -576,15 +576,10 @@ fn fixture_fronts(fixtures: &[Fixture], node_ip: IpAddr) -> HashMap<LbFrontKey, 
                 target_port: wire_port(fixture.target_port),
                 _pad: [0; 6],
             };
-            let flags = if fixture.vip_ip == node_ip {
-                FRONT_FLAG_IS_LOCAL
-            } else {
-                0
-            };
             (
                 fixture_key(fixture),
                 DesiredFront {
-                    flags,
+                    flags: 0,
                     endpoints: vec![endpoint],
                 },
             )
@@ -614,7 +609,7 @@ fn populate_fixtures(
         let failures = apply_fronts(
             &mut front_meta,
             &mut front_endpoints,
-            &fixture_fronts(fixtures, node_ip),
+            &fixture_fronts(fixtures),
             false,
         )
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
@@ -995,8 +990,7 @@ mod tests {
             "fixture invariant: both entries must share one Pod IP to exercise the bug"
         );
 
-        let node_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
-        let fronts = fixture_fronts(&fixtures, node_ip);
+        let fronts = fixture_fronts(&fixtures);
         assert_eq!(
             fronts.len(),
             2,
@@ -1053,7 +1047,7 @@ mod tests {
             "the front key must carry the v6 VIP's raw octets, \
              the same wire-encode boundary a v4 VIP's ipv4_mapped_v6 embedding uses"
         );
-        let fronts = fixture_fronts(std::slice::from_ref(&fixture), node_ip);
+        let fronts = fixture_fronts(std::slice::from_ref(&fixture));
         assert_eq!(
             fronts[&key].endpoints[0].backend.pod_ip,
             wire_ip_v6(pod_ip),

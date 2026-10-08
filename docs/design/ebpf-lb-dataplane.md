@@ -130,7 +130,7 @@ forward-write and return-read).
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
 | `FRONT_META` (front tuple -> live generation, count, flags) | ~385 KiB (measured) | 4096 entries by default (`--front-meta-max-entries`): nodes × Service ports. |
 | `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~1.06 MiB (measured) | 8192 entries by default (`--front-endpoints-max-entries`): up to two generations of every front coexist during a swap. Full map on every node. |
-| `FRONT_MISSES` | <1 KiB | Per-CPU counter of fail-closed endpoint lookups. |
+| `FRONT_MISSES` | <1 KiB | Per-CPU counter of lookups where `FRONT_META` hit but the endpoint was missing (ingress passes to host, decap drops). |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
 | **Total** | **~8–9 MiB** | Independent of vCPU count — maps are shared. |
@@ -146,6 +146,10 @@ DaemonSet per node, `hostNetwork`/`CAP_BPF`/`CAP_NET_ADMIN`, no CRI
 socket: loads tc-bpf programs once, watches `Service`/`EndpointSlice`,
 writes maps on change, idle. Pinned under `/sys/fs/bpf` so restarts keep
 flow state.
+
+First upgrade to the `FRONT_META` + `FRONT_ENDPOINTS` layout starts with an
+empty `FRONT_META`: until the controller's first reconcile fills it, new
+flows pass to the host unbalanced (an absent front is not a front).
 
 ## Prototype gates — go/no-go before Phase 3
 

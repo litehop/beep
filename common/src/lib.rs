@@ -257,12 +257,6 @@ pub struct LbFrontBackend {
     pub pod_ip: [u8; 16],
 }
 
-/// `FRONT_META` flag: this node owns the front address (it is one of this
-/// node's own front addresses, as opposed to a peer's). Front and underlay
-/// address sets stay strictly separate; this flag says nothing about
-/// `backend_node_ip`, `NODE_ALLOW` or any return-leg address.
-pub const FRONT_FLAG_IS_LOCAL: u16 = 1;
-
 /// `FRONT_META` value: which endpoint generation of a front is live, and how
 /// many endpoints it holds. `FRONT_META` is a `BPF_MAP_TYPE_HASH`, not an
 /// array, on purpose: replacing one element is atomic for concurrent
@@ -272,13 +266,13 @@ pub const FRONT_FLAG_IS_LOCAL: u16 = 1;
 /// so it can never observe a half-written endpoint set.
 ///
 /// Write protocol (controller, per front): a new generation is minted only
-/// when the front's endpoint set changes. (1) delete endpoint generation
-/// `g-1` if present, (2) write every slot under `g+1`, (3) replace this
-/// value with `{g+1, count, flags}`. At most two generations of a front's
-/// endpoints exist at any time; a reader that loaded generation `g` just
-/// before step 3 still finds it. Deleting a front drops its `FRONT_META`
-/// entry first, then its endpoints. On startup the controller deletes any
-/// endpoint generation other than the current and `g-1`.
+/// when the front's endpoint set changes. With `g` the live generation:
+/// (1) delete every endpoint generation other than `g`, (2) write every slot
+/// under `g+1`, (3) replace this value with `{g+1, count, flags}`. At most
+/// two generations of a front's endpoints exist at any time; a reader that
+/// loaded generation `g` just before step 3 still finds it. Deleting a front
+/// drops its `FRONT_META` entry first, then its endpoints. An unchanged front
+/// keeps `g` and `g-1`; anything older (e.g. crash leftovers) is deleted.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontMeta {

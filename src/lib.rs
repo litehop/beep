@@ -196,8 +196,8 @@ pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
 }
 
 /// Wire-form pod_ips of fixtures THIS node itself backs (`backend_node_ip
-/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `LB_FRONT_MAP`/
-/// `TARGET_PORTS` which every node populates identically from the full
+/// == node_ip`) -- the `POD_TARGETS` local serving-set, unlike `FRONT_META`/
+/// `FRONT_ENDPOINTS` which every node populates identically from the full
 /// fixture set since any node can be ingress for any VIP. `node_ip`'s family
 /// need not match every fixture's `backend_node_ip`; `IpAddr`'s `PartialEq`
 /// already treats a v4 and a v6 address as unequal regardless of numeric

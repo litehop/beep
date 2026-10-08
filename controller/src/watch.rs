@@ -15,7 +15,6 @@ use std::{collections::HashMap, net::IpAddr, time::Duration};
 
 use anyhow::Context;
 use beep::tunnel_remote_v6;
-use beep_common::FRONT_FLAG_IS_LOCAL;
 use beep_kubeconfig::HyperApiClient;
 use hyper::Method;
 use serde_json::Value;
@@ -128,6 +127,21 @@ pub struct WatchState {
     // just the very first LIST, but setting an already-`true` bool to `true`
     // again is a no-op, so that's harmless.
     nodes_listed: bool,
+    // The other-family-only warnings `desired` last reported, so a condition
+    // that persists across reconcile ticks is logged once, not every tick.
+    other_family_warned: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// Replaces `warned` with `current` and returns the messages in `current`
+/// that were not already in `warned`. A condition that clears and later
+/// returns is reported again.
+fn newly_warned(
+    warned: &mut std::collections::BTreeSet<String>,
+    current: std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let fresh = current.difference(warned).cloned().collect();
+    *warned = current;
+    fresh
 }
 
 enum EventKind {
@@ -585,11 +599,12 @@ impl WatchState {
             ..DesiredEntries::default()
         };
         let no_slices = HashMap::new();
+        let mut other_family_only = std::collections::BTreeSet::new();
         // The front-IP model (ebpf-lb-dataplane.md's "Packet flow" step 1):
         // every node's own address is a valid front for every Service, so
         // FRONT_META/FRONT_ENDPOINTS need one entry per KNOWN node address, not
         // just this controller's own `node.node_ip` -- the backend node's
-        // decap (`try_geneve_decap_forward`) looks up TARGET_PORTS keyed on
+        // decap (`try_geneve_decap_forward`) looks up FRONT_ENDPOINTS keyed on
         // whichever node the client actually dialed, which is any node in
         // the cluster, not necessarily this one.
         // Startup ordering: `node_ips` is empty until the Node LIST (run
@@ -637,10 +652,6 @@ impl WatchState {
             .flat_map(|a| a.fronts.iter())
             .copied()
             .collect();
-        let own_fronts: Vec<IpAddr> = self
-            .own_node_addrs(node.node_ip)
-            .map(|a| a.fronts.clone())
-            .unwrap_or_default();
         // NODE_ALLOW's peer set is every node's underlay addresses --
         // host-native, wrapped in `tunnel_remote_v6` to match NODE_ALLOW's
         // `[u8; 16]` key, matching `tkey.remote_ipv4`'s convention
@@ -760,9 +771,9 @@ impl WatchState {
                     vip_ip: *front_ip,
                     ports: ports.clone(),
                 };
-                let mut desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
+                let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
                 for port in reconcile::ports_without_same_family_endpoint(&view, &endpoint_slices) {
-                    eprintln!(
+                    other_family_only.insert(format!(
                         "controller: WARN service {}/{} front {front_ip}:{} has no ready {} \
                          endpoint, only endpoints of the other family; the front is left \
                          unprogrammed",
@@ -770,15 +781,16 @@ impl WatchState {
                         key.name,
                         port.port,
                         family_label(*front_ip),
-                    );
-                }
-                if own_fronts.contains(front_ip) {
-                    for front in desired.fronts.values_mut() {
-                        front.flags |= FRONT_FLAG_IS_LOCAL;
-                    }
+                    ));
                 }
                 aggregate.fronts.extend(desired.fronts);
             }
+        }
+        for msg in newly_warned(
+            &mut self.other_family_warned.lock().unwrap(),
+            other_family_only,
+        ) {
+            eprintln!("{msg}");
         }
         aggregate
     }
@@ -910,6 +922,24 @@ mod tests {
         net::{Ipv4Addr, Ipv6Addr},
     };
 
+    #[test]
+    fn a_persisting_warning_is_reported_once_and_again_after_it_clears() {
+        let set = |m: &[&str]| m.iter().map(|s| s.to_string()).collect();
+        let mut warned = Default::default();
+
+        assert_eq!(newly_warned(&mut warned, set(&["a"])), vec!["a"]);
+        assert!(
+            newly_warned(&mut warned, set(&["a"])).is_empty(),
+            "an unchanged condition must not re-log on every reconcile tick"
+        );
+        assert!(newly_warned(&mut warned, set(&[])).is_empty());
+        assert_eq!(
+            newly_warned(&mut warned, set(&["a"])),
+            vec!["a"],
+            "a condition that cleared and came back is new information"
+        );
+    }
+
     use beep::wire_ip_v6;
     use beep_common::unmap_ipv4;
 
@@ -926,7 +956,7 @@ mod tests {
     }
 
     // A watch that skipped type=LoadBalancer filtering would program
-    // LB_FRONT_MAP for a ClusterIP Service too -- exposing a Service never meant
+    // FRONT_META for a ClusterIP Service too -- exposing a Service never meant
     // to accept external traffic.
     #[test]
     fn cluster_ip_service_is_not_tracked() {
@@ -1204,7 +1234,7 @@ mod tests {
     // A single-port Service and its EndpointSlice both omit the port name
     // (legal when there is exactly one port) -- target-port resolution must
     // still succeed positionally, or every unnamed single-port Service
-    // (the common case) would silently get zero LB_FRONT_MAP entries.
+    // (the common case) would silently get zero FRONT_META entries.
     #[test]
     fn unnamed_single_port_resolves_positionally() {
         let mut state = WatchState::default();
@@ -1354,7 +1384,7 @@ mod tests {
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert!(
             desired.fronts.is_empty(),
-            "an endpoint on an unresolved node must not produce a LB_FRONT_MAP entry -- fabricating \
+            "an endpoint on an unresolved node must not produce a FRONT_META entry -- fabricating \
              a node_ip (e.g. 0.0.0.0) would misdirect the Geneve tunnel"
         );
     }
@@ -1362,7 +1392,7 @@ mod tests {
     // The front-IP model means EVERY node's own address is a valid ingress
     // for a Service (ebpf-lb-dataplane.md's "Packet flow" step 1) -- a
     // client dialing the OTHER node's address must still resolve on the
-    // backend node's own TARGET_PORTS, or `try_geneve_decap_forward`'s
+    // backend node's own FRONT_ENDPOINTS, or `try_geneve_decap_forward`'s
     // lookup misses and silently drops every forwarded packet before a
     // FLOW_TABLE entry is ever written -- this exact miss produced no
     // SYN-ACK and no FLOW_TABLE entry despite a working Geneve decap.
@@ -1419,7 +1449,7 @@ mod tests {
         assert_eq!(
             fronts,
             HashSet::from([[10, 0, 0, 5], [10, 0, 0, 6]]),
-            "TARGET_PORTS/LB_FRONT_MAP must cover every known node's address as a front, not just \
+            "FRONT_META/FRONT_ENDPOINTS must cover every known node's address as a front, not just \
              this node's own -- otherwise the backend node can never decap a forward packet \
              whose client dialed a DIFFERENT node's front IP"
         );
@@ -1896,7 +1926,7 @@ mod tests {
         assert_eq!(
             desired.fronts.len(),
             1,
-            "a v6-only node's own address must still become an LB_FRONT_MAP front -- \
+            "a v6-only node's own address must still become a FRONT_META front -- \
              silently dropping an unparseable-as-v4 InternalIP would make that node invisible \
              as an ingress, even though it genuinely serves this Service"
         );

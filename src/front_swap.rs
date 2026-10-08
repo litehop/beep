@@ -417,13 +417,13 @@ mod tests {
         let first = store.plan(&desired(&[(f, want(endpoint(7, 8443)))]), true);
         store.apply_all(&first, |_| {});
         let mut flagged = want(endpoint(7, 8443));
-        flagged.flags = beep_common::FRONT_FLAG_IS_LOCAL;
+        flagged.flags = 1;
         let plans = store.plan(&desired(&[(f, flagged)]), true);
 
         assert_eq!(plans[0].steps.len(), 1);
         store.apply_all(&plans, |_| {});
         assert_eq!(store.meta[&f].generation, 1);
-        assert_eq!(store.meta[&f].flags, beep_common::FRONT_FLAG_IS_LOCAL);
+        assert_eq!(store.meta[&f].flags, 1);
     }
 
     #[test]

@@ -1158,7 +1158,7 @@ mod tests {
     }
 
     // A Service scaled to zero, or mid-rollout with no ready pods yet, must
-    // not resolve to a stale backend -- LB_FRONT_MAP keeping a PREVIOUS entry
+    // not resolve to a stale backend -- FRONT_META keeping a PREVIOUS entry
     // here would misroute client traffic to a pod that's no longer healthy.
     #[test]
     fn service_with_no_ready_endpoints_produces_no_entries() {
@@ -1174,7 +1174,7 @@ mod tests {
 
         assert!(
             desired.fronts.is_empty(),
-            "no ready endpoint exists, so LB_FRONT_MAP must get no entry for this front -- \
+            "no ready endpoint exists, so FRONT_META must get no entry for this front -- \
              fabricating one would route to an unready pod"
         );
         assert!(desired.fronts.is_empty());
