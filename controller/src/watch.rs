@@ -695,8 +695,15 @@ impl WatchState {
                             // dropped for THIS reconcile pass rather than
                             // guessed at -- the next Node event re-triggers
                             // a reconcile that picks it up correctly.
+                            let mut node_addrs = Vec::new();
                             let node_ip = e.node_name.as_deref().and_then(|peer_name| {
                                 let peer = self.node_ips.get(peer_name)?;
+                                node_addrs = peer
+                                    .underlay
+                                    .iter()
+                                    .chain(peer.fronts.iter())
+                                    .copied()
+                                    .collect();
                                 let pick = pick_underlay_ip(&peer.underlay, node.node_ip)?;
                                 if !pick.shared_family {
                                     let peer_family = family_label(pick.ip);
@@ -715,6 +722,7 @@ impl WatchState {
                             Some(Endpoint {
                                 pod_ip: e.pod_ip,
                                 node_ip,
+                                node_addrs,
                                 ready: e.ready,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
                             })
@@ -2637,11 +2645,52 @@ mod tests {
                 ]},
             },
         }));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-b"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.6"}]},
+            },
+        }));
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [
+                    {"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}},
+                    {"addresses": ["10.244.1.9"], "nodeName": "node-b", "conditions": {"ready": true}},
+                ],
+            },
+        }));
         let local = node(Ipv4Addr::new(203, 0, 113, 5));
+        let desired = state.desired(&local);
         assert!(
-            state.desired(&local).pod_targets_known,
-            "a node whose --node-ip is its ExternalIP must be recognised, or POD_TARGETS stays \
-             gated and local backends are never programmed"
+            desired.pod_targets_known,
+            "a node whose --node-ip is its ExternalIP must be recognised, or the POD_TARGETS \
+             full-sync stays gated"
+        );
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 0, 9)))]),
+            "a node whose --node-ip is its ExternalIP must still program its own backend into \
+             POD_TARGETS (endpoint nodes resolve to the InternalIP underlay) and never a \
+             peer's backend"
         );
         let mut own = state.own_node_ips(local.node_ip);
         own.sort();

@@ -212,6 +212,10 @@ pub struct ServiceView {
 pub struct Endpoint {
     pub pod_ip: IpAddr,
     pub node_ip: IpAddr,
+    /// Every address (underlay and front, any family) the hosting node's
+    /// `Node` object reports. `node_ip` is only the one Geneve remote
+    /// picked from these, so node identity must be decided against this set.
+    pub node_addrs: Vec<IpAddr>,
     pub ready: bool,
     pub ports: Vec<u16>,
 }
@@ -224,7 +228,7 @@ pub struct EndpointSliceView {
     pub endpoints: Vec<Endpoint>,
 }
 
-/// A ready endpoint hosted on THIS node (`ep.node_ip == node.node_ip`) that
+/// A ready endpoint hosted on THIS node (`ep.node_addrs` contains `node.node_ip`) that
 /// `pod_targets_for_node`'s admission check excluded from `POD_TARGETS`
 /// because its `pod_ip` matched neither `pod_cidr` nor the hostNetwork
 /// signature. The rejection itself is correct anti-spoof behavior (see
@@ -289,7 +293,7 @@ pub struct DesiredEntries {
     /// Whether `pod_targets` was computed with THIS node's own address
     /// already resolvable in `WatchState::desired`'s endpoint->node_ip
     /// lookup (`pod_targets_for_node` can only admit an endpoint whose
-    /// resolved `node_ip` equals `NodeContext::node_ip`). `false` means
+    /// node reports `NodeContext::node_ip` among its addresses). `false` means
     /// "this node's own Node LIST/watch entry hasn't landed yet", not
     /// "this node hosts no backends" -- in a multi-node cluster, whichever
     /// position THIS node's own entry lands at in the startup Node LIST is
@@ -313,7 +317,8 @@ fn front_key(vip_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
 /// The CIDR/hostNetwork admission disjunct shared by `pod_targets_for_node`
 /// and `rejected_endpoints_for_node`: an endpoint is admitted if its pod_ip
 /// is in this node's pod_cidr OR it carries the hostNetwork signature
-/// (pod_ip == node_ip). In bare metal (no cloud LB, no BGP -- beep fronts
+/// (pod_ip is one of the endpoint's own node's addresses, in any family --
+/// not `ep.node_ip`, which is coerced to the reconciling node's family). In bare metal (no cloud LB, no BGP -- beep fronts
 /// the node's physical IP) a hostNetwork pod's IP IS the node IP, so
 /// without the second disjunct a Service backed by a hostNetwork pod would
 /// be silently excluded and every forward packet dropped at decap
@@ -324,7 +329,7 @@ fn front_key(vip_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
 /// to this condition can't silently drift between the admit path and its
 /// negated, observational complement below.
 fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
-    node.pod_cidr.contains(ep.pod_ip) || ep.pod_ip == ep.node_ip
+    node.pod_cidr.contains(ep.pod_ip) || ep.node_addrs.contains(&ep.pod_ip)
 }
 
 /// POD_TARGETS is this node's own local serving-set, port-agnostic by
@@ -343,7 +348,7 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     let mut pod_targets = HashSet::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready && ep.node_ip == node.node_ip && is_admitted(ep, node) {
+            if ep.ready && ep.node_addrs.contains(&node.node_ip) && is_admitted(ep, node) {
                 // POD_TARGETS' key is `[u8; 16]` (like NODE_ALLOW's), but wire-token
                 // (`wire_ip_v6`) like `LbFrontBackend::pod_ip` -- unlike NODE_ALLOW's
                 // host-native peer address, POD_TARGETS membership is checked against a
@@ -364,7 +369,7 @@ pub fn rejected_endpoints_for_node(
     let mut rejected = Vec::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready && ep.node_ip == node.node_ip && !is_admitted(ep, node) {
+            if ep.ready && ep.node_addrs.contains(&node.node_ip) && !is_admitted(ep, node) {
                 rejected.push(RejectedEndpoint {
                     pod_ip: ep.pod_ip,
                     reason: "pod_ip is outside the configured --pod-cidr and is not this \
@@ -539,6 +544,7 @@ mod tests {
         Endpoint {
             pod_ip: IpAddr::V4(pod_ip),
             node_ip: IpAddr::V4(node_ip),
+            node_addrs: vec![IpAddr::V4(node_ip)],
             ready: true,
             ports,
         }
@@ -548,6 +554,7 @@ mod tests {
         Endpoint {
             pod_ip: IpAddr::V6(pod_ip),
             node_ip: IpAddr::V6(node_ip),
+            node_addrs: vec![IpAddr::V6(node_ip)],
             ready: true,
             ports,
         }
@@ -913,6 +920,89 @@ mod tests {
             HashSet::from([wire_ip_v6(IpAddr::V4(this_node))]),
             "a hostNetwork backend (pod_ip == node_ip, outside pod_cidr) must be admitted into \
              POD_TARGETS or its forward traffic is dropped at decap on every node"
+        );
+    }
+
+    fn dual_stack_endpoint(pod_ip: IpAddr, node_addrs: Vec<IpAddr>) -> Endpoint {
+        Endpoint {
+            pod_ip,
+            // The Geneve remote is coerced to the reconciling node's (v4)
+            // family regardless of which address the pod uses.
+            node_ip: node_addrs[0],
+            node_addrs,
+            ready: true,
+            ports: vec![8080],
+        }
+    }
+
+    #[test]
+    fn dual_stack_hostnetwork_v6_pod_ip_is_admitted_on_a_v4_primary_node() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip = Ipv6Addr::new(0xfd00, 0xbeef, 0x98, 0, 0, 0, 0, 4);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![dual_stack_endpoint(
+                IpAddr::V6(node_v6_ip),
+                vec![IpAddr::V4(node_v4), IpAddr::V6(node_v6_ip)],
+            )],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(node_v4));
+
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([wire_ip_v6(IpAddr::V6(node_v6_ip))]),
+            "a dual-stack hostNetwork backend's v6 pod_ip is its own node's address and must be \
+             admitted into POD_TARGETS, or the v6 return leg is never recognised as node-local"
+        );
+        assert!(desired.rejected.is_empty(), "nothing should be rejected");
+    }
+
+    #[test]
+    fn external_ip_node_ip_selects_its_own_endpoints_and_never_a_peers() {
+        let internal = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let external = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let local_pod = IpAddr::V4(Ipv4Addr::new(10, 244, 0, 9));
+        let peer_pod = IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9));
+        let svc = single_port_service(Ipv4Addr::new(203, 0, 113, 5), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                dual_stack_endpoint(local_pod, vec![internal, external]),
+                dual_stack_endpoint(peer_pod, vec![peer]),
+            ],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(Ipv4Addr::new(203, 0, 113, 5)));
+
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([wire_ip_v6(local_pod)]),
+            "with --node-ip set to the ExternalIP, endpoints resolve to the InternalIP underlay \
+             address; local backends must still land in POD_TARGETS (else their traffic is \
+             never recognised as node-local) and a peer's backend must never"
+        );
+    }
+
+    #[test]
+    fn dual_stack_node_still_rejects_an_out_of_cidr_non_hostnetwork_pod() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip = Ipv6Addr::new(0xfd00, 0xbeef, 0x98, 0, 0, 0, 0, 4);
+        let stranger = IpAddr::V6(Ipv6Addr::new(0xfd00, 0xbeef, 0x98, 0, 0, 0, 0, 99));
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![dual_stack_endpoint(
+                stranger,
+                vec![IpAddr::V4(node_v4), IpAddr::V6(node_v6_ip)],
+            )],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(node_v4));
+
+        assert!(
+            desired.pod_targets.is_empty(),
+            "widening hostNetwork identity to every node family must not admit an arbitrary \
+             out-of-cidr pod_ip (anti-spoof)"
         );
     }
 
