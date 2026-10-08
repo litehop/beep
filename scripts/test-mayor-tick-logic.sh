@@ -72,7 +72,7 @@ build_scratch_repo() {
   SCRATCH_REPO="$scratch/repo"
   mkdir -p "$SCRATCH_REPO/scripts" "$SCRATCH_REPO/.claude/review-queue"
   cp "$SCRIPT" "$SCRATCH_REPO/scripts/mayor-tick.sh"
-  git init -q "$SCRATCH_REPO"
+  git init -q -b main "$SCRATCH_REPO"
   git -C "$SCRATCH_REPO" config user.email test@example.com
   git -C "$SCRATCH_REPO" config user.name "Test"
   git -C "$SCRATCH_REPO" commit -q --allow-empty -m init
@@ -1340,6 +1340,50 @@ assert "a draft PR with no queue entry and no review is NOT synthesized into pen
   "$([ "$(jq -r '.pending_reviews | index(5555) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
 assert "...and reconcile never even logs the synthesizing message for it" \
   "$(! printf '%s' "$TICK_OUT" | grep -q 'synthesizing pending_reviews entry' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 20. Mayor checkout not on main. A critical-reviewer once left the mayor
+#     checkout on a detached HEAD; the next tick's `merge --ff-only` silently
+#     advanced that detached HEAD and the mayor's later `git pull` then failed
+#     with "not currently on a branch". The tick must instead exit 40, say so
+#     in the state file, and not touch the checkout.
+# ---------------------------------------------------------------------------
+
+STUB_MERGED_BIN="$WORKDIR/stub-merged-bin"
+mkdir -p "$STUB_MERGED_BIN"
+cat > "$STUB_MERGED_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"--head"*) echo '{"number":7,"state":"MERGED"}' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$STUB_MERGED_BIN/gh"
+cp "$STUB_EMPTY_BIN/bd" "$STUB_MERGED_BIN/bd"
+
+run_full_tick "$STUB_MERGED_BIN" "" "ckagent" "ckagent"
+assert "control: on main with a merged worker PR, the tick plans the post-merge fast-forward (proves the checks below can see it)" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'merge --ff-only origin/main' && echo 1 || echo 0)"
+assert "...and exits clean, not 40, with state mayor_checkout_anomaly null" \
+  "$([ "$TICK_RC" -ne 40 ] && [ "$(jq -r '.mayor_checkout_anomaly' "$TICK_STATE")" = "null" ] && echo 1 || echo 0)"
+
+build_scratch_repo "ckagent"
+git -C "$SCRATCH_REPO" checkout -q --detach
+invoke_tick "$STUB_MERGED_BIN" "$SCRATCH_REPO" 1 "" "ckagent"
+assert "a detached-HEAD mayor checkout makes the tick exit 40 -- otherwise the operator never learns the checkout is off main" \
+  "$([ "$TICK_RC" -eq 40 ] && echo 1 || echo 0)"
+assert "...and the tick does NOT plan a fast-forward of the detached HEAD (it would strand the mayor's next git pull)" \
+  "$(! printf '%s' "$TICK_OUT" | grep -q 'merge --ff-only' && echo 1 || echo 0)"
+assert "...and the state file names the anomaly as detached-head" \
+  "$([ "$(jq -r '.mayor_checkout_anomaly' "$TICK_STATE")" = "detached-head" ] && echo 1 || echo 0)"
+assert "...and the anomaly is announced on stderr for the operator" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'ANOMALY mayor checkout is not on main' && echo 1 || echo 0)"
+
+build_scratch_repo "ckagent"
+git -C "$SCRATCH_REPO" checkout -q -b some-pr-branch
+invoke_tick "$STUB_MERGED_BIN" "$SCRATCH_REPO" 1 "" "ckagent"
+assert "a mayor checkout on a non-main branch also exits 40 with the branch named, and no fast-forward" \
+  "$([ "$TICK_RC" -eq 40 ] && [ "$(jq -r '.mayor_checkout_anomaly' "$TICK_STATE")" = "on-branch:some-pr-branch" ] && ! printf '%s' "$TICK_OUT" | grep -q 'merge --ff-only' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

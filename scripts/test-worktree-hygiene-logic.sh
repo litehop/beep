@@ -380,6 +380,87 @@ assert "...the SAME branch, with no matching --live-agents entry, is deleted -- 
   "$(! git -C "$D2" branch --list worker/agent-liveagent789 | grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 4d. STEP C2 -- finished fix-round worktrees keyed on the ai/worktrees/agent-<id>
+#    PATH. A fix-round worker checks out the PR branch under a local name
+#    (fix-<N>), so a worker/agent-* branch match never sees it and finished
+#    worktrees pile up until the mayor removes them by hand.
+# ---------------------------------------------------------------------------
+
+BARE_C2="$SANDBOX_ROOT/origin-c2.git"
+git init -q --bare "$BARE_C2"
+
+C2="$SANDBOX_ROOT/step-c2-repo"
+new_sandbox "$C2"
+printf 'line one\n' > "$C2/file.txt"
+git -C "$C2" add -A
+git -C "$C2" commit -q -m initial
+git -C "$C2" remote add origin "$BARE_C2"
+git -C "$C2" push -q origin main
+git -C "$C2" fetch -q origin
+
+mkdir -p "$C2/ai/worktrees"
+for pair in merged:fix-154 live:fix-156 dirty:fix-157 unmerged:fix-158; do
+  git -C "$C2" worktree add -q -b "${pair#*:}" "$C2/ai/worktrees/agent-${pair%%:*}" origin/main
+done
+printf 'local edit\n' > "$C2/ai/worktrees/agent-dirty/file.txt"
+printf 'new work\n' > "$C2/ai/worktrees/agent-unmerged/new.txt"
+git -C "$C2/ai/worktrees/agent-unmerged" add new.txt
+git -C "$C2/ai/worktrees/agent-unmerged" commit -q -m 'unmerged work'
+
+C2_OUT=$(LIVE_AGENTS="live" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  call step_c2_stale_agent_worktrees 2>&1)
+assert "a finished, merged, non-live fix-<N> worktree is removed -- otherwise the mayor must clean it by hand every fix round" \
+  "$([ ! -d "$C2/ai/worktrees/agent-merged" ] && echo 1 || echo 0)"
+assert "...and its local fix-<N> branch is deleted with it, not left dangling" \
+  "$(! git -C "$C2" branch --list fix-154 | grep -q fix-154 && echo 1 || echo 0)"
+assert "a worktree whose agent id is in --live-agents is kept even though its HEAD is merged -- reaping it would destroy a running worker's cwd" \
+  "$([ -d "$C2/ai/worktrees/agent-live" ] && git -C "$C2" branch --list fix-156 | grep -q fix-156 && echo 1 || echo 0)"
+assert "a dirty worktree is kept with its uncommitted work intact -- reaping it would lose edits" \
+  "$([ -f "$C2/ai/worktrees/agent-dirty/file.txt" ] && git -C "$C2" branch --list fix-157 | grep -q fix-157 && echo 1 || echo 0)"
+assert "...and the dirty worktree is reported loudly on stdout, not skipped silently" \
+  "$(printf '%s' "$C2_OUT" | grep -q 'dirty-worktree: .*agent-dirty' && echo 1 || echo 0)"
+assert "a worktree with commits not in origin/main is kept (awaiting merge) and logged, never reaped" \
+  "$([ -d "$C2/ai/worktrees/agent-unmerged" ] && printf '%s' "$C2_OUT" | grep -q 'keep-worktree: .*agent-unmerged' && echo 1 || echo 0)"
+
+C2_MAIN_RC=0
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  bash "$SCRIPT" --live-agents "live" >/dev/null 2>&1 || C2_MAIN_RC=$?
+assert "worktree-hygiene exits non-zero while a merged-but-dirty non-live worktree remains -- the mayor must notice it" \
+  "$([ "$C2_MAIN_RC" -ne 0 ] && echo 1 || echo 0)"
+
+# A worktree whose only unpushed work is a merge commit (main merged into the
+# branch, e.g. a conflict resolution): `git cherry` skips merge commits and
+# calls it merged, but the commit is not on origin/main and reaping loses it.
+BARE_C3="$SANDBOX_ROOT/origin-c3.git"
+git init -q --bare "$BARE_C3"
+
+C3="$SANDBOX_ROOT/step-c3-repo"
+new_sandbox "$C3"
+printf 'line one\n' > "$C3/file.txt"
+git -C "$C3" add -A
+git -C "$C3" commit -q -m initial
+git -C "$C3" remote add origin "$BARE_C3"
+git -C "$C3" push -q origin main
+mkdir -p "$C3/ai/worktrees"
+git -C "$C3" worktree add -q -b fix-mergeonly "$C3/ai/worktrees/agent-mergeonly" origin/main
+git -C "$C3" worktree add -q -b fix-livemain "$C3/ai/worktrees/agent-livemain" origin/main
+printf 'advance\n' > "$C3/other.txt"
+git -C "$C3" add other.txt
+git -C "$C3" commit -q -m 'main advances'
+git -C "$C3" push -q origin main
+git -C "$C3" fetch -q origin
+git -C "$C3/ai/worktrees/agent-mergeonly" merge -q --no-ff -m 'merge main into branch' origin/main
+
+C3_OUT=$(LIVE_AGENTS="livemain" WORKTREE_HYGIENE_REPO_ROOT="$C3" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  call step_c2_stale_agent_worktrees 2>&1)
+assert "a worktree whose sole unpushed work is a merge commit is kept -- patch-id comparison skips merge commits and would reap it, losing the commit" \
+  "$([ -d "$C3/ai/worktrees/agent-mergeonly" ] && git -C "$C3" branch --list fix-mergeonly | grep -q fix-mergeonly && echo 1 || echo 0)"
+assert "...and the keep is logged as not-ancestor, not skipped silently" \
+  "$(printf '%s' "$C3_OUT" | grep -q 'keep-worktree: .*agent-mergeonly.*not-ancestor' && echo 1 || echo 0)"
+assert "a live agent's clean worktree whose HEAD is an ancestor of origin/main (fresh worker, nothing committed yet) is kept -- it looks merged but --live-agents must protect it" \
+  "$([ -d "$C3/ai/worktrees/agent-livemain" ] && git -C "$C3" branch --list fix-livemain | grep -q fix-livemain && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 5. run_cmd dry-run gate -- the mechanism that keeps THIS test suite (and
 #    any manual dry-run) from ever killing a real process or deleting a
 #    real branch.
