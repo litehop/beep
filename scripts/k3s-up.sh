@@ -141,10 +141,28 @@ case "$k3s_state" in
   absent) ;;
   *) echo "FAIL: unexpected k3s install probe answer '$k3s_state' from $VM_A -- refusing to touch the cluster" >&2; exit 1 ;;
 esac
-if [ "$installed" = "1" ] && addrs="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)"; then
-  read_ok=1
+read_node_addrs() { # sets addrs/read_ok; a node that is not Ready is not a positive read
+  read_ok=0
+  addrs=""
+  local ready
+  ready="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" || return 0
+  [ "$ready" = "True" ] || return 0
+  if addrs="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)"; then
+    read_ok=1
+  fi
+}
+if [ "$installed" = "1" ]; then
+  read_node_addrs
 fi
 decision="$(k3s_reinstall_decision "$DUAL_STACK" "$V6_ONLY" "$installed" "$read_ok" "$addrs")"
+if [ "$decision" = "reinstall" ]; then
+  first_addrs="$addrs"
+  sleep 10
+  read_node_addrs
+  second="$(k3s_reinstall_decision "$DUAL_STACK" "$V6_ONLY" "$installed" "$read_ok" "$addrs")"
+  decision="$(k3s_confirm_reinstall "$decision" "$second")"
+  [ "$decision" = "reinstall" ] || echo "==> InternalIPs read '$first_addrs' then '${addrs:-none}' (second decision: $second) -- not a stable read, NOT reinstalling"
+fi
 case "$decision" in
   keep) ;;
   reinstall)
