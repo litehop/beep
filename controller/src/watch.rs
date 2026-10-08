@@ -1855,7 +1855,7 @@ mod tests {
                     "labels": {"kubernetes.io/service-name": "svc-a"},
                 },
                 "ports": [{"port": 8080, "protocol": "TCP"}],
-                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+                "endpoints": [{"addresses": ["2001:db8::9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
         state.mark_nodes_listed();
@@ -2110,7 +2110,7 @@ mod tests {
                 "spec": {
                     "type": "LoadBalancer",
                     "ports": [{"port": 80, "protocol": "TCP"}],
-                    "ipFamilies": ["IPv4"],
+                    "ipFamilies": ["IPv6"],
                 },
             },
         }));
@@ -2118,7 +2118,7 @@ mod tests {
             "type": "ADDED",
             "object": {
                 "metadata": {"name": "node-a"},
-                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+                "status": {"addresses": [{"type": "InternalIP", "address": "2001:db8::5"}]},
             },
         }));
         let v6_pod_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9);
@@ -2331,7 +2331,7 @@ mod tests {
                     "labels": {"kubernetes.io/service-name": "svc-a"},
                 },
                 "ports": [{"port": 8080, "protocol": "TCP"}],
-                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+                "endpoints": [{"addresses": ["2001:db8::9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
         state.mark_nodes_listed();
@@ -2389,7 +2389,10 @@ mod tests {
                     "labels": {"kubernetes.io/service-name": "svc-a"},
                 },
                 "ports": [{"port": 8080, "protocol": "TCP"}],
-                "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
+                "endpoints": [
+                    {"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}},
+                    {"addresses": ["2001:db8::9"], "nodeName": "node-a", "conditions": {"ready": true}},
+                ],
             },
         }));
         state.mark_nodes_listed();
