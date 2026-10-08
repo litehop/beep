@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Behaviour change:** the loader now refuses an uplink whose ARPHRD type
+  is neither Ethernet (1) nor a known L3-only tunnel type (PPP, RAWIP,
+  IPIP/IP6IP6, SIT, GRE/IP6GRE, NONE). Previously every non-Ethernet type
+  silently got an L2 header length of 0, which mis-parsed L2-bearing devices
+  the dataplane does not handle. The error names the interface, its type and
+  the supported set.
+
+### Fixed
+
+- Pinned maps whose type, key size, value size or `max_entries` differ from
+  the requested definition (e.g. after the raised `NODE_ALLOW`/`POD_TARGETS`
+  defaults, or a changed `--*-max-entries` flag) are deleted and recreated at
+  load time, with a log line per map, instead of silently keeping the old
+  shape. Conntrack maps lose their flows when recreated.
+
 ## [0.3.0] - 2026-09-21
 
 ### Added
