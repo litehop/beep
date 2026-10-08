@@ -45,14 +45,15 @@ k3s_seed_lan_v6() { # k3s_seed_lan_v6 <vm> <addr> [<vm> <addr> ...] -- idempoten
   done
 }
 
-k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy-mode] [dual-stack: 0|1] -- brings up the k3s server/agent pair (scripts/k3s-up.sh) and starts the client VM if it isn't already running; proxy-mode forwards to k3s-up.sh --proxy-mode (default iptables, matching k3s-up.sh's own default) so a caller can drive an IPVS-mode cluster without k3s-up.sh's own default silently resetting it back to iptables on the next invocation. dual-stack forwards to k3s-up.sh --dual-stack.
-  local vm_a="$1" vm_b="$2" vm_client="$3" proxy_mode="${4:-iptables}" dual_stack="${5:-0}"
+k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy-mode] [dual-stack: 0|1] [v6-only: 0|1] -- brings up the k3s server/agent pair (scripts/k3s-up.sh) and starts the client VM if it isn't already running; proxy-mode forwards to k3s-up.sh --proxy-mode (default iptables, matching k3s-up.sh's own default) so a caller can drive an IPVS-mode cluster without k3s-up.sh's own default silently resetting it back to iptables on the next invocation. dual-stack forwards to k3s-up.sh --dual-stack.
+  local vm_a="$1" vm_b="$2" vm_client="$3" proxy_mode="${4:-iptables}" dual_stack="${5:-0}" v6_only="${6:-0}"
   # A plain string, not an array: an empty bash array's "${arr[@]}" expansion
   # is an unbound-variable error under `set -u` on bash < 4.4 (macOS's
   # default /bin/bash is 3.2) -- confirmed live (smoke-k3s-controller.sh's
   # `set -euo pipefail` tripped on exactly this).
   local dual_stack_arg=""
   [ "$dual_stack" = "1" ] && dual_stack_arg="--dual-stack"
+  [ "$v6_only" = "1" ] && dual_stack_arg="--v6-only"
   "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b" --proxy-mode "$proxy_mode" $dual_stack_arg
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm_client}[[:space:]]+Running"; then
     limactl start "$vm_client"
@@ -64,7 +65,8 @@ k3s_provision_kubeconfig_secret() { # k3s_provision_kubeconfig_secret <vm-a> <ip
   [ "$rm_after" = "1" ] && rm_cmd='
   rm -f /tmp/beep-controller-kubeconfig'
   limactl shell "$vm_a" -- sudo bash -c "
-  sed 's#server: https://127.0.0.1:6443#server: https://${ip_a}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-controller-kubeconfig
+  sed 's#server: https://\(127.0.0.1\|\[::1\]\):6443#server: https://${ip_a}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-controller-kubeconfig
+  grep -qF 'server: https://${ip_a}:6443' /tmp/beep-controller-kubeconfig || { echo 'FAIL: kubeconfig server was not rewritten to ${ip_a}' >&2; exit 1; }
   k3s kubectl create secret generic $secret_name -n kube-system \
     --from-file=kubeconfig=/tmp/beep-controller-kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -$rm_cmd
 "

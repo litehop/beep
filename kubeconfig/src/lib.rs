@@ -159,9 +159,20 @@ impl HyperApiClient {
     /// Parse `server` + `path` into (host, port) for TCP connect.
     fn parse_addr(server: &str, path: &str) -> anyhow::Result<(String, u16, String)> {
         let uri: hyper::Uri = format!("{server}{path}").parse().context("parse URI")?;
-        let host = uri.host().context("URI missing host")?.to_owned();
+        // hyper keeps a v6 literal's brackets in `host()`; the TLS server name
+        // must be the bare address, while the dial address needs them back.
+        let host = uri
+            .host()
+            .context("URI missing host")?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
         let port = uri.port_u16().unwrap_or(443);
-        let addr = format!("{host}:{port}");
+        let addr = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
         Ok((host, port, addr))
     }
 
@@ -1071,6 +1082,32 @@ mod tests {
             .expect("must parse");
         assert_eq!(uri.host(), Some("10.0.0.1"));
         assert_eq!(uri.port_u16(), Some(6443));
+    }
+
+    /// A v6-only cluster's kubeconfig points at `https://[addr]:6443`: the
+    /// TLS server name must be the bare address (a bracketed name is rejected
+    /// as an invalid DNS name, so the controller never reaches the apiserver)
+    /// while the TCP dial address keeps its brackets.
+    #[test]
+    fn parse_addr_unbrackets_v6_tls_name_but_keeps_brackets_to_dial() {
+        let (host, port, addr) =
+            HyperApiClient::parse_addr("https://[fd00:beef:98::3]:6443", "/api/v1/nodes")
+                .expect("v6 literal server must parse");
+        assert_eq!(host, "fd00:beef:98::3");
+        assert_eq!(port, 6443);
+        assert_eq!(addr, "[fd00:beef:98::3]:6443");
+        let name: Result<rustls::pki_types::ServerName<'static>, _> = host.try_into();
+        assert!(
+            name.is_ok(),
+            "bare v6 literal must be a valid TLS server name"
+        );
+
+        let (host, _, addr) = HyperApiClient::parse_addr("https://10.0.0.1:6443", "/x")
+            .expect("v4 literal server must parse");
+        assert_eq!(
+            (host.as_str(), addr.as_str()),
+            ("10.0.0.1", "10.0.0.1:6443")
+        );
     }
 
     /// Verify that the bearer token field on HyperApiClient is correctly stored.
