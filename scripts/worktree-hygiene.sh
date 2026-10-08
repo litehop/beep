@@ -21,6 +21,13 @@
 #
 # STEP B: `git worktree prune -v` -- safe by definition, only removes
 #   metadata for worktrees whose directories are already gone.
+# STEP C2: reap finished `ai/worktrees/agent-<id>` worktrees keyed on the
+#   PATH (agent id not in --live-agents, clean tree, HEAD merged to
+#   origin/main, no open PR on its branch), then delete the local branch
+#   whatever its name -- fix-round workers check out an existing PR branch
+#   under a local name like fix-<N>, which STEP C's worker/agent-* match
+#   never sees. A dirty-but-merged worktree is kept and reported as an
+#   anomaly (non-zero exit); an unmerged one is kept with a log line.
 # STEP C: delete stale `worker/agent-*` branches, guarded so an in-flight
 #   worker's branch (its agent-id is in --live-agents; checked out in some
 #   worktree; or with a live worktree directory even if currently checked
@@ -47,6 +54,7 @@
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
 # mayor to look at: either a `git fetch`/`branch` failure in STEP B-D,
 # surfaced via this script's own `set -e` with git's own exit code, or STEP
+# C2 printing a `[hygiene] dirty-worktree: ...` line, or STEP
 # E printing at least one `[hygiene] stale-finding: ...` line (tracked via
 # an explicit count, not left to fall out of `set -e` incidentally) -- a
 # non-zero exit is always accompanied by a message naming the anomaly, never
@@ -202,6 +210,70 @@ has_live_worktree_dir() {
   local branch="$1" repo_root="$2"
   local agent_id="${branch#worker/agent-}"
   [ "$agent_id" != "$branch" ] && [ -d "$repo_root/ai/worktrees/agent-$agent_id" ]
+}
+
+# Emits one "<path>\t<branch>" line per `ai/worktrees/agent-<id>` worktree in
+# `git worktree list --porcelain` output (branch empty when detached). Keyed
+# on the PATH, not the branch name: a fix-round worker checks out an existing
+# PR branch under a local name like fix-<N>, which a worker/agent-* branch
+# match never sees.
+agent_worktrees() {
+  printf '%s\n' "$1" | awk '
+    /^worktree / { if (path != "") print path "\t" branch; path = substr($0, 10); branch = "" }
+    /^branch refs\/heads\// { branch = substr($0, 19) }
+    END { if (path != "") print path "\t" branch }
+  ' | awk -F'\t' '$1 ~ /\/ai\/worktrees\/agent-[^\/]+$/'
+}
+
+# True (exit 0) iff the worktree at `path` has any uncommitted change or
+# untracked file.
+worktree_is_dirty() {
+  [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]
+}
+
+# True (exit 0) iff every commit of the worktree's HEAD is already in
+# origin/main by patch-id (covers squash-merges).
+worktree_head_is_merged() {
+  [ -z "$(git -C "$REPO_ROOT" cherry origin/main "$(git -C "$1" rev-parse HEAD)" 2>/dev/null)" ]
+}
+
+HYGIENE_ANOMALIES=0
+
+# Reaps finished `ai/worktrees/agent-<id>` worktrees regardless of local
+# branch name: id not live, tree clean, HEAD merged to origin/main. A dirty
+# but merged worktree is an anomaly (counted, exit non-zero); an unmerged
+# one is a normal awaiting-merge state and is only logged.
+step_c2_stale_agent_worktrees() {
+  run_cmd git -C "$REPO_ROOT" fetch origin main
+  local porcelain open_pr_branches self wt_path branch agent_id
+  porcelain=$(git -C "$REPO_ROOT" worktree list --porcelain)
+  open_pr_branches=$(gh pr list -R litehop/beep --state open --json headRefName --jq '.[].headRefName')
+  self=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
+  while IFS=$'\t' read -r wt_path branch; do
+    [ -n "$wt_path" ] || continue
+    [ "$wt_path" != "$self" ] || continue
+    agent_id="${wt_path##*/agent-}"
+    if agent_id_is_live "$agent_id" "$LIVE_AGENTS"; then
+      continue
+    fi
+    if ! worktree_head_is_merged "$wt_path"; then
+      echo "[hygiene] keep-worktree: $wt_path (branch ${branch:-detached}) has commits not in origin/main -- not reaping"
+      continue
+    fi
+    if [ -n "$branch" ] && has_open_pr "$branch" "$open_pr_branches"; then
+      echo "[hygiene] keep-worktree: $wt_path (branch $branch) has an open PR -- not reaping"
+      continue
+    fi
+    if worktree_is_dirty "$wt_path"; then
+      echo "[hygiene] dirty-worktree: $wt_path (agent $agent_id, not live, HEAD merged) has uncommitted changes -- not reaping, inspect by hand"
+      HYGIENE_ANOMALIES=$(( HYGIENE_ANOMALIES + 1 ))
+      continue
+    fi
+    run_cmd git -C "$REPO_ROOT" worktree remove "$wt_path"
+    if [ -n "$branch" ] && [ "$branch" != "main" ]; then
+      run_cmd git -C "$REPO_ROOT" branch -D "$branch"
+    fi
+  done < <(agent_worktrees "$porcelain")
 }
 
 step_c_stale_worker_branches() {
@@ -399,9 +471,12 @@ main() {
   fi
 
   step_b_prune_worktrees
+  step_c2_stale_agent_worktrees
   step_c_stale_worker_branches
   step_d_gone_upstream_branches
-  step_e_stale_findings
+  local e_rc=0
+  step_e_stale_findings || e_rc=$?
+  [ "$e_rc" -eq 0 ] && [ "$HYGIENE_ANOMALIES" -eq 0 ]
 }
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
