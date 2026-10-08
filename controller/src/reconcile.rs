@@ -400,12 +400,18 @@ pub fn reconcile_service(
     // LB_FRONT_MAP/TARGET_PORTS are NOT node-scoped (any node can be ingress for
     // any VIP, mirroring the loader's fixture population), so backend
     // candidates are drawn from every endpoint across every slice --
-    // regardless of which node hosts them -- not just this node's own.
+    // regardless of which node hosts them -- not just this node's own. Only
+    // endpoints of the front's own address family qualify: the Geneve inner
+    // packet keeps the client's family, so a cross-family pod can never answer.
     for port in &svc.ports {
         let mut candidates: Vec<&Endpoint> = endpoints
             .iter()
             .copied()
-            .filter(|e| e.ready && e.ports.contains(&port.target_port))
+            .filter(|e| {
+                e.ready
+                    && e.ports.contains(&port.target_port)
+                    && e.pod_ip.is_ipv4() == svc.vip_ip.is_ipv4()
+            })
             .collect();
         // Decision #5 (single backend per front): today's LB_FRONT_MAP schema
         // holds exactly one backend per front, so pick deterministically --
@@ -1149,6 +1155,66 @@ mod tests {
         );
         assert!(desired.target_ports.is_empty());
         assert!(desired.pod_targets.is_empty());
+    }
+
+    // A dual-stack Service gets one front per family; a v6 front pointing at
+    // a v4 pod makes every v6 client silently time out (the reply can't be
+    // sent back in the client's family).
+    #[test]
+    fn dual_stack_pod_gets_each_front_programmed_with_its_own_family_address() {
+        let v4_pod = Ipv4Addr::new(192, 168, 104, 14);
+        let v6_pod: Ipv6Addr = "fd00:beef:98::4".parse().unwrap();
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip: Ipv6Addr = "fd00:beef:98::5".parse().unwrap();
+        let slices = vec![
+            EndpointSliceView {
+                endpoints: vec![ready_endpoint(v4_pod, node_v4, vec![80])],
+            },
+            EndpointSliceView {
+                endpoints: vec![ready_endpoint_v6(v6_pod, node_v6_ip, vec![80])],
+            },
+        ];
+        let node_ctx = node(node_v4);
+
+        let v4_front = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 8080, 80);
+        let v6_front = single_port_service_v6("fd00:beef:98::3".parse().unwrap(), 8080, 80);
+
+        let d4 = reconcile_service(&v4_front, &slices, &node_ctx);
+        let d6 = reconcile_service(&v6_front, &slices, &node_ctx);
+
+        let b4 = d4.lb_front_map.values().next().expect("v4 front backend");
+        let b6 = d6.lb_front_map.values().next().expect("v6 front backend");
+        assert_eq!(
+            b4.pod_ip,
+            wire_ip_v6(IpAddr::V4(v4_pod)),
+            "v4 front must get the v4 pod"
+        );
+        assert_eq!(
+            b6.pod_ip,
+            wire_ip_v6(IpAddr::V6(v6_pod)),
+            "v6 front must get the v6 pod; a v4 pod here makes v6 clients time out"
+        );
+    }
+
+    #[test]
+    fn dual_stack_service_with_only_v4_endpoints_gets_no_v6_front_entry() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![ready_endpoint(
+                Ipv4Addr::new(10, 244, 0, 9),
+                node_v4,
+                vec![80],
+            )],
+        }];
+        let v6_front = single_port_service_v6("fd00:beef:98::3".parse().unwrap(), 8080, 80);
+
+        let desired = reconcile_service(&v6_front, &slices, &node(node_v4));
+
+        assert!(
+            desired.lb_front_map.is_empty() && desired.target_ports.is_empty(),
+            "a v6 front with no v6 endpoint must fail closed; a cross-family backend would \
+             silently time out every v6 client"
+        );
     }
 
     // diff() is the exact machinery translating two successive reconcile
