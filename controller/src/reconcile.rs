@@ -228,7 +228,7 @@ pub struct EndpointSliceView {
     pub endpoints: Vec<Endpoint>,
 }
 
-/// A ready endpoint hosted on THIS node (`ep.node_ip == node.node_ip`) that
+/// A ready endpoint hosted on THIS node (`ep.node_addrs` contains `node.node_ip`) that
 /// `pod_targets_for_node`'s admission check excluded from `POD_TARGETS`
 /// because its `pod_ip` matched neither `pod_cidr` nor the hostNetwork
 /// signature. The rejection itself is correct anti-spoof behavior (see
@@ -293,7 +293,7 @@ pub struct DesiredEntries {
     /// Whether `pod_targets` was computed with THIS node's own address
     /// already resolvable in `WatchState::desired`'s endpoint->node_ip
     /// lookup (`pod_targets_for_node` can only admit an endpoint whose
-    /// resolved `node_ip` equals `NodeContext::node_ip`). `false` means
+    /// node reports `NodeContext::node_ip` among its addresses). `false` means
     /// "this node's own Node LIST/watch entry hasn't landed yet", not
     /// "this node hosts no backends" -- in a multi-node cluster, whichever
     /// position THIS node's own entry lands at in the startup Node LIST is
@@ -348,7 +348,7 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     let mut pod_targets = HashSet::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready && ep.node_ip == node.node_ip && is_admitted(ep, node) {
+            if ep.ready && ep.node_addrs.contains(&node.node_ip) && is_admitted(ep, node) {
                 // POD_TARGETS' key is `[u8; 16]` (like NODE_ALLOW's), but wire-token
                 // (`wire_ip_v6`) like `LbFrontBackend::pod_ip` -- unlike NODE_ALLOW's
                 // host-native peer address, POD_TARGETS membership is checked against a
@@ -369,7 +369,7 @@ pub fn rejected_endpoints_for_node(
     let mut rejected = Vec::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready && ep.node_ip == node.node_ip && !is_admitted(ep, node) {
+            if ep.ready && ep.node_addrs.contains(&node.node_ip) && !is_admitted(ep, node) {
                 rejected.push(RejectedEndpoint {
                     pod_ip: ep.pod_ip,
                     reason: "pod_ip is outside the configured --pod-cidr and is not this \
@@ -956,6 +956,32 @@ mod tests {
              admitted into POD_TARGETS, or the v6 return leg is never recognised as node-local"
         );
         assert!(desired.rejected.is_empty(), "nothing should be rejected");
+    }
+
+    #[test]
+    fn external_ip_node_ip_selects_its_own_endpoints_and_never_a_peers() {
+        let internal = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let external = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let local_pod = IpAddr::V4(Ipv4Addr::new(10, 244, 0, 9));
+        let peer_pod = IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9));
+        let svc = single_port_service(Ipv4Addr::new(203, 0, 113, 5), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                dual_stack_endpoint(local_pod, vec![internal, external]),
+                dual_stack_endpoint(peer_pod, vec![peer]),
+            ],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(Ipv4Addr::new(203, 0, 113, 5)));
+
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([wire_ip_v6(local_pod)]),
+            "with --node-ip set to the ExternalIP, endpoints resolve to the InternalIP underlay \
+             address; local backends must still land in POD_TARGETS (else their traffic is \
+             never recognised as node-local) and a peer's backend must never"
+        );
     }
 
     #[test]
