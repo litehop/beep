@@ -39,6 +39,8 @@
 # Test hook: BEEP_SMOKE_MAP_DUMP_TIMEOUT=<seconds> (default 20) bounds each
 # bpftool map dump; 0 forces every dump to time out, which must FAIL the gate
 # at the first map check (an unreadable map is never treated as empty).
+# BEEP_SMOKE_EVIDENCE_TIMEOUT=<seconds> (default 20) likewise bounds each call
+# of the FAIL-path evidence dump; 0 forces every call to report EVIDENCE TIMEOUT.
 set -euo pipefail
 
 VM_A="beep-node-a"
@@ -86,29 +88,15 @@ rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src (inst
   exit 1
 }
 
-kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
-  kill -9 "$1" 2>/dev/null || true
-}
-
 map_dump() { # map_dump <vm> <map-name> -- raw bpftool JSON dump of a pinned map on stdout, exit 0 (a genuinely empty map prints "[]"); exit 1 with the reason on stderr if the pin is missing/unreadable, bpftool/limactl fails, or the call times out. Callers MUST treat non-zero as a gate FAIL, never as "empty": an absence check must not pass on a dump that never happened. Bounded to ${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}s rather than a bare `limactl shell` call: observed live, a loaded node's SSH session can wedge indefinitely under this rig's load, which would otherwise hang the whole gate rather than failing loud (macOS has no `timeout` builtin, so this polls a backgrounded call).
-  local vm="$1" name="$2" out_file err_file waited limit="${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}" rc=0
+  local vm="$1" name="$2" out_file err_file limit="${BEEP_SMOKE_MAP_DUMP_TIMEOUT:-20}" rc=0 run_rc=0
   out_file="$(mktemp)"
   err_file="$(mktemp)"
-  ( limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>"$err_file" > "$out_file" ) &
-  local bg_pid=$!
-  waited=0
-  while kill -0 "$bg_pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if kill -0 "$bg_pid" 2>/dev/null; then
-    kill_tree "$bg_pid"
-    wait "$bg_pid" 2>/dev/null || true
+  bounded_run "$limit" limactl shell "$vm" -- sudo bpftool map dump pinned "$PIN_DIR/$name" --json 2>"$err_file" > "$out_file" || run_rc=$?
+  if [ "$run_rc" -eq 124 ]; then
     echo "map_dump $vm/$name timed out after ${limit}s" >&2
     rc=1
-  elif ! wait "$bg_pid"; then
+  elif [ "$run_rc" -ne 0 ]; then
     echo "map_dump $vm/$name failed: $(tr '\n' ' ' < "$err_file")" >&2
     rc=1
   elif [ ! -s "$out_file" ]; then
@@ -404,11 +392,14 @@ GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
 GENEVE_B_BEFORE="$(geneve_pkts "$VM_B")"
 
 echo "==> [10/12] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
-http_url() { # http_url <addr> <port> -- brackets IPv6 literals so the URL authority parses
+host_port() { # host_port <addr> <port> -- addr:port, bracketing IPv6 literals (URL authority and the backend's RemoteAddr both use this form)
   case "$1" in
-    *:*) echo "http://[$1]:$2/" ;;
-    *) echo "http://$1:$2/" ;;
+    *:*) echo "[$1]:$2" ;;
+    *) echo "$1:$2" ;;
   esac
+}
+http_url() { # http_url <addr> <port>
+  echo "http://$(host_port "$1" "$2")/"
 }
 round_trip() { # round_trip <curl-family-flag> <dial-addr> <port> <expect-client-addr> -- returns the body on success, prints ROUND-TRIP FAIL and returns 1 otherwise
   local flag="$1" addr="$2" port="$3" expect="$4" body rc url
@@ -421,8 +412,8 @@ round_trip() { # round_trip <curl-family-flag> <dial-addr> <port> <expect-client
     echo "FAIL: curl $flag $url rc=$rc" >&2
     return 1
   fi
-  if ! grep -q "RemoteAddr: ${expect}:" <<<"$body"; then
-    echo "FAIL: $url did not report RemoteAddr: ${expect}:* -- got: $body" >&2
+  if ! grep -qF "RemoteAddr: $(host_port "$expect" "")" <<<"$body"; then
+    echo "FAIL: $url did not report RemoteAddr: $(host_port "$expect" "")* -- got: $body" >&2
     return 1
   fi
   echo "$body"
@@ -433,23 +424,24 @@ round_trip -6 "$ULA_A" "$PORT_DUAL" "$ULA_CLIENT" >/dev/null || { echo "ROUND-TR
 echo "ROUND-TRIP-DUAL-V6: PASS (client $ULA_CLIENT -> $SVC_DUAL v6 front [$ULA_A]:$PORT_DUAL -> backend on $VM_B, client IP preserved)"
 
 echo "==> [11/12] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
-set +e
-V6_TO_V4ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -6 -m 5 "$(http_url "$ULA_A" "$PORT_V4")" 2>&1)"
-V6_TO_V4ONLY_RC=$?
-V4_TO_V6ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -4 -m 5 "$(http_url "$IP_A" "$PORT_V6")" 2>&1)"
-V4_TO_V6ONLY_RC=$?
-set -e
-if [ "$V6_TO_V4ONLY_RC" -eq 0 ]; then
-  echo "FAIL: a v6 client reached $SVC_V4 (SingleStack IPv4) at [${ULA_A}]:${PORT_V4} -- got: $V6_TO_V4ONLY" >&2
-  dump_evidence
-  exit 1
-fi
-if [ "$V4_TO_V6ONLY_RC" -eq 0 ]; then
-  echo "FAIL: a v4 client reached $SVC_V6 (SingleStack IPv6) at ${IP_A}:${PORT_V6} -- got: $V4_TO_V6ONLY" >&2
-  dump_evidence
-  exit 1
-fi
-echo "NEGATIVE-FAMILY-ISOLATION: PASS (v6 client refused by $SVC_V4's v4-only front, v4 client refused by $SVC_V6's v6-only front)"
+expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
+  local flag="$1" addr="$2" port="$3" out rc url
+  url="$(http_url "$addr" "$port")"
+  set +e
+  out="$(limactl shell "$VM_CLIENT" -- curl -sSv "$flag" -m 5 "$url" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 7 ] && grep -qF "failed: Connection refused" <<<"$out"; then
+    return 0
+  fi
+  echo "FAIL: curl $flag $url expected rc=7 + 'failed: Connection refused', got rc=$rc: $out" >&2
+  return 1
+}
+round_trip -4 "$IP_A" "$PORT_V4" "$IP_CLIENT" >/dev/null || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (positive control: v4 client could not reach $SVC_V4's v4 front $IP_A:$PORT_V4)" >&2; dump_evidence; exit 1; }
+round_trip -6 "$ULA_A" "$PORT_V6" "$ULA_CLIENT" >/dev/null || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (positive control: v6 client could not reach $SVC_V6's v6 front [$ULA_A]:$PORT_V6)" >&2; dump_evidence; exit 1; }
+expect_refused -6 "$ULA_A" "$PORT_V4" || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (v6 client vs $SVC_V4's v4-only front)" >&2; dump_evidence; exit 1; }
+expect_refused -4 "$IP_A" "$PORT_V6" || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (v4 client vs $SVC_V6's v6-only front)" >&2; dump_evidence; exit 1; }
+echo "NEGATIVE-FAMILY-ISOLATION: PASS (same-family positive controls served on $SVC_V4 v4 and $SVC_V6 v6; cross-family curls refused with rc=7 Connection refused)"
 
 GENEVE_A_AFTER="$(geneve_pkts "$VM_A")"
 GENEVE_B_AFTER="$(geneve_pkts "$VM_B")"
