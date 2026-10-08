@@ -1911,6 +1911,8 @@ mod tests {
 
     #[test]
     fn egress_return_outcome_passes_a_miss_so_a_hostnetwork_backend_nodes_own_egress_survives() {
+        // Only pins the decision; the call sites' wiring is guarded by the
+        // smoke NODE-EGRESS phase.
         // A hostNetwork backend's pod IP is the node's own address, so it is
         // in POD_TARGETS and every fresh connection the node originates
         // (SSH replies, kubelet, apiserver) passes admission yet has no
