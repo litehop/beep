@@ -695,8 +695,15 @@ impl WatchState {
                             // dropped for THIS reconcile pass rather than
                             // guessed at -- the next Node event re-triggers
                             // a reconcile that picks it up correctly.
+                            let mut node_addrs = Vec::new();
                             let node_ip = e.node_name.as_deref().and_then(|peer_name| {
                                 let peer = self.node_ips.get(peer_name)?;
+                                node_addrs = peer
+                                    .underlay
+                                    .iter()
+                                    .chain(peer.fronts.iter())
+                                    .copied()
+                                    .collect();
                                 let pick = pick_underlay_ip(&peer.underlay, node.node_ip)?;
                                 if !pick.shared_family {
                                     let peer_family = family_label(pick.ip);
@@ -715,6 +722,7 @@ impl WatchState {
                             Some(Endpoint {
                                 pod_ip: e.pod_ip,
                                 node_ip,
+                                node_addrs,
                                 ready: e.ready,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
                             })
