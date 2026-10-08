@@ -28,6 +28,12 @@
 #        review-queue entries (PR or non-PR) -- mayor investigates or
 #        dispatches critical-reviewer.
 #   30 = a worker worktree/branch with no PR at all -- mayor investigates.
+#   40 = the mayor checkout itself is on a detached HEAD or a branch other
+#        than main (state file: .mayor_checkout_anomaly = "detached-head" or
+#        "on-branch:<name>"). The post-merge fetch/`merge --ff-only`/worktree
+#        cleanup is SKIPPED -- fast-forwarding a detached HEAD silently
+#        strands the mayor's later `git pull` -- and the mayor must `git
+#        checkout main` before the next tick.
 #
 # --live-agents <comma-separated-agent-ids>: the mayor's own ListAgents-
 # derived set of currently running worker/agent-* subagents, fed in so
@@ -300,12 +306,25 @@ pr_gate_eligible() {
 # make a merge decision wrong, so it must not be masked by a same-tick
 # routine bd-ready signal.
 compute_exit_code() {
-  local bd_ready="$1" exceptions="$2" worktree="$3"
+  local bd_ready="$1" exceptions="$2" worktree="$3" checkout_anomaly="${4:-}"
   local code=0
   [ "$bd_ready" -gt 0 ] && [ "$code" -lt 10 ] && code=10
   [ "$exceptions" -gt 0 ] && [ "$code" -lt 20 ] && code=20
   [ "$worktree" -gt 0 ] && [ "$code" -lt 30 ] && code=30
+  [ -n "$checkout_anomaly" ] && code=40
   printf '%s' "$code"
+}
+
+# Empty when the mayor checkout is on main; otherwise "detached-head" or
+# "on-branch:<name>".
+mayor_checkout_anomaly() {
+  local branch
+  branch=$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || true)
+  case "$branch" in
+    main) ;;
+    "") printf 'detached-head' ;;
+    *) printf 'on-branch:%s' "$branch" ;;
+  esac
 }
 
 # Reads one `key: value` field from a review-queue file's YAML frontmatter
@@ -395,8 +414,9 @@ write_state() {
   local exit_code="$1" queue_files_json="$2" pending_reviews_json="$3" \
     merged_prs_json="$4" bd_ready_json="$5" worktree_anomalies_json="$6" \
     gate_exceptions_json="$7" pending_non_pr_json="${8:-[]}" \
-    queue_warnings_json="${9:-[]}"
+    queue_warnings_json="${9:-[]}" checkout_anomaly="${10:-}"
   jq -n \
+    --arg checkout_anomaly "$checkout_anomaly" \
     --arg ts "$TICK_TIMESTAMP" \
     --argjson exit_code "$exit_code" \
     --argjson queue_files "$queue_files_json" \
@@ -412,7 +432,8 @@ write_state() {
       bd_ready_ids:$bd_ready_ids, worktree_anomalies:$worktree_anomalies,
       gate_exceptions:$gate_exceptions,
       pending_non_pr_reviews:$pending_non_pr_reviews,
-      queue_warnings:$queue_warnings}' \
+      queue_warnings:$queue_warnings,
+      mayor_checkout_anomaly:(if $checkout_anomaly == "" then null else $checkout_anomaly end)}' \
     > "$STATE_FILE"
 }
 
@@ -885,7 +906,13 @@ main() {
   process_review_queue
   reconcile_missing_queue_entries
   gate_and_merge_prs
-  cleanup_merged_worktrees
+  local checkout_anomaly
+  checkout_anomaly=$(mayor_checkout_anomaly)
+  if [ -n "$checkout_anomaly" ]; then
+    echo "mayor-tick: ANOMALY mayor checkout is not on main ($checkout_anomaly) -- skipping post-merge fast-forward and worktree cleanup; run 'git checkout main' in $REPO_ROOT" >&2
+  else
+    cleanup_merged_worktrees
+  fi
   check_bd_ready
   check_worktree_anomalies
   refresh_dashboard
@@ -902,7 +929,7 @@ main() {
   # stale subset should escalate the exit code.
   local worktree_count=$WORKTREE_STALE_COUNT
   local exit_code
-  exit_code=$(compute_exit_code "$bd_ready_count" "$exception_count" "$worktree_count")
+  exit_code=$(compute_exit_code "$bd_ready_count" "$exception_count" "$worktree_count" "$checkout_anomaly")
 
   # "${ARR[@]+"${ARR[@]}"}", not the bare "${ARR[@]}", at every call site
   # below: macOS ships bash 3.2 as /bin/bash (this script's own shebang
@@ -919,7 +946,8 @@ main() {
     "$(json_raw_array "${WORKTREE_ANOMALIES[@]+"${WORKTREE_ANOMALIES[@]}"}")" \
     "$(json_raw_array "${GATE_EXCEPTIONS[@]+"${GATE_EXCEPTIONS[@]}"}")" \
     "$(json_raw_array "${PENDING_NON_PR_REVIEWS[@]+"${PENDING_NON_PR_REVIEWS[@]}"}")" \
-    "$(json_raw_array "${QUEUE_WARNINGS[@]+"${QUEUE_WARNINGS[@]}"}")"
+    "$(json_raw_array "${QUEUE_WARNINGS[@]+"${QUEUE_WARNINGS[@]}"}")" \
+    "$checkout_anomaly"
 
   echo "mayor-tick: exit_code=$exit_code state=$STATE_FILE"
   exit "$exit_code"
