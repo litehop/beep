@@ -279,6 +279,12 @@ struct NodeAddrs {
     fronts: Vec<IpAddr>,
 }
 
+impl NodeAddrs {
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.underlay.contains(&ip) || self.fronts.contains(&ip)
+    }
+}
+
 /// Parses every `type` address of a `Node` object; an address that fails to
 /// parse is logged and skipped, not silently dropped, so a malformed
 /// apiserver response stays diagnosable.
@@ -413,10 +419,21 @@ impl WatchState {
         }
     }
 
-    /// Every FRONT address THIS node's own Node object reports (found by
-    /// locating the Node entry whose underlay list contains `local_node_ip`)
-    /// -- the anchor set `status::merged_ingress` uses to tell this node's
-    /// own `status.loadBalancer.ingress` entries apart from another node's.
+    /// THIS node's own Node entry, found by matching `local_node_ip`
+    /// against the union of its underlay and front addresses: `--node-ip`
+    /// may be either (e.g. an ExternalIP on a node that also has an
+    /// InternalIP).
+    fn own_node_addrs(&self, local_node_ip: IpAddr) -> Option<&NodeAddrs> {
+        self.node_ips
+            .values()
+            .find(|addrs| addrs.contains(local_node_ip))
+    }
+
+    /// Every address (underlay and front) THIS node's own Node object
+    /// reports -- the anchor set `status::merged_ingress` uses to tell this
+    /// node's own `status.loadBalancer.ingress` entries apart from another
+    /// node's, including a previously published address (e.g. an
+    /// InternalIP) that is no longer a front and must be removed.
     /// Falls back to `[local_node_ip]` alone when this node's own Node
     /// entry hasn't resolved yet (the startup race `desired`'s
     /// `pod_targets_known` doc comment covers for POD_TARGETS): the
@@ -425,14 +442,20 @@ impl WatchState {
     /// family never regresses versus before this node gained multi-family
     /// awareness.
     pub fn own_node_ips(&self, local_node_ip: IpAddr) -> Vec<IpAddr> {
-        self.node_ips
-            .values()
-            .find(|addrs| addrs.underlay.contains(&local_node_ip))
-            .map(|addrs| addrs.fronts.clone())
+        self.own_node_addrs(local_node_ip)
+            .map(|addrs| {
+                let mut all = addrs.underlay.clone();
+                for ip in &addrs.fronts {
+                    if !all.contains(ip) {
+                        all.push(*ip);
+                    }
+                }
+                all
+            })
             .unwrap_or_else(|| vec![local_node_ip])
     }
 
-    /// The subset of `own_node_ips` this node should publish to `key`'s
+    /// This node's FRONT addresses that should be published to `key`'s
     /// `status.loadBalancer.ingress` right now -- narrowed to `key`'s own
     /// `spec.ipFamilies`, the same way `desired`'s front_ip loop narrows
     /// LB_FRONT_MAP/TARGET_PORTS. A dual-stack Service on a dual-stack node
@@ -443,7 +466,11 @@ impl WatchState {
         let Some(svc) = self.services.get(key) else {
             return Vec::new();
         };
-        self.own_node_ips(local_node_ip)
+        let fronts = match self.own_node_addrs(local_node_ip) {
+            Some(addrs) => addrs.fronts.clone(),
+            None => vec![local_node_ip],
+        };
+        fronts
             .into_iter()
             .filter(|ip| svc.fronts_family(Family::of(*ip)))
             .collect()
@@ -550,10 +577,7 @@ impl WatchState {
         // full-sync FREEZES (stops updating) rather than wiping -- worse
         // than staying current, but self-healing on relist and strictly
         // better than the pre-fix full-wipe.
-        let self_node_known = self
-            .node_ips
-            .values()
-            .any(|addrs| addrs.underlay.contains(&node.node_ip));
+        let self_node_known = self.own_node_addrs(node.node_ip).is_some();
         let mut aggregate = DesiredEntries {
             fronts_known: self.nodes_listed,
             pod_targets_known: self_node_known,
@@ -2594,6 +2618,37 @@ mod tests {
             state.ips_to_publish(&key, v6_only).is_empty(),
             "a v6-only node must publish nothing for a v4-only Service -- it has no v4 \
              address to add"
+        );
+    }
+
+    // `--node-ip` set to the ExternalIP of a node that also has an
+    // InternalIP must still identify this node; otherwise POD_TARGETS stays
+    // frozen forever and local backends are never programmed.
+    #[test]
+    fn node_ip_matching_only_the_external_ip_still_identifies_the_local_node() {
+        let mut state = WatchState::default();
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.5"},
+                    {"type": "ExternalIP", "address": "203.0.113.5"},
+                ]},
+            },
+        }));
+        let local = node(Ipv4Addr::new(203, 0, 113, 5));
+        assert!(
+            state.desired(&local).pod_targets_known,
+            "a node whose --node-ip is its ExternalIP must be recognised, or POD_TARGETS stays \
+             gated and local backends are never programmed"
+        );
+        let mut own = state.own_node_ips(local.node_ip);
+        own.sort();
+        assert_eq!(
+            own,
+            vec![ip("10.0.0.5"), ip("203.0.113.5")],
+            "the removal anchor set must cover both the underlay and front addresses"
         );
     }
 

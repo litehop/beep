@@ -38,9 +38,11 @@ use serde_json::{json, Value};
 /// trip at best, and under a concurrent write from another node, an
 /// unconditional overwrite risks dropping that node's entry).
 ///
-/// `own_ips` is every address this node's own Node object reports (any
-/// family, from `WatchState::own_node_ips`) -- the anchor set that decides
-/// which `existing` entries are "this node's own" versus another node's.
+/// `own_ips` is every address this node's own Node object reports (underlay
+/// and fronts, any family, from `WatchState::own_node_ips`) -- the anchor set
+/// that decides which `existing` entries are "this node's own" versus
+/// another node's, so a previously published underlay address that is no
+/// longer a front is pruned.
 /// `desired_ips` is the subset of `own_ips` that should be present right
 /// now for the calling Service (`WatchState::ips_to_publish`'s own
 /// `spec.ipFamilies` scoping). An `own_ips` entry present in `existing` but
@@ -322,6 +324,25 @@ mod tests {
             merged,
             vec![other_node, json!({"ip": "10.0.0.5"})],
             "another node's entry must survive a prune of this node's own stale family"
+        );
+    }
+
+    // A node that used to be published by its InternalIP and now fronts its
+    // ExternalIP (the underlay/front split) must not leave the InternalIP
+    // behind: clients would keep being sent to a private address that is no
+    // longer a front, and no other node would ever remove it.
+    #[test]
+    fn internal_to_external_transition_drops_the_stale_internal_entry() {
+        let internal = v4(10, 0, 0, 5);
+        let external = v4(203, 0, 113, 5);
+        let other_node = json!({"ip": "203.0.113.6"});
+        let existing = vec![json!({"ip": "10.0.0.5"}), other_node.clone()];
+        let merged = merged_ingress(&existing, &[internal, external], &[external])
+            .expect("the stale InternalIP entry must be rewritten");
+        assert_eq!(
+            merged,
+            vec![other_node, json!({"ip": "203.0.113.5"})],
+            "only the ExternalIP of this node may remain, alongside the other node's entry"
         );
     }
 
