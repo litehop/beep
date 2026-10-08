@@ -2,421 +2,283 @@
 Bead: beep-5lw
 ---
 
-# Multi-pod backend LB plan + estimates (beep-5lw)
+# Multi-endpoint backend LB plan + estimates (beep-5lw)
 
 Bead: beep-5lw
 Date: 2026-09-19
-Kind: findings (read-only audit, Phase 1 of audit -> operator-decides -> apply)
+As of 2026-10-08 (line numbers cite main at 0e75d0f)
+Kind: findings (Phase 1 of audit -> operator-decides -> apply)
 
 ## Recommendation (read this first)
 
-Add an **indexed endpoint table** (`LB_FRONT_ENDPOINTS`, replacing today's
-one-value `LB_FRONT_MAP`) plus a tiny **ready-count map** (`LB_FRONT_COUNT`),
-and select a backend on the first-packet miss with a **plain deterministic
-hash of the flow tuple modulo the ready count** -- one extra map lookup, zero
-loops, verifier-trivial. Do **not** build a Maglev permutation table: the
-existing, operator-accepted ADR
-(`docs/decisions/servicelb-flow-admission-affinity.md`) already commits to
-"a deterministic hash over the ready set" and justifies it on beep's actual
-scale ("u7s's small, often single-digit endpoint counts") -- Maglev's payoff
-over plain hashing only shows up with large backend tables and needs a
-controller-maintained permutation map beep does not otherwise need. Round-
-robin is worse than either here: it needs a shared, cross-CPU mutable
-counter on the hot path with no offsetting benefit, since per-flow stickiness
-already comes from the affinity pin (mayor-aie31.21), not from the selection
-algorithm.
+Build the multi-endpoint **shape** inside beep-xfa.1 (a per-front meta map
+plus a `(front, slot)` endpoint table, exactly one endpoint per front), then
+let beep-5lw add the behaviour: select a slot with a **plain deterministic
+hash of the flow tuple modulo the front's ready count**, make ingress
+**steer from the stored affinity pin** (it does not today -- see section 3),
+and have the controller emit every ready endpoint of the front's own address
+family. Keep **per-front dense slot renumbering** with backend identity
+`(pod_ip, target_port)`; no new identity and no BackendId table is needed
+(Q1). Do not build Maglev: the accepted ADR
+(`docs/decisions/servicelb-flow-admission-affinity.md:30`) already commits to
+"a deterministic hash over the ready set" at single-digit endpoint counts,
+and Maglev is the later upgrade only if churn proves to matter.
 
-**This selection algorithm feeds an affinity-pin mechanism that is already
-implemented in this repo** (`FWD_PENDING`, `ForwardFlowValue`,
-`fwd_pending_affinity_pin`, promotion into `FLOW_TABLE` --
-`ebpf/src/main.rs:190-246`, `common/src/lib.rs:258-340`). beep-5lw only has
-to change what feeds INTO that pin on a first-packet miss (today: the one
-fixed value `LB_FRONT_MAP` holds; after: the hash-selected slot out of
-`LB_FRONT_ENDPOINTS`). The eviction half of mayor-aie31.21 (scoped delete on
-endpoint removal) is **not implemented anywhere in this repo today** (no
-`evict`/`delete`-on-removal code exists outside passive LRU aging -- verified
-by grep across `ebpf/`, `src/`, `controller/`) and stays out of this bead's
-scope.
+**Estimate:** xfa.1 shape increment **~8-12h** on top of its consolidation;
+beep-5lw remainder **~23-37h** over 6 beads. The old 21-34h total was
+lower because it missed two items found on this refresh: ingress does not
+steer from the pin, and decap cannot find a per-endpoint `target_port` once
+a front has more than one endpoint.
 
-**Total estimate: ~24-34 hours (roughly 4-6 focused engineering days)**
-across 6 beads, S/M/L breakdown below. Biggest open question for the
-operator: accept **contiguous per-front slot renumbering** on every
-endpoint add/remove (simple, matches this codebase's existing "sort
-deterministically, no dedup" style) or invest now in a **global BackendId
-indirection** (Cilium-style, avoids renumbering churn, costs a second
-indirection hop and a controller-side ID allocator) -- see Open Questions.
+Must be decided **before xfa.1**: Q2 (where `target_port` lives, and how
+decap finds it) and Q1's confirmation. Everything else gates only 5lw.
 
-A real controller (`controller/` crate, `beep-controller`) already exists in
-this repo and already reconciles `Service`/`EndpointSlice` objects into
-these maps -- this is not future/aspirational work. `mayor-9gr0n` (closed
-2026-09-11 in the mayor tracker) is the design ancestor; the actual
-implementation landed in *this* repo under beep's own bead numbering
-starting with commit `f8222ae` (2026-09-10, `feat(controller): beep-
-controller crate + pure reconcile fn + tests`) and continued through beads
-like beep-90g. Every mayor-9gr0n/mayor-aie31.21 path reference below has
-been remapped from the stale `crates/servicelb/servicelb-ebpf/...` layout to
-this repo's real `ebpf/`, `src/`, `common/`, `controller/` layout.
+## 1. Current state (main, 2026-10-08)
 
-## 1. Current state: one backend per front, cited
+**Maps** (`ebpf/src/main.rs`): `LB_FRONT_MAP: HashMap<LbFrontKey,
+LbFrontBackend>` (:160, 4096 entries) and `TARGET_PORTS: HashMap<LbFrontKey,
+u16>` (:176, 4096) -- two maps on the same key; the file itself says "the two
+never interact" (:148). `POD_TARGETS` (:210, default 128) is the per-pod
+stale-pod/egress gate; `NODE_ALLOW` (:240, default 32) is the peer-underlay
+allow-list. `FWD_PENDING` (:297) and `FLOW_TABLE` (:351) hold conntrack.
+`MAP_NAMES` is 8 names (`src/lib.rs:36`), matching
+`scripts/assert-ebpf-map-memory.sh:45`.
 
-**The map.** `ebpf/src/main.rs:121-122`:
+**Types** (`common/src/lib.rs`): `LbFrontKey` (:241) is 16-byte front
+address + port + proto + pad, v4 stored v4-mapped; `LbFrontBackend` (:254) is
+one `{backend_node_ip, pod_ip}`; `ForwardFlowValue` (:301) is
+`{backend: LbFrontBackend, ingress_ifindex}`. Address fields still use
+legacy pre-rename names (xfa.1 renames them).
 
-```rust
-#[map]
-static LB_FRONT_MAP: HashMap<LbFrontKey, LbFrontBackend> = HashMap::with_max_entries(4096, 0);
-```
+**Readers.** Ingress reads `LB_FRONT_MAP` once per packet, v4 at
+`ebpf/src/main.rs:611` and v6 at `:753`. Decap-forward on the backend node
+reads `TARGET_PORTS` keyed by the INGRESS node's front (v4 `:951`, v6
+`:1163`) -- the front rides through Geneve unrewritten -- after the
+`POD_TARGETS` stale-pod check (`:915`). Return paths read neither.
 
-`LbFrontKey` (`common/src/lib.rs:210-217`) is the front tuple (`vip_ip:
-[u8;16]`, `vip_port`, `proto`); `LbFrontBackend` (`common/src/lib.rs:224-230`)
-is exactly **one** `{ backend_node_ip, pod_ip }` pair. There is no count, no
-list, no array -- the value type itself has room for one backend, full stop.
-(Naming note: the mayor-9gr0n/mayor-aie31.21 bead text calls these
-`VIP_MAP`/`VipKey`/`VipBackend`; those names never existed in this repo --
-`LB_FRONT_MAP`/`LbFrontKey`/`LbFrontBackend` are the real, current names,
-confirmed against `ebpf/src/main.rs` and `common/src/lib.rs`.)
+**Writers.** Controller: `reconcile_service` (`controller/src/reconcile.rs:389`)
+collects all ready candidates per Service port (:405-409) and keeps only the
+lowest pod IP (:410-420, "Decision #5 ... placeholder"); `apply.rs:60-61`
+opens the two pinned maps. Loader: `populate_fixtures` (`src/main.rs:563`)
+inserts one backend per `--fixture`; a repeated front silently overwrites.
+So all three layers agree on one backend per front today.
 
-**The lookup.** `ebpf/src/main.rs:533`, inside
-`try_uplink_ingress_headers` (the forward-path ingress classifier):
+**Per-family gap (beep-39a, in flight).** A dual-stack Service's v6 front was
+programmed with the v4 pod (`LB_FRONT_MAP` value `::ffff:192.168.104.14` under
+a v6 key). Selection must therefore be **per front, hence per family**: a
+front's endpoint set contains only endpoints whose pod address is the
+front's family; the hash and count are per front and never see the other
+family. beep-39a fixes this in `reconcile_service`; xfa.1 and 5lw must not
+re-merge families.
 
-```rust
-let backend = *unsafe { LB_FRONT_MAP.get(key) }?;
-```
+**Recently landed, relevant:** #154 (node address roles: underlay vs
+fronts), #157 (`Endpoint.node_addrs`, `controller/src/reconcile.rs:218`, node
+identity decided against the set), #158 (configurable `NODE_ALLOW`/`POD_TARGETS`
+caps; `capacity_hint` in `src/lib.rs:346`), #156 (egress pass-on-miss).
 
-One `get`, one value, no selection logic of any kind. This `backend` is
-what's threaded into `ForwardFlowValue` and pinned into `FWD_PENDING`
-(`ebpf/src/main.rs:562-571`) -- the affinity-pin machinery downstream already
-expects "the chosen backend," it just has never had more than one candidate
-to choose from.
+## 2. Target schema (this IS the xfa.1 schema)
 
-**The loader fixture.** `src/main.rs:371-406` (`fixture_key`/
-`populate_fixtures`): `--fixture` is `required = true` and repeatable
-(`src/main.rs:87-88`, `Vec<Fixture>`), but `fixture_key` hashes on
-`(vip_ip, vip_port, proto)` alone, and `populate_fixtures` does a plain
-`HashMap::insert` per fixture (`src/main.rs:390-405`). Two `--fixture` flags
-naming the same VIP:port:proto with different backends do not merge or
-error -- the later flag silently overwrites the earlier one in
-`LB_FRONT_MAP`. There is no CLI syntax today for "these two backends are
-alternatives for the same front."
-
-**The controller.** `controller/src/reconcile.rs:303-353`
-(`reconcile_service`) already collects every ready endpoint for a Service
-port (`candidates`, line 319-323) and then throws all but one away:
+Two maps replace `LB_FRONT_MAP` + `TARGET_PORTS`; `POD_TARGETS` stays.
 
 ```rust
-// Decision #5 (single backend per front): today's LB_FRONT_MAP schema
-// holds exactly one backend per front, so pick deterministically --
-// lowest pod IP -- rather than arbitrarily ...
-candidates.sort_by_key(|e| e.pod_ip);
-let Some(backend) = candidates.first() else { continue; };
+// beep-common, all #[repr(C)], explicit padding, no layout surprises
+struct FrontMeta { ready_count: u32, flags: u32 }          // flags: IS_LOCAL
+struct FrontEndpointKey { front: LbFrontKey, slot: u16 }   // 22 bytes, align 2
+struct FrontEndpoint { backend: LbFrontBackend, target_port: u16, _pad: u16 }
+// FRONT_META: HashMap<LbFrontKey, FrontMeta>
+// FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint>
 ```
 
-This is the exact deferred decision the bead description names ("Decision
-#5 ... deferred separately"). The controller-side data (`EndpointSliceView`,
-`Endpoint { pod_ip, node_ip, ready, ports }`, `controller/src/reconcile.rs:
-134-140`) already carries every ready endpoint; nothing about the watch
-layer needs to change, only what `reconcile_service` does with the
-already-collected `candidates` list.
+- `LbFrontBackend` and `ForwardFlowValue` stay **byte-identical**: the pin
+  keeps `{backend_node_ip, pod_ip}` + ifindex, so the `FLOW_TABLE` value
+  size, the union readers and the beep-03i eviction sweep are untouched.
+  `target_port` lives in the endpoint value, not in the pin.
+- `IS_LOCAL` means "this node owns this FRONT address" only. Front and
+  underlay address sets stay separate: `backend_node_ip`, `NODE_ALLOW` and
+  the return-leg ingress node are underlay concepts and never derive from
+  the front set.
+- Map count stays 8 (two replace two), so the memory-assert name list swaps
+  names but keeps its length. `FRONT_ENDPOINTS` is larger than the old map
+  (key 22 B + value 36 B per row, one row per front x endpoint); size its
+  default from the design doc's <1000-endpoint budget
+  (`docs/design/ebpf-lb-dataplane.md:131-132` already budgets a front-IP map
+  and a separate endpoint map) and re-measure against the 4 MiB ceiling
+  (`assert-ebpf-map-memory.sh:61`) with a live `bpftool map show`.
+- Capacity follows the existing pattern (answers the old Q5): one
+  `--*-max-entries` flag per new map (replacing `--lb-front-map-*` and
+  `--target-ports-*`), pinned-at-creation semantics, and `capacity_hint`
+  extended to name both so an `E2BIG` is fail-loud.
 
-**What can't be represented today:** any Service with more than one ready
-endpoint. `LB_FRONT_MAP` structurally has room for exactly one backend per
-front; the controller structurally discards every endpoint but one before
-it ever reaches the map; the loader's `--fixture` flag has no syntax for
-more than one backend per front either. All three layers agree with each
-other today (self-consistent single-backend design), which is exactly why
-this is a schema change, not a bug fix.
+**xfa.1 behaviour (count = 1):** ingress does `FRONT_META.get(front)`, then
+`FRONT_ENDPOINTS.get((front, 0))`; decap does the same slot-0 lookup for
+`target_port`. A meta miss or `ready_count == 0` is today's miss path. The
+controller writes `ready_count = 1` and slot 0 = the existing pick.
 
-## 2. Endpoint-map schema
+**Apply ordering (needed even at count 1):** write the endpoint row before
+raising the count; lower the count before deleting rows. A reader that sees
+count > rows gets an endpoint miss and drops that packet, same as today's
+fail-closed convention; it must never read a stale row as valid.
 
-Replace `LB_FRONT_MAP`'s single-value shape with two maps:
+## 3. Selection and the affinity pin (the correction)
 
-```rust
-// beep-common
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LbFrontEndpointKey {
-    pub front: LbFrontKey, // 20 bytes, no padding (existing type, unchanged)
-    pub slot: u16,         // offset 20 is already 2-aligned: no padding gap
-}
-```
+**Selection:** a pure `beep-common` fn
+`select_backend_slot(client_ip: [u8;16], client_port, front: &LbFrontKey,
+ready_count: u32) -> Option<u32>` using the bit-mixing style of
+`synthetic_port_seed` (`common/src/lib.rs:800`), no hashing crate. 16-byte
+addresses, not the old `u32` signature, because fronts are dual-stack.
+Deterministic, stateless, same answer on any CPU/node; round-robin needs a
+shared mutable cursor and Maglev's permutation table buys little at beep's
+scale because the pin carries stability.
 
-- `LB_FRONT_COUNT: HashMap<LbFrontKey, u32>` -- ready-endpoint count for a
-  front. A miss means "no such front" or "zero ready backends," identical
-  in effect to today's `LB_FRONT_MAP` miss (drop/pass-through via `?`).
-- `LB_FRONT_ENDPOINTS: HashMap<LbFrontEndpointKey, LbFrontBackend>` -- the
-  indexed table, slots `0..ready_count-1` populated contiguously per front.
-  Reuses `LbFrontBackend` unchanged (no new value type).
+**Verified: the pin stores the backend, not the slot -- but ingress does not
+steer from it.** `ForwardFlowValue.backend` (`common/src/lib.rs:301-304`)
+holds `{backend_node_ip, pod_ip}`; no slot index exists anywhere in
+conntrack. However ingress re-resolves the front on **every** packet
+(`ebpf/src/main.rs:611`, `:753`) and uses that fresh `backend` for the Geneve
+remote (:655, :786) and pod option (:674); `fwd_pending_affinity_pin`
+(`common/src/lib.rs:458`) only guards what is *written* into `FWD_PENDING`,
+and the pinned `backend` is read back only by eviction
+(`src/lib.rs:229-238`) -- the decap-return path reads just `ingress_ifindex`
+(`:1420`). Today that is harmless (one backend per front). With N endpoints,
+any change to N or to slot order would re-steer **established** flows to a
+different pod mid-connection. So 5lw must change ingress to: established
+(`FLOW_TABLE` forward hit) -> use the pinned backend; pending hit -> use the
+pending backend; miss -> hash to a slot and pin. The ADR's "later packets
+follow the stored pin" is only true once that lands.
 
-**Verifier/bounded-lookup trade-off.** This design needs **no loop at all**
-on the hot path -- unlike `resolve_backend_src_port`'s `PROBE_LIMIT`-bounded
-probe loop (`common/src/lib.rs:592-612`, a different problem: reverse-key
-conflict resolution), backend selection is one hash, one integer modulo,
-and one direct-key `HashMap` lookup:
+## 4. Composition with eviction (implemented)
 
-1. `LB_FRONT_COUNT.get(front_key)` -> `ready_count` (miss = today's drop
-   path, unchanged).
-2. `slot = hash(flow_tuple) % ready_count` (guard `ready_count == 0` the
-   same way a miss is guarded -- one scalar op, no loop, trivially provable
-   termination).
-3. `LB_FRONT_ENDPOINTS.get(LbFrontEndpointKey { front: front_key, slot })`
-   -> `LbFrontBackend` (miss should not happen if the controller keeps slots
-   dense, but must still be handled as "no backend," matching this file's
-   existing fail-loud drop convention rather than assumed).
+Epic beep-03i is closed: on endpoint removal the controller prunes
+`POD_TARGETS` and runs `evict_pod_flows` (`src/lib.rs:273`, called from
+`controller/src/apply.rs:231-257`), sweeping `FWD_PENDING` and `FLOW_TABLE`
+Forward/Reverse/PortMemo rows by departed `pod_ip` (`stale_forward_entries`
+keys on `value.backend.pod_ip`, `src/lib.rs:229`; reverse/port-memo on the
+key's pod address, :249). Smoke step "evict-pod" (`scripts/smoke.sh:30`)
+proves it on a live kernel. Consequences for this plan:
 
-Net cost over today: one extra `HashMap` lookup (2 total instead of 1) on
-the ingress fast path. No new loop, no new verifier risk class.
+- Eviction keys on pod address, so the same pod behind several fronts is
+  swept in one pass; no endpoint-table coupling.
+- With pin-steering (section 3), a removed endpoint's flows are deleted, the
+  next packet misses, and the hash picks a surviving slot -- the intended
+  re-home. Without pin-steering, eviction would be the only thing keeping
+  established flows off a re-numbered slot, which it is not designed to do.
+- The remaining window is between the endpoint row disappearing and the
+  sweep: new flows hash only over rows that exist (count lowered first),
+  so they cannot select the departed pod.
 
-**Sizing.** `docs/design/ebpf-lb-dataplane.md`'s own sizing table
-(lines 122-134) *already* budgets for exactly this split and has since
-Phase 1 (`as_of: 2026-09-07`, predates beep-5lw): a "Front-IP map (<100
-Services x <=2 protocols)" row at ~25 KiB *and a separate* "Endpoint map
-(<1000 endpoints)" row at ~128 KiB, explicitly annotated "Full map on every
-node." `LB_FRONT_COUNT` is the (cheap) front-IP-map role; `LB_FRONT_ENDPOINTS`
-is the (larger) endpoint-map role. The design intent for a real endpoint
-map predates this bead; it was simply never implemented -- `LB_FRONT_MAP`
-stayed a single-value placeholder through Phase 2/3/5.
+## 5. Controller
 
-`assert-ebpf-map-memory.sh:45` hard-codes the exact expected map name set
-(9 names today, including `LB_FRONT_MAP`) and a 4 MiB gross-regression
-ceiling (`assert-ebpf-map-memory.sh:60-61`). This gate **must** be updated
-(swap `LB_FRONT_MAP` for `LB_FRONT_COUNT`+`LB_FRONT_ENDPOINTS`, 10 names
-total) as part of the implementation bead, and the new total should be
-re-measured against the 4 MiB ceiling rather than assumed safe -- plain
-`HASH` maps (unlike the `LRU_HASH` conntrack tables this ceiling's comment
-walks through) may not fully preallocate `max_entries` up front, but that
-should be confirmed against a live `bpftool map show`, not asserted here.
+`reconcile_service` (`controller/src/reconcile.rs:389`) already has every
+ready endpoint in `candidates`. 5lw replaces the pick-one with: filter to
+the front's address family (beep-39a), sort by `pod_ip` (stable slots for the
+same input), emit `FRONT_ENDPOINTS[(front, i)]` per candidate and
+`FRONT_META[front].ready_count = len`. `diff`/`MapOp` are generic over
+key/value and `lb_front_backend_eq` (:494) compares the backend part; the
+endpoint-value comparison must include `target_port`. The existing tests
+encode pick-one and need rewriting. The watch layer parses only the first
+address per endpoint, `nodeName` and `conditions.ready`
+(`controller/src/watch.rs:262-266`); it does not parse `targetRef`.
 
-## 3. Selection algorithm: deterministic hash (not Maglev, not round-robin)
+## 6. Bead breakdown
 
-**Recommendation: plain deterministic hash of the flow 5-tuple, modulo the
-ready count.** Already the accepted design per
-`docs/decisions/servicelb-flow-admission-affinity.md` (Status: Accepted,
-2026-09-06): *"chosen once on a flow's first packet by a deterministic
-hash over the ready set. Later packets follow the stored pin."* This ADR's
-own rationale (lines 43-46) is the strongest argument against Maglev at
-beep's scale: *"at u7s's small, often single-digit endpoint counts,
-per-packet re-hashing's disruption fraction is too large to accept"* --
-which is exactly why affinity pinning (not the selection algorithm) is what
-carries the consistency burden. Once a flow is pinned, the selection
-algorithm is never consulted again for that flow until its specific backend
-is evicted -- at which point *that* flow has to move somewhere regardless
-of algorithm; no algorithm avoids that.
+**(a) beep-xfa.1 -- shape, count = 1, behaviour-preserving (increment
+~8-12h on top of the consolidation it already owns):**
 
-**Why not Maglev.** Maglev's entire value proposition is minimizing how
-many *unrelated* flows get reassigned when the backend set changes, via a
-large (typically >=65537-slot) per-service permutation table the control
-plane builds and keeps in sync. At beep's declared scale (design doc:
-"<10 nodes/<100 Services/<1000 endpoints," often single-digit endpoints per
-Service) that permutation table's memory and controller-side complexity
-buys almost nothing over plain `hash % N`, because affinity pinning already
-absorbs the "don't disturb existing flows" requirement structurally --
-Maglev and plain hashing produce identical behavior for already-pinned
-flows (neither is ever asked to re-decide), and for brand-new flows during
-a churn window, N is small enough that plain hashing's redistribution
-fraction is not the dominant cost.
+1. common: `FrontMeta`, `FrontEndpointKey`, `FrontEndpoint` + layout tests
+   (no padding, round-trip) (S, 2-3h).
+2. ebpf: two maps, v4/v6 ingress and v4/v6 decap switched to
+   meta -> slot 0 (M, 3-4h incremental).
+3. controller + loader: emit meta + slot 0, two-map apply ordering, fixture
+   population, `--*-max-entries` flags and `capacity_hint`, memory-assert
+   names (S/M, 3-5h incremental).
 
-**Why not round-robin.** Round-robin needs a mutable, shared cursor
-incremented on every new-flow (first-packet-miss) event. In a distributed,
-per-node dataplane with no cross-node coordination (this dataplane's
-explicit design constraint -- every node loads its own eBPF programs and
-maps independently), that cursor is either per-node (so two nodes acting as
-ingress for the same VIP diverge immediately and non-deterministically) or
-needs cross-CPU/cross-node synchronization this dataplane has no mechanism
-for. A hash needs no shared state and gives the same answer on any CPU, any
-node, replayed identically -- a strictly stronger property for zero
-additional cost.
+**Where xfa.1 stops (scope-creep risks).** Out of xfa.1, each with the
+temptation that causes the creep:
 
-**Concrete shape.** A pure function in `beep-common`, mirroring
-`synthetic_port_seed`'s existing bit-mixing style
-(`common/src/lib.rs:648-652`) rather than pulling in a hashing crate
-(minimal-deps stance):
+- `ready_count > 1` or any hash: tempting because the table is right there;
+  xfa.1 asserts count == 1 in tests and the controller keeps the lowest-pod
+  pick.
+- Pin-steering at ingress: tempting while editing the same lines
+  (`:611`/`:753`); it changes forward-path semantics and needs its own
+  smoke (5lw).
+- Carrying `target_port` in the Geneve option so decap drops its front
+  lookup: tempting because xfa.1 already touches decap; it changes the wire
+  option length and both ends (5lw, Q2).
+- Changing `LbFrontBackend`/`ForwardFlowValue` layout (e.g. folding
+  `target_port` into the pin): breaks the `FLOW_TABLE` value size and the
+  03i union readers.
+- Family filtering (beep-39a), weights, terminating endpoints, BackendId/UID.
+- Legacy front-address renames: bound to `LbFrontKey`/`RevFlowValue`
+  fields and the code the new types touch; a repo-wide rename of every test
+  literal is the likeliest source of diff bloat -- split it if it exceeds
+  the shape change itself.
 
-```rust
-pub fn select_backend_slot(client_ip: u32, client_port: u16,
-                            front_ip: u32, front_port: u16,
-                            ready_count: u32) -> Option<u32> {
-    if ready_count == 0 { return None; }
-    let mixed = /* same rotate/xor mixing style as synthetic_port_seed */;
-    Some(mixed % ready_count)
-}
-```
+**(b) beep-5lw -- behaviour (~23-37h):**
 
-Unit-testable exactly like `resolve_backend_src_port` (host-side, no kernel
-needed): fixed inputs produce a fixed slot; sweeping many flows across a
-fixed `ready_count` should distribute roughly evenly (same style of test as
-`common/src/lib.rs`'s existing `many_fronts_sharing_a_backend_pod_never_
-produce_a_duplicate_reverse_key`).
+1. common: `select_backend_slot` + determinism/distribution tests (S, 2-3h).
+2. ebpf: pin-steering at ingress, hash on miss, v4+v6 (M, 6-9h). Largest
+   verifier/correctness surface; needs the established-flow stability test.
+3. decap target_port per endpoint (Geneve option or slot match), v4+v6
+   (M, 5-8h); only if Q2 resolves to per-endpoint.
+4. controller: emit all ready endpoints per front-family, two-map diff
+   ordering, rewrite pick-one tests (M/L, 6-10h).
+5. smoke: 2+ pods behind one front, assert traffic lands on more than one
+   and that endpoint removal re-homes only the removed pod's flows (M, 3-5h;
+   Linux/Lima only).
+6. docs: sizing table, packet-flow note (`ebpf-lb-dataplane.md:55`) (S, 1-2h).
 
-## 4. Composition with mayor-aie31.21 (fixed, not re-litigated)
-
-aie31.21's accepted decision (`bd show mayor-aie31.21`, operator 2026-09-07):
-stored per-flow affinity, `FWD_FLOW` (now `FWD_PENDING`/`FLOW_TABLE` in this
-repo's real map names) pins the **full** backend identity
-(`backend_node_ip` + `pod_ip`), chosen **once** on the first-packet miss via
-a deterministic hash over the ready set; later packets follow the pin.
-Eviction table: UDP `FWD_FLOW` delete mandatory, TCP `FWD_FLOW` delete YES,
-`REV_FLOW` delete both protocols.
-
-**The pin mechanism is already built, in this repo, today** --
-`ForwardFlowValue { backend: LbFrontBackend, ingress_ifindex: u32 }`
-(`common/src/lib.rs:270-275`), `FwdPendingPin`/`fwd_pending_affinity_pin`
-(`common/src/lib.rs:319-340`), wired into `try_uplink_ingress_headers`
-(`ebpf/src/main.rs:555-572`): on a `FLOW_TABLE` miss, it mints exactly once
-into `FWD_PENDING` and never rewrites an existing pin. This is precisely
-aie31.21's "chosen once ... later packets follow the stored pin" -- it is
-just currently fed by `LB_FRONT_MAP`'s single fixed value instead of a
-selection among N.
-
-**The seam is exactly line 533.** Today:
-
-```rust
-let backend = *unsafe { LB_FRONT_MAP.get(key) }?;
-```
-
-becomes (schematically):
-
-```rust
-let ready_count = unsafe { LB_FRONT_COUNT.get(key) }.copied()?;
-let slot = select_backend_slot(src_ip, src_port, dst_ip, dst_port, ready_count)?;
-let backend = *unsafe {
-    LB_FRONT_ENDPOINTS.get(LbFrontEndpointKey { front: key, slot })
-}?;
-```
-
-Everything downstream of this line (`ForwardFlowValue` construction,
-`fwd_pending_affinity_pin`, promotion into `FLOW_TABLE` on the observed
-return leg) is untouched. beep-5lw's entire dataplane-side surface area is
-this one substitution: what feeds the pin, not how the pin itself works.
-
-**Eviction is NOT implemented and is out of scope here.** Grepped across
-`ebpf/`, `src/`, `controller/`: no selective delete-on-endpoint-removal
-pass exists anywhere in this repo -- only passive LRU aging. aie31.21's
-eviction half (mandatory UDP `FWD_FLOW` delete, TCP YES, `REV_FLOW` both
-protocols) remains open implementation work, tracked under aie31.21 itself,
-not this bead. beep-5lw's multi-endpoint selection makes that eviction work
-*matter more* (a departed endpoint that was one of several is now silently
-still selectable by a stale `LB_FRONT_ENDPOINTS` slot until the controller's
-next reconcile removes it -- a narrower window than today's single-backend
-case, not a new hazard), but does not require implementing it.
-
-## 5. Controller programming
-
-**A real controller exists in this repo today** -- `controller/`
-(`beep-controller` crate: `main.rs`, `watch.rs`, `reconcile.rs`, `apply.rs`,
-`status.rs`). `mayor-9gr0n` (closed 2026-09-11 in the mayor tracker) is the
-design ancestor; git history shows the actual crate landing in *this* repo
-starting `f8222ae` (2026-09-10, `feat(controller): beep-controller crate +
-pure reconcile fn + tests`) and growing under beep's own bead series (e.g.
-beep-90g vendoring `beep-kubeconfig`). This is live, tested code, not
-aspirational -- `reconcile_service` and `diff`/`apply_ops` already have a
-substantial unit-test suite (`controller/src/reconcile.rs:410+`,
-`controller/src/apply.rs:341+`). Do not treat mayor-9gr0n's "controller
-watches Service/EndpointSlice" as future work; it is done. What's
-unfinished is specifically the pick-one step inside it.
-
-**The change.** `reconcile_service` (`controller/src/reconcile.rs:303-353`)
-already builds `candidates: Vec<&Endpoint>` from every ready endpoint
-across every `EndpointSliceView` (line 309, 319-323) before discarding all
-but the lowest-pod-IP one. Replace the discard with:
-
-- Sort `candidates` deterministically (already does this, by `pod_ip`) so
-  two reconciles over the same input assign the same slot to the same
-  endpoint -- unchanged property, just no longer collapsed to one.
-- Emit one `LbFrontEndpointKey { front: key, slot: i }` -> `LbFrontBackend`
-  entry per candidate into a new `desired.lb_front_endpoints: HashMap<
-  LbFrontEndpointKey, LbFrontBackend>` field on `DesiredEntries`
-  (`controller/src/reconcile.rs:171-225`).
-- Emit `desired.lb_front_count: HashMap<LbFrontKey, u32>` with
-  `candidates.len()` for the front.
-
-The existing `diff`/`MapOp<K, V>` machinery (`controller/src/reconcile.rs:
-355-402`) is already generic over `K, V` and needs no change; `apply.rs`'s
-`PinnedMaps`/`apply_ops` (`controller/src/apply.rs:38-100`) needs two new
-`open_hash_map` calls (`LB_FRONT_ENDPOINTS`, `LB_FRONT_COUNT`) replacing the
-one for `LB_FRONT_MAP`, following the exact pattern already used for
-`TARGET_PORTS`.
-
-**Loader-side fixture parity.** `src/main.rs`'s `--fixture` flag and
-`populate_fixtures` (`src/main.rs:380-406`) is the non-controller,
-smoke-test code path and needs the equivalent change: allow repeated
-`--fixture` entries sharing a front to become slots 0..N-1 in
-`LB_FRONT_ENDPOINTS` instead of silently overwriting each other in
-`LB_FRONT_MAP`, plus write `LB_FRONT_COUNT`. `MAP_NAMES`
-(`src/lib.rs:33-42`) needs `LB_FRONT_MAP` swapped for the two new names.
-
-## 6. Proposed bead breakdown (for operator approval -- not created)
-
-Dependency order top to bottom; no beads created per this task's scope.
-
-1. **beep-common: endpoint-map types + selection hash (S, ~3-4h).** Add
-   `LbFrontEndpointKey`, `select_backend_slot` (+ no-padding/round-trip/
-   distribution unit tests mirroring the existing `resolve_backend_src_
-   port` test style). No kernel dependency; runs on macOS via `cargo test
-   -p beep-common`.
-2. **ebpf: swap `LB_FRONT_MAP` for `LB_FRONT_COUNT`+`LB_FRONT_ENDPOINTS`,
-   wire the selection call into `try_uplink_ingress_headers` (M, ~5-8h).**
-   Depends on (1). Touches `ebpf/src/main.rs:121-138` (map decls) and
-   `:527-572` (selection + pin). Update
-   `scripts/assert-ebpf-map-memory.sh:45`'s expected name list and re-verify
-   the 4 MiB ceiling against a live `bpftool map show`.
-3. **loader: `--fixture`/`populate_fixtures` multi-backend support (S/M,
-   ~3-5h).** Depends on (1)+(2). Touches `src/main.rs:371-406`,
-   `src/lib.rs:33-42` (`MAP_NAMES`).
-4. **controller: `reconcile_service` emits all ready endpoints, `apply.rs`
-   wiring (M/L, ~6-10h).** Depends on (1)+(2). Touches
-   `controller/src/reconcile.rs:171-225,303-353` and
-   `controller/src/apply.rs:38-100`; the existing ~450-line test suite in
-   both files encodes today's pick-one behavior and needs rewriting, not
-   just extending -- this is the biggest single piece of work in the plan.
-5. **dataplane smoke: multi-backend round trip + distribution assertion
-   (M, ~3-5h).** Depends on (2)+(3)+(4). Extends `scripts/smoke.sh` (or a
-   sibling script) to run 2+ backend fixtures/pods behind one VIP and
-   assert traffic actually lands on more than one, not just that it round-
-   trips. Linux/Lima-VM only, per this repo's build-gate split.
-6. **docs: sizing table + packet-flow note reconciliation (S, ~1-2h).**
-   `docs/design/ebpf-lb-dataplane.md`'s sizing table (lines 122-134)
-   already anticipates this split; update it to name the real map pair and
-   confirm the "(2) Ingress hashes to a ready backend" packet-flow line
-   (line 55) now matches the implementation instead of describing intent
-   only.
-
-**Total: ~21-34 hours.** Suggested priority: **P2**, matching the parent
-epic (`mayor-aie31`) and `mayor-aie31.21` -- a load balancer that can only
-front one backend per Service is not yet doing the thing its name promises,
-and this is core-correctness work, not a performance nicety.
+Suggested priority: P2 -- a load balancer that fronts one backend per
+Service is not yet doing what its name promises.
 
 ## 7. Open questions for the operator
 
-1. **Contiguous slot renumbering vs. BackendId indirection.** The schema in
-   Section 2 renumbers `LB_FRONT_ENDPOINTS` slots 0..N-1 contiguously per
-   front; removing endpoint at slot k shifts every slot after it. At
-   beep's declared scale (<1000 endpoints total) this is cheap per
-   reconcile tick, and only affects yet-unpinned new flows during the
-   reconcile race (already-pinned flows are untouched, per Section 4). The
-   alternative -- a global, controller-assigned `BackendId` table decoupled
-   from any one front's slot numbering (Cilium's actual design) -- avoids
-   renumbering entirely but adds a second indirection hop and a controller-
-   side ID allocator/lifecycle this bead's plan does not otherwise need.
-   Recommend accepting the simpler renumbering design; flag if churn proves
-   to matter in practice.
-2. **Same backend, multiple fronts.** A pod backing two Service ports (two
-   `LbFrontKey`s) gets two independent `LB_FRONT_ENDPOINTS` entries under
-   the Section 2 schema -- no dedup. Acceptable at declared scale; revisit
-   if `LB_FRONT_ENDPOINTS`'s size becomes a real constraint.
-3. **Weighted selection.** `Endpoint` (`controller/src/reconcile.rs:134-140`)
-   carries no weight field; Section 3's hash treats every ready endpoint
-   as equal-probability. Is unweighted selection sufficient for v1, or does
-   `externalTrafficPolicy=Local`-style node-local preference need scoping
-   now?
-4. **Terminating-but-still-serving endpoints.** `Endpoint.ready` is the
-   only readiness signal tracked today (`controller/src/watch.rs:161`,
-   "`conditions.ready` defaults to `true`") -- there is no separate
-   terminating/serving distinction. Should a *newly selected* flow (first-
-   packet miss) ever be allowed to land on a terminating-but-still-serving
-   endpoint, or should the ready-set for new selections exclude it while
-   aie31.21's (not-yet-built) eviction still treats it as valid for
-   already-pinned flows? Worth deciding before, not during, aie31.21's
-   eviction implementation.
-5. **`LB_FRONT_COUNT`/`LB_FRONT_ENDPOINTS` `max_entries` defaults.** Follow
-   the existing `--fwd-pending-max-entries`-style DaemonSet-configurable
-   pattern (`src/lib.rs:165-186`), or hard-code the design doc's <1000-
-   endpoint ceiling for v1 and make it configurable later?
+**1. New identity needed? (Mayor analysis, verified.) No.**
+- Fronts are already keyed by `LbFrontKey` (front address + port + proto).
+- Backends are already identified by `(pod_ip, target_port)`: the pin stores
+  `pod_ip` (section 3), eviction keys on it (section 4), and
+  `FrontEndpoint` carries both. Verified differences from the mayor note:
+  eviction matches `pod_ip` alone, not the pair, which is correct (a departed
+  pod takes every port with it).
+- `targetRef.uid` (Pod UID) exists on EndpointSlice endpoints but the
+  controller does not parse it (`watch.rs:262-266`); nothing in the
+  dataplane needs it. Use it only if controller-side diffing across pod-IP
+  reuse proves ambiguous.
+- The "renumbering vs BackendId" fork is not an identity gap. Hash-mod-N
+  needs dense positions 0..N-1 and a UID cannot be an array index; Cilium's
+  BackendId exists to keep positions stable. Because the pin stores the
+  backend (not the slot) and, after 5lw's pin-steering, ingress follows the
+  pin, renumbering re-maps only NEW flows.
+- **Recommendation:** per-front slot renumbering, identity `(pod_ip,
+  target_port)`, no BackendId table. Maglev is the later upgrade if churn
+  matters; it also needs no new identity.
+- Caveat: "renumbering only re-maps new flows" holds only after 5lw's
+  pin-steering lands (section 3); until then it is false.
+
+**2. Where does `target_port` live, and how does decap find it? (Before
+xfa.1.)** Operator direction puts it in the endpoint value. At count 1 decap
+reads slot 0. At N the backend node only knows the front and `pod_ip`, not
+the slot, and named ports can resolve differently per pod. Options: (a)
+carry `target_port` in the Geneve option beside `pod_ip` (removes decap's
+front lookup entirely; recommended, 5lw); (b) require all endpoints of a
+front to share one port and drop disagreeing ones (simple, loses named-port
+semantics); (c) scan slots for the `pod_ip` match (a loop; avoid). xfa.1 only
+needs agreement that `target_port` is in the endpoint value and decap uses
+slot 0 for now.
+
+**3. Same pod behind several fronts? (Before xfa.1; answer: no dedup.)**
+Each front owns its own rows. Acceptable at the declared scale; eviction
+already sweeps by pod address. Schema-neutral.
+
+**4. Weights. (Before 5lw only.)** `Endpoint`
+(`controller/src/reconcile.rs:212`) has no weight. Recommend unweighted for
+v1; `FrontEndpoint._pad` can hold a weight later without a size change, so
+this is not schema-affecting now.
+
+**5. Terminating-but-serving endpoints. (Before 5lw only.)** Only
+`conditions.ready` is tracked (`watch.rs:265`, defaulting to true).
+Recommend excluding terminating endpoints from the selectable set; already
+pinned flows are unaffected by that choice (pin-steering) and are cleaned up
+by eviction when the pod goes away. No per-endpoint flag needed.
+
+**6. `max_entries` defaults. Resolved:** follow the `--*-max-entries`
+pattern (section 2) unless the memory re-measure rules a default out.
