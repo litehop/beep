@@ -508,7 +508,7 @@ fn recreate_mismatched_pins(pin_dir: &Path, max_entries: &[(&str, u32)]) -> anyh
     if !MAP_NAMES.iter().any(|n| pin_dir.join(n).exists()) {
         return Ok(());
     }
-    let probe_dir = pin_dir.join(".requested");
+    let probe_dir = pin_dir.join("requested-probe");
     let _ = std::fs::remove_dir_all(&probe_dir);
     std::fs::create_dir(&probe_dir).with_context(|| format!("creating {}", probe_dir.display()))?;
     let result = (|| {
