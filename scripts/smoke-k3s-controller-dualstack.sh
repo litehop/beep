@@ -372,15 +372,15 @@ front_has_family() { # front_has_family <vm> <port> <family: v4|v6> [any] -- tru
   [ "$rc" -le 1 ] || { echo "FAIL: $vm FRONT_META/FRONT_ENDPOINTS dump is not parseable JSON -- front presence/absence is unknown" >&2; dump_evidence; exit 1; }
   return "$rc"
 }
-front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
-front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
-front_has_family "$VM_A" "$PORT_V4" v4 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev4 front for $SVC_V4 (port $PORT_V4)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_DUAL" v4 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no live v4 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_DUAL" v6 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no live v6 front for $SVC_DUAL (port $PORT_DUAL)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_V4" v4 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no live v4 front for $SVC_V4 (port $PORT_V4)" >&2; dump_evidence; exit 1; }
 if front_has_family "$VM_A" "$PORT_V4" v6 any; then
   echo "FAIL: $VM_A FRONT_META has a v6 front for SingleStack-IPv4 $SVC_V4 (port $PORT_V4) -- should be v4-only" >&2
   dump_evidence
   exit 1
 fi
-front_has_family "$VM_A" "$PORT_V6" v6 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no livev6 front for $SVC_V6 (port $PORT_V6)" >&2; dump_evidence; exit 1; }
+front_has_family "$VM_A" "$PORT_V6" v6 || { echo "FAIL: $VM_A FRONT_META/FRONT_ENDPOINTS has no live v6 front for $SVC_V6 (port $PORT_V6)" >&2; dump_evidence; exit 1; }
 if front_has_family "$VM_A" "$PORT_V6" v4 any; then
   echo "FAIL: $VM_A FRONT_META has a v4 front for SingleStack-IPv6 $SVC_V6 (port $PORT_V6) -- should be v6-only" >&2
   dump_evidence

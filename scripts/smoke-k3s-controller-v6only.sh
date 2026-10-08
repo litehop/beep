@@ -17,8 +17,9 @@
 # same-node self-loop, so the gate also requires (a) geneve0 counters moving
 # on both nodes, (b) Geneve-over-v6 packets captured on each node's eth0 in
 # BOTH directions between the two ULAs, with the v4 UDP/6081 DROP rule's packet
-# counter still 0 on both nodes (the eth0 capture sits after that drop, so only
-# the counter proves no v4 Geneve was attempted), and (c) a FLOW_TABLE entry for
+# counter unchanged on both nodes since a positive-control probe moved it 0 -> 1
+# (the eth0 capture sits after that drop, so only the counter proves no v4
+# Geneve was attempted), and (c) a FLOW_TABLE entry for
 # the client's v6 address on the ingress node.
 #
 # NOT COVERED: a dual-stack ingress node fronting a v6-only backend node. k3s
@@ -339,6 +340,29 @@ jq -e --argjson b "$(v6_bytes "$ULA_B")" 'any(.[]; .key == $b)' <<<"$dump" >/dev
 }
 echo "MAP-PROGRAMMING: PASS ($VM_A FRONT_META/FRONT_ENDPOINTS [$ULA_A]:$PORT_V6 -> v6 underlay remote $ULA_B / pod $ULA_B; $VM_B POD_TARGETS admits $ULA_B)"
 
+echo "==> positive control: one v4 UDP/6081 probe per node must move the DROP counter 0 -> 1"
+# The probe is a locally generated v4 UDP/6081 datagram, so it takes the same
+# netfilter OUTPUT hook as geneve0's encap: the tunnel's UDP socket transmits
+# through udp_tunnel_xmit_skb -> ip_local_out -> NF_INET_LOCAL_OUT. A counter
+# that stays 0 here would mean the rule is not on that path and NO-V4-GENEVE
+# below could never fail.
+V4_BLOCK_BASELINE_A=""
+V4_BLOCK_BASELINE_B=""
+for vm in "$VM_A" "$VM_B"; do
+  [ "$vm" = "$VM_A" ] && peer="$VM_B" || peer="$VM_A"
+  peer_ip="$(eth0_ip "$peer")"
+  before="$(v4_block_pkts "$vm")" || { echo "NO-V4-GENEVE-CONTROL: FAIL ($vm: cannot read the v4 UDP/6081 DROP counter)" >&2; exit 1; }
+  # the DROP verdict surfaces to sendto as EPERM; the counter below is the assertion
+  limactl shell "$vm" -- sudo bash -c "echo probe > /dev/udp/$peer_ip/6081" 2>/dev/null || true
+  after="$(v4_block_pkts "$vm")" || { echo "NO-V4-GENEVE-CONTROL: FAIL ($vm: cannot re-read the v4 UDP/6081 DROP counter)" >&2; exit 1; }
+  if [ "$before" -ne 0 ] || [ "$after" -ne 1 ]; then
+    echo "NO-V4-GENEVE-CONTROL: FAIL ($vm: DROP counter $before -> $after after one v4 UDP/6081 probe to $peer_ip; wanted 0 -> 1 -- the rule is not matching or not on the OUTPUT path, or v4 Geneve was already attempted)" >&2
+    exit 1
+  fi
+  if [ "$vm" = "$VM_A" ]; then V4_BLOCK_BASELINE_A="$after"; else V4_BLOCK_BASELINE_B="$after"; fi
+done
+echo "NO-V4-GENEVE-CONTROL: PASS (one v4 UDP/6081 probe moved each node's DROP counter 0 -> 1, so the rule matches and sits on the OUTPUT path geneve0 encap traverses)"
+
 echo "==> [9/12] snapshotting geneve0 counters and starting an eth0 Geneve capture on both nodes"
 geneve_pkts() { limactl shell "$1" -- bash -c "ip -s -j link show geneve0 | jq '.[0].stats64.rx.packets + .[0].stats64.tx.packets'"; }
 GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
@@ -397,14 +421,15 @@ for vm in "$VM_A" "$VM_B"; do
 done
 echo "UNDERLAY-V6-TRAVERSAL: PASS (Geneve over v6 observed on both nodes' eth0 in both directions between $ULA_A and $ULA_B -- forward and symmetric return crossed the v6 underlay)"
 for vm in "$VM_A" "$VM_B"; do
+  if [ "$vm" = "$VM_A" ]; then baseline="$V4_BLOCK_BASELINE_A"; else baseline="$V4_BLOCK_BASELINE_B"; fi
   v4_attempts="$(v4_block_pkts "$vm")" || { echo "NO-V4-GENEVE: FAIL ($vm: cannot read back exactly one v4 UDP/6081 DROP rule -- v4 attempts are unknown)" >&2; dump_evidence; exit 1; }
-  if ! [[ "$v4_attempts" =~ ^[0-9]+$ ]] || [ "$v4_attempts" -ne 0 ]; then
-    echo "NO-V4-GENEVE: FAIL ($vm's v4 UDP/6081 DROP rule counted '$v4_attempts' packets -- the dataplane attempted v4 Geneve on a v6-only cluster)" >&2
+  if ! [[ "$v4_attempts" =~ ^[0-9]+$ ]] || [ "$v4_attempts" -ne "$baseline" ]; then
+    echo "NO-V4-GENEVE: FAIL ($vm's v4 UDP/6081 DROP rule counted '$v4_attempts' packets, baseline after the control probe was $baseline -- the dataplane attempted v4 Geneve on a v6-only cluster)" >&2
     dump_evidence
     exit 1
   fi
 done
-echo "NO-V4-GENEVE: PASS (the v4 UDP/6081 DROP rule's packet counter is 0 on $VM_A and $VM_B after the round trip -- no v4 Geneve was ever attempted, not merely none seen past the drop)"
+echo "NO-V4-GENEVE: PASS (the v4 UDP/6081 DROP rule's packet counter is unchanged from its post-control baseline on $VM_A and $VM_B after the round trip -- no v4 Geneve was ever attempted, not merely none seen past the drop)"
 
 echo "==> [12/12] confirming a FLOW_TABLE entry for the client exists on the ingress node"
 dump="$(map_dump "$VM_A" FLOW_TABLE)" || { echo "FAIL: cannot read $VM_A FLOW_TABLE" >&2; dump_evidence; exit 1; }

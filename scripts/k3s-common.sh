@@ -64,12 +64,61 @@ k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy
   fi
 }
 
-k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 0|1> <k3s-installed: 0|1> <read-ok: 0|1> <internal-ips> -- prints keep, reinstall, or unreadable. A reinstall wipes the cluster, so it needs a positive read of the node's InternalIPs: an installed k3s whose kubectl failed or answered empty (apiserver briefly down) is unreadable, never "not shaped as requested". A plain call keeps a dual-stack cluster but cannot use a v6-only one (the agent joins over v4).
-  local dual="$1" v6_only="$2" installed="$3" read_ok="$4" addrs="$5" have_v4=0 have_v6=0
+k3s_is_ipv4() { # k3s_is_ipv4 <token> -- strict dotted quad: four octets 0-255, no leading zeros
+  local o
+  [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  local IFS=.
+  for o in $1; do
+    [ "$o" -le 255 ] || return 1
+    [ "${#o}" -eq 1 ] || [ "${o:0:1}" != "0" ] || return 1
+  done
+}
+
+k3s_is_ipv6() { # k3s_is_ipv6 <token> -- strict v6 literal: hex groups of 1-4 digits, 8 groups or fewer with exactly one "::", optional trailing embedded v4; no brackets, ports or zones
+  local t="$1" head tail g groups=0 v4_tail
+  [[ "$t" =~ ^[0-9A-Fa-f:.]+$ ]] && [[ "$t" == *:* ]] || return 1
+  [[ "$t" == *:::* ]] && return 1
+  if [[ "$t" == *.* ]]; then
+    v4_tail="${t##*:}"
+    k3s_is_ipv4 "$v4_tail" || return 1
+    t="${t%"$v4_tail"}0:0"
+  fi
+  if [[ "$t" == *::* ]]; then
+    head="${t%%::*}"
+    tail="${t#*::}"
+    [[ "$tail" == *::* ]] && return 1
+    [[ "$head" == :* || "$head" == *: || "$tail" == :* || "$tail" == *: ]] && return 1
+  else
+    [[ "$t" == :* || "$t" == *: ]] && return 1
+    head="$t"
+    tail=""
+  fi
+  for g in ${head//:/ } ${tail//:/ }; do
+    [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    groups=$((groups + 1))
+  done
+  if [[ "$t" == *::* ]]; then
+    [ "$groups" -le 7 ]
+  else
+    [ "$groups" -eq 8 ]
+  fi
+}
+
+k3s_confirm_reinstall() { # k3s_confirm_reinstall <first-decision> <second-decision> -- a wipe needs two consecutive reads that both say reinstall; disagreement (e.g. a node still registering its second InternalIP) is unreadable, so a transient partial list never destroys a healthy cluster. Agreeing keep/unreadable pass through.
+  if [ "$1" = "$2" ]; then echo "$1"; else echo unreadable; fi
+}
+
+k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 0|1> <k3s-installed: 0|1> <read-ok: 0|1> <internal-ips> -- prints keep, reinstall, or unreadable. A reinstall wipes the cluster, so it needs a positive read of the node's InternalIPs in which EVERY whitespace-separated token is a strict IP literal: a failed, empty, or error-text answer (even one with dots/colons, e.g. 'error: 127.0.0.1:6443' with exit 0) is unreadable, never "not shaped as requested". A plain call keeps a dual-stack cluster but cannot use a v6-only one (the agent joins over v4).
+  local dual="$1" v6_only="$2" installed="$3" read_ok="$4" ips="$5" have_v4=0 have_v6=0 tok any=0 bad=0
   [ "$installed" = "1" ] || { echo keep; return 0; }
-  case "$addrs" in *.*) have_v4=1 ;; esac
-  case "$addrs" in *:*) have_v6=1 ;; esac
-  if [ "$read_ok" != "1" ] || { [ "$have_v4" = "0" ] && [ "$have_v6" = "0" ]; }; then
+  for tok in $ips; do
+    any=1
+    if k3s_is_ipv4 "$tok"; then have_v4=1
+    elif k3s_is_ipv6 "$tok"; then have_v6=1
+    else bad=1
+    fi
+  done
+  if [ "$read_ok" != "1" ] || [ "$any" = "0" ] || [ "$bad" = "1" ]; then
     echo unreadable
   elif [ "$v6_only" = "1" ]; then
     { [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; } && echo keep || echo reinstall
