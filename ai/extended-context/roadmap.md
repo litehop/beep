@@ -1,101 +1,89 @@
 ---
 name: roadmap
-description: Settled facts and near-term trajectory for beep's ServiceLB dataplane as of 2026-09-14 -- current state, the testable-by-u7s bar, and open versioning decisions. Read this first when picking up beep with no prior session context.
+description: Where beep stands against the operator's six-gate v1.0 plan as of 2026-10-08 -- gate table, critical path (real hardware), near-term bead sequence, release state, and firm principles. Read this first when picking up beep with no prior session context.
 ---
 
 # Roadmap
 
-## Current state (2026-09-14)
+As of 2026-10-08, beep has cleared gate 1 of the six-gate v1.0 plan, gate 2
+(IPv6) is code-complete except IPv6-only-node validation, and the critical
+path is now gate 3: tests on real hardware, which only the operator can
+provision.
 
-The ServiceLB epic (`mayor-aie31`) is functionally complete: all 7 phase
-beads (`mayor-g6u8s` through `mayor-g9l0f`) are closed, including Phase 7's
-conformance harness. The epic bead itself stays OPEN -- it still owns a tail
-of P2-P4 follow-on beads (`mayor-aie31.19` DWARF strip, `mayor-aie31.21`
-affinity+eviction, `mayor-aie31.22` metrics, `mayor-aie31.4` eventual repo
-split), not because the dataplane is unproven.
+v1.0 = production-ready (operator, 2026-09-19). Order is fixed: functional
+correctness first, then the perf/quality and security audits, then docs. Epic:
+`beep-xfa`. Verify any status below with `bd show` / `git tag` before relying
+on it; this file is a snapshot.
 
-e2e status on the k3s-on-Lima rig (`beep-lbs`, `scripts/e2e-lb-k3s.sh`'s
-7-spec upstream LoadBalancer focus list): 6 of 7 specs PASS or are explained
-as non-bugs. Cross-node LB delivery is PROVEN -- upstream specs 3/4 (the
->=2-node "target nodes with endpoints" specs) PASS via Geneve, and both UDP
-flow-affinity specs PASS. Specs 2/5 (the ETP:Local "should work from pods"
-family) were fixed by `beep-bol` (beep-client was missing a standalone
-`kubectl` binary -- a harness gap, not a dataplane bug). Spec 1 ("should
-work for type=LoadBalancer") still reports FAIL, but only because Lima's
-flat /24 defeats the upstream heuristic that infers masquerading from the
-client's subnet -- beep's own logs show the real client IP delivered. This
-is confirmed in `ebpf/src/main.rs`: the forward leg's DNAT rewrites only the
-destination IP/port (VIP -> pod:targetPort) and, when a source-port
-collision forces a remap, the source port -- it never touches the client's
-source IP. Genuinely-external client-IP verification is deferred to
-`beep-903`, which needs operator-provisioned real cloud nodes.
+## Gates
 
-Controller footprint is measured, not estimated: `beep-toi` (PR #57) put
-idle/loaded RSS at ~6.8-7.7 MiB and gates it in CI's memory-smoke job.
-`beep-eyz`'s dhat profile (PR #63) attributes that baseline to aya's BTF
-parse at load time, not to rustls/aws-lc-rs or trimmable heap -- idle
-retained Rust heap is only ~128 KiB, but BTF parsing produces a TRANSIENT
-~17-31 MiB peak that any DaemonSet memory limit must clear (`beep-39n`, in
-flight on a separate worktree at time of writing).
+| # | Gate | Status | What remains | Tracking |
+| --- | --- | --- | --- | --- |
+| 1 | Multi-interface | Shipped as multi-symmetric-uplink in v0.2.0 (repeatable `--uplink-iface`, per-uplink `l2_hlen`, return via ingress uplink) | Egress-interface selection for the relay leg was deferred out of the MVP; `beep-eix` (open, P3) still owns it. | `beep-eix` |
+| 2 | Dual-stack IPv6, incl. IPv6-only nodes (no NAT64/DNS64) | Dual-stack inner + underlay implemented; controller-driven dual-stack round trip proven on the Lima k3s rig; IPv6-only dataplane gaps (e.g. peer attestation, node identity) closed | Controller-driven IPv6-only-node round trip on the rig (`.18`); `7qm.19` fix merged (#155), full-rig PASS pending, blocked by `beep-nj6` (node-b SSH wedge; likely the pre-#156 egress drop, rerun on main in progress); acceptance also needs IPv6-only validated cross-node on a real fleet, which depends on gate 3 | `beep-7qm` |
+| 3 | Tests on actual VPS / real hardware | Not started; needs operator-provisioned nodes | Real-fleet round trip: genuinely external client IP, provider uRPF/NAT, MTU, IPv6-only, native-v6 registry pull, documented k3s+u7s real-hardware deploy | `beep-903` |
+| 4 | Performance + code-quality audit | Not started | Includes the `unsafe` reduction audit; perf follow-ons are queued below | `beep-uqn`, `beep-xfa.5`, `beep-7qm.15`, `beep-xvw` |
+| 5 | Red-team security audit | Not started | No bead yet; file when gate 3 is underway | none |
+| 6 | Documentation refinement | Not started | Last by design | none |
 
-Delivery: the image is published to `docker.io/valerauko/beep-lb` (`:latest`
-+ `:sha` tags via `.github/workflows/delivery.yaml`, decided in `beep-vk5`)
--- Docker Hub is natively pullable over IPv6, resolving the project's
-IPv6-only-registry constraint. `deploy/daemonset.yaml` pulls `:latest`.
+Also a v1.0 functional requirement: selective conntrack eviction on endpoint
+removal (firm, operator 2026-09-19). Done: `beep-03i` closed (PR #134, #135),
+smoke-proven on a live kernel.
 
-## Near-term goal -- "testable by u7s"
+## Critical path
 
-Two bars gate beep being usable from the u7s monorepo it was extracted from.
-The dataplane itself is proven; the shipped deploy artifact had gaps that
-blocked u7s from reaching that dataplane at all (`beep-a5k`'s diagnosis, PR
-#74):
+Gate 3 (real hardware) is the critical path. It is operator-provisioned, so
+agents cannot advance it alone. Gate 2's IPv6-only acceptance ("validated
+cross-node on real fleet") also waits on it. Until nodes exist, agent work is
+the in-repo functional tail below, then gate 4 prep.
 
-- **Consumable**: an image u7s can pull. Met -- Docker Hub, IPv6-reachable.
-- **Functional**: real LoadBalancer delivery, single-node AND cross-node,
-  with the real client IP preserved. Met at the dataplane level -- proven
-  on the k3s-on-Lima rig per the e2e status above -- but the as-shipped
-  `deploy/daemonset.yaml` couldn't reach that dataplane on a fresh node: it
-  never created `geneve0` (immediate CrashLoop) and never disabled the
-  reverse-path filter on it (packets decap correctly but the backend Pod
-  sees zero of them, `FLOW_TABLE` notwithstanding). `beep-o1b` fixed both by
-  making the controller self-prep at startup; a third gap (pod-CIDR
-  hardcoded to `10.42.0.0/16` in the manifest) is tracked separately in
-  `beep-1d4`.
+## Near-term sequence
 
-u7s tests beep by standing up the same kind of local VM rig beep itself
-uses (Lima + k3s), not a real cloud fleet. So the remaining requirement is
-that VM rig plus documentation good enough for a human AND an agent to
-reproduce the test -- not production-fleet sign-off. Treat `beep-903`
-(genuinely-external client IP against a real provider's uRPF/NAT/IPv6) as
-DEFERRED production-hardening, off this path -- it does not block u7s
-integration.
+1. `beep-xfa.1` -- consolidate `LB_FRONT_MAP` + `TARGET_PORTS` into one
+   `FRONTS` map `{backend_node_ip, pod_ip, target_port, flags(IS_LOCAL)}`.
+   Approved by the operator 2026-10-08. It removes the relay self-loop by
+   construction, keeps `POD_TARGETS` for the decap stale-pod check, keeps
+   front and underlay address sets strictly separate, and renames legacy
+   `vip_*` identifiers in the same change.
+2. Loader/eBPF tail: `beep-0p2` (pinned-map `max_entries` mismatch after the
+   xfa.4 cap change; overlaps `mayor-cutt9`), then `beep-7qm.18`/`.19` rig
+   work, then the perf beads (`beep-xfa.5` measure-first, `beep-7qm.15`,
+   `beep-xvw`).
+3. `beep-5lw` -- multi-endpoint backend selection. Open, parked on a design
+   fork (slot renumbering vs `BackendId`), sequenced after `beep-xfa.1`
+   because the consolidation reshapes the same front-to-backend maps. Its
+   prerequisite `beep-03i` is done.
 
-`beep-n24` (the 2-node WireGuard smoke rig's martian-source drop) is a
-test-rig co-location artifact -- that rig's "client" shares an address with
-the backend node's own `lo` -- not a cross-node functional gap, and should
-not be treated as a v0.x blocker.
+Closed 2026-10-08 (PRs #154, #156, #157, #158): node address roles
+(`beep-xfa.3`), egress pass-on-miss (`beep-xfa.2`, P1), node-identity for
+local endpoints and hostNetwork admission (`beep-xfa.6`, `beep-7qm.17`, P1),
+configurable `NODE_ALLOW`/`POD_TARGETS` caps (`beep-xfa.4`).
 
-## Near-term work items
+## Release state
 
-- `beep-hmj` -- bidirectional cross-node e2e: assert delivery + real client
-  IP in both directions (Service on node-A dialed via node-B, and the
-  reverse), to catch a return-path asymmetry a one-directional proof can't.
-- `beep-39n` -- DaemonSet memory request/limit sized to clear the measured
-  ~31 MiB BTF-parse peak, plus control-plane tolerations, so beep schedules
-  on resource-starved and control-plane nodes.
+Tags: `v0.1.0` (2026-09-14, single-backend delivery), `v0.2.0`
+(multi-interface), `v0.3.0` (dual-stack inner services over an IPv4 Geneve
+underlay; see `CHANGELOG.md`). Operator 2026-10-08: cutting a release is NOT
+a priority; show progress against the gates first. Scheme and scope:
+`docs/decisions/versioning.md`. The image is published to Docker Hub
+(`docker.io/valerauko/beep-lb`); IPv6-native pull is unverified and tracked
+under gate 3.
 
-## Versioning trajectory
+## Firm principles
 
-**Ratified 2026-09-14**: v0.1.0 = single-backend-per-Service delivery is
-sufficient for u7s's first integration; multi-endpoint LB (`beep-5lw`) is a
-fast-follow, not a v0.1.0 blocker. The controller ships single-endpoint
-today by design (deferred from `mayor-9gr0n`). Full scheme and scope in
-`docs/decisions/versioning.md`.
-
-`.github/workflows/delivery.yaml` now publishes
-`docker.io/valerauko/beep-lb:<tag>` on any `v*` git tag push, alongside its
-existing `:latest`/`:sha` branch-push tags. Still open, and owned by the
-operator per the ADR's cut procedure: push the `v0.1.0` tag itself, then
-pin `deploy/daemonset.yaml` to `:v0.1.0` instead of `:latest`. The eventual
-repo split (`mayor-aie31.4`) for an independent release cadence stays out
-of scope for v0.1.0.
+- **Positive identification** (operator 2026-09-24): act only on packets
+  positively identified as beep's own (front hit on ingress, `FLOW_TABLE` hit
+  on return/egress); everything else passes untouched. Never drop on a map
+  miss. Memory: `dataplane-positive-identification`.
+- **IPv6-only nodes** (operator 2026-09-10): infra must work on IPv6-only
+  nodes; never assume NAT64/DNS64. Applies to all infra decisions, including
+  the registry pull path. Memory: `architectural-constraint-operator-2026-09-10-firm-beep`.
+- **Front vs underlay addresses** are different sets and are never conflated
+  (operator 2026-09-24); `NODE_ALLOW` and `Reverse.ingress_node_ip` are
+  underlay concepts.
+- **Dataplane fix gate** (operator 2026-10-08): every `ebpf/` bug fix needs a
+  local `scripts/smoke.sh` A/B (pre-fix FAIL, post-fix PASS) on the assigned
+  VM; CI evidence is not a substitute. Memory:
+  `dataplane-fix-gate-operator-2026-10-08-firm`.
+- **Terminology**: never "VIP"; say front address. Memory:
+  `terminology-no-vip`.
