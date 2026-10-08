@@ -1108,6 +1108,18 @@ mod tests {
             (host.as_str(), addr.as_str()),
             ("10.0.0.1", "10.0.0.1:6443")
         );
+
+        let (host, _, addr) = HyperApiClient::parse_addr("https://k3s.example.internal:6443", "/x")
+            .expect("hostname server must parse");
+        assert_eq!(
+            (host.as_str(), addr.as_str()),
+            ("k3s.example.internal", "k3s.example.internal:6443")
+        );
+        let name: Result<rustls::pki_types::ServerName<'static>, _> = host.try_into();
+        assert!(
+            name.is_ok(),
+            "a hostname must stay a valid TLS server name (not be bracketed or mangled)"
+        );
     }
 
     /// Verify that the bearer token field on HyperApiClient is correctly stored.

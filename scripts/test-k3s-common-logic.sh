@@ -30,11 +30,12 @@ expect_eq() {
   fi
 }
 
-alive_count() { # alive_count <pidfile> -- how many pids listed in the file are still running
-  local n=0 p
+alive_count() { # alive_count <pidfile> -- how many pids listed in the file are still running (an unreaped zombie is dead)
+  local n=0 p st
   while read -r p; do
     [ -n "$p" ] || continue
-    if kill -0 "$p" 2>/dev/null; then n=$((n + 1)); fi
+    st="$(ps -o stat= -p "$p" 2>/dev/null || true)"
+    case "$st" in "" | Z*) ;; *) n=$((n + 1)) ;; esac
   done < "$1"
   echo "$n"
 }
@@ -94,10 +95,37 @@ expect_eq "a timed-out evidence call prints the loud EVIDENCE TIMEOUT line" yes 
 
 limactl() { echo "stub-limactl $*"; }
 kube() { echo "stub-kube $*"; }
+# shellcheck disable=SC2034 # read by k3s_dump_evidence
 CONTROLLER_SELECTOR="app=x"
 k3s_dump_evidence vm-a vm-b /pin >/dev/null
 declare -F ev >/dev/null && leaked=yes || leaked=no
 expect_eq "k3s_dump_evidence does not leak an 'ev' helper into the caller's global scope" no "$leaked"
+
+V4="10.0.0.5"
+V6="fd00:beef:98::3"
+decide() { k3s_reinstall_decision "$@"; }
+expect_eq "no k3s installed: nothing to wipe, fresh install proceeds" keep "$(decide 0 1 0 0 '')"
+expect_eq "installed but kubectl failed (apiserver down) never wipes a healthy v6-only cluster" unreadable "$(decide 0 1 1 0 '')"
+expect_eq "installed and kubectl answered empty never wipes, even when asked for v6-only" unreadable "$(decide 0 1 1 1 '')"
+expect_eq "unreadable also guards the dual-stack request" unreadable "$(decide 1 0 1 1 '')"
+expect_eq "unreadable also guards the plain request" unreadable "$(decide 0 0 1 0 '')"
+expect_eq "a failed read is unreadable even if stale output looks like an address" unreadable "$(decide 0 1 1 0 "$V6")"
+expect_eq "a non-address answer is unreadable, not a shape" unreadable "$(decide 0 1 1 1 'garbage')"
+expect_eq "v6-only requested on a v6-only cluster is a no-op" keep "$(decide 0 1 1 1 "$V6")"
+expect_eq "v6-only requested on a dual-stack cluster reinstalls (shape is immutable)" reinstall "$(decide 0 1 1 1 "$V4 $V6")"
+expect_eq "v6-only requested on a v4 cluster reinstalls" reinstall "$(decide 0 1 1 1 "$V4")"
+expect_eq "dual-stack requested on a dual-stack cluster is a no-op" keep "$(decide 1 0 1 1 "$V4 $V6")"
+expect_eq "dual-stack requested on a v4 cluster reinstalls" reinstall "$(decide 1 0 1 1 "$V4")"
+expect_eq "dual-stack requested on a v6-only cluster reinstalls" reinstall "$(decide 1 0 1 1 "$V6")"
+expect_eq "plain call keeps a v4 cluster" keep "$(decide 0 0 1 1 "$V4")"
+expect_eq "plain call keeps a dual-stack cluster (never silently reverts it)" keep "$(decide 0 0 1 1 "$V4 $V6")"
+expect_eq "plain call cannot use a v6-only cluster (agent joins over v4) so reinstalls" reinstall "$(decide 0 0 1 1 "$V6")"
+
+rc=0
+msg="$(k3s_bring_up_cluster a b c iptables 1 1 2>&1)" || rc=$?
+expect_eq "dual-stack + v6-only together is rejected instead of v6-only silently winning" 1 "$rc"
+case "$msg" in *"mutually exclusive"*) said=yes ;; *) said=no ;; esac
+expect_eq "the rejection says why" yes "$said"
 
 echo "---"
 echo "PASS=$PASS FAIL=$FAIL"

@@ -52,11 +52,33 @@ k3s_bring_up_cluster() { # k3s_bring_up_cluster <vm-a> <vm-b> <vm-client> [proxy
   # default /bin/bash is 3.2) -- confirmed live (smoke-k3s-controller.sh's
   # `set -euo pipefail` tripped on exactly this).
   local dual_stack_arg=""
+  if [ "$dual_stack" = "1" ] && [ "$v6_only" = "1" ]; then
+    echo "FAIL: dual-stack and v6-only are mutually exclusive" >&2
+    return 1
+  fi
   [ "$dual_stack" = "1" ] && dual_stack_arg="--dual-stack"
   [ "$v6_only" = "1" ] && dual_stack_arg="--v6-only"
   "$SCRIPT_DIR/k3s-up.sh" --vm-a "$vm_a" --vm-b "$vm_b" --proxy-mode "$proxy_mode" $dual_stack_arg
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm_client}[[:space:]]+Running"; then
     limactl start "$vm_client"
+  fi
+}
+
+k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 0|1> <k3s-installed: 0|1> <read-ok: 0|1> <internal-ips> -- prints keep, reinstall, or unreadable. A reinstall wipes the cluster, so it needs a positive read of the node's InternalIPs: an installed k3s whose kubectl failed or answered empty (apiserver briefly down) is unreadable, never "not shaped as requested". A plain call keeps a dual-stack cluster but cannot use a v6-only one (the agent joins over v4).
+  local dual="$1" v6_only="$2" installed="$3" read_ok="$4" addrs="$5" have_v4=0 have_v6=0
+  [ "$installed" = "1" ] || { echo keep; return 0; }
+  case "$addrs" in *.*) have_v4=1 ;; esac
+  case "$addrs" in *:*) have_v6=1 ;; esac
+  if [ "$read_ok" != "1" ] || { [ "$have_v4" = "0" ] && [ "$have_v6" = "0" ]; }; then
+    echo unreadable
+  elif [ "$v6_only" = "1" ]; then
+    { [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; } && echo keep || echo reinstall
+  elif [ "$dual" = "1" ]; then
+    { [ "$have_v6" = "1" ] && [ "$have_v4" = "1" ]; } && echo keep || echo reinstall
+  elif [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; then
+    echo reinstall
+  else
+    echo keep
   fi
 }
 

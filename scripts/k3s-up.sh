@@ -129,27 +129,39 @@ fi
 # not just a restart with new EXEC args, to avoid leaving stale CNI/iptables
 # state behind. A plain call never reverts a dual-stack cluster, but cannot
 # use a v6-only one (the agent joins over v4), so that is reinstalled too.
-have_v4=0
-have_v6=0
+k3s_state="$(limactl shell "$VM_A" -- bash -c '[ -x /usr/local/bin/k3s ] && echo installed || echo absent')" || {
+  echo "FAIL: could not determine whether k3s is installed on $VM_A -- refusing to touch the cluster" >&2
+  exit 1
+}
+installed=0
+read_ok=0
 addrs=""
-if limactl shell "$VM_A" -- test -x /usr/local/bin/k3s >/dev/null 2>&1; then
-  addrs="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
-  case "$addrs" in *.*) have_v4=1 ;; esac
-  case "$addrs" in *:*) have_v6=1 ;; esac
+case "$k3s_state" in
+  installed) installed=1 ;;
+  absent) ;;
+  *) echo "FAIL: unexpected k3s install probe answer '$k3s_state' from $VM_A -- refusing to touch the cluster" >&2; exit 1 ;;
+esac
+if [ "$installed" = "1" ] && addrs="$(limactl shell "$VM_A" -- sudo /usr/local/bin/k3s kubectl get node "lima-$VM_A" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)"; then
+  read_ok=1
 fi
-reinstall=0
-if [ "$V6_ONLY" = "1" ]; then
-  { [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; } || reinstall=1
-elif [ "$DUAL_STACK" = "1" ]; then
-  { [ "$have_v6" = "1" ] && [ "$have_v4" = "1" ]; } || reinstall=1
-elif [ "$have_v6" = "1" ] && [ "$have_v4" = "0" ]; then
-  reinstall=1
-fi
-if [ "$reinstall" = "1" ]; then
-  echo "==> $VM_A/$VM_B are not shaped as requested (dual-stack=$DUAL_STACK v6-only=$V6_ONLY, live InternalIPs: '${addrs:-none}') -- uninstalling k3s before reinstalling"
-  limactl shell "$VM_B" -- sudo bash -c '[ -x /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true' >/dev/null 2>&1 || true
-  limactl shell "$VM_A" -- sudo bash -c '[ -x /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh || true' >/dev/null 2>&1 || true
-fi
+decision="$(k3s_reinstall_decision "$DUAL_STACK" "$V6_ONLY" "$installed" "$read_ok" "$addrs")"
+case "$decision" in
+  keep) ;;
+  reinstall)
+    echo "==> $VM_A/$VM_B are not shaped as requested (dual-stack=$DUAL_STACK v6-only=$V6_ONLY, live InternalIPs: '${addrs:-none}') -- uninstalling k3s before reinstalling"
+    limactl shell "$VM_B" -- sudo bash -c '[ -x /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true' >/dev/null 2>&1 || true
+    limactl shell "$VM_A" -- sudo bash -c '[ -x /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh || true' >/dev/null 2>&1 || true
+    if [ "$V6_ONLY" = "0" ]; then
+      for vm in "$VM_A" "$VM_B"; do
+        limactl shell "$vm" -- sudo ip -6 route del default dev eth0 metric 2048 >/dev/null 2>&1 || true
+      done
+    fi
+    ;;
+  *)
+    echo "FAIL: k3s is installed on $VM_A but node lima-$VM_A's InternalIPs could not be read (answer: '${addrs:-empty}', read ok: $read_ok) -- cannot tell whether the live cluster matches dual-stack=$DUAL_STACK v6-only=$V6_ONLY, so NOT reinstalling; check the apiserver (limactl shell $VM_A -- sudo k3s kubectl get nodes) or uninstall k3s by hand" >&2
+    exit 1
+    ;;
+esac
 
 echo "==> [2/4] installing k3s server on $VM_A (node-ip=$NODE_IP_A, --disable=servicelb,traefik, proxy-mode=$PROXY_MODE, dual-stack=$DUAL_STACK, v6-only=$V6_ONLY)"
 limactl shell "$VM_A" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --disable=servicelb,traefik --node-ip=$NODE_IP_A --write-kubeconfig-mode=644$KUBE_PROXY_ARG$CIDR_ARGS' sh -"
