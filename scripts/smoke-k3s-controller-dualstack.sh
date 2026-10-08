@@ -424,23 +424,24 @@ round_trip -6 "$ULA_A" "$PORT_DUAL" "$ULA_CLIENT" >/dev/null || { echo "ROUND-TR
 echo "ROUND-TRIP-DUAL-V6: PASS (client $ULA_CLIENT -> $SVC_DUAL v6 front [$ULA_A]:$PORT_DUAL -> backend on $VM_B, client IP preserved)"
 
 echo "==> [11/12] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
-set +e
-V6_TO_V4ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -6 -m 5 "$(http_url "$ULA_A" "$PORT_V4")" 2>&1)"
-V6_TO_V4ONLY_RC=$?
-V4_TO_V6ONLY="$(limactl shell "$VM_CLIENT" -- curl -sS -4 -m 5 "$(http_url "$IP_A" "$PORT_V6")" 2>&1)"
-V4_TO_V6ONLY_RC=$?
-set -e
-if [ "$V6_TO_V4ONLY_RC" -eq 0 ]; then
-  echo "FAIL: a v6 client reached $SVC_V4 (SingleStack IPv4) at [${ULA_A}]:${PORT_V4} -- got: $V6_TO_V4ONLY" >&2
-  dump_evidence
-  exit 1
-fi
-if [ "$V4_TO_V6ONLY_RC" -eq 0 ]; then
-  echo "FAIL: a v4 client reached $SVC_V6 (SingleStack IPv6) at ${IP_A}:${PORT_V6} -- got: $V4_TO_V6ONLY" >&2
-  dump_evidence
-  exit 1
-fi
-echo "NEGATIVE-FAMILY-ISOLATION: PASS (v6 client refused by $SVC_V4's v4-only front, v4 client refused by $SVC_V6's v6-only front)"
+expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
+  local flag="$1" addr="$2" port="$3" out rc url
+  url="$(http_url "$addr" "$port")"
+  set +e
+  out="$(limactl shell "$VM_CLIENT" -- curl -sSv "$flag" -m 5 "$url" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 7 ] && grep -qF "failed: Connection refused" <<<"$out"; then
+    return 0
+  fi
+  echo "FAIL: curl $flag $url expected rc=7 + 'failed: Connection refused', got rc=$rc: $out" >&2
+  return 1
+}
+round_trip -4 "$IP_A" "$PORT_V4" "$IP_CLIENT" >/dev/null || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (positive control: v4 client could not reach $SVC_V4's v4 front $IP_A:$PORT_V4)" >&2; dump_evidence; exit 1; }
+round_trip -6 "$ULA_A" "$PORT_V6" "$ULA_CLIENT" >/dev/null || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (positive control: v6 client could not reach $SVC_V6's v6 front [$ULA_A]:$PORT_V6)" >&2; dump_evidence; exit 1; }
+expect_refused -6 "$ULA_A" "$PORT_V4" || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (v6 client vs $SVC_V4's v4-only front)" >&2; dump_evidence; exit 1; }
+expect_refused -4 "$IP_A" "$PORT_V6" || { echo "NEGATIVE-FAMILY-ISOLATION: FAIL (v4 client vs $SVC_V6's v6-only front)" >&2; dump_evidence; exit 1; }
+echo "NEGATIVE-FAMILY-ISOLATION: PASS (same-family positive controls served on $SVC_V4 v4 and $SVC_V6 v6; cross-family curls refused with rc=7 Connection refused)"
 
 GENEVE_A_AFTER="$(geneve_pkts "$VM_A")"
 GENEVE_B_AFTER="$(geneve_pkts "$VM_B")"
