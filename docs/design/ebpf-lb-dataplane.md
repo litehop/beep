@@ -51,7 +51,12 @@ directly; no floating IP, no ARP/BGP announcement (servicelb ADR). DNS
 publishes each node's own address and every node accepts the service
 port, so the packet lands on whichever node the client dialed — the
 "ingress node." `NODE_IP:SVC_PORT` **is the LB front IP**: node-owned,
-not necessarily virtual, never assumed to sit behind a cloud LB. (2)
+not necessarily virtual, never assumed to sit behind a cloud LB. The
+controller derives two separate address sets per node from Node
+`status.addresses`, each rule applied per address family: the front address
+is the ExternalIP when configured, else the InternalIP; the underlay
+address (Geneve remote, `NODE_ALLOW`) is the InternalIP when configured,
+else the ExternalIP. (2)
 Ingress hashes to a ready backend, writes a flow-affinity entry keyed on
 the forward tuple `(CLIENT_IP, SRC_PORT, FRONT_IP, FRONT_PORT, proto)`,
 and (3) stamps Geneve metadata (remote = backend node, fixed VNI, a
