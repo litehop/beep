@@ -458,7 +458,7 @@ fn main() -> anyhow::Result<()> {
 
     populate_config(&mut ebpf, &geneve_iface).context("populating CONFIG map")?;
     populate_uplink_config(&mut ebpf, &uplink_ifaces).context("populating UPLINK_CONFIG map")?;
-    populate_fixtures(&mut ebpf, &fixtures, node_ip)
+    populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
         .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
 
     let uplink_iface_refs: Vec<&str> = uplink_ifaces.iter().map(String::as_str).collect();
@@ -592,17 +592,25 @@ fn fixture_fronts(fixtures: &[Fixture], node_ip: IpAddr) -> HashMap<LbFrontKey, 
         .collect()
 }
 
-fn populate_fixtures(ebpf: &mut Ebpf, fixtures: &[Fixture], node_ip: IpAddr) -> anyhow::Result<()> {
+fn populate_fixtures(
+    ebpf: &mut Ebpf,
+    fixtures: &[Fixture],
+    node_ip: IpAddr,
+    pin_dir: &Path,
+) -> anyhow::Result<()> {
     {
-        let mut front_meta: AyaHashMap<_, LbFrontKey, FrontMeta> = AyaHashMap::try_from(
-            ebpf.take_map("FRONT_META")
-                .ok_or_else(|| anyhow!("no map named `FRONT_META` in the eBPF object"))?,
-        )?;
+        // Opened from the pins `load_ebpf` just created: both maps are needed
+        // at once, and taking them out of `ebpf` would close the fds the
+        // programs still have to relocate against.
+        let open = |name: &str| -> anyhow::Result<MapData> {
+            let path = pin_dir.join(name);
+            MapData::from_pin(&path)
+                .with_context(|| format!("opening pinned map `{name}` from {}", path.display()))
+        };
+        let mut front_meta: AyaHashMap<_, LbFrontKey, FrontMeta> =
+            AyaHashMap::try_from(Map::HashMap(open("FRONT_META")?))?;
         let mut front_endpoints: AyaHashMap<_, FrontEndpointKey, FrontEndpoint> =
-            AyaHashMap::try_from(
-                ebpf.take_map("FRONT_ENDPOINTS")
-                    .ok_or_else(|| anyhow!("no map named `FRONT_ENDPOINTS` in the eBPF object"))?,
-            )?;
+            AyaHashMap::try_from(Map::HashMap(open("FRONT_ENDPOINTS")?))?;
         let failures = apply_fronts(
             &mut front_meta,
             &mut front_endpoints,

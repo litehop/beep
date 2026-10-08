@@ -128,9 +128,9 @@ forward-write and return-read).
 |---|---|---|
 | Userspace control-plane process | ~6.9 MiB RSS | Rust async binary; idle after reconcile. Measured, not estimated — gated by CI's `memory-smoke` job (`scripts/memory-smoke-controller.sh`). |
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
-| `FRONT_META` (front tuple -> live generation, count, flags) | <0.5 MiB | 4096 entries by default (`--front-meta-max-entries`): nodes × Service ports. |
-| `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | <1 MiB | 8192 entries by default (`--front-endpoints-max-entries`): up to two generations of every front coexist during a swap. Full map on every node. |
-| `FRONT_ENDPOINT_MISSES` | <1 KiB | Per-CPU counter of fail-closed endpoint lookups. |
+| `FRONT_META` (front tuple -> live generation, count, flags) | ~385 KiB (measured) | 4096 entries by default (`--front-meta-max-entries`): nodes × Service ports. |
+| `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~1.06 MiB (measured) | 8192 entries by default (`--front-endpoints-max-entries`): up to two generations of every front coexist during a swap. Full map on every node. |
+| `FRONT_MISSES` | <1 KiB | Per-CPU counter of fail-closed endpoint lookups. |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
 | **Total** | **~8–9 MiB** | Independent of vCPU count — maps are shared. |

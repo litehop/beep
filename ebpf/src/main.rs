@@ -181,7 +181,7 @@ static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
 /// non-zero value means the controller's generation-swap protocol was
 /// violated or an endpoint write failed.
 #[map]
-static FRONT_ENDPOINT_MISSES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static FRONT_MISSES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Backend-local: which pod IPs are this node's own beep backend Pods,
 /// keyed on pod IP alone -- deliberately NOT on target port, unlike
@@ -383,14 +383,14 @@ fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
 /// `FRONT_ENDPOINTS` read at the generation it names. A front absent from
 /// `FRONT_META` is simply not a front (`None`, uncounted). A front present
 /// but without a readable endpoint is a protocol violation: counted in
-/// `FRONT_ENDPOINT_MISSES` and failed closed (`None`).
+/// `FRONT_MISSES` and failed closed (`None`).
 #[inline(always)]
 fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
     let meta = *unsafe { FRONT_META.get(front) }?;
     let endpoint = front_endpoint_key(front, meta)
         .and_then(|key| unsafe { FRONT_ENDPOINTS.get(key) }.copied());
     if endpoint.is_none() {
-        if let Some(misses) = FRONT_ENDPOINT_MISSES.get_ptr_mut(0) {
+        if let Some(misses) = FRONT_MISSES.get_ptr_mut(0) {
             unsafe { *misses += 1 };
         }
     }

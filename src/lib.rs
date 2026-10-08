@@ -40,7 +40,7 @@ pub const MAP_NAMES: [&str; 9] = [
     "UPLINK_CONFIG",
     "FRONT_META",
     "FRONT_ENDPOINTS",
-    "FRONT_ENDPOINT_MISSES",
+    "FRONT_MISSES",
     "POD_TARGETS",
     "NODE_ALLOW",
     "FWD_PENDING",
@@ -701,6 +701,16 @@ mod tests {
         expected.sort_unstable();
         actual.sort_unstable();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_names_fit_the_kernel_name_limit() {
+        // The kernel truncates map names to 15 bytes; a longer name shows up
+        // truncated in `bpftool` and fails the memory assertion's exact-name
+        // match.
+        for name in MAP_NAMES {
+            assert!(name.len() <= 15, "{name} exceeds BPF_OBJ_NAME_LEN - 1");
+        }
     }
 
     #[test]

@@ -31,9 +31,9 @@
 #
 # SECOND FIX: the above still self-looped on node-b. node-b's own
 # `--uplink-iface eth0` gave it a `uplink_ingress` classifier on the SAME
-# device the client's SYN transits en route to node-a -- and LB_FRONT_MAP is
+# device the client's SYN transits en route to node-a -- and FRONT_META is
 # deliberately unfiltered by node ownership (any node can be ingress for any
-# VIP, so TARGET_PORTS' forward-decap lookup on the real backend node needs
+# VIP, so FRONT_ENDPOINTS' forward-decap lookup on the real backend node needs
 # the real front's key regardless of which node "owns" that VIP) -- so
 # node-b's eth0 ingress matched the in-transit SYN and Geneve-encapped it to
 # itself before it ever reached node-a. The client's packet never crossed
