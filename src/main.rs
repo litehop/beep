@@ -611,6 +611,11 @@ fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
         .collect()
 }
 
+/// The fixture loader is the sole writer of the front maps (POD_TARGETS and
+/// NODE_ALLOW are already rewritten to exactly its set), and the maps are
+/// pinned, so a front dropped from `--fixture` must be removed on restart.
+const FIXTURE_PRUNES_ABSENT_FRONTS: bool = true;
+
 fn populate_fixtures(
     ebpf: &mut Ebpf,
     fixtures: &[Fixture],
@@ -634,7 +639,7 @@ fn populate_fixtures(
             &mut front_meta,
             &mut front_endpoints,
             &fixture_fronts(fixtures),
-            false,
+            FIXTURE_PRUNES_ABSENT_FRONTS,
         )
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
         if !failures.is_empty() {
@@ -1057,6 +1062,67 @@ mod tests {
             1,
             "this demonstrates why pod-IP-only keying was insufficient -- \
              both Service ports collapse to the same map key"
+        );
+    }
+
+    #[test]
+    fn front_dropped_from_fixture_set_is_removed_meta_first() {
+        // Pinned FRONT_META/FRONT_ENDPOINTS outlive the loader: a front
+        // removed from `--fixture` would otherwise keep routing after restart.
+        // META goes first so the datapath never sees a live front with no
+        // endpoints.
+        use beep::front_swap::{plan_front_writes, FrontWrite};
+        use beep_common::{FrontEndpointKey, FrontMeta};
+
+        let kept = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
+        let dropped = parse_fixture("10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443").unwrap();
+        let both = fixture_fronts(&[kept, dropped]);
+        let only_kept = fixture_fronts(&[kept]);
+
+        let dropped_key = fixture_key(&dropped);
+        let current_meta: HashMap<_, _> = both
+            .keys()
+            .map(|k| {
+                (
+                    *k,
+                    FrontMeta {
+                        generation: 1,
+                        count: 1,
+                        flags: 0,
+                    },
+                )
+            })
+            .collect();
+        let current_endpoints: HashMap<FrontEndpointKey, _> = both
+            .iter()
+            .map(|(k, d)| {
+                (
+                    FrontEndpointKey {
+                        front: *k,
+                        generation: 1,
+                        slot: 0,
+                        _pad: 0,
+                    },
+                    d.endpoints[0],
+                )
+            })
+            .collect();
+
+        let plans = plan_front_writes(
+            &current_meta,
+            &current_endpoints,
+            &only_kept,
+            FIXTURE_PRUNES_ABSENT_FRONTS,
+        );
+        assert_eq!(plans.len(), 1, "only the dropped front needs writes");
+        assert_eq!(plans[0].front, dropped_key);
+        assert!(
+            matches!(
+                plans[0].steps.as_slice(),
+                [FrontWrite::DeleteMeta(_), FrontWrite::DeleteEndpoint(_)]
+            ),
+            "a dropped fixture front must be removed, FRONT_META before its endpoints: {:?}",
+            plans[0].steps
         );
     }
 
