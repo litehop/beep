@@ -42,7 +42,7 @@ UNKNOWN_DIR="?"
 
 resolve_dir() { # $1 base, $2 path
   case "$2" in
-    -|*'$'*) printf '%s' "$UNKNOWN_DIR" ;;
+    -|*'$'*|*'`'*) printf '%s' "$UNKNOWN_DIR" ;;
     "") printf '%s' "$1" ;;
     /*) printf '%s' "$2" ;;
     "~"*) printf '%s' "$HOME${2#\~}" ;;
@@ -69,14 +69,23 @@ is_read_only() { # $1 subcommand, rest: its args
   case "$sub" in
     stash)
       a=$(strip_quotes "${1:-}")
-      [ "$a" = list ] || [ "$a" = show ]
+      [ "$a" = list ] || [ "$a" = show ] || return 1
+      shift
+      for a in "$@"; do
+        case "$(strip_quotes "$a")" in
+          -p | --patch | --stat | --oneline | --name-only | --name-status) ;;
+          -*) return 1 ;;
+        esac
+      done
       ;;
     restore)
       local staged=1
       for a in "$@"; do
-        case "$(strip_quotes "$a")" in
+        a=$(strip_quotes "$a")
+        case "$a" in
+          --) break ;;
           --staged | -S) staged=0 ;;
-          --worktree | -W | -SW | -WS) return 1 ;;
+          -*) return 1 ;;
         esac
       done
       return "$staged"
@@ -94,36 +103,47 @@ block() { # $1 subcommand, $2 dir
   exit 2
 }
 
-split_segments() { # $1 command line -> newline-separated segments
-  local s="$1" out="" c q="" i=0 n=${#1}
+split_segments() { # $1 command line, $2 "raw" to ignore quoting -> newline-separated segments
+  local s="$1" raw="${2:-}" out="" c q="" bt=0 i=0 n=${#1}
+  # ANSI-C quoting ($'..') has escape rules this tracker does not model.
+  case "$s" in *"\$'"*) raw=raw ;; esac
   while [ "$i" -lt "$n" ]; do
     c=${s:i:1}
-    if [ "$c" = "\\" ] && [ "$q" != "'" ]; then
+    if [ "$c" = "\\" ] && [ "$q" != "'" ] && [ -z "$raw" ]; then
       out+="$c${s:i+1:1}"
       i=$((i + 2))
       continue
     fi
     if [ -n "$q" ]; then
       if [ "$q" = '"' ] && [ "$c" = '$' ] && [ "${s:i+1:1}" = "(" ]; then
-        out+=$'\n'
+        out+=$'$\n'
         i=$((i + 2))
         continue
       fi
       if [ "$q" = '"' ] && [ "$c" = '`' ]; then
-        out+=$'\n'
+        if [ "$bt" -eq 0 ]; then out+=$'$\n'; else out+=$'\n'; fi
+        bt=$((1 - bt))
       else
         out+="$c"
       fi
       [ "$c" = "$q" ] && q=""
     else
       case "$c" in
-        \'|\") q="$c"; out+="$c" ;;
-        ';' | '|' | '&' | '(' | ')' | '`') out+=$'\n' ;;
+        \'|\") [ -z "$raw" ] && q="$c"; out+="$c" ;;
+        '`')
+          if [ "$bt" -eq 0 ]; then out+=$'$\n'; else out+=$'\n'; fi
+          bt=$((1 - bt))
+          ;;
+        ';' | '|' | '&' | '(' | ')') out+=$'\n' ;;
         *) out+="$c" ;;
       esac
     fi
     i=$((i + 1))
   done
+  if [ -n "$q" ] && [ -z "$raw" ]; then
+    split_segments "$s" raw
+    return
+  fi
   printf '%s' "$out"
 }
 

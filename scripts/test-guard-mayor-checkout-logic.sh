@@ -109,6 +109,30 @@ expect "read-only git after cd - is still allowed" 0
 HOME="$MAYOR" run_hook agent-1 "$WT" "cd && git reset --hard"
 expect "bare cd goes to HOME (the mayor checkout here) and is blocked" 2
 
+run_hook agent-1 "$MAYOR" "echo \$'\\'' ; git checkout x ; echo \$'\\''"
+expect "ANSI-C \$'..' quoting cannot desync the splitter into hiding a real checkout" 2
+
+run_hook agent-1 "$MAYOR" "echo \"a ; git checkout x"
+expect "unbalanced quote falls back to unconditional split (fail closed)" 2
+
+run_hook agent-1 "$MAYOR" "git restore --staged --work f"
+expect "git accepts unambiguous long-option prefixes, so --work must not pass as read-only restore" 2
+
+run_hook agent-1 "$MAYOR" "git restore --staged --source=HEAD f"
+expect "restore allowlist: any flag besides --staged/-S is blocked" 2
+
+run_hook agent-1 "$MAYOR" "git restore --staged -- f"
+expect "restore --staged with -- separator stays read-only" 0
+
+run_hook agent-1 "$MAYOR" "git stash list --output=f"
+expect "stash allowlist: --output writes files, so unlisted flags are blocked" 2
+
+run_hook agent-1 "$WT" "cd \"\$(echo $MAYOR)\" && git checkout x"
+expect "cd to a command-substituted dir is unknown, so a following checkout fails closed" 2
+
+run_hook agent-1 "$WT" "cd \`echo $MAYOR\` && git checkout x"
+expect "cd to a backtick-substituted dir is unknown, so a following checkout fails closed" 2
+
 run_hook "" "$MAYOR" "git checkout main"
 expect "mayor session (no agent_id) can still move its own HEAD" 0
 
