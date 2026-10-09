@@ -226,6 +226,34 @@ extract_substs() { # $1 heredoc body -> its substitutions, one per line
   printf '%s' "$out"
 }
 
+# `<<` inside $(( ... )) is a shift, not a heredoc opener; blank its `<`s so
+# the opener regex cannot swallow later lines.
+mask_arith() { # $1 line
+  local s="$1" out="" c i=0 n=${#1} d=0
+  while [ "$i" -lt "$n" ]; do
+    c=${s:i:1}
+    if [ "$d" -eq 0 ]; then
+      if [ "${s:i:3}" = '$((' ]; then
+        d=2
+        out+='$(('
+        i=$((i + 3))
+        continue
+      fi
+    else
+      if [ "$c" = "(" ]; then
+        d=$((d + 1))
+      elif [ "$c" = ")" ]; then
+        d=$((d - 1))
+      elif [ "$c" = "<" ]; then
+        c="_"
+      fi
+    fi
+    out+="$c"
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
 # Heredoc bodies are data: drop quoted ones, keep only substitutions of
 # unquoted ones. A heredoc with no terminator line is left in place.
 strip_heredocs() { # $1 command line
@@ -244,7 +272,8 @@ strip_heredocs() { # $1 command line
       continue
     fi
     out+="$line"$'\n'
-    if [[ $line =~ $HEREDOC_RE ]]; then
+    check=$(mask_arith "$line")
+    if [[ $check =~ $HEREDOC_RE ]]; then
       dash="${BASH_REMATCH[2]}"
       quoted="${BASH_REMATCH[3]}"
       delim="${BASH_REMATCH[4]}"

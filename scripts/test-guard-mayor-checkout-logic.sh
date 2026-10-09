@@ -239,6 +239,18 @@ expect "escaped \\\$( in an unquoted heredoc is literal text" 0
 run_hook agent-1 "$MAYOR" $'cat <<\'EOF\'\ngit checkout x'
 expect "heredoc without a terminator is not stripped (fail closed)" 2
 
+run_hook agent-1 "$MAYOR" $'echo $((1<<2))\ngit checkout x\n2'
+expect "<< inside \$((...)) is a shift, so a matching later line must not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" $'echo $(( (x) <<EOF ))\ngit checkout x\nEOF'
+expect "spaced/nested arithmetic with a word-shaped shift operand does not open a heredoc either" 2
+
+run_hook agent-1 "$MAYOR" $'echo $((1<<2))\ngit status\n2'
+expect "plain arithmetic with a read-only git line stays allowed" 0
+
+run_hook agent-1 "$MAYOR" $'echo $((1<<2)); cat <<EOF\ngit checkout x is text\nEOF'
+expect "a real heredoc after arithmetic on the same line is still stripped" 0
+
 run_hook agent-1 "$MAYOR" $'if true; then git checkout x; fi'
 expect "if/then compound does not hide a checkout" 2
 
