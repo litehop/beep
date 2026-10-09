@@ -16,6 +16,9 @@
 # syntax: command-position `git` (optionally behind env/command/builtin/sudo/
 # exec/time, `xargs ... git`, or `bash -c '...'`) in `;`/`&&`/`||`/`|`/newline-
 # separated segments; substitutions inside double quotes are scanned as code.
+# Backslash-newline is joined; heredoc bodies are data (quoted delimiter: not
+# scanned; unquoted: only $(...)/backtick substitutions scanned); leading
+# if/then/else/elif/do/while/until/{/!/backslash are skipped to reach `git`.
 #
 # Fail closed: GIT_DIR=/GIT_WORK_TREE= prefixes, --git-dir/--work-tree, and
 # `-c alias.X=...` (when X is invoked) make the target unknown, so a
@@ -27,7 +30,9 @@
 # - xargs/find -exec/parallel wrapping a shell (`xargs sh -c 'git ...'`);
 #   only `xargs ... git <sub>` is scanned
 # - eval, sourced scripts, functions, variables expanded into the command,
-#   and heredoc bodies fed to a shell
+#   and heredoc bodies fed to a shell (`bash <<EOF`)
+# - a second heredoc on one line, `<<` inside quotes mistaken for a heredoc,
+#   `case` arms (`x) git checkout y ;;`), and partial escapes (`g\it`)
 set -euo pipefail
 
 INPUT=$(cat)
@@ -183,9 +188,77 @@ split_segments() { # $1 command line, $2 "raw" to ignore quoting -> newline-sepa
   printf '%s' "$out"
 }
 
+HEREDOC_RE='(^|[^<])<<(-?)[[:space:]]*([\"'"'"']?)([A-Za-z0-9_.-]+)'
+TAB=$'\t'
+
+# Only $(...) and `...` inside an unquoted heredoc body run as code.
+extract_substs() { # $1 heredoc body -> its substitutions, one per line
+  local s="$1" out="" c i=0 n=${#1} d=0 bt=0
+  while [ "$i" -lt "$n" ]; do
+    c=${s:i:1}
+    if [ "$c" = "\\" ]; then
+      [ "$d" -gt 0 ] || [ "$bt" -eq 1 ] && out+="$c${s:i+1:1}"
+      i=$((i + 2))
+      continue
+    fi
+    if [ "$d" -eq 0 ] && [ "$bt" -eq 0 ]; then
+      if [ "$c" = '$' ] && [ "${s:i+1:1}" = "(" ]; then
+        d=1
+        out+='$('
+        i=$((i + 1))
+      elif [ "$c" = '`' ]; then
+        bt=1
+        out+="$c"
+      fi
+    else
+      out+="$c"
+      if [ "$bt" -eq 1 ]; then
+        if [ "$c" = '`' ]; then bt=0; out+=$'\n'; fi
+      elif [ "$c" = "(" ]; then
+        d=$((d + 1))
+      elif [ "$c" = ")" ]; then
+        d=$((d - 1))
+        [ "$d" -eq 0 ] && out+=$'\n'
+      fi
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+# Heredoc bodies are data: drop quoted ones, keep only substitutions of
+# unquoted ones. A heredoc with no terminator line is left in place.
+strip_heredocs() { # $1 command line
+  local out="" line check delim="" dash="" quoted="" body=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -n "$delim" ]; then
+      check="$line"
+      [ "$dash" = "-" ] && check=${line#"${line%%[!$TAB]*}"}
+      if [ "$check" = "$delim" ]; then
+        [ -n "$quoted" ] || out+=$(extract_substs "$body")$'\n'
+        delim=""
+        body=""
+      else
+        body+="$line"$'\n'
+      fi
+      continue
+    fi
+    out+="$line"$'\n'
+    if [[ $line =~ $HEREDOC_RE ]]; then
+      dash="${BASH_REMATCH[2]}"
+      quoted="${BASH_REMATCH[3]}"
+      delim="${BASH_REMATCH[4]}"
+    fi
+  done <<< "$1"
+  [ -z "$delim" ] || out+="$body"
+  printf '%s' "$out"
+}
+
 check_cmdline() { # $1 command line, $2 starting dir
-  local line dir="$2" seg
-  line=$(split_segments "$1")
+  local line dir="$2" seg cmd
+  cmd=$(strip_heredocs "$1")
+  cmd="${cmd//\\$'\n'/}"
+  line=$(split_segments "$cmd")
   while IFS= read -r seg; do
     check_segment "$seg" "$dir"
     dir="$SEG_DIR"
@@ -205,14 +278,17 @@ check_segment() { # $1 segment, $2 dir; sets SEG_DIR (dir after any `cd`)
   tok=$(strip_quotes "${t[0]}")
   while [ "$i" -lt "$n" ]; do
     tok=$(strip_quotes "${t[$i]}")
+    tok="${tok#\\}"
     case "$tok" in
       GIT_DIR=*|GIT_WORK_TREE=*) gunk=1; i=$((i + 1)) ;;
       [A-Za-z_]*=*|env|command|builtin|sudo|exec|time|nohup) i=$((i + 1)) ;;
+      if|then|else|elif|do|while|until|'{'|'!') i=$((i + 1)) ;;
       *) break ;;
     esac
   done
   [ "$i" -lt "$n" ] || return 0
   tok=$(strip_quotes "${t[$i]}")
+  tok="${tok#\\}"
   if [ "${tok##*/}" = xargs ]; then
     j=$((i + 1))
     while [ "$j" -lt "$n" ] && [ "$(strip_quotes "${t[$j]}")" != git ]; do j=$((j + 1)); done

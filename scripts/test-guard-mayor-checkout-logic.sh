@@ -210,6 +210,71 @@ expect "a real command after a closed quoted substitution is still checked" 2
 run_hook agent-1 "$MAYOR" "echo \"\$(git status; git log)\""
 expect "read-only git inside quoted substitution stays allowed" 0
 
+for q in "'EOF'" '"EOF"' "\\EOF"; do
+  run_hook agent-1 "$MAYOR" $'gh pr comment 1 --body "$(cat <<'"$q"$'\ngit checkout main\ngit reset --hard; it\'s fine\nEOF\n)"'
+  expect "quoted heredoc <<$q body is data, so prose mentioning git checkout in a PR comment is allowed" 0
+done
+
+run_hook agent-1 "$MAYOR" $'gh pr comment 1 --body "$(cat <<-\'EOF\'\n\tgit checkout main\n\tEOF\n)"'
+expect "<<-'EOF' with tab-indented terminator is a quoted heredoc too" 0
+
+run_hook agent-1 "$MAYOR" $'cat <<\'EOF\'\ngit checkout x\nEOF\ngit checkout y'
+expect "a real checkout after the heredoc terminator is still blocked (stripping must not swallow the rest)" 2
+
+run_hook agent-1 "$MAYOR" $'cat <<EOF\n$(git checkout x)\nEOF'
+expect "unquoted heredoc expands \$(...), so a checkout inside it runs and is blocked" 2
+
+run_hook agent-1 "$MAYOR" $'cat <<EOF\n`git reset --hard`\nEOF'
+expect "unquoted heredoc expands backticks, so a reset inside it is blocked" 2
+
+run_hook agent-1 "$MAYOR" $'cat <<EOF\ngit checkout x is just text\nEOF'
+expect "unquoted heredoc plain text is data, not a git invocation" 0
+
+run_hook agent-1 "$MAYOR" $'cat <<EOF\n$(echo hi\ngit checkout x\n)\nEOF'
+expect "multi-line substitution inside an unquoted heredoc is scanned" 2
+
+run_hook agent-1 "$MAYOR" $'cat <<EOF\n\\$(git checkout x)\nEOF'
+expect "escaped \\\$( in an unquoted heredoc is literal text" 0
+
+run_hook agent-1 "$MAYOR" $'cat <<\'EOF\'\ngit checkout x'
+expect "heredoc without a terminator is not stripped (fail closed)" 2
+
+run_hook agent-1 "$MAYOR" $'if true; then git checkout x; fi'
+expect "if/then compound does not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" "if git checkout x; then echo; fi"
+expect "if <move> is a command position" 2
+
+run_hook agent-1 "$MAYOR" "for f in a; do git checkout x; done"
+expect "for/do compound does not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" "false || { git checkout x; }"
+expect "brace group does not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" "! git checkout x"
+expect "negation prefix does not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" "\\git checkout x"
+expect "backslash-escaped git (alias bypass spelling) is still git" 2
+
+run_hook agent-1 "$MAYOR" $'git \\\ncheckout x'
+expect "backslash-newline between git and subcommand is a line continuation" 2
+
+run_hook agent-1 "$WT" $'git fetch origin main && git checkout -B w1 origin/main'
+expect "worker fetch + checkout -B in own worktree stays allowed" 0
+
+run_hook agent-1 "$WT" "git push origin HEAD:worker/x"
+expect "push HEAD:branch stays allowed" 0
+
+run_hook agent-1 "$MAYOR" "git commit -m \"fix: a; b \$(date)\""
+expect "commit with ; and \$() in message stays allowed" 0
+
+run_hook agent-1 "$MAYOR" "gh pr create --title t --body \"\$(cat body.md)\""
+expect "gh pr create --body \"\$(cat file)\" stays allowed" 0
+
+run_hook agent-1 "$MAYOR" "if true; then git status; fi"
+expect "read-only git inside if/then stays allowed" 0
+
 run_hook "" "$MAYOR" "git checkout main"
 expect "mayor session (no agent_id) can still move its own HEAD" 0
 
