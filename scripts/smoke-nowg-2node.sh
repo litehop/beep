@@ -140,12 +140,42 @@ remote "$VM_B" setup-backend --pod-ip "$POD_IP"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
 
 echo "==> [5/8] NEGATIVE CONTROL: NODE_ALLOW not seeded -- the round trip must FAIL"
+# Attribution to NODE_ALLOW, not just "some failure": curl must time out
+# (rc=28; a crashed loader/backend gives rc=7/52), both loaders must still be
+# alive, and the forward Geneve packet must have reached node-b's geneve0
+# (rx moved: the underlay and decap path work) without being delivered -- the
+# admission drop happens in beep's hook after geneve0 has counted the packet,
+# so the backend must have logged no connection from the client.
+NC_RX_A_BEFORE="$(geneve_rx "$VM_A")"
+NC_RX_B_BEFORE="$(geneve_rx "$VM_B")"
 curl_front 8
+NC_RX_A_AFTER="$(geneve_rx "$VM_A")"
+NC_RX_B_AFTER="$(geneve_rx "$VM_B")"
+echo "NEGATIVE-CONTROL: curl rc=$CLIENT_RC; geneve0 rx $VM_A $NC_RX_A_BEFORE -> $NC_RX_A_AFTER, $VM_B $NC_RX_B_BEFORE -> $NC_RX_B_AFTER"
 if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
   echo "NEGATIVE-CONTROL: FAIL (round trip succeeded without NODE_ALLOW seeding -- the rig does not prove peer admission)" >&2
   exit 1
 fi
-echo "NEGATIVE-CONTROL: PASS (unseeded round trip failed as required: curl rc=$CLIENT_RC)"
+if [ "$CLIENT_RC" -ne 28 ]; then
+  echo "NEGATIVE-CONTROL: FAIL (curl rc=$CLIENT_RC, expected 28 timeout -- a refused/reset connection is not a NODE_ALLOW drop: '$CLIENT_BODY')" >&2
+  exit 1
+fi
+for vm in "$VM_A" "$VM_B"; do
+  limactl shell "$vm" -- pgrep -x "$BIN_NAME" >/dev/null || {
+    echo "NEGATIVE-CONTROL: FAIL (loader not running on $vm after the unseeded attempt -- crash, not admission drop)" >&2
+    exit 1
+  }
+done
+if [ "$NC_RX_B_AFTER" -le "$NC_RX_B_BEFORE" ]; then
+  echo "NEGATIVE-CONTROL: FAIL ($VM_B geneve0 rx did not move: the packet never arrived, so the timeout is not attributable to NODE_ALLOW)" >&2
+  exit 1
+fi
+NC_BACKEND_LOG="$(limactl shell "$VM_B" -- cat "/tmp/wg2node-backend-${TARGET_PORT}.log" 2>/dev/null || true)"
+if echo "$NC_BACKEND_LOG" | grep -q "Connection received on ${IP_CLIENT} "; then
+  echo "NEGATIVE-CONTROL: FAIL (backend received the client connection despite no NODE_ALLOW seeding)" >&2
+  exit 1
+fi
+echo "NEGATIVE-CONTROL: PASS (unseeded: curl timed out, loaders alive, packet reached $VM_B geneve0 but was not delivered)"
 
 echo "==> [6/8] seeding NODE_ALLOW bidirectionally"
 NODE_A_KEY="$(remote "$VM_A" dump-node-allow-key)"
