@@ -17,11 +17,15 @@
 //! Every tick also deletes endpoint generations other than current and `g-1`,
 //! which is what cleans up after a crashed predecessor on startup.
 
-use std::{collections::HashSet, net::Ipv4Addr, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    net::Ipv4Addr,
+    path::Path,
+};
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep::front_swap::apply_fronts;
+use beep::front_swap::{apply_fronts, DesiredFront};
 use beep_common::{
     unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
     LbFrontKey, TcpFlowKey,
@@ -48,6 +52,13 @@ pub struct PinnedMaps {
     /// `NODE_ALLOW` needs its own sticky latch instead of just reading
     /// `desired.fronts_known` directly on each tick.
     fronts_ever_known: bool,
+    /// Every cluster backend (and its pod uid, if known) as of the last tick
+    /// whose sweep finished. In-memory only: a remote pod that departs, or an
+    /// IP reused, while the controller is down is not detected (nothing to
+    /// compare against, and sweeping every pin on each start would reset all
+    /// live flows). Local departures survive a restart via the `POD_TARGETS`
+    /// rows.
+    known_backends: HashMap<[u8; 16], Option<String>>,
 }
 
 fn open_hash_map<K: aya::Pod, V: aya::Pod>(
@@ -79,6 +90,7 @@ impl PinnedMaps {
             fwd_pending: open_hash_map(pin_dir, "FWD_PENDING")?,
             flow_table: open_hash_map(pin_dir, "FLOW_TABLE")?,
             fronts_ever_known: false,
+            known_backends: HashMap::new(),
         })
     }
 
@@ -106,8 +118,36 @@ impl PinnedMaps {
     /// entry instead of the whole list (`DesiredEntries::pod_targets_known`'s
     /// doc comment).
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
+        // Departed and reused pod IPs (cluster-wide, local or remote) are
+        // swept in one walk BEFORE any new state naming them is written; on a
+        // failed sweep only the installs naming those IPs are withheld and the
+        // next tick retries.
+        let installed_pod_targets: anyhow::Result<Vec<[u8; 16]>> = if desired.pod_targets_known {
+            self.pod_targets
+                .keys()
+                .collect::<Result<_, _>>()
+                .context("reading POD_TARGETS")
+        } else {
+            Ok(Vec::new())
+        };
+        let (fwd_pending, flow_table) = (&mut self.fwd_pending, &mut self.flow_table);
+        let mut plan = plan_tick(
+            desired,
+            installed_pod_targets.as_deref().unwrap_or_default(),
+            &mut self.known_backends,
+            |pods| beep::evict_pod_flows(fwd_pending, flow_table, pods),
+        );
+        let sweep_result = match plan.sweep_error.take() {
+            Some(e) => Err(e.context("sweeping flows of departed or reused backend pods")),
+            None => Ok(()),
+        };
         let fronts_result = if desired.fronts_known {
-            apply_front_maps(&mut self.front_meta, &mut self.front_endpoints, desired)
+            apply_front_maps(
+                &mut self.front_meta,
+                &mut self.front_endpoints,
+                &plan.fronts,
+                plan.prune_fronts,
+            )
         } else {
             Ok(())
         };
@@ -119,21 +159,19 @@ impl PinnedMaps {
             self.fronts_ever_known,
         )
         .context("applying NODE_ALLOW");
-        let pod_targets_result = if desired.pod_targets_known {
-            apply_pod_targets(
-                &mut self.pod_targets,
-                &mut self.fwd_pending,
-                &mut self.flow_table,
-                &desired.pod_targets,
-            )
-            .context("applying POD_TARGETS")
-        } else {
-            Ok(())
+        let pod_targets_result = match installed_pod_targets {
+            Ok(_) if desired.pod_targets_known => {
+                apply_pod_targets(&mut self.pod_targets, &plan.pod_targets, &plan.delete_rows)
+                    .context("applying POD_TARGETS")
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
         };
 
         fronts_result?;
         node_allow_result?;
         pod_targets_result?;
+        sweep_result?;
         Ok(())
     }
 }
@@ -143,9 +181,10 @@ impl PinnedMaps {
 fn apply_front_maps(
     front_meta: &mut AyaHashMap<MapData, LbFrontKey, FrontMeta>,
     front_endpoints: &mut AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
-    desired: &DesiredEntries,
+    fronts: &HashMap<LbFrontKey, DesiredFront>,
+    prune_absent: bool,
 ) -> anyhow::Result<()> {
-    let failures = apply_fronts(front_meta, front_endpoints, &desired.fronts, true)
+    let failures = apply_fronts(front_meta, front_endpoints, fronts, prune_absent)
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
     for (front, message) in &failures {
         eprintln!(
@@ -183,33 +222,26 @@ fn describe_lb_front_key(key: &LbFrontKey) -> String {
 /// `POD_TARGETS` isn't map-shaped like the front maps
 /// (`reconcile::DesiredEntries::pod_targets` is a set, not a map), so it's a
 /// full membership sync -- same prune-then-insert pattern as the loader's
-/// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
-/// Continues past an individual write failure, like the front writes.
-///
-/// All of a tick's stale (departed) pod IPs also run ONE `beep::evict_pod_flows`
-/// pass against `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
-/// conntrack rows would otherwise pin routing to a dead backend, or
-/// misroute a FUTURE, unrelated owner of that pod IP if it's reused. Their
-/// `POD_TARGETS` rows are deleted only after the sweep succeeds
-/// (`evict_then_delete_departed`).
+/// own `populate_fixtures`. `delete_rows` are the departed rows whose conntrack
+/// sweep already succeeded (`plan_tick`); `install` excludes IPs whose sweep is
+/// still pending. Continues past an individual write failure, like the front
+/// writes.
 fn apply_pod_targets(
     map: &mut AyaHashMap<MapData, [u8; 16], u8>,
-    fwd_pending: &mut AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
-    flow_table: &mut AyaHashMap<MapData, FlowKey, FlowValue>,
-    desired: &HashSet<[u8; 16]>,
+    install: &HashSet<[u8; 16]>,
+    delete_rows: &HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
-    let existing: Vec<[u8; 16]> = map.keys().collect::<Result<_, _>>()?;
-    let live: Vec<[u8; 16]> = desired.iter().copied().collect();
     let mut failed = 0;
-    let departed: HashSet<[u8; 16]> = beep::stale_pod_targets(&existing, &live)
-        .into_iter()
-        .collect();
-    failed += evict_then_delete_departed(
-        &departed,
-        |pods| beep::evict_pod_flows(fwd_pending, flow_table, pods),
-        |pod| map.remove(&pod).map_err(Into::into),
-    );
-    for ip in &live {
+    for pod in delete_rows {
+        if let Err(e) = map.remove(pod) {
+            failed += 1;
+            eprintln!(
+                "controller: POD_TARGETS delete for pod {} failed: {e:#}",
+                describe_pod_target_ip(*pod)
+            );
+        }
+    }
+    for ip in install {
         if let Err(e) = map.insert(ip, 1u8, 0) {
             failed += 1;
             eprintln!(
@@ -228,34 +260,119 @@ fn apply_pod_targets(
     Ok(())
 }
 
-/// Sweeps `departed` pods' conntrack, and only on success deletes their
-/// `POD_TARGETS` rows. The row is what makes a pod show up as departed on the
-/// next reconcile, so deleting it before a failed sweep would orphan that
-/// pod's flows forever. Returns the number of failures.
-fn evict_then_delete_departed(
-    departed: &HashSet<[u8; 16]>,
+/// Pod IPs present in both maps under different known uids: the IP now belongs
+/// to a different pod, so conntrack rows pinned for the old owner would steer
+/// its in-flight packets to the new one. New IPs, unchanged uids, and IPs
+/// without a known uid on either side are never reused.
+fn reused_pod_ips(
+    known: &HashMap<[u8; 16], Option<String>>,
+    desired: &HashMap<[u8; 16], Option<String>>,
+) -> HashSet<[u8; 16]> {
+    desired
+        .iter()
+        .filter(|(ip, uid)| match (known.get(*ip), uid) {
+            (Some(Some(old)), Some(new)) => old != new,
+            _ => false,
+        })
+        .map(|(ip, _)| *ip)
+        .collect()
+}
+
+/// What one reconcile tick may write after its conntrack sweep.
+struct TickPlan {
+    /// The sweep's failure, if any; the caller reports it after every map has
+    /// converged.
+    sweep_error: Option<anyhow::Error>,
+    /// Fronts to write: those naming an IP whose sweep is pending are held
+    /// back at their installed endpoints.
+    fronts: HashMap<LbFrontKey, DesiredFront>,
+    /// False while a front is held back (pruning would delete it). This
+    /// pauses pruning of every absent front, not just the held one, until the
+    /// sweep succeeds: `plan_front_writes` only knows all-or-nothing pruning,
+    /// and the pause is bounded by the sweep retry.
+    prune_fronts: bool,
+    /// `POD_TARGETS` IPs to insert, minus IPs whose sweep is pending.
+    pod_targets: HashSet<[u8; 16]>,
+    /// Departed `POD_TARGETS` rows to delete: only once their sweep succeeded,
+    /// since the row is what makes the pod show up as departed on a retry.
+    delete_rows: HashSet<[u8; 16]>,
+}
+
+/// Decides the sweep and runs it through `evict` (one conntrack walk for every
+/// IP in the set), then derives what the rest of the tick may install.
+///
+/// The sweep covers (a) local `POD_TARGETS` rows no longer desired and (b)
+/// every cluster backend that left `desired.cluster_backends` or came back
+/// under a different uid -- including remote pods, whose pins live on this
+/// (ingress) node but which `POD_TARGETS` never holds. On failure only the
+/// swept IPs stay pending (in `known`, and out of the installs); everything
+/// else converges.
+fn plan_tick(
+    desired: &DesiredEntries,
+    installed_pod_targets: &[[u8; 16]],
+    known: &mut HashMap<[u8; 16], Option<String>>,
     evict: impl FnOnce(&HashSet<[u8; 16]>) -> anyhow::Result<()>,
-    mut delete: impl FnMut([u8; 16]) -> anyhow::Result<()>,
-) -> usize {
-    if let Err(e) = evict(departed) {
-        eprintln!(
-            "controller: conntrack eviction sweep for {} departed pod(s) failed, keeping their \
-             POD_TARGETS rows for retry: {e:#}",
-            departed.len()
+) -> TickPlan {
+    let mut sweep = HashSet::new();
+    let mut delete_rows = HashSet::new();
+    if desired.pod_targets_known {
+        let live: Vec<[u8; 16]> = desired.pod_targets.iter().copied().collect();
+        delete_rows = beep::stale_pod_targets(installed_pod_targets, &live)
+            .into_iter()
+            .collect();
+        sweep.extend(delete_rows.iter().copied());
+        sweep.extend(
+            known
+                .keys()
+                .filter(|ip| !desired.cluster_backends.contains_key(*ip))
+                .copied(),
         );
-        return 1;
+        sweep.extend(reused_pod_ips(known, &desired.cluster_backends));
     }
-    let mut failed = 0;
-    for pod in departed {
-        if let Err(e) = delete(*pod) {
-            failed += 1;
-            eprintln!(
-                "controller: POD_TARGETS delete for pod {} failed: {e:#}",
-                describe_pod_target_ip(*pod)
-            );
+
+    let sweep_error = if sweep.is_empty() {
+        None
+    } else {
+        evict(&sweep).err()
+    };
+    let pending: HashSet<[u8; 16]> = if sweep_error.is_some() {
+        sweep
+    } else {
+        HashSet::new()
+    };
+
+    if desired.pod_targets_known {
+        if sweep_error.is_some() {
+            known.retain(|ip, _| pending.contains(ip));
+            for (ip, uid) in &desired.cluster_backends {
+                if !pending.contains(ip) {
+                    known.insert(*ip, uid.clone());
+                }
+            }
+            delete_rows.clear();
+        } else {
+            known.clone_from(&desired.cluster_backends);
         }
     }
-    failed
+
+    let fronts: HashMap<_, _> = desired
+        .fronts
+        .iter()
+        .filter(|(_, front)| {
+            !front
+                .endpoints
+                .iter()
+                .any(|ep| pending.contains(&ep.backend.pod_ip))
+        })
+        .map(|(key, front)| (*key, front.clone()))
+        .collect();
+    TickPlan {
+        prune_fronts: fronts.len() == desired.fronts.len(),
+        fronts,
+        pod_targets: desired.pod_targets.difference(&pending).copied().collect(),
+        delete_rows,
+        sweep_error,
+    }
 }
 
 /// Formats a `POD_TARGETS` pod IP for logging. Unlike `describe_node_allow_peer`'s
@@ -370,52 +487,211 @@ fn node_allow_stale_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beep_common::ipv4_mapped_v6;
+    use beep_common::{ipv4_mapped_v6, LbFrontBackend};
 
-    #[test]
-    fn failed_sweep_keeps_departed_pod_rows_so_next_tick_retries() {
-        let departed: HashSet<[u8; 16]> =
-            [ipv4_mapped_v6(1), ipv4_mapped_v6(2)].into_iter().collect();
-        let mut deleted = Vec::new();
-        let failed = evict_then_delete_departed(
-            &departed,
-            |_| anyhow::bail!("map iter failed"),
-            |pod| {
-                deleted.push(pod);
-                Ok(())
-            },
-        );
-        assert_eq!(failed, 1);
-        assert!(
-            deleted.is_empty(),
-            "POD_TARGETS rows deleted before a failed sweep orphan those pods' flows forever"
-        );
+    type Known = HashMap<[u8; 16], Option<String>>;
+
+    fn ip(n: u32) -> [u8; 16] {
+        ipv4_mapped_v6(n)
+    }
+
+    fn backends(pairs: &[(u32, Option<&str>)]) -> Known {
+        pairs
+            .iter()
+            .map(|(n, uid)| (ip(*n), uid.map(str::to_owned)))
+            .collect()
+    }
+
+    fn front_key(port: u16) -> LbFrontKey {
+        LbFrontKey {
+            front_ip: ip(100),
+            front_port: port,
+            proto: 6,
+            _pad: 0,
+        }
+    }
+
+    fn front_to(pod: u32) -> DesiredFront {
+        DesiredFront {
+            flags: 0,
+            endpoints: vec![FrontEndpoint {
+                backend: LbFrontBackend {
+                    backend_node_ip: ip(200),
+                    pod_ip: ip(pod),
+                },
+                target_port: 80,
+                _pad: [0; 6],
+            }],
+        }
+    }
+
+    fn desired(cluster: Known, local: &[u32], fronts: &[(u16, u32)]) -> DesiredEntries {
+        DesiredEntries {
+            fronts: fronts
+                .iter()
+                .map(|(port, pod)| (front_key(*port), front_to(*pod)))
+                .collect(),
+            pod_targets: local.iter().map(|n| ip(*n)).collect(),
+            cluster_backends: cluster,
+            fronts_known: true,
+            pod_targets_known: true,
+            ..DesiredEntries::default()
+        }
+    }
+
+    /// Runs `plan_tick` with an evictor that records its calls.
+    fn tick(
+        d: &DesiredEntries,
+        installed: &[u32],
+        known: &mut Known,
+        fail: bool,
+    ) -> (TickPlan, Vec<HashSet<[u8; 16]>>) {
+        let installed: Vec<[u8; 16]> = installed.iter().map(|n| ip(*n)).collect();
+        let mut calls = Vec::new();
+        let plan = plan_tick(d, &installed, known, |pods| {
+            calls.push(pods.clone());
+            if fail {
+                anyhow::bail!("map iter failed")
+            }
+            Ok(())
+        });
+        (plan, calls)
+    }
+
+    fn set(ns: &[u32]) -> HashSet<[u8; 16]> {
+        ns.iter().map(|n| ip(*n)).collect()
     }
 
     #[test]
-    fn successful_sweep_deletes_every_departed_pod_row_after_one_sweep() {
-        let departed: HashSet<[u8; 16]> =
-            [ipv4_mapped_v6(1), ipv4_mapped_v6(2)].into_iter().collect();
-        let mut sweeps = 0;
-        let mut deleted = HashSet::new();
-        let failed = evict_then_delete_departed(
-            &departed,
-            |pods| {
-                sweeps += 1;
-                assert_eq!(pods.len(), 2, "all departed pods swept together");
-                Ok(())
-            },
-            |pod| {
-                deleted.insert(pod);
-                Ok(())
-            },
+    fn departed_remote_backend_is_swept_on_the_ingress_node() {
+        // Pins to a pod on another node live here, but POD_TARGETS only holds
+        // local pods: without cluster-wide tracking the flow blackholes at
+        // the backend's decap check until LRU eviction.
+        let mut known = backends(&[(7, Some("remote"))]);
+        let d = desired(Known::new(), &[], &[]);
+        let (plan, calls) = tick(&d, &[], &mut known, false);
+        assert_eq!(calls, vec![set(&[7])]);
+        assert!(plan.sweep_error.is_none());
+        assert!(known.is_empty(), "swept pod is forgotten");
+    }
+
+    #[test]
+    fn reused_remote_ip_is_swept_before_the_new_pod_is_fronted() {
+        // The old pod's pins would otherwise steer in-flight packets to the
+        // different workload that now owns the IP.
+        let mut known = backends(&[(7, Some("old"))]);
+        let d = desired(backends(&[(7, Some("new"))]), &[], &[(80, 7)]);
+        let (plan, calls) = tick(&d, &[], &mut known, false);
+        assert_eq!(calls, vec![set(&[7])]);
+        assert!(plan.sweep_error.is_none());
+        assert_eq!(known, backends(&[(7, Some("new"))]));
+    }
+
+    #[test]
+    fn unchanged_new_or_unidentified_backends_never_sweep() {
+        // A sweep resets live flows; it must only fire on a real departure or
+        // identity change.
+        let mut known = backends(&[(1, Some("a")), (2, None), (3, Some("c"))]);
+        let d = desired(
+            backends(&[(1, Some("a")), (2, Some("x")), (3, None), (4, Some("d"))]),
+            &[],
+            &[],
         );
-        assert_eq!(failed, 0);
+        let (_, calls) = tick(&d, &[], &mut known, false);
+        assert!(calls.is_empty(), "no pod left or changed owner: {calls:?}");
+    }
+
+    #[test]
+    fn local_departed_row_is_swept_even_after_a_controller_restart() {
+        // `known` is empty after a restart; the POD_TARGETS row is the only
+        // record that the local pod ever existed.
+        let mut known = Known::new();
+        let d = desired(Known::new(), &[], &[]);
+        let (plan, calls) = tick(&d, &[5], &mut known, false);
+        assert_eq!(calls, vec![set(&[5])]);
+        assert_eq!(plan.delete_rows, set(&[5]));
+    }
+
+    #[test]
+    fn every_departed_and_reused_ip_shares_one_table_walk() {
+        let mut known = backends(&[(1, Some("a")), (2, Some("b")), (3, Some("c"))]);
+        let d = desired(backends(&[(3, Some("c2"))]), &[], &[]);
+        let (_, calls) = tick(&d, &[9], &mut known, false);
+        assert_eq!(calls, vec![set(&[1, 2, 3, 9])]);
+    }
+
+    #[test]
+    fn unknown_pod_targets_skip_the_sweep_and_keep_tracking() {
+        // Own node not resolved yet: the cluster set is untrustworthy, so
+        // nothing may be swept or forgotten.
+        let mut known = backends(&[(7, Some("remote"))]);
+        let mut d = desired(Known::new(), &[], &[]);
+        d.pod_targets_known = false;
+        let (_, calls) = tick(&d, &[], &mut known, false);
+        assert!(calls.is_empty());
+        assert_eq!(known, backends(&[(7, Some("remote"))]));
+    }
+
+    #[test]
+    fn failed_sweep_withholds_only_the_affected_ips_installs() {
+        // R's IP changed owner and its sweep fails; S is unrelated. S's front
+        // and POD_TARGETS row, and a new front, must still converge -- only
+        // what names R waits for the retry.
+        let mut known = backends(&[(7, Some("old")), (8, Some("s"))]);
+        let d = desired(
+            backends(&[(7, Some("new")), (8, Some("s")), (9, Some("t"))]),
+            &[7, 8, 9],
+            &[(80, 7), (81, 8), (82, 9)],
+        );
+        let (plan, calls) = tick(&d, &[7, 8], &mut known, true);
+        assert_eq!(calls, vec![set(&[7])]);
+        assert!(plan.sweep_error.is_some());
         assert_eq!(
-            sweeps, 1,
-            "one table walk per tick regardless of departed count"
+            plan.fronts.keys().copied().collect::<HashSet<_>>(),
+            [front_key(81), front_key(82)].into_iter().collect(),
+            "only the front naming the unswept IP is held back"
         );
-        assert_eq!(deleted, departed);
+        assert!(
+            !plan.prune_fronts,
+            "pruning would delete the held-back front instead of leaving it"
+        );
+        assert_eq!(plan.pod_targets, set(&[8, 9]));
+        assert_eq!(
+            known,
+            backends(&[(7, Some("old")), (8, Some("s")), (9, Some("t"))]),
+            "the reuse stays pending; unaffected backends are tracked"
+        );
+
+        let (plan, calls) = tick(&d, &[7, 8], &mut known, false);
+        assert_eq!(calls, vec![set(&[7])], "the retry sweeps the pending IP");
+        assert_eq!(plan.fronts.len(), 3);
+        assert!(plan.prune_fronts);
+        assert_eq!(plan.pod_targets, set(&[7, 8, 9]));
+    }
+
+    #[test]
+    fn failed_sweep_keeps_departed_pod_rows_so_next_tick_retries() {
+        // Deleting the row before a failed sweep orphans that pod's flows
+        // forever: nothing would mark it departed again.
+        let mut known = Known::new();
+        let d = desired(Known::new(), &[], &[]);
+        let (plan, _) = tick(&d, &[1, 2], &mut known, true);
+        assert!(plan.delete_rows.is_empty());
+        let (plan, calls) = tick(&d, &[1, 2], &mut known, false);
+        assert_eq!(calls, vec![set(&[1, 2])]);
+        assert_eq!(plan.delete_rows, set(&[1, 2]));
+    }
+
+    #[test]
+    fn departed_pod_whose_sweep_is_pending_is_recognised_when_its_ip_returns() {
+        // The IP leaves, the sweep fails, the IP returns under a new pod: the
+        // departed pod's pins must still be swept.
+        let mut known = backends(&[(1, Some("old"))]);
+        let gone = desired(Known::new(), &[], &[]);
+        let (_, _) = tick(&gone, &[], &mut known, true);
+        let back = desired(backends(&[(1, Some("new"))]), &[], &[]);
+        let (_, calls) = tick(&back, &[], &mut known, false);
+        assert_eq!(calls, vec![set(&[1])]);
     }
 
     #[test]
