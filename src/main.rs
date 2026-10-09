@@ -635,9 +635,8 @@ fn plan_fixture_fronts(
 /// would delete the controller's live fronts.
 fn require_explicit_pin_dir(pin_dir: Option<PathBuf>) -> Result<PathBuf, String> {
     pin_dir.ok_or_else(|| {
-        "--fixture mode requires an explicit --pin-dir: it prunes every front not in the \
-         fixture set, so it must not share the controller's default pin dir \
-         (/sys/fs/bpf/beep)"
+        "an explicit --pin-dir is required: the loader prunes every front not in its fixture \
+         set, so it must not use the controller's default pin dir (/sys/fs/bpf/beep)"
             .to_string()
     })
 }
