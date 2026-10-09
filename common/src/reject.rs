@@ -341,9 +341,125 @@ pub fn icmp6_unreachable_in_place(
     true
 }
 
+/// Nanoseconds to earn one reply token: 100 replies/s per CPU. A node's
+/// total is that times its CPU count, the same order as the kernel's own
+/// ICMP limit (`icmp_msgs_per_sec` 1000, burst 50) on a typical node.
+pub const REJECT_NS_PER_TOKEN: u64 = 10_000_000;
+/// Most replies one CPU can emit back to back after sitting idle.
+pub const REJECT_BURST: u64 = 25;
+
+/// Per-CPU reply budget. All-zero is a valid initial state and starts full.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RejectBucket {
+    pub tokens: u64,
+    pub last_refill_ns: u64,
+}
+
+/// Whether one more reject reply may be sent at monotonic time `now_ns`.
+/// Without this cap a spoofed-source flood at an empty front becomes one
+/// reply per packet aimed at the victim.
+pub fn reject_admit(bucket: &mut RejectBucket, now_ns: u64) -> bool {
+    if now_ns < bucket.last_refill_ns {
+        bucket.last_refill_ns = now_ns;
+    } else {
+        let earned = (now_ns - bucket.last_refill_ns) / REJECT_NS_PER_TOKEN;
+        if earned > 0 {
+            bucket.tokens = bucket.tokens.saturating_add(earned).min(REJECT_BURST);
+            bucket.last_refill_ns += earned * REJECT_NS_PER_TOKEN;
+        }
+    }
+    if bucket.tokens == 0 {
+        return false;
+    }
+    bucket.tokens -= 1;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flood_is_capped_at_burst_so_a_spoofed_victim_is_not_reflected_at() {
+        let mut b = RejectBucket::default();
+        let now = 1_000_000_000_000;
+        let sent = (0..10_000).filter(|_| reject_admit(&mut b, now)).count();
+        assert_eq!(sent as u64, REJECT_BURST);
+    }
+
+    #[test]
+    fn sustained_flood_is_held_to_the_refill_rate() {
+        let mut b = RejectBucket::default();
+        let start = 5_000_000_000_000;
+        let mut sent = 0;
+        for i in 0..100_000u64 {
+            // one packet per 10 us for one second
+            if reject_admit(&mut b, start + i * 10_000) {
+                sent += 1;
+            }
+        }
+        let max = REJECT_BURST + 1_000_000_000 / REJECT_NS_PER_TOKEN;
+        assert!(sent <= max, "{sent} replies in 1s exceeds {max}");
+        assert!(
+            sent >= max - 1,
+            "{sent} replies: bucket starves below its rate"
+        );
+    }
+
+    #[test]
+    fn a_legit_client_is_answered_again_after_the_flood_stops() {
+        let mut b = RejectBucket::default();
+        let t = 1_000_000_000_000;
+        while reject_admit(&mut b, t) {}
+        assert!(
+            !reject_admit(&mut b, t + REJECT_NS_PER_TOKEN - 1),
+            "no token may appear before a full interval"
+        );
+        assert!(
+            reject_admit(&mut b, t + REJECT_NS_PER_TOKEN),
+            "a client refused during a flood must get its reply once a token is earned"
+        );
+    }
+
+    #[test]
+    fn idle_time_never_banks_more_than_the_burst() {
+        let mut b = RejectBucket::default();
+        assert!(reject_admit(&mut b, 1_000_000_000_000));
+        let later = 1_000_000_000_000 + 3_600_000_000_000;
+        let sent = (0..1_000).filter(|_| reject_admit(&mut b, later)).count();
+        assert_eq!(sent as u64, REJECT_BURST);
+    }
+
+    #[test]
+    fn clock_going_backwards_neither_refills_nor_wedges_the_bucket() {
+        let mut b = RejectBucket::default();
+        let t = 9_000_000_000_000;
+        while reject_admit(&mut b, t) {}
+        assert!(
+            !reject_admit(&mut b, t - 5_000_000_000_000),
+            "a backwards clock must not mint tokens"
+        );
+        assert!(
+            reject_admit(&mut b, t - 5_000_000_000_000 + REJECT_NS_PER_TOKEN),
+            "after a backwards step the bucket must resume refilling, not stay stuck until the old time"
+        );
+    }
+
+    #[test]
+    fn extreme_timestamps_do_not_overflow() {
+        let mut b = RejectBucket {
+            tokens: u64::MAX,
+            last_refill_ns: 0,
+        };
+        assert!(reject_admit(&mut b, u64::MAX));
+        assert!(
+            b.tokens <= REJECT_BURST,
+            "a corrupt token count must be clamped"
+        );
+        let mut b = RejectBucket::default();
+        assert!(reject_admit(&mut b, u64::MAX));
+    }
 
     const CLIENT4: [u8; 4] = [203, 0, 113, 2];
     const FRONT4: [u8; 4] = [203, 0, 113, 1];
