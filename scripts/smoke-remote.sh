@@ -700,13 +700,14 @@ echo "==> pin steering: a flow held open while its front is re-pointed at anothe
 PIN_STEER_FIFO="/tmp/beep-smoke-pin-steer-fifo"
 PIN_STEER_BACKEND_IN="/tmp/beep-smoke-pin-steer-backend.in"
 PIN_STEER_MSG="PINMSG"
+PIN_DRAIN_MSG="PINDRAIN"
 rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
 mkfifo "$PIN_STEER_FIFO"
 pin_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
-nohup bash -c "sleep 20 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
+nohup bash -c "sleep 60 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
 disown
 sleep 0.5
-nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG} ) | timeout 20 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
+nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_DRAIN_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
 disown
 for _ in $(seq 1 30); do
   pin_flows_now=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
@@ -745,6 +746,32 @@ pin_new_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EV
   exit 1
 }
 echo "PIN-STEERING (new flow): PASS (a fresh flow followed the new endpoint ${REPLACEMENT_POD_IP})"
+
+# Drain: the front's ready count drops to 0 (rolling update) while the pinned
+# flow is still open. It must keep forwarding; only a NEW connection is refused.
+bpftool map update pinned "$PIN_DIR/FRONT_META" key 0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ') $((EVICT_FRONT_PORT >> 8)) $((EVICT_FRONT_PORT & 255)) 6 0 value 0 0 0 0 0 0 0 0 || {
+  echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
+  exit 1
+}
+printf '\n' 1<>"$PIN_STEER_FIFO"
+for _ in $(seq 1 25); do
+  grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
+  sleep 0.2
+done
+grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null || {
+  echo "FAIL: after the front's ready count dropped to 0, a packet of the established flow did not reach its pinned pod ${POD_IP} (backend received: '$(cat "$PIN_STEER_BACKEND_IN" 2>/dev/null)'). A draining front must keep forwarding pinned flows; resetting them breaks live connections during a rolling update." >&2
+  exit 1
+}
+echo "PIN-DRAIN (established): PASS (pinned flow kept forwarding with the front at count 0)"
+drain_rc=0
+drain_start=$(date +%s%N)
+ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/" >/dev/null 2>&1 || drain_rc=$?
+drain_ms=$((($(date +%s%N) - drain_start) / 1000000))
+[ "$drain_rc" -eq 7 ] && [ "$drain_ms" -lt 2000 ] || {
+  echo "FAIL: a NEW connection to the count-0 front must be refused immediately (curl rc 7, <2000ms), got rc=$drain_rc after ${drain_ms}ms" >&2
+  exit 1
+}
+echo "PIN-DRAIN (new flow): PASS (new connection refused after ${drain_ms}ms)"
 EVICT_FRONT_POD_IP="$POD_IP"
 stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"

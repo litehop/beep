@@ -1003,8 +1003,10 @@ pub enum IngressSteer {
 
 /// Ingress backend choice for one packet of a front. An existing pin
 /// (`established` from `FLOW_TABLE`, else `pending` from `FWD_PENDING`) always
-/// wins over the hash: a changed endpoint count or slot order must never move
-/// a live connection to a pod holding no state for it. Only a flow with no pin
+/// wins over the hash, and over a zero count: a changed endpoint count or slot
+/// order must never move a live connection to a pod holding no state for it,
+/// and a front draining to zero ready endpoints must not reset live
+/// connections. Only a flow with no pin is rejected at count 0, else it
 /// reduces `hash` (a `flow_hash` of the flow) over `meta.count` and reads the
 /// chosen row through `endpoint_at`.
 pub fn ingress_steer(
@@ -1015,11 +1017,11 @@ pub fn ingress_steer(
     front: LbFrontKey,
     endpoint_at: impl FnOnce(FrontEndpointKey) -> Option<FrontEndpoint>,
 ) -> IngressSteer {
-    if meta.count == 0 {
-        return IngressSteer::Reject;
-    }
     if let Some(backend) = established.or(pending) {
         return IngressSteer::Forward(backend);
+    }
+    if meta.count == 0 {
+        return IngressSteer::Reject;
     }
     let Some(slot) = slot_in_range(hash, meta.count as u32) else {
         return IngressSteer::Drop;
@@ -2777,9 +2779,24 @@ mod tests {
     }
 
     #[test]
-    fn front_without_endpoints_is_rejected_even_with_a_stale_pin() {
+    fn pinned_flow_keeps_forwarding_when_front_drains_to_zero_endpoints() {
         let front = test_front();
-        let steered = ingress_steer(meta(1, 0), Some(backend_n(1)), None, 0, front, |_| {
+        for (established, pending) in [(Some(backend_n(1)), None), (None, Some(backend_n(2)))] {
+            let steered = ingress_steer(meta(1, 0), established, pending, 0, front, |_| {
+                panic!("no row may be read for a pinned flow")
+            });
+            assert_eq!(
+                steered,
+                IngressSteer::Forward(established.or(pending).unwrap()),
+                "a rolling update can drop the ready count to 0; live connections must drain, not reset"
+            );
+        }
+    }
+
+    #[test]
+    fn unpinned_flow_on_front_without_endpoints_is_rejected() {
+        let front = test_front();
+        let steered = ingress_steer(meta(1, 0), None, None, 0, front, |_| {
             panic!("no row may be read when count is 0")
         });
         assert_eq!(steered, IngressSteer::Reject);
