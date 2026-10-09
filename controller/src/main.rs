@@ -187,9 +187,16 @@ struct RetryBackoff {
 }
 
 impl RetryBackoff {
+    /// A failure while a retry is still pending (a watch event mid-backoff)
+    /// keeps the armed deadline and the delay, so an event storm cannot
+    /// postpone the retry or inflate the backoff; only a failed attempt at or
+    /// past the deadline grows it.
     fn record(&mut self, ok: bool, now: Instant) {
         if ok {
             *self = Self::default();
+            return;
+        }
+        if self.retry_at.is_some_and(|at| now < at) {
             return;
         }
         let delay = RETRY_INITIAL
@@ -204,6 +211,28 @@ impl RetryBackoff {
     }
 }
 
+/// Runs `apply` and records its outcome in `retry`.
+fn reconcile_once(
+    apply: impl FnOnce() -> anyhow::Result<()>,
+    retry: &Mutex<RetryBackoff>,
+    now: Instant,
+) {
+    let result = apply();
+    if let Err(e) = &result {
+        eprintln!("controller: applying reconciled maps failed (will retry): {e:#}");
+    }
+    retry.lock().unwrap().record(result.is_ok(), now);
+}
+
+/// Runs `run` only when a retry is due; returns whether it ran.
+fn retry_tick(retry: &Mutex<RetryBackoff>, now: Instant, run: impl FnOnce()) -> bool {
+    let due = retry.lock().unwrap().due(now);
+    if due {
+        run();
+    }
+    due
+}
+
 fn apply_reconcile(
     state: &Mutex<WatchState>,
     maps: &Mutex<PinnedMaps>,
@@ -212,11 +241,11 @@ fn apply_reconcile(
 ) {
     let desired = state.lock().unwrap().desired(node);
     warn_on_rejected_endpoints(&desired, node);
-    let result = maps.lock().unwrap().apply(&desired);
-    if let Err(e) = &result {
-        eprintln!("controller: applying reconciled maps failed (will retry): {e:#}");
-    }
-    retry.lock().unwrap().record(result.is_ok(), Instant::now());
+    reconcile_once(
+        || maps.lock().unwrap().apply(&desired),
+        retry,
+        Instant::now(),
+    );
 }
 
 /// Re-runs the full reconcile whenever `retry` says a failed apply is due.
@@ -229,10 +258,9 @@ async fn run_retry_loop(
 ) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(RETRY_POLL).await;
-        let due = retry.lock().unwrap().due(Instant::now());
-        if due {
-            apply_reconcile(&state, &maps, &retry, &node);
-        }
+        retry_tick(&retry, Instant::now(), || {
+            apply_reconcile(&state, &maps, &retry, &node)
+        });
     }
 }
 
@@ -712,21 +740,88 @@ mod tests {
     fn backoff_doubles_then_caps_so_a_persistent_failure_does_not_hammer_the_maps() {
         let t0 = Instant::now();
         let mut b = RetryBackoff::default();
-        let mut delays = Vec::new();
+        let mut now = t0;
+        let mut secs = Vec::new();
         for _ in 0..8 {
-            b.record(false, t0);
-            delays.push(b.retry_at.unwrap() - t0);
+            b.record(false, now);
+            let at = b.retry_at.unwrap();
+            secs.push((at - now).as_secs());
+            now = at;
         }
-        let secs: Vec<u64> = delays.iter().map(Duration::as_secs).collect();
         assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
         for _ in 0..200 {
-            b.record(false, t0);
+            b.record(false, now);
+            let at = b.retry_at.unwrap();
+            assert_eq!(at - now, RETRY_MAX, "no overflow past the cap");
+            now = at;
+        }
+    }
+
+    #[test]
+    fn event_storm_during_failure_neither_postpones_retry_nor_inflates_backoff() {
+        let t0 = Instant::now();
+        let mut b = RetryBackoff::default();
+        b.record(false, t0);
+        let armed = b.retry_at.unwrap();
+        for ms in 1..900 {
+            b.record(false, t0 + Duration::from_millis(ms));
         }
         assert_eq!(
-            b.retry_at.unwrap() - t0,
-            RETRY_MAX,
-            "no overflow past the cap"
+            b.retry_at,
+            Some(armed),
+            "watch-driven failures must not push the pending retry out"
         );
+        assert_eq!(b.failures, 1, "only failed retry attempts grow the backoff");
+        b.record(false, armed);
+        assert_eq!(
+            b.retry_at.unwrap() - armed,
+            2 * RETRY_INITIAL,
+            "a failed retry attempt must double the delay"
+        );
+    }
+
+    fn failing() -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("map full"))
+    }
+
+    #[test]
+    fn failed_reconcile_arms_a_retry_and_success_disarms_it() {
+        let t0 = Instant::now();
+        let retry = Mutex::new(RetryBackoff::default());
+        reconcile_once(failing, &retry, t0);
+        assert!(
+            retry.lock().unwrap().due(t0 + RETRY_INITIAL),
+            "a failed apply must arm a retry or departed pods stay pinned"
+        );
+        reconcile_once(|| Ok(()), &retry, t0 + RETRY_INITIAL);
+        assert!(
+            !retry.lock().unwrap().due(t0 + RETRY_MAX),
+            "a successful apply must stop the retries"
+        );
+    }
+
+    #[test]
+    fn retry_tick_reruns_reconcile_only_when_due() {
+        let t0 = Instant::now();
+        let retry = Mutex::new(RetryBackoff::default());
+        let mut runs = 0;
+        assert!(!retry_tick(&retry, t0, || runs += 1), "nothing armed");
+        reconcile_once(failing, &retry, t0);
+        assert!(!retry_tick(&retry, t0, || runs += 1), "backoff not elapsed");
+        assert_eq!(runs, 0);
+        assert!(
+            retry_tick(&retry, t0 + RETRY_INITIAL, || {
+                runs += 1;
+                reconcile_once(|| Ok(()), &retry, t0 + RETRY_INITIAL);
+            }),
+            "a due retry must re-run reconcile with no watch event"
+        );
+        assert_eq!(runs, 1);
+        assert!(
+            !retry_tick(&retry, t0 + RETRY_MAX, || runs += 1),
+            "a successful retry must not run again"
+        );
+        assert_eq!(runs, 1);
     }
 
     #[test]
@@ -734,8 +829,8 @@ mod tests {
         let t0 = Instant::now();
         let mut b = RetryBackoff::default();
         b.record(false, t0);
-        b.record(false, t0);
-        b.record(true, t0);
+        b.record(false, t0 + RETRY_INITIAL);
+        b.record(true, t0 + RETRY_INITIAL);
         assert!(
             !b.due(t0 + RETRY_MAX),
             "a healthy apply must not keep retrying"
