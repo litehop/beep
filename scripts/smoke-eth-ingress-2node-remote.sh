@@ -175,6 +175,28 @@ start_loader() {
   cat "$LOADER_LOG"
 }
 
+# A bare loader's NODE_ALLOW holds only its own --node-ip, so a Geneve decap
+# from the OTHER node is dropped until that peer's key is added. The key is
+# the loader's own raw bytes (not an IP string) so the encoding always
+# matches. Only valid while the map holds the single self-entry.
+dump_node_allow_key() {
+  bpftool map dump pinned "$PIN_DIR/NODE_ALLOW" -j | jq -r '.[0].key | join(" ")'
+}
+
+seed_node_allow() {
+  local key_hex=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --key-hex) key_hex="$2"; shift 2 ;;
+      *) echo "seed-node-allow: unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$key_hex" ] || { echo "seed-node-allow: --key-hex required" >&2; exit 1; }
+  # shellcheck disable=SC2086 # $key_hex is a bpftool-supplied space-separated byte list, meant to split.
+  bpftool map update pinned "$PIN_DIR/NODE_ALLOW" key $key_hex value 0x01
+  echo "NODE-ALLOW-SEED: PASS (added peer key ${key_hex// /:})"
+}
+
 start_backend_responder() {
   local pod_ip="" port=""
   while [[ $# -gt 0 ]]; do
@@ -196,6 +218,8 @@ start_backend_responder() {
 dump_evidence() {
   echo "== bpftool map dump: FRONT_META =="
   bpftool map dump pinned "$PIN_DIR/FRONT_META" 2>&1 || true
+  echo "== bpftool map dump: NODE_ALLOW =="
+  bpftool map dump pinned "$PIN_DIR/NODE_ALLOW" 2>&1 || true
   echo "== bpftool map dump: FWD_PENDING =="
   bpftool map dump pinned "$PIN_DIR/FWD_PENDING" 2>&1 || true
   echo "== bpftool map dump: FLOW_TABLE =="
@@ -242,10 +266,12 @@ case "$cmd" in
   setup-backend) setup_backend "$@" ;;
   start-loader) start_loader "$@" ;;
   start-backend-responder) start_backend_responder "$@" ;;
+  dump-node-allow-key) dump_node_allow_key ;;
+  seed-node-allow) seed_node_allow "$@" ;;
   dump-evidence) dump_evidence ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 {setup-wg|pubkey|setup-geneve|check-uplink|setup-backend|start-loader|start-backend-responder|dump-evidence|cleanup} [args...]" >&2
+    echo "usage: $0 {setup-wg|pubkey|setup-geneve|check-uplink|setup-backend|start-loader|start-backend-responder|dump-node-allow-key|seed-node-allow|dump-evidence|cleanup} [args...]" >&2
     exit 1
     ;;
 esac
