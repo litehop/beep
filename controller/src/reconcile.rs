@@ -215,6 +215,10 @@ pub struct Endpoint {
     pub node_addrs: Vec<IpAddr>,
     pub ready: bool,
     pub ports: Vec<u16>,
+    /// `endpoints[].targetRef.uid`: the owning pod's identity, absent when the
+    /// slice carries no `targetRef`. Lets the controller notice a pod IP
+    /// handed to a different pod (`cluster_backends`).
+    pub pod_uid: Option<String>,
 }
 
 /// One `EndpointSlice` object. A Service can be backed by more than one of
@@ -225,7 +229,7 @@ pub struct EndpointSliceView {
     pub endpoints: Vec<Endpoint>,
 }
 
-/// A ready endpoint hosted on THIS node (`ep.node_addrs` contains `node.node_ip`) that
+/// An endpoint hosted on THIS node (`ep.node_addrs` contains `node.node_ip`) that
 /// `pod_targets_for_node`'s admission check excluded from `POD_TARGETS`
 /// because its `pod_ip` matched neither `pod_cidr` nor the hostNetwork
 /// signature. The rejection itself is correct anti-spoof behavior (see
@@ -250,6 +254,10 @@ pub struct DesiredEntries {
     /// (`beep::front_swap`).
     pub fronts: HashMap<LbFrontKey, DesiredFront>,
     pub pod_targets: HashSet<[u8; 16]>,
+    /// Every backend pod IP still in a slice, with its owning pod uid, if
+    /// known (`cluster_backends`). Drives the departed/reused sweep in
+    /// `PinnedMaps::apply`; `pod_targets` stays this node's local subset.
+    pub cluster_backends: HashMap<[u8; 16], Option<String>>,
     /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
     /// `tunnel_remote_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
     /// host-native value -- the same convention `LbFrontBackend::
@@ -359,7 +367,10 @@ fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
 /// POD_TARGETS is this node's own local serving-set, port-agnostic by
 /// design (`beep_common::egress_return_admission`'s doc comment) --
 /// membership must never depend on which front port an endpoint answers,
-/// only on whether THIS node hosts it and is ready to serve it. Deliberately
+/// only on whether THIS node hosts it and it is still present in a slice --
+/// readiness is not consulted, since a terminating pod's already-pinned flows
+/// need decap and return admission until the endpoint is removed. New flows
+/// only ever reach ready endpoints via `FRONT_ENDPOINTS`. Deliberately
 /// independent of `ServiceView` (no `front_ip`/`ports` input): unlike
 /// `FRONT_META`/`FRONT_ENDPOINTS`, POD_TARGETS is EndpointSlice/local-node-derived,
 /// not front-derived, so `WatchState::desired` can (and must) call this even
@@ -372,7 +383,7 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     let mut pod_targets = HashSet::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready && ep.node_addrs.contains(&node.node_ip) && is_admitted(ep, node) {
+            if ep.node_addrs.contains(&node.node_ip) && is_admitted(ep, node) {
                 // POD_TARGETS' key is `[u8; 16]` (like NODE_ALLOW's), but wire-token
                 // (`wire_ip_v6`) like `LbFrontBackend::pod_ip` -- unlike NODE_ALLOW's
                 // host-native peer address, POD_TARGETS membership is checked against a
@@ -384,7 +395,25 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     pod_targets
 }
 
-/// The observational complement of `pod_targets_for_node`: every ready,
+/// Every endpoint still present in a slice, wherever it is hosted, keyed by
+/// wire pod IP with its owning pod uid when the slice carries a `targetRef`.
+/// Readiness is deliberately not consulted: a terminating-but-serving pod or
+/// one flapping its readiness probe still owns its pinned flows, which end only
+/// when the endpoint leaves every slice. Unlike `pod_targets_for_node` this is
+/// cluster-wide: the conntrack pins a node holds for a flow name the backend
+/// pod, which is usually on another node.
+pub fn cluster_backends(slices: &[EndpointSliceView]) -> HashMap<[u8; 16], Option<String>> {
+    let mut backends: HashMap<[u8; 16], Option<String>> = HashMap::new();
+    for ep in slices.iter().flat_map(|s| s.endpoints.iter()) {
+        let uid = backends.entry(wire_ip_v6(ep.pod_ip)).or_default();
+        if uid.is_none() {
+            uid.clone_from(&ep.pod_uid);
+        }
+    }
+    backends
+}
+
+/// The observational complement of `pod_targets_for_node`: every
 /// this-node-hosted endpoint that `is_admitted` excluded, paired with why.
 pub fn rejected_endpoints_for_node(
     slices: &[EndpointSliceView],
@@ -393,7 +422,7 @@ pub fn rejected_endpoints_for_node(
     let mut rejected = Vec::new();
     for slice in slices {
         for ep in &slice.endpoints {
-            if ep.ready && ep.node_addrs.contains(&node.node_ip) && !is_admitted(ep, node) {
+            if ep.node_addrs.contains(&node.node_ip) && !is_admitted(ep, node) {
                 rejected.push(RejectedEndpoint {
                     pod_ip: ep.pod_ip,
                     reason: "pod_ip is outside the configured --pod-cidr and is not this \
@@ -546,6 +575,7 @@ mod tests {
             node_addrs: vec![IpAddr::V4(node_ip)],
             ready: true,
             ports,
+            pod_uid: None,
         }
     }
 
@@ -556,6 +586,7 @@ mod tests {
             node_addrs: vec![IpAddr::V6(node_ip)],
             ready: true,
             ports,
+            pod_uid: None,
         }
     }
 
@@ -892,6 +923,60 @@ mod tests {
         );
     }
 
+    // The ingress node pins flows to backends hosted anywhere, so its departed/
+    // reused sweep must see every backend, not just the local ones, and a pod
+    // that is merely unready (terminating, or flapping its probe) must stay
+    // tracked or its pinned flows are cut mid-drain.
+    #[test]
+    fn cluster_backends_spans_nodes_keeps_unready_endpoints_and_known_uids() {
+        let this_node = Ipv4Addr::new(10, 0, 0, 5);
+        let other_node = Ipv4Addr::new(10, 0, 0, 6);
+        let mut local = ready_endpoint(Ipv4Addr::new(10, 244, 0, 9), this_node, vec![8080]);
+        local.pod_uid = Some("local".to_owned());
+        let mut remote = ready_endpoint(Ipv4Addr::new(10, 244, 1, 9), other_node, vec![8080]);
+        remote.pod_uid = Some("remote".to_owned());
+        let mut unready = ready_endpoint(Ipv4Addr::new(10, 244, 1, 10), other_node, vec![8080]);
+        unready.ready = false;
+        let anonymous = ready_endpoint(Ipv4Addr::new(10, 244, 1, 11), other_node, vec![8080]);
+
+        let backends = cluster_backends(&[EndpointSliceView {
+            endpoints: vec![local, remote, unready, anonymous],
+        }]);
+
+        let wire =
+            |third: u8, last: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, third, last)));
+        assert_eq!(
+            backends,
+            HashMap::from([
+                (wire(0, 9), Some("local".to_owned())),
+                (wire(1, 9), Some("remote".to_owned())),
+                (wire(1, 10), None),
+                (wire(1, 11), None),
+            ]),
+            "a remote pod must be tracked or its pins on this node outlive it; an unready pod \
+             must be too, or draining flows are swept the moment readiness drops"
+        );
+    }
+
+    // A terminating pod on this node still receives its pinned flows' packets
+    // and sends their replies; dropping it from POD_TARGETS would cut them at
+    // decap/return admission and make the controller sweep them as departed.
+    #[test]
+    fn unready_local_endpoint_stays_in_pod_targets_so_pinned_flows_drain() {
+        let this_node = Ipv4Addr::new(10, 0, 0, 5);
+        let mut draining = ready_endpoint(Ipv4Addr::new(10, 244, 0, 9), this_node, vec![8080]);
+        draining.ready = false;
+
+        let targets = pod_targets_for_node(
+            &[EndpointSliceView {
+                endpoints: vec![draining],
+            }],
+            &node(this_node),
+        );
+
+        assert!(targets.contains(&wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 0, 9)))));
+    }
+
     // node_ip matching alone must not be sufficient to admit a pod into
     // POD_TARGETS -- pod_cidr containment (or the hostNetwork pod_ip ==
     // node_ip signature) is the cross-check that catches a claim node_ip
@@ -962,6 +1047,7 @@ mod tests {
             node_addrs,
             ready: true,
             ports: vec![8080],
+            pod_uid: None,
         }
     }
 
@@ -1177,8 +1263,6 @@ mod tests {
             "no ready endpoint exists, so FRONT_META must get no entry for this front -- \
              fabricating one would route to an unready pod"
         );
-        assert!(desired.fronts.is_empty());
-        assert!(desired.pod_targets.is_empty());
     }
 
     // A dual-stack Service gets one front per family; a v6 front pointing at
