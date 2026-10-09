@@ -62,7 +62,9 @@ the first time, then confirm with "Verify your deployment" below.
    IP, and a front IP inside the pod CIDR can byte-collide a forward and
    reverse flow key. The standalone `beep` loader (driven by `--fixture`
    for manual/smoke runs — not the shipped `beep-controller` DaemonSet
-   binary) rejects such a front at startup: `front_outside_pod_cidr`
+   binary; it requires an explicit `--pin-dir` and must never share one with
+   the controller, since it prunes every front not in its `--fixture` set)
+   rejects such a front at startup: `front_outside_pod_cidr`
    (`src/main.rs:195`). The DaemonSet binary itself never feeds this path a
    user-supplied front — its front IP is always a `Node` object's own
    address — so on a normally-addressed cluster (node IPs and pod IPs are

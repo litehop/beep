@@ -821,6 +821,7 @@ pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyh
         ebpf.map_mut("UPLINK_CONFIG")
             .ok_or_else(|| anyhow!("no map named `UPLINK_CONFIG` in the eBPF object"))?,
     )?;
+    let mut configured = Vec::with_capacity(uplink_ifaces.len());
     for uplink_iface in uplink_ifaces {
         let uplink_ifindex = iface_index(uplink_iface)
             .with_context(|| format!("resolving ifindex for {uplink_iface}"))?;
@@ -831,8 +832,22 @@ pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyh
             "uplink {uplink_iface}: ifindex {uplink_ifindex}, ARPHRD type {uplink_arphrd}, L2 header skip {l2_hlen} byte(s)"
         );
         uplink_config.insert(uplink_ifindex, UplinkConfig { l2_hlen }, 0)?;
+        configured.push(uplink_ifindex);
+    }
+    // The map is pinned, so rows from a prior run survive a restart. Deleted
+    // only after the new set is in place, so a kept uplink is never absent.
+    let existing: Vec<u32> = uplink_config.keys().collect::<Result<_, _>>()?;
+    for ifindex in stale_uplink_ifindexes(&existing, &configured) {
+        uplink_config.remove(&ifindex)?;
     }
     Ok(())
+}
+
+/// `UPLINK_CONFIG` rows in `existing` whose ifindex is not in `configured`.
+/// A row is an admission grant for ingress on that ifindex, so one left behind
+/// by a dropped `--uplink-iface` keeps admitting traffic on it.
+pub fn stale_uplink_ifindexes(existing: &[u32], configured: &[u32]) -> Vec<u32> {
+    stale_pod_targets(existing, configured)
 }
 
 /// Loads the named classifier once, then attaches it at EVERY iface in
@@ -1254,6 +1269,22 @@ mod tests {
         assert!(
             stale_pod_targets(&live, &live).is_empty(),
             "a pod still claimed by the local serving-set must not be pruned from POD_TARGETS"
+        );
+    }
+
+    #[test]
+    fn dropped_uplink_row_is_pruned_and_kept_uplinks_survive() {
+        // UPLINK_CONFIG is pinned: a row for an uplink dropped from
+        // --uplink-iface would otherwise keep admitting ingress on that
+        // ifindex after restart.
+        assert_eq!(
+            stale_uplink_ifindexes(&[2, 7, 9], &[2, 9]),
+            vec![7],
+            "only the removed uplink's row may be deleted; kept uplinks must stay admitted"
+        );
+        assert!(
+            stale_uplink_ifindexes(&[2, 9], &[2, 9]).is_empty(),
+            "an unchanged uplink set must not delete any row"
         );
     }
 
