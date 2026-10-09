@@ -36,7 +36,7 @@ use aya::{
 };
 use beep::{
     attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
-    front_swap::{apply_fronts, DesiredFront},
+    front_swap::{plan_front_writes, run_front_plan, DesiredFront, FrontPlan, FrontWrite},
     load_ebpf, local_pod_ips, parse_fixture, parse_iface_name, populate_config,
     populate_uplink_config, random_seed, stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture,
     DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES, DEFAULT_FRONT_META_MAX_ENTRIES,
@@ -141,9 +141,11 @@ struct Args {
     #[arg(long, default_value = "geneve0", value_parser = parse_iface_name)]
     geneve_iface: String,
 
-    /// Directory on a bpffs mount where programs/links are pinned.
-    #[arg(long, default_value = "/sys/fs/bpf/beep")]
-    pin_dir: PathBuf,
+    /// Directory on a bpffs mount where programs/links are pinned. Required:
+    /// fixture mode prunes fronts absent from `--fixture`, so it must not
+    /// default to the controller's `/sys/fs/bpf/beep`.
+    #[arg(long)]
+    pin_dir: Option<PathBuf>,
 
     /// One FRONT_IP:PORT -> backend-node/PodIP:TargetPort fixture entry, repeatable
     /// to cover one Pod behind more than one Service port (a plain multi-port
@@ -445,6 +447,7 @@ fn main() -> anyhow::Result<()> {
         node_allow_max_entries,
         pod_targets_max_entries,
     } = Args::parse();
+    let pin_dir = require_explicit_pin_dir(pin_dir).map_err(|e| anyhow!(e))?;
 
     for fixture in &fixtures {
         front_outside_pod_cidr(fixture.front_ip, pod_cidr).map_err(|e| anyhow!(e))?;
@@ -611,6 +614,34 @@ fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
         .collect()
 }
 
+/// The fixture loader is the sole writer of the front maps (POD_TARGETS and
+/// NODE_ALLOW are already rewritten to exactly its set), and the maps are
+/// pinned, so a front dropped from `--fixture` must be removed on restart.
+fn plan_fixture_fronts(
+    current_meta: &HashMap<LbFrontKey, FrontMeta>,
+    current_endpoints: &HashMap<FrontEndpointKey, FrontEndpoint>,
+    fixtures: &[Fixture],
+) -> Vec<FrontPlan> {
+    plan_front_writes(
+        current_meta,
+        current_endpoints,
+        &fixture_fronts(fixtures),
+        true,
+    )
+}
+
+/// `--fixture` mode prunes absent fronts, so it must never share a pin dir
+/// with the controller (default `/sys/fs/bpf/beep`): the next fixture start
+/// would delete the controller's live fronts.
+fn require_explicit_pin_dir(pin_dir: Option<PathBuf>) -> Result<PathBuf, String> {
+    pin_dir.ok_or_else(|| {
+        "--fixture mode requires an explicit --pin-dir: it prunes every front not in the \
+         fixture set, so it must not share the controller's default pin dir \
+         (/sys/fs/bpf/beep)"
+            .to_string()
+    })
+}
+
 fn populate_fixtures(
     ebpf: &mut Ebpf,
     fixtures: &[Fixture],
@@ -630,15 +661,24 @@ fn populate_fixtures(
             AyaHashMap::try_from(Map::HashMap(open("FRONT_META")?))?;
         let mut front_endpoints: AyaHashMap<_, FrontEndpointKey, FrontEndpoint> =
             AyaHashMap::try_from(Map::HashMap(open("FRONT_ENDPOINTS")?))?;
-        let failures = apply_fronts(
-            &mut front_meta,
-            &mut front_endpoints,
-            &fixture_fronts(fixtures),
-            false,
-        )
-        .context("reading FRONT_META/FRONT_ENDPOINTS")?;
-        if !failures.is_empty() {
-            let detail: Vec<String> = failures.into_iter().map(|(_, e)| e).collect();
+        let current_meta: HashMap<LbFrontKey, FrontMeta> = front_meta
+            .iter()
+            .collect::<Result<_, _>>()
+            .context("reading FRONT_META")?;
+        let current_endpoints: HashMap<FrontEndpointKey, FrontEndpoint> = front_endpoints
+            .iter()
+            .collect::<Result<_, _>>()
+            .context("reading FRONT_ENDPOINTS")?;
+        let mut detail: Vec<String> = Vec::new();
+        for plan in plan_fixture_fronts(&current_meta, &current_endpoints, fixtures) {
+            detail.extend(run_front_plan(&plan, |step| match step {
+                FrontWrite::DeleteEndpoint(k) => front_endpoints.remove(k),
+                FrontWrite::PutEndpoint(k, v) => front_endpoints.insert(k, v, 0),
+                FrontWrite::PutMeta(k, v) => front_meta.insert(k, v, 0),
+                FrontWrite::DeleteMeta(k) => front_meta.remove(k),
+            }));
+        }
+        if !detail.is_empty() {
             anyhow::bail!(
                 "{} front write(s) failed: {}; {} / {}",
                 detail.len(),
@@ -1057,6 +1097,74 @@ mod tests {
             1,
             "this demonstrates why pod-IP-only keying was insufficient -- \
              both Service ports collapse to the same map key"
+        );
+    }
+
+    #[test]
+    fn fixture_mode_refuses_to_default_to_the_controller_pin_dir() {
+        // Fixture mode prunes fronts; defaulting to the controller's pin dir
+        // would let a manual `beep --fixture` wipe a live controller's fronts.
+        assert!(
+            require_explicit_pin_dir(None)
+                .unwrap_err()
+                .contains("--pin-dir"),
+            "a missing --pin-dir must be refused with an error naming the flag"
+        );
+        assert_eq!(
+            require_explicit_pin_dir(Some(PathBuf::from("/sys/fs/bpf/beep-smoke"))),
+            Ok(PathBuf::from("/sys/fs/bpf/beep-smoke"))
+        );
+    }
+
+    #[test]
+    fn front_dropped_from_fixture_set_is_removed_meta_first() {
+        // Pinned FRONT_META/FRONT_ENDPOINTS outlive the loader: a front
+        // removed from `--fixture` would otherwise keep routing after restart.
+        // META goes first so the datapath never sees a live front with no
+        // endpoints.
+        let kept = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
+        let dropped = parse_fixture("10.0.0.5:443:tcp:10.0.0.6:10.244.1.7:8443").unwrap();
+        let both = fixture_fronts(&[kept, dropped]);
+
+        let dropped_key = fixture_key(&dropped);
+        let current_meta: HashMap<_, _> = both
+            .keys()
+            .map(|k| {
+                (
+                    *k,
+                    FrontMeta {
+                        generation: 1,
+                        count: 1,
+                        flags: 0,
+                    },
+                )
+            })
+            .collect();
+        let current_endpoints: HashMap<FrontEndpointKey, _> = both
+            .iter()
+            .map(|(k, d)| {
+                (
+                    FrontEndpointKey {
+                        front: *k,
+                        generation: 1,
+                        slot: 0,
+                        _pad: 0,
+                    },
+                    d.endpoints[0],
+                )
+            })
+            .collect();
+
+        let plans = plan_fixture_fronts(&current_meta, &current_endpoints, &[kept]);
+        assert_eq!(plans.len(), 1, "only the dropped front needs writes");
+        assert_eq!(plans[0].front, dropped_key);
+        assert!(
+            matches!(
+                plans[0].steps.as_slice(),
+                [FrontWrite::DeleteMeta(_), FrontWrite::DeleteEndpoint(_)]
+            ),
+            "a dropped fixture front must be removed, FRONT_META before its endpoints: {:?}",
+            plans[0].steps
         );
     }
 

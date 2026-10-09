@@ -20,15 +20,13 @@
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
 # is > 0 and under a gross-regression ceiling (not a tight bound, just a
-# tripwire for an accidental max_entries blow-up). The ceiling is 4 MiB:
+# tripwire for an accidental max_entries blow-up). The ceiling is 6 MiB, an
+# INTERIM value: the measured footprint is 4,185,352 bytes (CI run
+# 37885413497), so 6 MiB is ~1.5x, pending the FRONT_ENDPOINTS sizing
+# decision; the long-term value is re-derived at ~2x the measured footprint.
 # LRU_HASH conntrack maps (FWD_PENDING/FLOW_TABLE) preallocate for their
-# full max_entries capacity regardless of active-flow count. FLOW_TABLE
-# merged the former separate FWD_MAIN+REV_FLOW maps into one 16384-entry
-# table, measured at ~1.88 MiB (1,966,976 bytes) preallocated per node;
-# FWD_PENDING adds a smaller tier on top (2048 entries by default, ~+240
-# KiB). NODE_ALLOW (32 entries) and POD_TARGETS (128 entries), both
-# HashMap<[u8;16],u8>, add a few more KiB -- 4 MiB still leaves comfortable
-# headroom over that real, near-constant footprint.
+# full max_entries capacity regardless of active-flow count; FLOW_TABLE
+# (16384 entries, ~2.25 MiB) is the largest share.
 set -euo pipefail
 
 csv="${1:?usage: $0 <ebpf-map-memory.csv>}"
@@ -57,7 +55,7 @@ expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
   exit 1
 }
 [ "$total" -gt 0 ] || { echo "FAIL: total bytes_memlock is 0 despite ${#expected[@]} maps discovered -- bpftool map show broken?" >&2; exit 1; }
-limit=$((4 * 1024 * 1024))
-[ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 4 MiB gross-regression ceiling" >&2; exit 1; }
+limit=$((6 * 1024 * 1024))
+[ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 6 MiB gross-regression ceiling" >&2; exit 1; }
 
 echo "PASS: exactly ${#expected[@]} known beep maps discovered, total bytes_memlock=$total is within the gross-regression ceiling"
