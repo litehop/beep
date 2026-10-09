@@ -63,14 +63,14 @@ use aya_ebpf::{
 use beep_common::{
     address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
     egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
-    forward_admission, front_endpoint_key, fwd_pending_affinity_pin, ipv4_mapped_v6,
-    is_redirected_return_mark, occupant_conflicts, peer_node_admission, resolve_backend_src_port,
-    return_authorization, tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums,
-    BackendPortDecision, BackendPortResolution, Config, DecapForwardPodAdmission,
-    EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey, FlowValue,
-    ForwardAdmission, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta, FwdPendingPin,
-    LbFrontKey, PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey,
-    UplinkConfig, REDIRECTED_RETURN_MARK,
+    flow_hash, forward_admission, front_endpoint_key, fwd_pending_affinity_pin, ingress_steer,
+    ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts, peer_node_admission,
+    resolve_backend_src_port, return_authorization, tunnel_remote_addr, unmap_ipv4,
+    AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
+    DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey,
+    FlowValue, ForwardAdmission, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
+    FwdPendingPin, IngressSteer, LbFrontBackend, LbFrontKey, PeerNodeAdmission, PortMemoValue,
+    ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -391,11 +391,78 @@ fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
     let endpoint = front_endpoint_key(front, meta)
         .and_then(|key| unsafe { FRONT_ENDPOINTS.get(key) }.copied());
     if endpoint.is_none() {
-        if let Some(misses) = FRONT_MISSES.get_ptr_mut(0) {
-            unsafe { *misses += 1 };
-        }
+        count_front_miss();
     }
     endpoint
+}
+
+#[inline(always)]
+fn count_front_miss() {
+    if let Some(misses) = FRONT_MISSES.get_ptr_mut(0) {
+        unsafe { *misses += 1 };
+    }
+}
+
+/// Ingress backend for one packet of a front: the flow's existing pin
+/// (`FLOW_TABLE` forward, else `FWD_PENDING`) if any, else a seeded hash over
+/// the front's endpoints, pinned into `FWD_PENDING` only (a new flow never
+/// writes `FLOW_TABLE`; see `forward_admission`). `Err` is the verdict to
+/// return instead of tunnelling.
+#[inline(always)]
+fn ingress_backend(
+    front: LbFrontKey,
+    client_ip: [u8; 16],
+    client_port: u16,
+    flow_key: TcpFlowKey,
+    fwd_key: FlowKey,
+    ingress_ifindex: u32,
+) -> Result<LbFrontBackend, i32> {
+    let Some(meta) = unsafe { FRONT_META.get(front) }.copied() else {
+        return Err(TC_ACT_OK);
+    };
+    let Some(seed) = CONFIG.get(0).map(|c| c.flow_hash_seed) else {
+        return Err(TC_ACT_OK);
+    };
+    let established = unsafe { FLOW_TABLE.get(fwd_key) }.map(|v| unsafe { v.forward.backend });
+    let pending = if established.is_some() {
+        None
+    } else {
+        unsafe { FWD_PENDING.get(flow_key) }.copied()
+    };
+    let steer = ingress_steer(
+        meta,
+        established,
+        pending.map(|p| p.backend),
+        flow_hash(seed, client_ip, client_port, &front),
+        front,
+        |key| unsafe { FRONT_ENDPOINTS.get(key) }.copied(),
+    );
+    match steer {
+        IngressSteer::Forward(backend) => {
+            if let ForwardAdmission::MintPending = forward_admission(established.is_some()) {
+                let admitted = ForwardFlowValue {
+                    backend,
+                    ingress_ifindex,
+                };
+                if let FwdPendingPin::Insert(candidate) =
+                    fwd_pending_affinity_pin(pending, admitted)
+                {
+                    if FWD_PENDING.insert(flow_key, candidate, 0).is_err() {
+                        return Err(TC_ACT_OK);
+                    }
+                }
+            }
+            Ok(backend)
+        }
+        IngressSteer::Pass => {
+            count_front_miss();
+            Err(TC_ACT_OK)
+        }
+        IngressSteer::Drop => {
+            count_front_miss();
+            Err(TC_ACT_SHOT)
+        }
+    }
 }
 
 /// Host-specific runtime config the loader fills in after attach (an
@@ -635,7 +702,6 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
         proto,
         _pad: 0,
     };
-    let backend = front_endpoint(key)?.backend;
 
     let src_ip: u32 = load_direct(ctx, ip_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
@@ -651,30 +717,17 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
         proto,
         FlowDirection::Forward,
     );
-    // Admission control: an established flow (FLOW_TABLE forward-tagged
-    // hit) needs no write at all -- the lookup itself refreshed its LRU
-    // recency. A new flow mints ONLY into FWD_PENDING, never FLOW_TABLE
-    // directly, so an off-path flood of forward-only packets can churn
-    // FWD_PENDING but can never touch an established flow's FLOW_TABLE
-    // entry.
-    if let ForwardAdmission::MintPending =
-        forward_admission(unsafe { FLOW_TABLE.get(fwd_key) }.is_some())
-    {
-        // A PENDING lookup is an RCU read that already refreshes this
-        // entry's LRU recency, so once minted the backend choice never
-        // needs rewriting -- a write takes the bucket's raw_spinlock and can
-        // run the LRU shrink path, unlike a read.
-        let admitted = ForwardFlowValue {
-            backend,
-            ingress_ifindex,
-        };
-        match fwd_pending_affinity_pin(unsafe { FWD_PENDING.get(flow_key) }.copied(), admitted) {
-            FwdPendingPin::Insert(candidate) => {
-                FWD_PENDING.insert(flow_key, candidate, 0).ok()?;
-            }
-            FwdPendingPin::Keep => {}
-        }
-    }
+    let backend = match ingress_backend(
+        key,
+        client_ip_v6,
+        src_port,
+        flow_key,
+        fwd_key,
+        ingress_ifindex,
+    ) {
+        Ok(backend) => backend,
+        Err(verdict) => return Some(verdict),
+    };
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
@@ -777,7 +830,6 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
         proto,
         _pad: 0,
     };
-    let backend = front_endpoint(key)?.backend;
 
     let client_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
@@ -792,20 +844,17 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
         proto,
         FlowDirection::Forward,
     );
-    if let ForwardAdmission::MintPending =
-        forward_admission(unsafe { FLOW_TABLE.get(fwd_key) }.is_some())
-    {
-        let admitted = ForwardFlowValue {
-            backend,
-            ingress_ifindex,
-        };
-        match fwd_pending_affinity_pin(unsafe { FWD_PENDING.get(flow_key) }.copied(), admitted) {
-            FwdPendingPin::Insert(candidate) => {
-                FWD_PENDING.insert(flow_key, candidate, 0).ok()?;
-            }
-            FwdPendingPin::Keep => {}
-        }
-    }
+    let backend = match ingress_backend(
+        key,
+        client_ip_v6,
+        src_port,
+        flow_key,
+        fwd_key,
+        ingress_ifindex,
+    ) {
+        Ok(backend) => backend,
+        Err(verdict) => return Some(verdict),
+    };
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
