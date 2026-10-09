@@ -54,7 +54,7 @@ use aya_ebpf::{
         TC_ACT_SHOT,
     },
     helpers::{
-        bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_change_tail,
+        bpf_csum_diff, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_change_tail,
         bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_load_bytes,
         bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt, bpf_skb_store_bytes,
     },
@@ -520,12 +520,24 @@ fn reject_tcp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
         let Some(reply) = buf.first_chunk_mut::<TCP_RST_V4_LEN>() else {
             return TC_ACT_OK;
         };
-        if !load_into(ctx, l3, &mut reply[..TCP_RST_V4_IN_LEN]) || !tcp_rst_in_place_v4(reply) {
+        // Offending IPv4 header with source and destination exchanged, then
+        // the first TCP bytes.
+        if !(load_into(ctx, l3, &mut reply[..12])
+            && load_into(ctx, l3 + 16, &mut reply[12..16])
+            && load_into(ctx, l3 + 12, &mut reply[16..20])
+            && load_into(ctx, l3 + IP_HLEN, &mut reply[20..TCP_RST_V4_IN_LEN])
+            && tcp_rst_in_place_v4(reply, csum_native))
+        {
             return TC_ACT_OK;
         }
         send_reply(ctx, ingress_ifindex, l3, &reply[..])
     } else {
-        if !load_into(ctx, l3, &mut buf[..TCP_RST_V6_IN_LEN]) || !tcp_rst_in_place_v6(buf) {
+        if !(load_into(ctx, l3, &mut buf[..8])
+            && load_into(ctx, l3 + 24, &mut buf[8..24])
+            && load_into(ctx, l3 + 8, &mut buf[24..40])
+            && load_into(ctx, l3 + IP6_HLEN, &mut buf[40..TCP_RST_V6_IN_LEN])
+            && tcp_rst_in_place_v6(buf, csum_native))
+        {
             return TC_ACT_OK;
         }
         send_reply(ctx, ingress_ifindex, l3, &buf[..])
@@ -546,13 +558,21 @@ fn reject_udp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
             return TC_ACT_OK;
         };
         let quote = ICMP_UNREACH_V4_LEN - ICMP_QUOTE_V4_LEN;
-        if !load_into(ctx, l3, &mut reply[quote..]) || !icmp_unreachable_in_place_v4(reply) {
+        if !(load_into(ctx, l3 + 16, &mut reply[12..16])
+            && load_into(ctx, l3 + 12, &mut reply[16..20])
+            && load_into(ctx, l3, &mut reply[quote..])
+            && icmp_unreachable_in_place_v4(reply, csum_native))
+        {
             return TC_ACT_OK;
         }
         send_reply(ctx, ingress_ifindex, l3, &reply[..])
     } else {
         let quote = ICMP6_UNREACH_LEN - ICMP6_QUOTE_LEN;
-        if !load_into(ctx, l3, &mut buf[quote..]) || !icmp6_unreachable_in_place(buf) {
+        if !(load_into(ctx, l3 + 24, &mut buf[8..24])
+            && load_into(ctx, l3 + 8, &mut buf[24..40])
+            && load_into(ctx, l3, &mut buf[quote..])
+            && icmp6_unreachable_in_place(buf, csum_native))
+        {
             return TC_ACT_OK;
         }
         send_reply(ctx, ingress_ifindex, l3, &buf[..])
@@ -571,6 +591,21 @@ fn send_reply(ctx: &TcContext, ingress_ifindex: u32, l3: usize, reply: &[u8]) ->
         return TC_ACT_SHOT;
     }
     redirect_client_bound(ingress_ifindex).unwrap_or(TC_ACT_SHOT)
+}
+
+/// The raw checksum summer `beep_common::reject` is built on:
+/// `bpf_csum_diff` over `data`, a multiple of 4 bytes.
+#[inline(always)]
+fn csum_native(data: &[u8], seed: u32) -> u32 {
+    unsafe {
+        bpf_csum_diff(
+            core::ptr::null_mut(),
+            0,
+            data.as_ptr().cast_mut().cast(),
+            data.len() as u32,
+            seed,
+        ) as u32
+    }
 }
 
 /// `bpf_skb_load_bytes` into all of `dst` (a constant length at every call

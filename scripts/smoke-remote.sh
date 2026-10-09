@@ -839,7 +839,7 @@ assert_tcp_refused() { # <label> <curl-url> [curl-extra-arg]
   end=$(date +%s%N)
   ms=$(((end - start) / 1000000))
   [ "$rc" -eq 7 ] && [ "$ms" -lt 2000 ] || {
-    echo "FAIL: $1: expected an immediate connection refusal (curl rc 7, <2000ms) from beep's RST, got rc=$rc after ${ms}ms (rc 28 = the client hung; rc 0/52 = the packet passed to the host listener)" >&2
+    echo "FAIL: $1: expected an immediate connection refusal (curl rc 7, <2000ms) from beep's RST, got rc=$rc after ${ms}ms (rc 28 = the client hung; rc 0/1/52 = the packet passed to the host listener)" >&2
     exit 1
   }
   echo "REJECT-TCP ($1): PASS (curl rc=7 connection refused after ${ms}ms)"
