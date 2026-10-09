@@ -221,12 +221,13 @@ GOOD_CSV="$TMPDIR_TEST/good.csv"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
+  echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$GOOD_CSV"
 set +e
 bash "$ASSERT_SCRIPT" "$GOOD_CSV" >/dev/null 2>&1
 GOOD_EXIT=$?
 set -e
-assert_true "a correct single-tick CSV with all 9 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
+assert_true "a correct single-tick CSV with all 10 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
 
 # A single tick that dropped FRONT_ENDPOINTS — the actual shape an "8 of 9 maps
 # found" discovery regression produces against the fixed CI invocation.
@@ -241,6 +242,7 @@ DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
+  echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$DROPPED_CSV"
 set +e
 DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" 2>&1)"

@@ -131,6 +131,7 @@ forward-write and return-read).
 | `FRONT_META` (front tuple -> live generation, count, flags) | ~385 KiB (measured) | 4096 entries by default (`--front-meta-max-entries`): nodes × Service ports. |
 | `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~1.06 MiB (measured) | 8192 entries by default (`--front-endpoints-max-entries`): up to two generations of every front coexist during a swap. Full map on every node. |
 | `FRONT_MISSES` | <1 KiB | Per-CPU counter of lookups where `FRONT_META` hit but the endpoint was missing (ingress passes to host, decap drops). |
+| `REJECT_BUCKET` | <1 KiB | Per-CPU token bucket (100 replies/s, burst 25) gating TCP RST / ICMP unreachable replies from fronts with no ready backends; over budget the packet is dropped. |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
 | **Total** | **~8–9 MiB** | Independent of vCPU count — maps are shared. |
