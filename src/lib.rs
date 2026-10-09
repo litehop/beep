@@ -784,6 +784,17 @@ fn uplink_l2_hlen_or_err(iface: &str, arphrd: u16) -> anyhow::Result<u32> {
     })
 }
 
+/// An uplink past `UPLINK_CONFIG`'s capacity would fail at map insert (or be
+/// silently dropped from admission), so refuse the whole list up front.
+fn check_uplink_count(count: usize, capacity: u32) -> anyhow::Result<()> {
+    if count > capacity as usize {
+        return Err(anyhow!(
+            "{count} --uplink-iface values exceed UPLINK_CONFIG capacity ({capacity})"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves each uplink's ifindex and L2 header length (a WireGuard/tun
 /// uplink has no Ethernet header, unlike a real NIC/veth -- see
 /// `uplink_l2_header_len`'s doc comment) and writes one `UPLINK_CONFIG`
@@ -791,6 +802,13 @@ fn uplink_l2_hlen_or_err(iface: &str, arphrd: u16) -> anyhow::Result<u32> {
 /// admission gate for multi-uplink client traffic
 /// (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
 pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyhow::Result<()> {
+    let capacity = aya_obj::Object::parse(ebpf_object())
+        .map_err(|e| anyhow!("parsing the beep-ebpf object's map definitions: {e}"))?
+        .maps
+        .get("UPLINK_CONFIG")
+        .ok_or_else(|| anyhow!("map UPLINK_CONFIG is missing from the beep-ebpf object"))?
+        .max_entries();
+    check_uplink_count(uplink_ifaces.len(), capacity)?;
     let mut uplink_config: AyaHashMap<_, u32, UplinkConfig> = AyaHashMap::try_from(
         ebpf.map_mut("UPLINK_CONFIG")
             .ok_or_else(|| anyhow!("no map named `UPLINK_CONFIG` in the eBPF object"))?,
@@ -888,6 +906,16 @@ mod tests {
     use super::*;
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn uplink_count_at_capacity_ok_one_past_rejected() {
+        assert!(check_uplink_count(8, 8).is_ok());
+        let err = check_uplink_count(9, 8).unwrap_err().to_string();
+        assert!(
+            err.contains("capacity (8)"),
+            "a 9th uplink must fail loud naming the cap, not be silently unadmitted: {err}"
+        );
+    }
 
     #[test]
     fn iface_name_accepts_normal_and_15_byte_names() {
