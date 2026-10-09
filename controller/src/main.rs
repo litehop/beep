@@ -526,6 +526,8 @@ async fn main() -> anyhow::Result<()> {
     drop(ebpf);
     // malloc_trim is a glibc extension; musl's allocator has no equivalent,
     // so the RSS-return optimization is simply skipped on musl builds.
+    //
+    // SAFETY: malloc_trim takes no pointers and only releases free heap pages.
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);

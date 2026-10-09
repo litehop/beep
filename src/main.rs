@@ -516,6 +516,10 @@ fn main() -> anyhow::Result<()> {
     // glibc doesn't return freed heap to the OS on its own -- without an
     // explicit trim the drop above frees the allocator's own bookkeeping
     // but resident memory stays at the load-time high-water mark.
+    // musl has no malloc_trim; skip the optimisation there.
+    //
+    // SAFETY: malloc_trim takes no pointers and only releases free heap pages.
+    #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);
     }
