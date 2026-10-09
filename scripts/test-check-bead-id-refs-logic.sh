@@ -64,7 +64,7 @@ commit_tree() {
 run_gate() {
   local dir="$1"
   set +e
-  (cd "$dir" && bash "$SCRIPT") >"$dir/.gate-out" 2>&1
+  (cd "$dir" && PATH="$BD_STUB_DIR:$PATH" bash "$SCRIPT") >"$dir/.gate-out" 2>&1
   local rc=$?
   set -e
   echo "$rc"
@@ -72,6 +72,22 @@ run_gate() {
 
 SANDBOX_ROOT=$(mktemp -d)
 trap 'rm -rf "$SANDBOX_ROOT"' EXIT
+
+# Stub `bd` ahead of any real one so results never depend on the host's
+# tracker: with BD_STUB_IDS unset it fails (the "bd unavailable" fallback);
+# otherwise it lists those ids in `bd list --json` shape.
+BD_STUB_DIR="$SANDBOX_ROOT/bd-stub"
+mkdir -p "$BD_STUB_DIR"
+cat > "$BD_STUB_DIR/bd" <<'STUBEOF'
+#!/usr/bin/env bash
+[ -n "${BD_STUB_IDS:-}" ] || exit 1
+echo '['
+for id in $BD_STUB_IDS; do
+  printf '  {\n    "id": "%s",\n    "title": "t",\n    "dependencies": [\n      {\n        "issue_id": "%s",\n        "depends_on_id": "beep-flow"\n      }\n    ]\n  },\n' "$id" "$id"
+done
+echo ']'
+STUBEOF
+chmod +x "$BD_STUB_DIR/bd"
 
 # ---------------------------------------------------------------------------
 # 1. Clean tree: ordinary source, no bead-ID-shaped token -> passes.
@@ -357,6 +373,38 @@ assert "...and the failure output names the git grep -P / PCRE requirement, not 
   "$(grep -qi 'PCRE' "$S12/.gate-out" && echo 1 || echo 0)"
 assert "...and the failure output never prints the false-clean 'bead-id-refs: ok' line" \
   "$(! grep -q 'bead-id-refs: ok' "$S12/.gate-out" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 13. With a reachable tracker, only tokens that are real bead IDs are
+#     rejected: beep-flow-hash-seed (a legitimate resource name that merely
+#     starts with a 4-char word) must pass, or workers rename around the
+#     guard; a real ID (and its dotted sub-ID) must still fail. The stub also
+#     lists beep-flow as a dependency target only -- not an issue -- to prove
+#     only top-level ids count.
+# ---------------------------------------------------------------------------
+S13_OK="$SANDBOX_ROOT/13-identifier"
+new_sandbox "$S13_OK"
+mkdir -p "$S13_OK/src"
+printf '// Secret beep-flow-hash-seed holds the seed\nfn f() {}\n' > "$S13_OK/src/lib.rs"
+commit_tree "$S13_OK"
+RC13_OK=$(BD_STUB_IDS="beep-xyz beep-5lw beep-5lw.2" run_gate "$S13_OK")
+assert "beep-flow-hash-seed passes when beep-flow is not an existing bead" \
+  "$([ "$RC13_OK" -eq 0 ] && echo 1 || echo 0)"
+
+RC13_FALLBACK=$(run_gate "$S13_OK")
+assert "...but with bd unavailable the guard fails closed to the shape regex (beep-flow flagged)" \
+  "$([ "$RC13_FALLBACK" -ne 0 ] && echo 1 || echo 0)"
+
+S13_ROT="$SANDBOX_ROOT/13-real-id"
+new_sandbox "$S13_ROT"
+mkdir -p "$S13_ROT/src"
+printf '// see beep-xyz and beep-5lw.2 and beep-flow-hash-seed\nfn f() {}\n' > "$S13_ROT/src/lib.rs"
+commit_tree "$S13_ROT"
+RC13_ROT=$(BD_STUB_IDS="beep-xyz beep-5lw beep-5lw.2" run_gate "$S13_ROT")
+assert "real bead IDs (beep-xyz, dotted beep-5lw.2) are still rejected when bd is reachable" \
+  "$([ "$RC13_ROT" -ne 0 ] && echo 1 || echo 0)"
+assert "...naming both real ids but not the identifier" \
+  "$(grep -qF 'beep-xyz' "$S13_ROT/.gate-out" && grep -qF 'beep-5lw.2' "$S13_ROT/.gate-out" && ! grep -qE 'beep-flow$' "$S13_ROT/.gate-out" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
