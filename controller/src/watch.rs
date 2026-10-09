@@ -263,7 +263,7 @@ fn parse_service(obj: &Value) -> Option<RawService> {
 /// when absent (the Kubernetes API's own documented default for that
 /// field) -- treating a missing value as "not ready" would silently exclude
 /// every endpoint an apiserver doesn't bother setting the field on.
-fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
+fn parse_endpoint_slice(obj: &Value) -> RawEndpointSlice {
     let ports = obj["ports"]
         .as_array()
         .map(|arr| {
@@ -277,8 +277,12 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
                 .collect()
         })
         .unwrap_or_default();
+    // The apiserver omits `endpoints` once the last pod is gone; reading that as
+    // unparseable would keep the departed endpoint, and its pins, forever.
     let endpoints = obj["endpoints"]
-        .as_array()?
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
         .iter()
         .filter_map(|e| {
             let pod_ip = e["addresses"].as_array()?.first()?.as_str()?.parse().ok()?;
@@ -290,7 +294,7 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
             })
         })
         .collect();
-    Some(RawEndpointSlice { ports, endpoints })
+    RawEndpointSlice { ports, endpoints }
 }
 
 /// The two address roles one `Node` object plays, kept strictly separate:
@@ -523,12 +527,10 @@ impl WatchState {
                 }
             }
             EventKind::Upsert => {
-                if let Some(raw) = parse_endpoint_slice(obj) {
-                    self.slices
-                        .entry(owner)
-                        .or_default()
-                        .insert(slice_name, raw);
-                }
+                self.slices
+                    .entry(owner)
+                    .or_default()
+                    .insert(slice_name, parse_endpoint_slice(obj));
             }
         }
     }
@@ -913,8 +915,8 @@ impl WatchState {
                 for port in reconcile::ports_without_same_family_endpoint(&view, &endpoint_slices) {
                     other_family_only.insert(format!(
                         "controller: WARN service {}/{} front {front_ip}:{} has no ready {} \
-                         endpoint, only endpoints of the other family; the front is left \
-                         unprogrammed",
+                         endpoint, only endpoints of the other family; the front rejects \
+                         new connections",
                         key.namespace,
                         key.name,
                         port.port,
@@ -1105,10 +1107,27 @@ mod tests {
                 {"addresses": ["10.244.0.5"], "targetRef": {"kind": "Pod", "uid": "u-1"}},
                 {"addresses": ["10.244.0.6"]},
             ]
-        }))
-        .unwrap();
+        }));
         assert_eq!(slice.endpoints[0].pod_uid.as_deref(), Some("u-1"));
         assert_eq!(slice.endpoints[1].pod_uid, None);
+    }
+
+    // The apiserver drops `endpoints` from a slice whose last pod is gone.
+    // Ignoring that update would leave the departed endpoint, and its pins,
+    // in place forever.
+    #[test]
+    fn slice_modified_to_omit_endpoints_removes_the_departed_pod_and_sweeps_its_pins() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        let mut known = known_after(&state);
+        let mut emptied = slice_obj("s1", &[]);
+        emptied.as_object_mut().unwrap().remove("endpoints");
+
+        state.apply_endpoint_slice_event(
+            &serde_json::json!({"type": "MODIFIED", "object": emptied}),
+        );
+
+        assert_eq!(swept(&state, &mut known), HashSet::from([pod_wire(9)]));
     }
 
     fn node(ip: Ipv4Addr) -> NodeContext {
@@ -3486,6 +3505,34 @@ mod tests {
             before,
             "a refused Service relist must leave fronts programmed"
         );
+    }
+
+    // Every endpoint going not-ready (rolling update, failing probe) must keep
+    // the Service's front owned at zero endpoints: new clients are rejected and
+    // flows pinned to the draining pod keep working. Dropping the front would
+    // pass new SYNs to the host (hang) and cut the pinned flows.
+    #[test]
+    fn all_endpoints_not_ready_keeps_an_empty_front_and_does_not_sweep_the_draining_pod() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        let mut known = known_after(&state);
+        let mut draining = slice_obj("s1", pods);
+        draining["endpoints"][0]["conditions"]["ready"] = false.into();
+
+        state.replace_endpoint_slices(&[draining]).unwrap();
+
+        let desired = state.desired(&node(SELF_IP));
+        assert_eq!(desired.fronts.len(), 2, "one front per node address");
+        assert!(
+            desired.fronts.values().all(|f| f.endpoints.is_empty()),
+            "a not-ready endpoint must never be selected for new flows"
+        );
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::new(),
+            "the not-ready pod is still in the slice, so its pinned flows must not be swept"
+        );
+        assert!(desired.cluster_backends.contains_key(&pod_wire(9)));
     }
 
     // Deleting one of two Services is legitimate and must withdraw only it.
