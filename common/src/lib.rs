@@ -9,6 +9,8 @@
 //! & affinity" section and its "Settled wire-format decisions".
 #![cfg_attr(not(test), no_std)]
 
+pub mod reject;
+
 /// TCP/UDP flow-affinity key: IPv6-primary, 37 bytes (16+16+2+2+1), no
 /// padding. A flat byte array rather than a `#[repr(C)]` struct: the kernel
 /// hashes/compares a `BPF_MAP_TYPE_*_HASH` key's raw bytes, and a padded
@@ -330,6 +332,26 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
     Some(FrontEndpointKey {
         front,
         generation: meta.generation,
+        slot: FRONT_SLOT_FIRST,
+        _pad: 0,
+    })
+}
+
+/// The `FRONT_ENDPOINTS` key decap reads for the target port of a front. At
+/// `count == 0` that is slot 0 of the previous generation, which the write
+/// protocol leaves in place: flows pinned before the front drained must keep
+/// resolving their target port, or they would be dropped on the backend node
+/// even though ingress still forwards them.
+///
+/// INTERIM: remove once the target port travels in the forward Geneve option.
+/// It only covers a front drained by exactly one swap (the next swap deletes
+/// every non-live generation, so a second generation bump at count 0 loses the
+/// rows), and slot 0 may name a different target port than the pinned pod
+/// under named ports.
+pub fn decap_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> FrontEndpointKey {
+    front_endpoint_key(front, meta).unwrap_or(FrontEndpointKey {
+        front,
+        generation: meta.generation.wrapping_sub(1),
         slot: FRONT_SLOT_FIRST,
         _pad: 0,
     })
@@ -988,8 +1010,10 @@ pub fn select_backend_slot(
 /// What ingress does with a packet addressed to a front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressSteer {
-    /// Front has no endpoints: not provably servable, leave the packet alone.
-    Pass,
+    /// An owned front with no ready endpoints: answer the client (RST /
+    /// unreachable) so it fails fast. Distinct from a `FRONT_META` miss,
+    /// which is not a front at all and is never seen here.
+    Reject,
     /// The front has endpoints but the chosen row is unreadable: fail closed
     /// rather than leak a front-addressed packet to the host stack.
     Drop,
@@ -999,8 +1023,10 @@ pub enum IngressSteer {
 
 /// Ingress backend choice for one packet of a front. An existing pin
 /// (`established` from `FLOW_TABLE`, else `pending` from `FWD_PENDING`) always
-/// wins over the hash: a changed endpoint count or slot order must never move
-/// a live connection to a pod holding no state for it. Only a flow with no pin
+/// wins over the hash, and over a zero count: a changed endpoint count or slot
+/// order must never move a live connection to a pod holding no state for it,
+/// and a front draining to zero ready endpoints must not reset live
+/// connections. Only a flow with no pin is rejected at count 0, else it
 /// reduces `hash` (a `flow_hash` of the flow) over `meta.count` and reads the
 /// chosen row through `endpoint_at`.
 pub fn ingress_steer(
@@ -1011,11 +1037,11 @@ pub fn ingress_steer(
     front: LbFrontKey,
     endpoint_at: impl FnOnce(FrontEndpointKey) -> Option<FrontEndpoint>,
 ) -> IngressSteer {
-    if meta.count == 0 {
-        return IngressSteer::Pass;
-    }
     if let Some(backend) = established.or(pending) {
         return IngressSteer::Forward(backend);
+    }
+    if meta.count == 0 {
+        return IngressSteer::Reject;
     }
     let Some(slot) = slot_in_range(hash, meta.count as u32) else {
         return IngressSteer::Drop;
@@ -1419,6 +1445,28 @@ mod tests {
             "a front advertising zero endpoints must not read a slot: it would forward to an \
              endpoint that belongs to no live generation"
         );
+    }
+
+    #[test]
+    fn decap_reads_the_prior_generation_when_the_front_drained_so_pinned_flows_survive() {
+        let drained = FrontMeta {
+            generation: 4,
+            count: 0,
+            flags: 0,
+        };
+        let key = decap_endpoint_key(sample_front(), drained);
+        assert_eq!(
+            (key.generation, key.slot, key._pad),
+            (3, FRONT_SLOT_FIRST, 0),
+            "a drained front's rows live under the previous generation; reading the empty live \
+             one drops every pinned flow on the backend node"
+        );
+        let live = FrontMeta {
+            generation: 4,
+            count: 2,
+            flags: 0,
+        };
+        assert_eq!(decap_endpoint_key(sample_front(), live).generation, 4);
     }
 
     // LbFrontKey/LbFrontBackend/RevFlowValue's address fields widened from
@@ -2773,11 +2821,26 @@ mod tests {
     }
 
     #[test]
-    fn front_without_endpoints_passes_untouched_even_with_a_stale_pin() {
+    fn pinned_flow_keeps_forwarding_when_front_drains_to_zero_endpoints() {
         let front = test_front();
-        let steered = ingress_steer(meta(1, 0), Some(backend_n(1)), None, 0, front, |_| {
+        for (established, pending) in [(Some(backend_n(1)), None), (None, Some(backend_n(2)))] {
+            let steered = ingress_steer(meta(1, 0), established, pending, 0, front, |_| {
+                panic!("no row may be read for a pinned flow")
+            });
+            assert_eq!(
+                steered,
+                IngressSteer::Forward(established.or(pending).unwrap()),
+                "a rolling update can drop the ready count to 0; live connections must drain, not reset"
+            );
+        }
+    }
+
+    #[test]
+    fn unpinned_flow_on_front_without_endpoints_is_rejected() {
+        let front = test_front();
+        let steered = ingress_steer(meta(1, 0), None, None, 0, front, |_| {
             panic!("no row may be read when count is 0")
         });
-        assert_eq!(steered, IngressSteer::Pass);
+        assert_eq!(steered, IngressSteer::Reject);
     }
 }
