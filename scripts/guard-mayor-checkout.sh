@@ -10,10 +10,24 @@
 # --git-common-dir (same detection as assert-worktree-boundary.sh). Linked
 # worktrees (ai/worktrees/*, scratch worktrees) are therefore always allowed.
 #
-# Effective directory: the hook's cwd, updated by `cd <dir>` segments and
-# overridden per-command by `git -C <dir>`. Best effort on shell syntax:
-# command-position `git` (optionally behind env/command/sudo/exec/time or
-# `bash -c '...'`) in `;`/`&&`/`||`/`|`/newline-separated segments.
+# Effective directory: the hook's cwd, updated by `cd`/`pushd <dir>` segments
+# (flags and `builtin cd` handled; `popd` and `pushd` without a dir make it
+# unknown) and overridden per-command by `git -C <dir>`. Best effort on shell
+# syntax: command-position `git` (optionally behind env/command/builtin/sudo/
+# exec/time, `xargs ... git`, or `bash -c '...'`) in `;`/`&&`/`||`/`|`/newline-
+# separated segments; substitutions inside double quotes are scanned as code.
+#
+# Fail closed: GIT_DIR=/GIT_WORK_TREE= prefixes, --git-dir/--work-tree, and
+# `-c alias.X=...` (when X is invoked) make the target unknown, so a
+# HEAD-moving subcommand is blocked.
+#
+# Accepted residuals (accidental-move threat model, not an adversary):
+# - aliases or GIT_DIR/GIT_WORK_TREE set earlier (git config, `export`, a
+#   previous segment) rather than on the invocation
+# - xargs/find -exec/parallel wrapping a shell (`xargs sh -c 'git ...'`);
+#   only `xargs ... git <sub>` is scanned
+# - eval, sourced scripts, functions, variables expanded into the command,
+#   and heredoc bodies fed to a shell
 set -euo pipefail
 
 INPUT=$(cat)
@@ -104,7 +118,8 @@ block() { # $1 subcommand, $2 dir
 }
 
 split_segments() { # $1 command line, $2 "raw" to ignore quoting -> newline-separated segments
-  local s="$1" raw="${2:-}" out="" c q="" bt=0 i=0 n=${#1}
+  local s="$1" raw="${2:-}" out="" c q="" bt=0 bt_quoted=0 pd=0 i=0 n=${#1}
+  local -a sub_pd=()
   # ANSI-C quoting ($'..') has escape rules this tracker does not model.
   case "$s" in *"\$'"*) raw=raw ;; esac
   while [ "$i" -lt "$n" ]; do
@@ -115,17 +130,25 @@ split_segments() { # $1 command line, $2 "raw" to ignore quoting -> newline-sepa
       continue
     fi
     if [ -n "$q" ]; then
+      # Inside "...", a substitution's body is code again: leave quote mode
+      # until it closes so its separators split, then resume the quote.
       if [ "$q" = '"' ] && [ "$c" = '$' ] && [ "${s:i+1:1}" = "(" ]; then
         out+=$'$\n'
+        sub_pd+=("$pd")
+        pd=$((pd + 1))
+        q=""
         i=$((i + 2))
         continue
       fi
       if [ "$q" = '"' ] && [ "$c" = '`' ]; then
-        if [ "$bt" -eq 0 ]; then out+=$'$\n'; else out+=$'\n'; fi
-        bt=$((1 - bt))
-      else
-        out+="$c"
+        out+=$'$\n'
+        bt=1
+        bt_quoted=1
+        q=""
+        i=$((i + 1))
+        continue
       fi
+      out+="$c"
       [ "$c" = "$q" ] && q=""
     else
       case "$c" in
@@ -133,8 +156,21 @@ split_segments() { # $1 command line, $2 "raw" to ignore quoting -> newline-sepa
         '`')
           if [ "$bt" -eq 0 ]; then out+=$'$\n'; else out+=$'\n'; fi
           bt=$((1 - bt))
+          if [ "$bt" -eq 0 ] && [ "$bt_quoted" -eq 1 ]; then
+            bt_quoted=0
+            q='"'
+          fi
           ;;
-        ';' | '|' | '&' | '(' | ')') out+=$'\n' ;;
+        '(') pd=$((pd + 1)); out+=$'\n' ;;
+        ')')
+          [ "$pd" -gt 0 ] && pd=$((pd - 1))
+          out+=$'\n'
+          if [ "${#sub_pd[@]}" -gt 0 ] && [ "${sub_pd[${#sub_pd[@]}-1]}" -eq "$pd" ]; then
+            unset 'sub_pd[${#sub_pd[@]}-1]'
+            q='"'
+          fi
+          ;;
+        ';' | '|' | '&') out+=$'\n' ;;
         *) out+="$c" ;;
       esac
     fi
@@ -159,7 +195,7 @@ check_cmdline() { # $1 command line, $2 starting dir
 SEG_DIR=""
 check_segment() { # $1 segment, $2 dir; sets SEG_DIR (dir after any `cd`)
   local -a t
-  local dir="$2" i=0 n tok gdir sub
+  local dir="$2" i=0 n tok gdir sub gunk=0 j alias_name="" alias_val=""
   SEG_DIR="$dir"
   set -f
   read -ra t <<< "$1" || true
@@ -170,19 +206,47 @@ check_segment() { # $1 segment, $2 dir; sets SEG_DIR (dir after any `cd`)
   while [ "$i" -lt "$n" ]; do
     tok=$(strip_quotes "${t[$i]}")
     case "$tok" in
-      [A-Za-z_]*=*|env|command|sudo|exec|time|nohup) i=$((i + 1)) ;;
+      GIT_DIR=*|GIT_WORK_TREE=*) gunk=1; i=$((i + 1)) ;;
+      [A-Za-z_]*=*|env|command|builtin|sudo|exec|time|nohup) i=$((i + 1)) ;;
       *) break ;;
     esac
   done
   [ "$i" -lt "$n" ] || return 0
   tok=$(strip_quotes "${t[$i]}")
+  if [ "${tok##*/}" = xargs ]; then
+    j=$((i + 1))
+    while [ "$j" -lt "$n" ] && [ "$(strip_quotes "${t[$j]}")" != git ]; do j=$((j + 1)); done
+    [ "$j" -lt "$n" ] || return 0
+    i=$j
+    tok=git
+  fi
   case "${tok##*/}" in
-    cd)
-      if [ $((i + 1)) -lt "$n" ]; then
-        SEG_DIR=$(resolve_dir "$dir" "$(strip_quotes "${t[$((i + 1))]}")")
+    cd|pushd)
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        tok=$(strip_quotes "${t[$j]}")
+        case "$tok" in
+          --) j=$((j + 1)); break ;;
+          -) break ;;
+          -*) j=$((j + 1)) ;;
+          *) break ;;
+        esac
+      done
+      if [ "$j" -lt "$n" ]; then
+        tok=$(strip_quotes "${t[$j]}")
+        case "$tok" in
+          +*) SEG_DIR="$UNKNOWN_DIR" ;;
+          *) SEG_DIR=$(resolve_dir "$dir" "$tok") ;;
+        esac
+      elif [ "${t[$i]}" = pushd ]; then
+        SEG_DIR="$UNKNOWN_DIR"
       else
         SEG_DIR="$HOME"
       fi
+      return 0
+      ;;
+    popd)
+      SEG_DIR="$UNKNOWN_DIR"
       return 0
       ;;
     bash|sh|zsh)
@@ -208,14 +272,38 @@ check_segment() { # $1 segment, $2 dir; sets SEG_DIR (dir after any `cd`)
         i=$((i + 1))
         [ "$i" -lt "$n" ] && gdir=$(resolve_dir "$gdir" "$(strip_quotes "${t[$i]}")")
         ;;
-      -c|--git-dir|--work-tree|--namespace|--exec-path) i=$((i + 1)) ;;
+      -c)
+        i=$((i + 1))
+        if [ "$i" -lt "$n" ]; then
+          tok=$(strip_quotes "${t[$i]}")
+          case "$tok" in
+            [Aa][Ll][Ii][Aa][Ss].*=*)
+              tok="${tok#*.}"
+              alias_name="${tok%%=*}"
+              alias_val=$(strip_quotes "${tok#*=}")
+              ;;
+          esac
+        fi
+        ;;
+      --git-dir|--work-tree) i=$((i + 1)); gunk=1 ;;
+      --git-dir=*|--work-tree=*) gunk=1 ;;
+      --namespace|--exec-path) i=$((i + 1)) ;;
       -*) ;;
       *) break ;;
     esac
     i=$((i + 1))
   done
   [ "$i" -lt "$n" ] || return 0
+  [ "$gunk" -eq 0 ] || gdir="$UNKNOWN_DIR"
   sub=$(strip_quotes "${t[$i]}")
+  case "$alias_val" in
+    '!'*)
+      # A quoted shell-alias body spans tokens, so the invoked name is unreliable.
+      if [ "$gdir" = "$UNKNOWN_DIR" ] || is_main_checkout "$gdir"; then block "alias" "$gdir"; fi
+      return 0
+      ;;
+  esac
+  [ -n "$alias_name" ] && [ "$sub" = "$alias_name" ] && sub="${alias_val%% *}"
   case "$BLOCKED_SUBCMDS" in
     *" $sub "*)
       if is_read_only "$sub" "${t[@]:$((i + 1))}"; then return 0; fi
