@@ -889,6 +889,58 @@ fn synthetic_port_seed(front_ip: [u8; 16], front_port: u16) -> u16 {
     (mixed as u16) % REMAP_PORT_RANGE
 }
 
+fn mix32(h: u32, w: u32) -> u32 {
+    let h = (h ^ w).wrapping_mul(0x9E37_79B1);
+    h ^ (h >> 15)
+}
+
+/// 32-bit hash of a flow's (client ip, client port, front) tuple. Fixed-length
+/// and little-endian word reads so every node and CPU computes the same value
+/// for the same flow. Hash once, then reduce with `slot_in_range` for as many
+/// ranges as needed (e.g. all endpoints, then only node-local ones) without
+/// re-hashing.
+pub fn flow_hash(client_ip: [u8; 16], client_port: u16, front: &LbFrontKey) -> u32 {
+    let mut h = 0x811C_9DC5_u32;
+    let mut i = 0;
+    while i < 16 {
+        h = mix32(
+            h,
+            u32::from_le_bytes(client_ip[i..i + 4].try_into().unwrap()),
+        );
+        h = mix32(
+            h,
+            u32::from_le_bytes(front.front_ip[i..i + 4].try_into().unwrap()),
+        );
+        i += 4;
+    }
+    h = mix32(h, (client_port as u32) | ((front.front_port as u32) << 16));
+    h = mix32(h, front.proto as u32);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xC2B2_AE35);
+    h ^ (h >> 16)
+}
+
+/// Maps `hash` uniformly onto `[0, n)` via multiply-shift (no division, so
+/// verifier-safe). `None` when `n == 0`.
+pub fn slot_in_range(hash: u32, n: u32) -> Option<u32> {
+    if n == 0 {
+        return None;
+    }
+    Some(((hash as u64 * n as u64) >> 32) as u32)
+}
+
+/// Backend slot in `[0, n)` for a flow; `None` when `n == 0`.
+pub fn select_backend_slot(
+    client_ip: [u8; 16],
+    client_port: u16,
+    front: &LbFrontKey,
+    n: u32,
+) -> Option<u32> {
+    slot_in_range(flow_hash(client_ip, client_port, front), n)
+}
+
 /// Whether `try_geneve_decap_forward` should reuse a previously-committed
 /// backend-src-port for this flow, or run `resolve_backend_src_port`'s probe
 /// fresh. `resolve_backend_src_port`'s occupancy check only proves
@@ -2229,6 +2281,146 @@ mod tests {
         assert_eq!(
             address_rewrite_checksums(true),
             AddressRewriteChecksums::L4PseudoOnly
+        );
+    }
+
+    fn test_front() -> LbFrontKey {
+        LbFrontKey {
+            front_ip: ipv4_mapped_v6(u32::from_ne_bytes([10, 96, 0, 10])),
+            front_port: 80,
+            proto: 6,
+            _pad: 0,
+        }
+    }
+
+    fn v6_client(i: u32) -> [u8; 16] {
+        let mut ip = [0u8; 16];
+        ip[0] = 0xfd;
+        ip[12..16].copy_from_slice(&i.to_be_bytes());
+        ip
+    }
+
+    fn v4_client(i: u32) -> [u8; 16] {
+        ipv4_mapped_v6(u32::from_ne_bytes((0x0a00_0000 + i).to_be_bytes()))
+    }
+
+    // Structured (sequential) inputs on purpose: real clients are sequential
+    // addresses and ephemeral ports, which is what weak hashes bunch up on.
+    fn chi_square(client: fn(u32) -> [u8; 16], n: u32) -> f64 {
+        let front = test_front();
+        let total = 20_000u32;
+        let mut counts = [0u32; 8];
+        for i in 0..total {
+            let slot =
+                select_backend_slot(client(i / 40), 32768 + (i % 40) as u16, &front, n).unwrap();
+            counts[slot as usize] += 1;
+        }
+        let expected = total as f64 / n as f64;
+        counts[..n as usize]
+            .iter()
+            .map(|&c| (c as f64 - expected).powi(2) / expected)
+            .sum()
+    }
+
+    #[test]
+    fn same_flow_always_picks_same_slot_or_established_tcp_sessions_split() {
+        let front = test_front();
+        let first = select_backend_slot(v4_client(7), 40000, &front, 5);
+        for _ in 0..100 {
+            assert_eq!(select_backend_slot(v4_client(7), 40000, &front, 5), first);
+        }
+        assert_eq!(
+            flow_hash(v6_client(7), 40000, &front),
+            flow_hash(v6_client(7), 40000, &front)
+        );
+    }
+
+    #[test]
+    fn hash_value_is_pinned_so_nodes_and_releases_agree_on_flow_placement() {
+        let front = test_front();
+        assert_eq!(flow_hash(v4_client(1), 1234, &front), 529_365_140);
+    }
+
+    #[test]
+    fn slot_is_always_below_count_or_dataplane_indexes_past_the_endpoint_table() {
+        let front = test_front();
+        for n in 1..=64u32 {
+            for i in 0..500u32 {
+                let s = select_backend_slot(v6_client(i), 1000 + i as u16, &front, n).unwrap();
+                assert!(s < n, "slot {s} out of range for n={n}");
+            }
+        }
+        for h in [0, 1, u32::MAX / 2, u32::MAX - 1, u32::MAX] {
+            assert!(slot_in_range(h, u32::MAX).unwrap() < u32::MAX);
+        }
+    }
+
+    #[test]
+    fn zero_endpoints_yields_none_instead_of_a_bogus_slot() {
+        let front = test_front();
+        assert_eq!(select_backend_slot(v4_client(1), 1, &front, 0), None);
+        assert_eq!(slot_in_range(u32::MAX, 0), None);
+    }
+
+    #[test]
+    fn single_endpoint_always_slot_zero_or_a_lone_pod_loses_traffic() {
+        let front = test_front();
+        for i in 0..1000u32 {
+            assert_eq!(
+                select_backend_slot(v4_client(i), i as u16, &front, 1),
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn v4_clients_spread_evenly_or_one_pod_is_overloaded() {
+        for n in 2..=8 {
+            let x = chi_square(v4_client, n);
+            // df<=7; 30 is beyond the p=0.001 critical value (24.3).
+            assert!(x < 30.0, "n={n} chi-square {x}");
+        }
+    }
+
+    #[test]
+    fn v6_clients_spread_evenly_or_one_pod_is_overloaded() {
+        for n in 2..=8 {
+            let x = chi_square(v6_client, n);
+            assert!(x < 30.0, "n={n} chi-square {x}");
+        }
+    }
+
+    #[test]
+    fn every_tuple_field_influences_the_hash_or_those_flows_pile_onto_one_pod() {
+        let front = test_front();
+        let base = flow_hash(v4_client(1), 1000, &front);
+        let mut other_front = front;
+        other_front.front_port = 81;
+        let mut other_proto = front;
+        other_proto.proto = 17;
+        let mut other_front_ip = front;
+        other_front_ip.front_ip[15] ^= 1;
+        assert_ne!(flow_hash(v4_client(2), 1000, &front), base);
+        assert_ne!(flow_hash(v4_client(1), 1001, &front), base);
+        assert_ne!(flow_hash(v4_client(1), 1000, &other_front), base);
+        assert_ne!(flow_hash(v4_client(1), 1000, &other_proto), base);
+        assert_ne!(flow_hash(v4_client(1), 1000, &other_front_ip), base);
+    }
+
+    #[test]
+    fn one_hash_serves_full_and_local_subrange_or_local_preference_needs_a_second_hash() {
+        let front = test_front();
+        let h = flow_hash(v4_client(3), 5555, &front);
+        let all = slot_in_range(h, 6).unwrap();
+        let local = slot_in_range(h, 2).unwrap();
+        assert!(all < 6 && local < 2);
+        assert_eq!(
+            Some(all),
+            select_backend_slot(v4_client(3), 5555, &front, 6)
+        );
+        assert_eq!(
+            Some(local),
+            select_backend_slot(v4_client(3), 5555, &front, 2)
         );
     }
 }
