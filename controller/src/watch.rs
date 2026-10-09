@@ -263,7 +263,7 @@ fn parse_service(obj: &Value) -> Option<RawService> {
 /// when absent (the Kubernetes API's own documented default for that
 /// field) -- treating a missing value as "not ready" would silently exclude
 /// every endpoint an apiserver doesn't bother setting the field on.
-fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
+fn parse_endpoint_slice(obj: &Value) -> RawEndpointSlice {
     let ports = obj["ports"]
         .as_array()
         .map(|arr| {
@@ -277,8 +277,12 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
                 .collect()
         })
         .unwrap_or_default();
+    // The apiserver omits `endpoints` once the last pod is gone; reading that as
+    // unparseable would keep the departed endpoint, and its pins, forever.
     let endpoints = obj["endpoints"]
-        .as_array()?
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
         .iter()
         .filter_map(|e| {
             let pod_ip = e["addresses"].as_array()?.first()?.as_str()?.parse().ok()?;
@@ -290,7 +294,7 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
             })
         })
         .collect();
-    Some(RawEndpointSlice { ports, endpoints })
+    RawEndpointSlice { ports, endpoints }
 }
 
 /// The two address roles one `Node` object plays, kept strictly separate:
@@ -523,12 +527,10 @@ impl WatchState {
                 }
             }
             EventKind::Upsert => {
-                if let Some(raw) = parse_endpoint_slice(obj) {
-                    self.slices
-                        .entry(owner)
-                        .or_default()
-                        .insert(slice_name, raw);
-                }
+                self.slices
+                    .entry(owner)
+                    .or_default()
+                    .insert(slice_name, parse_endpoint_slice(obj));
             }
         }
     }
@@ -1105,10 +1107,27 @@ mod tests {
                 {"addresses": ["10.244.0.5"], "targetRef": {"kind": "Pod", "uid": "u-1"}},
                 {"addresses": ["10.244.0.6"]},
             ]
-        }))
-        .unwrap();
+        }));
         assert_eq!(slice.endpoints[0].pod_uid.as_deref(), Some("u-1"));
         assert_eq!(slice.endpoints[1].pod_uid, None);
+    }
+
+    // The apiserver drops `endpoints` from a slice whose last pod is gone.
+    // Ignoring that update would leave the departed endpoint, and its pins,
+    // in place forever.
+    #[test]
+    fn slice_modified_to_omit_endpoints_removes_the_departed_pod_and_sweeps_its_pins() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        let mut known = known_after(&state);
+        let mut emptied = slice_obj("s1", &[]);
+        emptied.as_object_mut().unwrap().remove("endpoints");
+
+        state.apply_endpoint_slice_event(
+            &serde_json::json!({"type": "MODIFIED", "object": emptied}),
+        );
+
+        assert_eq!(swept(&state, &mut known), HashSet::from([pod_wire(9)]));
     }
 
     fn node(ip: Ipv4Addr) -> NodeContext {
