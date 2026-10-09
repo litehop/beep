@@ -26,7 +26,7 @@ use beep::{
 use beep_controller::{
     apply::PinnedMaps,
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
-    seed::load_or_create_seed,
+    seed::{converge_seed, load_or_create_seed, write_config_seed},
     status::ensure_node_ingress,
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -41,6 +41,8 @@ use serde_json::Value;
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+const SEED_POLL: Duration = Duration::from_secs(30);
 
 const DEFAULT_FWD_PENDING_MAX_ENTRIES: u32 = 2048;
 const DEFAULT_FLOW_TABLE_MAX_ENTRIES: u32 = 16384;
@@ -269,6 +271,31 @@ async fn run_retry_loop(
         retry_tick(&retry, Instant::now(), || {
             apply_reconcile(&state, &maps, &retry, &node)
         });
+    }
+}
+
+/// Re-reads the seed Secret every `SEED_POLL` and converges CONFIG on it, so a
+/// rotation or deletion cannot leave this node hashing with a seed the rest
+/// of the cluster (or a restarting node) no longer uses. A failed pass keeps
+/// the current seed and is retried on the next tick.
+async fn run_seed_loop(
+    client: Arc<HyperApiClient>,
+    namespace: String,
+    pin_dir: PathBuf,
+    mut current: u64,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::time::sleep(SEED_POLL).await;
+        match converge_seed(&client, &namespace, current).await {
+            Ok(Some(seed)) => match write_config_seed(&pin_dir, seed) {
+                Ok(()) => current = seed,
+                Err(e) => {
+                    eprintln!("controller: WARN writing adopted flow-hash seed failed: {e:#}")
+                }
+            },
+            Ok(None) => {}
+            Err(e) => eprintln!("controller: WARN flow-hash seed re-read failed: {e:#}"),
+        }
     }
 }
 
@@ -576,10 +603,23 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("all 3 hooks attached; watching Service/EndpointSlice/Node");
 
+    let controller = async {
+        let (watches, seed) = tokio::join!(
+            run_controller_loop(Arc::clone(&client), state, maps, node),
+            run_seed_loop(
+                Arc::clone(&client),
+                args.seed_namespace.clone(),
+                args.pin_dir.clone(),
+                flow_hash_seed,
+            ),
+        );
+        watches.and(seed)
+    };
+
     #[cfg(feature = "dhat-heap")]
     {
         tokio::select! {
-            result = run_controller_loop(client, state, maps, node) => result,
+            result = controller => result,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("controller: dhat-heap: SIGINT received, flushing dhat-heap.json");
                 Ok(())
@@ -587,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     #[cfg(not(feature = "dhat-heap"))]
-    run_controller_loop(client, state, maps, node).await
+    controller.await
 }
 
 #[cfg(test)]

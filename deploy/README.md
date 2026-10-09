@@ -26,6 +26,12 @@ Manifest skeleton for the beep servicelb controller.
   controller to start creates it, the rest read it; every node must share it
   or ingress-node changes re-steer flows). Treat that Secret as sensitive:
   anyone who can read it can precompute which source ports hit which backend.
+  Running controllers re-read the Secret every 30s and converge on it: a
+  changed value is adopted (logged as a WARN, never the value) and a deleted
+  Secret is recreated with the controller's current seed, first creator wins.
+  To rotate, edit the Secret; every node switches within one poll interval.
+  Flows already steered by a conntrack pin keep their backend; only new flows
+  are placed with the new seed, and may land on different backends.
 
 ## Required per-cluster configuration & gotchas
 
