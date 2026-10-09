@@ -48,7 +48,7 @@ use beep_common::{
 };
 use clap::Parser;
 
-/// `beep evict-pod <pod-ip> [--pin-dir <dir>]`: a HIDDEN, test-only one-shot
+/// `beep evict-pod <pod-ip>... [--pin-dir <dir>]`: a HIDDEN, test-only one-shot
 /// that runs the real conntrack eviction sweep (`beep::evict_pod_flows`)
 /// against a running loader's already-pinned maps, without going through a
 /// live kube API. Not advertised in `--help` -- dispatched by literal argv[1]
@@ -59,8 +59,9 @@ use clap::Parser;
 /// exercise the exact same sweep logic production reconciles run.
 #[derive(Parser, Debug)]
 struct EvictPodArgs {
-    /// Pod IP to evict.
-    pod_ip: IpAddr,
+    /// Pod IPs to evict, swept together in one pass like a reconcile tick.
+    #[arg(required = true)]
+    pod_ips: Vec<IpAddr>,
 
     /// Same bpffs pin directory the target loader instance was started
     /// with.
@@ -85,8 +86,9 @@ fn open_pinned_hash_map<K: aya::Pod, V: aya::Pod>(
 /// tick for a departed pod, so this trigger proves the real sweep logic
 /// rather than a stand-in.
 fn run_evict_pod(args: EvictPodArgs) -> anyhow::Result<()> {
-    let EvictPodArgs { pod_ip, pin_dir } = args;
-    let departed_pod = wire_ip_v6(pod_ip);
+    let EvictPodArgs { pod_ips, pin_dir } = args;
+    let departed_pods: std::collections::HashSet<[u8; 16]> =
+        pod_ips.iter().copied().map(wire_ip_v6).collect();
 
     let mut pod_targets: AyaHashMap<MapData, [u8; 16], u8> =
         open_pinned_hash_map(&pin_dir, "POD_TARGETS")?;
@@ -95,13 +97,17 @@ fn run_evict_pod(args: EvictPodArgs) -> anyhow::Result<()> {
     let mut flow_table: AyaHashMap<MapData, FlowKey, FlowValue> =
         open_pinned_hash_map(&pin_dir, "FLOW_TABLE")?;
 
-    if let Err(e) = pod_targets.remove(&departed_pod) {
-        eprintln!("evict-pod: POD_TARGETS delete for {pod_ip} failed: {e:#}");
+    for (pod_ip, departed_pod) in pod_ips.iter().zip(pod_ips.iter().copied().map(wire_ip_v6)) {
+        if let Err(e) = pod_targets.remove(&departed_pod) {
+            eprintln!("evict-pod: POD_TARGETS delete for {pod_ip} failed: {e:#}");
+        }
     }
-    evict_pod_flows(&mut fwd_pending, &mut flow_table, departed_pod)
+    evict_pod_flows(&mut fwd_pending, &mut flow_table, &departed_pods)
         .context("conntrack eviction sweep")?;
     eprintln!(
-        "evict-pod: swept POD_TARGETS/FWD_PENDING/FLOW_TABLE for pod {pod_ip} under {}",
+        "evict-pod: swept POD_TARGETS/FWD_PENDING/FLOW_TABLE for {} pod(s) {:?} under {}",
+        pod_ips.len(),
+        pod_ips,
         pin_dir.display()
     );
     Ok(())

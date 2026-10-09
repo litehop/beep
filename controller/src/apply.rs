@@ -186,12 +186,12 @@ fn describe_lb_front_key(key: &LbFrontKey) -> String {
 /// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
 /// Continues past an individual write failure, like the front writes.
 ///
-/// Each stale (departed) pod IP also runs `beep::evict_pod_flows` against
-/// `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
+/// All of a tick's stale (departed) pod IPs also run ONE `beep::evict_pod_flows`
+/// pass against `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
 /// conntrack rows would otherwise pin routing to a dead backend, or
-/// misroute a FUTURE, unrelated owner of that pod IP if it's reused. Run
-/// even if the `POD_TARGETS` delete itself failed: a write error on this one map
-/// must not leave stale conntrack state behind too.
+/// misroute a FUTURE, unrelated owner of that pod IP if it's reused. Their
+/// `POD_TARGETS` rows are deleted only after the sweep succeeds
+/// (`evict_then_delete_departed`).
 fn apply_pod_targets(
     map: &mut AyaHashMap<MapData, [u8; 16], u8>,
     fwd_pending: &mut AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
@@ -201,22 +201,14 @@ fn apply_pod_targets(
     let existing: Vec<[u8; 16]> = map.keys().collect::<Result<_, _>>()?;
     let live: Vec<[u8; 16]> = desired.iter().copied().collect();
     let mut failed = 0;
-    for stale in beep::stale_pod_targets(&existing, &live) {
-        if let Err(e) = map.remove(&stale) {
-            failed += 1;
-            eprintln!(
-                "controller: POD_TARGETS delete for pod {} failed: {e:#}",
-                describe_pod_target_ip(stale)
-            );
-        }
-        if let Err(e) = beep::evict_pod_flows(fwd_pending, flow_table, stale) {
-            failed += 1;
-            eprintln!(
-                "controller: conntrack eviction sweep for departed pod {} failed: {e:#}",
-                describe_pod_target_ip(stale)
-            );
-        }
-    }
+    let departed: HashSet<[u8; 16]> = beep::stale_pod_targets(&existing, &live)
+        .into_iter()
+        .collect();
+    failed += evict_then_delete_departed(
+        &departed,
+        |pods| beep::evict_pod_flows(fwd_pending, flow_table, pods),
+        |pod| map.remove(&pod).map_err(Into::into),
+    );
     for ip in &live {
         if let Err(e) = map.insert(ip, 1u8, 0) {
             failed += 1;
@@ -234,6 +226,36 @@ fn apply_pod_targets(
         );
     }
     Ok(())
+}
+
+/// Sweeps `departed` pods' conntrack, and only on success deletes their
+/// `POD_TARGETS` rows. The row is what makes a pod show up as departed on the
+/// next reconcile, so deleting it before a failed sweep would orphan that
+/// pod's flows forever. Returns the number of failures.
+fn evict_then_delete_departed(
+    departed: &HashSet<[u8; 16]>,
+    evict: impl FnOnce(&HashSet<[u8; 16]>) -> anyhow::Result<()>,
+    mut delete: impl FnMut([u8; 16]) -> anyhow::Result<()>,
+) -> usize {
+    if let Err(e) = evict(departed) {
+        eprintln!(
+            "controller: conntrack eviction sweep for {} departed pod(s) failed, keeping their \
+             POD_TARGETS rows for retry: {e:#}",
+            departed.len()
+        );
+        return 1;
+    }
+    let mut failed = 0;
+    for pod in departed {
+        if let Err(e) = delete(*pod) {
+            failed += 1;
+            eprintln!(
+                "controller: POD_TARGETS delete for pod {} failed: {e:#}",
+                describe_pod_target_ip(*pod)
+            );
+        }
+    }
+    failed
 }
 
 /// Formats a `POD_TARGETS` pod IP for logging. Unlike `describe_node_allow_peer`'s
@@ -349,6 +371,52 @@ fn node_allow_stale_peers(
 mod tests {
     use super::*;
     use beep_common::ipv4_mapped_v6;
+
+    #[test]
+    fn failed_sweep_keeps_departed_pod_rows_so_next_tick_retries() {
+        let departed: HashSet<[u8; 16]> =
+            [ipv4_mapped_v6(1), ipv4_mapped_v6(2)].into_iter().collect();
+        let mut deleted = Vec::new();
+        let failed = evict_then_delete_departed(
+            &departed,
+            |_| anyhow::bail!("map iter failed"),
+            |pod| {
+                deleted.push(pod);
+                Ok(())
+            },
+        );
+        assert_eq!(failed, 1);
+        assert!(
+            deleted.is_empty(),
+            "POD_TARGETS rows deleted before a failed sweep orphan those pods' flows forever"
+        );
+    }
+
+    #[test]
+    fn successful_sweep_deletes_every_departed_pod_row_after_one_sweep() {
+        let departed: HashSet<[u8; 16]> =
+            [ipv4_mapped_v6(1), ipv4_mapped_v6(2)].into_iter().collect();
+        let mut sweeps = 0;
+        let mut deleted = HashSet::new();
+        let failed = evict_then_delete_departed(
+            &departed,
+            |pods| {
+                sweeps += 1;
+                assert_eq!(pods.len(), 2, "all departed pods swept together");
+                Ok(())
+            },
+            |pod| {
+                deleted.insert(pod);
+                Ok(())
+            },
+        );
+        assert_eq!(failed, 0);
+        assert_eq!(
+            sweeps, 1,
+            "one table walk per tick regardless of departed count"
+        );
+        assert_eq!(deleted, departed);
+    }
 
     #[test]
     fn node_allow_stale_peers_never_deletes_before_fronts_known_first_seen() {
