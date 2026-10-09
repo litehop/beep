@@ -894,25 +894,32 @@ fn mix32(h: u32, w: u32) -> u32 {
     h ^ (h >> 15)
 }
 
+fn le_words(b: &[u8; 16]) -> [u32; 4] {
+    [
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+        u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+    ]
+}
+
 /// 32-bit hash of a flow's (client ip, client port, front) tuple. Fixed-length
 /// and little-endian word reads so every node and CPU computes the same value
 /// for the same flow. Hash once, then reduce with `slot_in_range` for as many
 /// ranges as needed (e.g. all endpoints, then only node-local ones) without
 /// re-hashing.
 pub fn flow_hash(client_ip: [u8; 16], client_port: u16, front: &LbFrontKey) -> u32 {
+    let c = le_words(&client_ip);
+    let f = le_words(&front.front_ip);
     let mut h = 0x811C_9DC5_u32;
-    let mut i = 0;
-    while i < 16 {
-        h = mix32(
-            h,
-            u32::from_le_bytes(client_ip[i..i + 4].try_into().unwrap()),
-        );
-        h = mix32(
-            h,
-            u32::from_le_bytes(front.front_ip[i..i + 4].try_into().unwrap()),
-        );
-        i += 4;
-    }
+    h = mix32(h, c[0]);
+    h = mix32(h, f[0]);
+    h = mix32(h, c[1]);
+    h = mix32(h, f[1]);
+    h = mix32(h, c[2]);
+    h = mix32(h, f[2]);
+    h = mix32(h, c[3]);
+    h = mix32(h, f[3]);
     h = mix32(h, (client_port as u32) | ((front.front_port as u32) << 16));
     h = mix32(h, front.proto as u32);
     h ^= h >> 16;
@@ -2296,6 +2303,7 @@ mod tests {
     fn v6_client(i: u32) -> [u8; 16] {
         let mut ip = [0u8; 16];
         ip[0] = 0xfd;
+        ip[4..8].copy_from_slice(&(i / 16).to_be_bytes());
         ip[12..16].copy_from_slice(&i.to_be_bytes());
         ip
     }
@@ -2405,6 +2413,29 @@ mod tests {
         assert_ne!(flow_hash(v4_client(1), 1000, &other_front), base);
         assert_ne!(flow_hash(v4_client(1), 1000, &other_proto), base);
         assert_ne!(flow_hash(v4_client(1), 1000, &other_front_ip), base);
+    }
+
+    #[test]
+    fn every_ip_byte_influences_the_hash_or_ips_sharing_a_suffix_pile_onto_one_pod() {
+        let front = test_front();
+        let client = v6_client(0x0102_0304);
+        let base = flow_hash(client, 1000, &front);
+        for i in 0..16 {
+            let mut c = client;
+            c[i] ^= 0x80;
+            assert_ne!(
+                flow_hash(c, 1000, &front),
+                base,
+                "client_ip byte {i} ignored"
+            );
+            let mut f = front;
+            f.front_ip[i] ^= 0x80;
+            assert_ne!(
+                flow_hash(client, 1000, &f),
+                base,
+                "front_ip byte {i} ignored"
+            );
+        }
     }
 
     #[test]
