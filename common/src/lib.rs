@@ -9,6 +9,8 @@
 //! & affinity" section and its "Settled wire-format decisions".
 #![cfg_attr(not(test), no_std)]
 
+pub mod reject;
+
 /// TCP/UDP flow-affinity key: IPv6-primary, 37 bytes (16+16+2+2+1), no
 /// padding. A flat byte array rather than a `#[repr(C)]` struct: the kernel
 /// hashes/compares a `BPF_MAP_TYPE_*_HASH` key's raw bytes, and a padded
@@ -988,8 +990,10 @@ pub fn select_backend_slot(
 /// What ingress does with a packet addressed to a front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressSteer {
-    /// Front has no endpoints: not provably servable, leave the packet alone.
-    Pass,
+    /// An owned front with no ready endpoints: answer the client (RST /
+    /// unreachable) so it fails fast. Distinct from a `FRONT_META` miss,
+    /// which is not a front at all and is never seen here.
+    Reject,
     /// The front has endpoints but the chosen row is unreadable: fail closed
     /// rather than leak a front-addressed packet to the host stack.
     Drop,
@@ -1012,7 +1016,7 @@ pub fn ingress_steer(
     endpoint_at: impl FnOnce(FrontEndpointKey) -> Option<FrontEndpoint>,
 ) -> IngressSteer {
     if meta.count == 0 {
-        return IngressSteer::Pass;
+        return IngressSteer::Reject;
     }
     if let Some(backend) = established.or(pending) {
         return IngressSteer::Forward(backend);
@@ -2773,11 +2777,11 @@ mod tests {
     }
 
     #[test]
-    fn front_without_endpoints_passes_untouched_even_with_a_stale_pin() {
+    fn front_without_endpoints_is_rejected_even_with_a_stale_pin() {
         let front = test_front();
         let steered = ingress_steer(meta(1, 0), Some(backend_n(1)), None, 0, front, |_| {
             panic!("no row may be read when count is 0")
         });
-        assert_eq!(steered, IngressSteer::Pass);
+        assert_eq!(steered, IngressSteer::Reject);
     }
 }
