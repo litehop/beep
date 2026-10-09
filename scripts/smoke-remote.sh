@@ -93,6 +93,10 @@ RESTART_LOADER_LOG="/tmp/beep-smoke-loader-restart.log"
 EVICT_FRONT_PORT="19104"
 EVICT_TARGET_PORT="18084"
 EVICT_FRONT_POD_IP="$POD_IP"
+# Cold-neighbor-cache fixture: its own front so the control's half-open flow
+# can't pollute any other section's listener.
+COLD_FRONT_PORT="19105"
+COLD_TARGET_PORT="18085"
 EVICT_RESPONSE_FILE="/tmp/beep-smoke-response-evict.http"
 EVICT_BACKEND_LOG="/tmp/beep-smoke-backend-evict.log"
 REPLACEMENT_POD_IP="198.51.100.60"
@@ -134,6 +138,7 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
@@ -236,6 +241,7 @@ start_loader() {
     --fixture "${FRONT_IP}:${FRONT_PORT3}:udp:${FLOOD_BACKEND_NODE_IP}:${POD_IP}:${TARGET_PORT3}" \
     --fixture "${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${UPLINK2_TARGET_PORT}" \
     --fixture "${FRONT_IP}:${EVICT_FRONT_PORT}:tcp:${FRONT_IP}:${EVICT_FRONT_POD_IP}:${EVICT_TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${COLD_FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${COLD_TARGET_PORT}" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -362,6 +368,69 @@ body3=$(ip netns exec "$UPLINK2_NETNS" curl -sS -m 5 "http://${UPLINK2_FRONT_IP}
   exit 1
 }
 echo "SECOND-UPLINK ROUND-TRIP: PASS (client ${UPLINK2_CLIENT_IP} via ${UPLINK2_IFACE} -> front ${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT} -> backend ${POD_IP}:${UPLINK2_TARGET_PORT} -> response 'OK3', returned via the SAME uplink it arrived on)"
+
+echo "==> cold neighbor cache: the return leg's bpf_redirect_neigh must resolve a client the host has NO neighbour entry for"
+# The client's own SYN normally warms the host's neighbour cache (the client
+# ARPs for FRONT_IP, the host learns the client from the request), which is
+# why the plain round trips above can't exercise resolution at all. A
+# permanent client-side entry for the host removes that ARP, so nothing but
+# the return leg itself can populate the host's entry for CLIENT_IP.
+COLD_RESPONSE_FILE="/tmp/beep-smoke-response-cold.http"
+COLD_BACKEND_LOG="/tmp/beep-smoke-backend-cold.log"
+host_mac=$(cat /sys/class/net/smoke-veth0/address)
+ip netns exec smoke-client ip neigh replace "$FRONT_IP" lladdr "$host_mac" dev smoke-veth1 nud permanent
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nCOLD' > "$COLD_RESPONSE_FILE"
+
+host_neigh() { ip -4 neigh show "$CLIENT_IP" dev smoke-veth0; }
+flush_host_neigh_and_assert_absent() {
+  ip neigh del "$CLIENT_IP" dev smoke-veth0 2>/dev/null || true
+  local entry
+  entry=$(host_neigh)
+  [ -z "$entry" ] || {
+    echo "FAIL: host still has a neighbour entry for ${CLIENT_IP} after flush ('$entry') -- the cold-cache premise does not hold" >&2
+    exit 1
+  }
+}
+
+echo "==> control: client answers no ARP (arp off), so a cold return leg CANNOT resolve -- the round trip must fail"
+ip netns exec smoke-client ip link set smoke-veth1 arp off
+flush_host_neigh_and_assert_absent
+nohup nc -l -N "$POD_IP" "$COLD_TARGET_PORT" < "$COLD_RESPONSE_FILE" >"$COLD_BACKEND_LOG" 2>&1 &
+cold_nc_pid=$!
+disown
+sleep 0.5
+if control_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${FRONT_IP}:${COLD_FRONT_PORT}/" 2>&1); then
+  echo "FAIL: cold-neighbor control succeeded ('$control_body') although the client could never answer ARP -- the return leg is NOT depending on neighbour resolution, so the variant below proves nothing" >&2
+  exit 1
+fi
+control_entry=$(host_neigh)
+case "$control_entry" in
+  *lladdr*) echo "FAIL: control resolved ${CLIENT_IP} ('$control_entry') despite arp off on the client" >&2; exit 1 ;;
+esac
+echo "COLD-NEIGHBOR CONTROL: PASS (unresolvable client => round trip failed and host neighbour is '${control_entry:-absent}' -- success below can only come from real resolution)"
+kill "$cold_nc_pid" 2>/dev/null || true
+ip netns exec smoke-client ip link set smoke-veth1 arp on
+
+echo "==> cold-cache round trip: flush the host's entry for ${CLIENT_IP}, then drive the flow"
+flush_host_neigh_and_assert_absent
+nohup nc -l -N "$POD_IP" "$COLD_TARGET_PORT" < "$COLD_RESPONSE_FILE" >"$COLD_BACKEND_LOG" 2>&1 &
+cold_nc_pid=$!
+disown
+sleep 0.5
+cold_body=$(ip netns exec smoke-client curl -sS -m 8 "http://${FRONT_IP}:${COLD_FRONT_PORT}/") || {
+  echo "FAIL: round trip with a cold host neighbour cache did not complete -- bpf_redirect_neigh failed to resolve ${CLIENT_IP} on the return leg" >&2
+  exit 1
+}
+[ "$cold_body" = "COLD" ] || {
+  echo "FAIL: expected body 'COLD' on the cold-cache round trip, got: $cold_body" >&2
+  exit 1
+}
+cold_entry=$(host_neigh)
+case "$cold_entry" in
+  *FAILED*|*INCOMPLETE*|"") echo "FAIL: reply was delivered but the host's neighbour for ${CLIENT_IP} is '${cold_entry:-absent}', not resolved" >&2; exit 1 ;;
+esac
+kill "$cold_nc_pid" 2>/dev/null || true
+echo "COLD-NEIGHBOR ROUND-TRIP: PASS (neighbour for ${CLIENT_IP} absent before the flow, '${cold_entry}' after; response 'COLD' delivered)"
 
 # bpftool exits nonzero AND still prints a JSON error object to stdout for a
 # missing pin (`{"error": "..."}`) -- piping that straight into `jq length`
