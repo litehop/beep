@@ -342,6 +342,12 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
 /// protocol leaves in place: flows pinned before the front drained must keep
 /// resolving their target port, or they would be dropped on the backend node
 /// even though ingress still forwards them.
+///
+/// INTERIM: remove once the target port travels in the forward Geneve option.
+/// It only covers a front drained by exactly one swap (the next swap deletes
+/// every non-live generation, so a second generation bump at count 0 loses the
+/// rows), and slot 0 may name a different target port than the pinned pod
+/// under named ports.
 pub fn decap_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> FrontEndpointKey {
     front_endpoint_key(front, meta).unwrap_or(FrontEndpointKey {
         front,

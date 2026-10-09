@@ -698,16 +698,17 @@ echo "POD-IP-REUSE ROUND-TRIP: PASS (fresh flow through reused pod IP ${POD_IP} 
 
 echo "==> pin steering: a flow held open while its front is re-pointed at another pod must keep reaching the pod that holds its state"
 PIN_STEER_FIFO="/tmp/beep-smoke-pin-steer-fifo"
+PIN_DRAIN_FIFO="/tmp/beep-smoke-pin-drain-fifo"
 PIN_STEER_BACKEND_IN="/tmp/beep-smoke-pin-steer-backend.in"
 PIN_STEER_MSG="PINMSG"
 PIN_DRAIN_MSG="PINDRAIN"
-rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
-mkfifo "$PIN_STEER_FIFO"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN"
+mkfifo "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO"
 pin_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 nohup bash -c "sleep 60 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
 disown
 sleep 0.5
-nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_DRAIN_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
+nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_DRAIN_FIFO}; printf '%s' ${PIN_DRAIN_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
 disown
 for _ in $(seq 1 30); do
   pin_flows_now=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
@@ -749,15 +750,18 @@ echo "PIN-STEERING (new flow): PASS (a fresh flow followed the new endpoint ${RE
 
 # Drain: the front's ready count drops to 0 (rolling update) while the pinned
 # flow is still open. It must keep forwarding; only a NEW connection is refused.
-# Mirrors the controller's swap to an empty set: next generation, count 0, the
-# previous generation's rows left in FRONT_ENDPOINTS.
+# Exercises the dataplane path directly: next generation, count 0, the previous
+# generation's rows left in FRONT_ENDPOINTS. The controller does not yet write
+# count 0 (it deletes FRONT_META for an empty set).
 DRAIN_FRONT_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ') $((EVICT_FRONT_PORT >> 8)) $((EVICT_FRONT_PORT & 255)) 6 0"
-drain_gen=$(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0]')
-bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((drain_gen + 1)) 0 0 0 0 0 0 0 || {
+drain_gen_bytes=($(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0:4][]'))
+drain_gen=$((drain_gen_bytes[0] | drain_gen_bytes[1] << 8 | drain_gen_bytes[2] << 16 | drain_gen_bytes[3] << 24))
+drain_gen=$(((drain_gen + 1) & 0xffffffff))
+bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((drain_gen & 255)) $(((drain_gen >> 8) & 255)) $(((drain_gen >> 16) & 255)) $(((drain_gen >> 24) & 255)) 0 0 0 0 || {
   echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
   exit 1
 }
-printf '\n' 1<>"$PIN_STEER_FIFO"
+printf '\n' 1<>"$PIN_DRAIN_FIFO"
 for _ in $(seq 1 25); do
   grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
   sleep 0.2
@@ -781,7 +785,7 @@ stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"
 wait_for_attach "$EVICT_LOADER_LOG_REUSE"
 pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
-rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN"
 
 echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hostNetwork backend), a fresh outbound connection from it must still leave the uplink"
 # A hostNetwork backend's pod IP IS the node's address, so POD_TARGETS holds
