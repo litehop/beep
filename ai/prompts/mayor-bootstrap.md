@@ -76,6 +76,10 @@ other in-flight workers and their write surfaces so the receiver pattern-matches
 for collisions; explicit "do not edit the mayor checkout" and "do not merge PRs";
 require tests + final report (changed files, commands run, branch/PR, risks).
 Worker may close its own bead after opening the PR with a cross-ref reason.
+The `scripts/guard-mayor-checkout.sh` PreToolUse hook blocks subagents from
+running HEAD-moving git commands in the mayor checkout; a worker's "MAYOR
+CHECKOUT GUARD" rejection means it should use `gh pr diff <n>` or a scratch
+`git worktree add`, not that the hook is broken.
 Before dispatching, run `scripts/bead-premise-check.sh <bead-id>`. Exit 0
 (still-broken) — proceed with dispatch. Exit 1 (no-longer-broken) — the
 alleged broken symbol/missing file/stale convention already landed; close
