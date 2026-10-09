@@ -134,7 +134,7 @@ forward-write and return-read).
 | `REJECT_BUCKET` | <1 KiB | Per-CPU token bucket (100 replies/s, burst 25) gating TCP RST / ICMP unreachable replies from fronts with no ready backends; over budget the packet is dropped. |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
-| **Total** | **~8–9 MiB** | Independent of vCPU count — maps are shared. |
+| **Total** | **~8–9 MiB** | Independent of vCPU count except `REJECT_BUCKET`, which is per-CPU (<1 KiB per CPU); all other maps are shared. |
 
 All maps pre-allocate their full ceiling — loxilb's "cannot start on 1GB
 node" failure mode (gate 2) — sized for u7s's envelope (<10 nodes/<100

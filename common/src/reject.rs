@@ -341,11 +341,15 @@ pub fn icmp6_unreachable_in_place(
     true
 }
 
-/// Nanoseconds to earn one reply token: 100 replies/s per CPU. A node's
-/// total is that times its CPU count, the same order as the kernel's own
-/// ICMP limit (`icmp_msgs_per_sec` 1000, burst 50) on a typical node.
+/// Nanoseconds to earn one reply token: 100 replies/s per CPU. The limit is
+/// per CPU, so the node-wide ceiling scales with CPU count (6,400/s on 64
+/// cores, against the kernel's own ICMP limit of ~1,000/s per node:
+/// `icmp_msgs_per_sec` 1000, burst 50). Per-CPU keeps the bucket lock-free and
+/// free of cross-CPU cache-line contention in the packet path; a hard
+/// node-wide cap would divide the rate by the possible-CPU count instead.
 pub const REJECT_NS_PER_TOKEN: u64 = 10_000_000;
-/// Most replies one CPU can emit back to back after sitting idle.
+/// Most replies one CPU can emit back to back after sitting idle (per CPU,
+/// like the rate).
 pub const REJECT_BURST: u64 = 25;
 
 /// Per-CPU reply budget. All-zero is a valid initial state and starts full.

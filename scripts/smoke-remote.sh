@@ -929,10 +929,14 @@ pkill -f "nc -[46] -l -N ${FRONT_IP}" 2>/dev/null || true
 echo "REJECT: PASS (owned count-0 fronts refuse TCP and UDP on v4+v6 immediately; non-owned fronts still pass to the host)"
 
 echo "==> reject rate limit: a UDP flood at a count-0 front must draw a bounded number of ICMP replies, and a probe after the flood must still be answered"
-# Pinned to one CPU so one per-CPU bucket (burst 25, 100/s) serves the whole
-# flood. Replies are counted as frames received on the client veth; the only
-# traffic on it during the flood is beep's replies. Unbounded, every flood
-# packet would be answered.
+# The bucket is per CPU, and the veth delivers each flood packet to beep on
+# the sender's CPU, so `taskset -c 0` makes one bucket (burst 25, 100/s) serve
+# the whole flood. On a multi-CPU runner CPU 0 must be the only CPU the flood
+# lands on (the bound below is for one bucket; it does not scale with nproc),
+# which holds because the sender is pinned, not because nproc is 1. Replies
+# are counted as frames received on the client veth; the only traffic on it
+# during the flood is beep's replies. Unbounded, every flood packet would be
+# answered.
 FLOOD_PACKETS=3000
 FLOOD_BURST=25
 FLOOD_RATE=100
@@ -945,9 +949,11 @@ sleep 1
 rx_after=$(rx_packets)
 flood_ms=$(((flood_end - flood_start) / 1000000))
 flood_replies=$((rx_after - rx_before))
-# Allowed: the burst plus the refill over the flood and the settle second,
-# plus slack for unrelated link traffic (neighbour discovery).
-flood_max=$((FLOOD_BURST + FLOOD_RATE * (flood_ms + 1000) / 1000 + 20))
+# Allowed: the burst plus the refill earned while the flood ran (nothing
+# refills once it stops), plus slack for a rounding token and unrelated link
+# traffic (neighbour discovery). Tight on purpose: a gate with burst 100 must
+# fail.
+flood_max=$((FLOOD_BURST + FLOOD_RATE * flood_ms / 1000 + 10))
 echo "FLOOD: sent $FLOOD_PACKETS UDP packets in ${flood_ms}ms, client received $flood_replies frames (allowed <= $flood_max)"
 [ "$flood_replies" -le "$flood_max" ] || {
   echo "FAIL: $flood_replies replies to $FLOOD_PACKETS flood packets exceeds the reject budget of $flood_max -- a spoofed-source flood at an empty front would be reflected at the victim packet for packet" >&2
