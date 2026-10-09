@@ -286,7 +286,10 @@ struct TickPlan {
     /// Fronts to write: those naming an IP whose sweep is pending are held
     /// back at their installed endpoints.
     fronts: HashMap<LbFrontKey, DesiredFront>,
-    /// False while a front is held back (pruning would delete it).
+    /// False while a front is held back (pruning would delete it). This
+    /// pauses pruning of every absent front, not just the held one, until the
+    /// sweep succeeds: `plan_front_writes` only knows all-or-nothing pruning,
+    /// and the pause is bounded by the sweep retry.
     prune_fronts: bool,
     /// `POD_TARGETS` IPs to insert, minus IPs whose sweep is pending.
     pod_targets: HashSet<[u8; 16]>,

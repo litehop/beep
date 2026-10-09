@@ -1318,8 +1318,9 @@ mod tests {
                     wire(Ipv4Addr::new(10, 244, 1, 9)),
                     Some("remote".to_owned())
                 ),
+                (wire(Ipv4Addr::new(10, 244, 1, 10)), None),
             ]),
-            "every ready backend cluster-wide, with its uid; not-ready pods excluded"
+            "every backend still in a slice cluster-wide, with its uid, ready or not"
         );
 
         state.apply_endpoint_slice_event(&serde_json::json!({
@@ -1329,6 +1330,102 @@ mod tests {
         assert!(
             state.desired(&ingress).cluster_backends.is_empty(),
             "a departed backend must leave the set so the sweep sees it go"
+        );
+    }
+
+    // A terminating pod (ready=false, serving=true) and a pod flapping its
+    // readiness probe keep their pinned flows until the endpoint leaves the
+    // slice: the sweep keys on presence, so these must not look departed --
+    // neither in the cluster-wide set nor in this node's POD_TARGETS (which
+    // gates decap and return admission of the draining flows) -- while a
+    // slice update that drops the endpoint, or an ADDED relist replay that
+    // lists only some slices, must behave correctly too.
+    #[test]
+    fn draining_and_flapping_endpoints_stay_tracked_until_removed_from_the_slice() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        for (name, ip) in [("node-a", "10.0.0.5"), ("node-b", "10.0.0.6")] {
+            state.apply_node_event(&serde_json::json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": name},
+                    "status": {"addresses": [{"type": "InternalIP", "address": ip}]},
+                },
+            }));
+        }
+        state.mark_nodes_listed();
+        let slice = |name: &str, endpoints: serde_json::Value| {
+            serde_json::json!({
+                "type": "MODIFIED",
+                "object": {
+                    "metadata": {
+                        "namespace": "default",
+                        "name": name,
+                        "labels": {"kubernetes.io/service-name": "svc-a"},
+                    },
+                    "ports": [{"port": 8080, "protocol": "TCP"}],
+                    "endpoints": endpoints,
+                },
+            })
+        };
+        let local = serde_json::json!({
+            "addresses": ["10.244.0.9"], "nodeName": "node-a",
+            "conditions": {"ready": false, "serving": true, "terminating": true},
+        });
+        let remote = serde_json::json!({
+            "addresses": ["10.244.1.9"], "nodeName": "node-b",
+            "conditions": {"ready": false, "serving": false, "terminating": false},
+        });
+        state.apply_endpoint_slice_event(&slice("s1", serde_json::json!([local, remote])));
+        let other = serde_json::json!({
+            "addresses": ["10.244.1.20"], "nodeName": "node-b", "conditions": {"ready": true},
+        });
+        state.apply_endpoint_slice_event(&slice("s2", serde_json::json!([other])));
+        let ingress = node(Ipv4Addr::new(10, 0, 0, 5));
+        let wire =
+            |third: u8, last: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, third, last)));
+
+        let desired = state.desired(&ingress);
+        for pod in [wire(0, 9), wire(1, 9), wire(1, 20)] {
+            assert!(
+                desired.cluster_backends.contains_key(&pod),
+                "a draining or flapping pod must not look departed or its pinned flows are cut"
+            );
+        }
+        assert!(
+            desired.pod_targets.contains(&wire(0, 9)),
+            "the draining local pod keeps decap/return admission for its pinned flows"
+        );
+        assert!(
+            desired.backends().values().all(|b| b.pod_ip == wire(1, 20)),
+            "only the ready endpoint is selectable for new flows"
+        );
+
+        state.apply_endpoint_slice_event(&slice("s1", serde_json::json!([remote])));
+        let desired = state.desired(&ingress);
+        assert!(
+            !desired.cluster_backends.contains_key(&wire(0, 9))
+                && !desired.pod_targets.contains(&wire(0, 9)),
+            "an endpoint removed from its slice has departed"
+        );
+
+        let mut replay = slice("s1", serde_json::json!([remote]));
+        replay["type"] = "ADDED".into();
+        state.apply_endpoint_slice_event(&replay);
+        assert!(
+            state.desired(&ingress).cluster_backends.contains_key(&wire(1, 20)),
+            "a relist replays slices additively; slices not yet replayed must not read as departed, \
+             or a relist would sweep every other slice's flows"
         );
     }
 
