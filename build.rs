@@ -10,6 +10,9 @@ use std::process::Command;
 use anyhow::{bail, Context as _};
 
 fn main() -> aya_build::Result<()> {
+    // aya-build only watches `ebpf/`; the object also embeds `beep-common`.
+    println!("cargo:rerun-if-changed=common");
+    println!("cargo:rerun-if-changed=Cargo.lock");
     aya_build::build_ebpf(
         [aya_build::Package {
             name: "beep-ebpf",

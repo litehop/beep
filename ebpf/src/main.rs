@@ -46,24 +46,31 @@
 //! also takes plain host order (the kernel applies `cpu_to_be64`
 //! internally), consistent with `remote_ipv4` here.
 
+use core::mem::MaybeUninit;
+
 use aya_ebpf::{
     bindings::{
         bpf_tunnel_key, BPF_F_PSEUDO_HDR, BPF_F_TUNINFO_IPV6, TC_ACT_OK, TC_ACT_REDIRECT,
         TC_ACT_SHOT,
     },
     helpers::{
-        bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_change_type,
-        bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_set_tunnel_key,
-        bpf_skb_set_tunnel_opt,
+        bpf_csum_diff, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_change_tail,
+        bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_load_bytes,
+        bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt, bpf_skb_store_bytes,
     },
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
+use beep_common::reject::{
+    icmp6_unreachable_in_place, icmp_unreachable_in_place_v4, tcp_rst_in_place_v4,
+    tcp_rst_in_place_v6, ICMP6_QUOTE_LEN, ICMP6_UNREACH_LEN, ICMP_QUOTE_V4_LEN,
+    ICMP_UNREACH_V4_LEN, TCP_RST_V4_IN_LEN, TCP_RST_V4_LEN, TCP_RST_V6_IN_LEN, TCP_RST_V6_LEN,
+};
 use beep_common::{
-    address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
-    egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
-    flow_hash, forward_admission, front_endpoint_key, fwd_pending_affinity_pin, ingress_steer,
+    address_rewrite_checksums, backend_port_resolution, decap_endpoint_key,
+    decap_forward_pod_admission, egress_return_admission, egress_return_outcome, encode_flow_key,
+    encode_tcp_flow_key, flow_hash, forward_admission, fwd_pending_affinity_pin, ingress_steer,
     ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts, peer_node_admission,
     resolve_backend_src_port, return_authorization, tunnel_remote_addr, unmap_ipv4,
     AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
@@ -388,8 +395,7 @@ fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
 #[inline(always)]
 fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
     let meta = *unsafe { FRONT_META.get(front) }?;
-    let endpoint = front_endpoint_key(front, meta)
-        .and_then(|key| unsafe { FRONT_ENDPOINTS.get(key) }.copied());
+    let endpoint = unsafe { FRONT_ENDPOINTS.get(decap_endpoint_key(front, meta)) }.copied();
     if endpoint.is_none() {
         count_front_miss();
     }
@@ -416,12 +422,12 @@ fn ingress_backend(
     flow_key: TcpFlowKey,
     fwd_key: FlowKey,
     ingress_ifindex: u32,
-) -> Result<LbFrontBackend, i32> {
+) -> Result<LbFrontBackend, IngressMiss> {
     let Some(meta) = unsafe { FRONT_META.get(front) }.copied() else {
-        return Err(TC_ACT_OK);
+        return Err(IngressMiss::Verdict(TC_ACT_OK));
     };
     let Some(seed) = CONFIG.get(0).map(|c| c.flow_hash_seed) else {
-        return Err(TC_ACT_OK);
+        return Err(IngressMiss::Verdict(TC_ACT_OK));
     };
     let established = unsafe { FLOW_TABLE.get(fwd_key) }.map(|v| unsafe { v.forward.backend });
     let pending = if established.is_some() {
@@ -448,20 +454,190 @@ fn ingress_backend(
                     fwd_pending_affinity_pin(pending, admitted)
                 {
                     if FWD_PENDING.insert(flow_key, candidate, 0).is_err() {
-                        return Err(TC_ACT_OK);
+                        return Err(IngressMiss::Verdict(TC_ACT_OK));
                     }
                 }
             }
             Ok(backend)
         }
-        IngressSteer::Pass => {
+        IngressSteer::Reject => {
             count_front_miss();
-            Err(TC_ACT_OK)
+            Err(IngressMiss::Reject)
         }
         IngressSteer::Drop => {
             count_front_miss();
-            Err(TC_ACT_SHOT)
+            Err(IngressMiss::Verdict(TC_ACT_SHOT))
         }
+    }
+}
+
+/// Why `ingress_backend` produced no backend.
+enum IngressMiss {
+    /// Return this verdict as-is.
+    Verdict(i32),
+    /// Owned front with no ready endpoints: answer the client.
+    Reject,
+}
+
+/// Entry gate shared by the two reject paths: the L3 offset and whether the
+/// client packet is IPv4, or `None` when the packet must not be answered at
+/// all (link-layer broadcast/multicast or not addressed to this host).
+#[inline(always)]
+fn reject_l3(ctx: &TcContext, ingress_ifindex: u32) -> Option<(usize, bool)> {
+    if unsafe { (*ctx.skb.skb).pkt_type } != PACKET_HOST {
+        return None;
+    }
+    let l3 = unsafe { UPLINK_CONFIG.get(ingress_ifindex) }?.l2_hlen as usize;
+    let ver = ctx.load::<u8>(l3).ok()?;
+    Some((l3, ver >> 4 == 4))
+}
+
+/// Answers a client TCP packet addressed to an owned front with no ready
+/// endpoints with a RST, sent back out the interface it arrived on. Packets
+/// that must not be answered (RSTs, multicast/broadcast, non-first
+/// fragments, malformed) pass to the host exactly as before, never dropped.
+///
+/// The BPF stack is 512 bytes in total and shared with the steering/encap
+/// caller, whose frame is already 352: this is a separate frame
+/// (`inline(never)`; a plain `i32` return avoids the `Option<i32>`
+/// miscompile noted at `geneve_ingress`) that must stay within the 160 that
+/// remain, and must not call a subprogram of its own (`memset`/`memcpy`
+/// frames cost 32 each). Hence one reply buffer, left uninitialised on
+/// purpose (zeroing it is a `memset` call): the offending headers are loaded
+/// into its front and `beep_common::reject` rewrites them into the reply.
+/// SAFETY of the uninitialised buffer: the builder reads only the loaded
+/// prefix before overwriting the rest, and the whole buffer is written
+/// before it is stored.
+#[inline(never)]
+fn reject_tcp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
+    let Some((l3, is_v4)) = reject_l3(ctx, ingress_ifindex) else {
+        return TC_ACT_OK;
+    };
+    let mut raw = MaybeUninit::<[u8; TCP_RST_V6_LEN]>::uninit();
+    let buf = unsafe { &mut *raw.as_mut_ptr() };
+    if is_v4 {
+        let Some(reply) = buf.first_chunk_mut::<TCP_RST_V4_LEN>() else {
+            return TC_ACT_OK;
+        };
+        // Offending IPv4 header with source and destination exchanged, then
+        // the first TCP bytes.
+        if !(load_into(ctx, l3, &mut reply[..12])
+            && load_into(ctx, l3 + 16, &mut reply[12..16])
+            && load_into(ctx, l3 + 12, &mut reply[16..20])
+            && load_into(ctx, l3 + IP_HLEN, &mut reply[20..TCP_RST_V4_IN_LEN])
+            && tcp_rst_in_place_v4(reply, csum_native))
+        {
+            return TC_ACT_OK;
+        }
+        send_reply(ctx, ingress_ifindex, l3, &reply[..])
+    } else {
+        if !(load_into(ctx, l3, &mut buf[..8])
+            && load_into(ctx, l3 + 24, &mut buf[8..24])
+            && load_into(ctx, l3 + 8, &mut buf[24..40])
+            && load_into(ctx, l3 + IP6_HLEN, &mut buf[40..TCP_RST_V6_IN_LEN])
+            && tcp_rst_in_place_v6(buf, csum_native))
+        {
+            return TC_ACT_OK;
+        }
+        send_reply(ctx, ingress_ifindex, l3, &buf[..])
+    }
+}
+
+/// UDP counterpart of `reject_tcp`: an ICMP(v6) port-unreachable quoting the
+/// offending IP header and the first 8 bytes behind it.
+#[inline(never)]
+fn reject_udp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
+    let Some((l3, is_v4)) = reject_l3(ctx, ingress_ifindex) else {
+        return TC_ACT_OK;
+    };
+    let mut raw = MaybeUninit::<[u8; ICMP6_UNREACH_LEN]>::uninit();
+    let buf = unsafe { &mut *raw.as_mut_ptr() };
+    if is_v4 {
+        let Some(reply) = buf.first_chunk_mut::<ICMP_UNREACH_V4_LEN>() else {
+            return TC_ACT_OK;
+        };
+        let quote = ICMP_UNREACH_V4_LEN - ICMP_QUOTE_V4_LEN;
+        if !(load_into(ctx, l3 + 16, &mut reply[12..16])
+            && load_into(ctx, l3 + 12, &mut reply[16..20])
+            && load_into(ctx, l3, &mut reply[quote..])
+            && icmp_unreachable_in_place_v4(reply, csum_native))
+        {
+            return TC_ACT_OK;
+        }
+        send_reply(ctx, ingress_ifindex, l3, &reply[..])
+    } else {
+        let quote = ICMP6_UNREACH_LEN - ICMP6_QUOTE_LEN;
+        if !(load_into(ctx, l3 + 24, &mut buf[8..24])
+            && load_into(ctx, l3 + 8, &mut buf[24..40])
+            && load_into(ctx, l3, &mut buf[quote..])
+            && icmp6_unreachable_in_place(buf, csum_native))
+        {
+            return TC_ACT_OK;
+        }
+        send_reply(ctx, ingress_ifindex, l3, &buf[..])
+    }
+}
+
+/// Replaces everything from the L3 header on with `reply` and sends it back
+/// out the ingress interface. A failed resize leaves the packet untouched,
+/// so it passes to the host; once rewritten, failure can only drop.
+#[inline(always)]
+fn send_reply(ctx: &TcContext, ingress_ifindex: u32, l3: usize, reply: &[u8]) -> i32 {
+    if !resize_packet(ctx, l3 + reply.len()) {
+        return TC_ACT_OK;
+    }
+    if !put(ctx, l3, reply) {
+        return TC_ACT_SHOT;
+    }
+    redirect_client_bound(ingress_ifindex).unwrap_or(TC_ACT_SHOT)
+}
+
+/// The raw checksum summer `beep_common::reject` is built on:
+/// `bpf_csum_diff` over `data`, a multiple of 4 bytes.
+#[inline(always)]
+fn csum_native(data: &[u8], seed: u32) -> u32 {
+    unsafe {
+        bpf_csum_diff(
+            core::ptr::null_mut(),
+            0,
+            data.as_ptr().cast_mut().cast(),
+            data.len() as u32,
+            seed,
+        ) as u32
+    }
+}
+
+/// `bpf_skb_load_bytes` into all of `dst` (a constant length at every call
+/// site); `TcContext::load_bytes` would silently clamp to a short packet.
+#[inline(always)]
+fn load_into(ctx: &TcContext, offset: usize, dst: &mut [u8]) -> bool {
+    unsafe {
+        bpf_skb_load_bytes(
+            ctx.skb.skb.cast(),
+            offset as u32,
+            dst.as_mut_ptr().cast(),
+            dst.len() as u32,
+        ) == 0
+    }
+}
+
+/// Resizes the packet to exactly `len` bytes. A failed resize leaves it
+/// untouched, so the caller can still pass it to the host.
+#[inline(always)]
+fn resize_packet(ctx: &TcContext, len: usize) -> bool {
+    unsafe { bpf_skb_change_tail(ctx.skb.skb, len as u32, 0) == 0 }
+}
+
+#[inline(always)]
+fn put(ctx: &TcContext, offset: usize, part: &[u8]) -> bool {
+    unsafe {
+        bpf_skb_store_bytes(
+            ctx.skb.skb.cast(),
+            offset as u32,
+            part.as_ptr().cast(),
+            part.len() as u32,
+            0,
+        ) == 0
     }
 }
 
@@ -687,7 +863,11 @@ fn uplink_ingress_encap(
         ingress_ifindex,
     ) {
         Ok(backend) => backend,
-        Err(verdict) => return Some(verdict),
+        Err(IngressMiss::Verdict(verdict)) => return Some(verdict),
+        Err(IngressMiss::Reject) if flow.front.proto == IPPROTO_TCP => {
+            return Some(reject_tcp(ctx, ingress_ifindex))
+        }
+        Err(IngressMiss::Reject) => return Some(reject_udp(ctx, ingress_ifindex)),
     };
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;

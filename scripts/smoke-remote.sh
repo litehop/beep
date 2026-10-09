@@ -140,6 +140,7 @@ cleanup() {
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
+  pkill -f "tcpdump -nn -l -vv -i smoke-veth1" 2>/dev/null || true
   rm -rf "$PIN_DIR"
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
   # netns: deleting the netns first can orphan smoke-veth1's namespace --
@@ -697,15 +698,17 @@ echo "POD-IP-REUSE ROUND-TRIP: PASS (fresh flow through reused pod IP ${POD_IP} 
 
 echo "==> pin steering: a flow held open while its front is re-pointed at another pod must keep reaching the pod that holds its state"
 PIN_STEER_FIFO="/tmp/beep-smoke-pin-steer-fifo"
+PIN_DRAIN_FIFO="/tmp/beep-smoke-pin-drain-fifo"
 PIN_STEER_BACKEND_IN="/tmp/beep-smoke-pin-steer-backend.in"
 PIN_STEER_MSG="PINMSG"
-rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
-mkfifo "$PIN_STEER_FIFO"
+PIN_DRAIN_MSG="PINDRAIN"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN"
+mkfifo "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO"
 pin_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
-nohup bash -c "sleep 20 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
+nohup bash -c "sleep 60 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
 disown
 sleep 0.5
-nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG} ) | timeout 20 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
+nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_DRAIN_FIFO}; printf '%s' ${PIN_DRAIN_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
 disown
 for _ in $(seq 1 30); do
   pin_flows_now=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
@@ -744,12 +747,45 @@ pin_new_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EV
   exit 1
 }
 echo "PIN-STEERING (new flow): PASS (a fresh flow followed the new endpoint ${REPLACEMENT_POD_IP})"
+
+# Drain: the front's ready count drops to 0 (rolling update) while the pinned
+# flow is still open. It must keep forwarding; only a NEW connection is refused.
+# Exercises the dataplane path directly: next generation, count 0, the previous
+# generation's rows left in FRONT_ENDPOINTS. The controller does not yet write
+# count 0 (it deletes FRONT_META for an empty set).
+DRAIN_FRONT_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ') $((EVICT_FRONT_PORT >> 8)) $((EVICT_FRONT_PORT & 255)) 6 0"
+drain_gen_bytes=($(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0:4][]'))
+drain_gen=$((drain_gen_bytes[0] | drain_gen_bytes[1] << 8 | drain_gen_bytes[2] << 16 | drain_gen_bytes[3] << 24))
+drain_gen=$(((drain_gen + 1) & 0xffffffff))
+bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((drain_gen & 255)) $(((drain_gen >> 8) & 255)) $(((drain_gen >> 16) & 255)) $(((drain_gen >> 24) & 255)) 0 0 0 0 || {
+  echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
+  exit 1
+}
+printf '\n' 1<>"$PIN_DRAIN_FIFO"
+for _ in $(seq 1 25); do
+  grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
+  sleep 0.2
+done
+grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null || {
+  echo "FAIL: after the front's ready count dropped to 0, a packet of the established flow did not reach its pinned pod ${POD_IP} (backend received: '$(cat "$PIN_STEER_BACKEND_IN" 2>/dev/null)'). A draining front must keep forwarding pinned flows; resetting them breaks live connections during a rolling update." >&2
+  exit 1
+}
+echo "PIN-DRAIN (established): PASS (pinned flow kept forwarding with the front at count 0)"
+drain_rc=0
+drain_start=$(date +%s%N)
+ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/" >/dev/null 2>&1 || drain_rc=$?
+drain_ms=$((($(date +%s%N) - drain_start) / 1000000))
+[ "$drain_rc" -eq 7 ] && [ "$drain_ms" -lt 2000 ] || {
+  echo "FAIL: a NEW connection to the count-0 front must be refused immediately (curl rc 7, <2000ms), got rc=$drain_rc after ${drain_ms}ms" >&2
+  exit 1
+}
+echo "PIN-DRAIN (new flow): PASS (new connection refused after ${drain_ms}ms)"
 EVICT_FRONT_POD_IP="$POD_IP"
 stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"
 wait_for_attach "$EVICT_LOADER_LOG_REUSE"
 pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
-rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN"
 
 echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hostNetwork backend), a fresh outbound connection from it must still leave the uplink"
 # A hostNetwork backend's pod IP IS the node's address, so POD_TARGETS holds
@@ -775,6 +811,122 @@ grep -q "node-egress-payload" "$NODE_EGRESS_OUT" || {
   exit 1
 }
 echo "NODE-EGRESS: PASS (fresh connection from ${FRONT_IP}, a POD_TARGETS member, passed hook 3 with no FLOW_TABLE reverse entry)"
+
+echo "==> reject: an owned front with no ready backends must answer the client (TCP RST / ICMP(v6) port unreachable) instead of passing to the host"
+# Each owned front gets a FRONT_META row with count 0 (inserted directly, like
+# the node-egress phase above) AND a live host listener on the same address:port.
+# Without the listener the host kernel would itself RST/ICMP and the phase could
+# not tell beep's reply from a pass-through; with it, a pass-through connects (TCP)
+# or is swallowed (UDP), so only beep's own reply produces a refusal.
+FRONT_IP6="2001:db8:5::1"
+CLIENT_IP6="2001:db8:5::2"
+FRONT_IP6_KEY="32 1 13 184 0 5 0 0 0 0 0 0 0 0 0 1"
+FRONT_IP4_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ')"
+REJECT_TCP4_PORT=19300
+REJECT_UDP4_PORT=19301
+REJECT_TCP6_PORT=19302
+REJECT_UDP6_PORT=19303
+CONTROL_TCP4_PORT=19304
+CONTROL_TCP6_PORT=19305
+REJECT_CAPTURE="/tmp/beep-smoke-reject-capture.txt"
+ip addr add "${FRONT_IP6}/64" dev smoke-veth0 nodad
+ip netns exec smoke-client ip addr add "${CLIENT_IP6}/64" dev smoke-veth1 nodad
+
+set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
+  bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 || {
+    echo "FAIL: could not insert a count-0 FRONT_META row (key ip bytes '$1', port $2)" >&2
+    exit 1
+  }
+}
+host_listener() { # <tcp|udp> <4|6> <addr> <port>
+  if [ "$1" = tcp ]; then
+    nohup timeout 40 bash -c "printf HOSTPASS | nc -$2 -l -N $3 $4" >/dev/null 2>&1 &
+  else
+    nohup timeout 40 nc -$2 -u -l "$3" "$4" >/dev/null 2>&1 &
+  fi
+  disown
+}
+set_front_count_zero "$FRONT_IP4_KEY" "$REJECT_TCP4_PORT" 6
+set_front_count_zero "$FRONT_IP4_KEY" "$REJECT_UDP4_PORT" 17
+set_front_count_zero "$FRONT_IP6_KEY" "$REJECT_TCP6_PORT" 6
+set_front_count_zero "$FRONT_IP6_KEY" "$REJECT_UDP6_PORT" 17
+host_listener tcp 4 "$FRONT_IP" "$REJECT_TCP4_PORT"
+host_listener udp 4 "$FRONT_IP" "$REJECT_UDP4_PORT"
+host_listener tcp 6 "$FRONT_IP6" "$REJECT_TCP6_PORT"
+host_listener udp 6 "$FRONT_IP6" "$REJECT_UDP6_PORT"
+host_listener tcp 4 "$FRONT_IP" "$CONTROL_TCP4_PORT"
+host_listener tcp 6 "$FRONT_IP6" "$CONTROL_TCP6_PORT"
+sleep 1
+
+REJECT_CAPTURE_PID=""
+if command -v tcpdump >/dev/null; then
+  ip netns exec smoke-client tcpdump -nn -l -vv -i smoke-veth1 >"$REJECT_CAPTURE" 2>&1 &
+  REJECT_CAPTURE_PID=$!
+  sleep 1
+else
+  echo "WARN: tcpdump not installed -- reply-on-the-wire capture skipped; client-side behaviour is still asserted" >&2
+fi
+
+assert_tcp_refused() { # <label> <curl-url> [curl-extra-arg]
+  local start end rc=0 ms
+  start=$(date +%s%N)
+  ip netns exec smoke-client curl -sS -m 5 ${3:-} "$2" >/dev/null 2>&1 || rc=$?
+  end=$(date +%s%N)
+  ms=$(((end - start) / 1000000))
+  [ "$rc" -eq 7 ] && [ "$ms" -lt 2000 ] || {
+    echo "FAIL: $1: expected an immediate connection refusal (curl rc 7, <2000ms) from beep's RST, got rc=$rc after ${ms}ms (rc 28 = the client hung; rc 0/1/52 = the packet passed to the host listener)" >&2
+    exit 1
+  }
+  echo "REJECT-TCP ($1): PASS (curl rc=7 connection refused after ${ms}ms)"
+}
+assert_udp_refused() { # <label> <addr> <port>
+  local out rc=0
+  out=$(ip netns exec smoke-client timeout 6 bash -c 'exec 3<>"/dev/udp/$0/$1"; printf probe >&3; read -r -t 3 -u 3 _' "$2" "$3" 2>&1) || rc=$?
+  case "$out" in
+    *"Connection refused"*) echo "REJECT-UDP ($1): PASS (client socket got ECONNREFUSED from beep's ICMP unreachable)" ;;
+    *)
+      echo "FAIL: $1: the UDP probe to the owned count-0 front ${2}:${3} saw no ICMP port unreachable (rc=$rc, output '$out') -- the client would wait out its timeout" >&2
+      exit 1
+      ;;
+  esac
+}
+assert_tcp_refused "v4" "http://${FRONT_IP}:${REJECT_TCP4_PORT}/"
+assert_udp_refused "v4" "$FRONT_IP" "$REJECT_UDP4_PORT"
+assert_tcp_refused "v6" "http://[${FRONT_IP6}]:${REJECT_TCP6_PORT}/" -g
+assert_udp_refused "v6" "$FRONT_IP6" "$REJECT_UDP6_PORT"
+
+control4=$(ip netns exec smoke-client nc -w 3 "$FRONT_IP" "$CONTROL_TCP4_PORT" </dev/null 2>&1 || true)
+control6=$(ip netns exec smoke-client nc -6 -w 3 "$FRONT_IP6" "$CONTROL_TCP6_PORT" </dev/null 2>&1 || true)
+[ "$control4" = "HOSTPASS" ] && [ "$control6" = "HOSTPASS" ] || {
+  echo "FAIL: a front beep does not own (no FRONT_META row) must still pass to the host stack; v4 got '$control4', v6 got '$control6', expected HOSTPASS" >&2
+  exit 1
+}
+echo "REJECT-CONTROL: PASS (non-owned fronts on v4 and v6 still reach the host listener)"
+
+if [ -n "$REJECT_CAPTURE_PID" ]; then
+  sleep 0.5
+  kill "$REJECT_CAPTURE_PID" 2>/dev/null || true
+  wait "$REJECT_CAPTURE_PID" 2>/dev/null || true
+  # Only beep's replies are judged: the client's own packets show
+  # "incorrect" checksums here because the veth leaves them offloaded.
+  replies=$(grep -E "Flags \[R|unreachable" "$REJECT_CAPTURE" || true)
+  echo "client-side capture of beep's replies (RST flags / unreachable):"
+  echo "$replies"
+  rst_count=$(grep -c "Flags \[R" <<<"$replies" || true)
+  icmp_count=$(grep -c "unreachable" <<<"$replies" || true)
+  if [ "$rst_count" -lt 2 ] || [ "$icmp_count" -lt 2 ]; then
+    echo "FAIL: capture on the client side shows $rst_count RST(s) and $icmp_count unreachable(s), expected at least 2 of each (v4 + v6)" >&2
+    cat "$REJECT_CAPTURE" >&2
+    exit 1
+  fi
+  if grep -E "Flags \[R" <<<"$replies" | grep -qv "(correct)" || grep -qE "incorrect|bad|wrong" <<<"$replies"; then
+    echo "FAIL: a reject reply carried a wrong checksum; a real client would silently drop it" >&2
+    cat "$REJECT_CAPTURE" >&2
+    exit 1
+  fi
+fi
+pkill -f "nc -[46] -l -N ${FRONT_IP}" 2>/dev/null || true
+echo "REJECT: PASS (owned count-0 fronts refuse TCP and UDP on v4+v6 immediately; non-owned fronts still pass to the host)"
 
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
 # This fixture is a self-loop (FRONT_IP is also this node's own address, and
