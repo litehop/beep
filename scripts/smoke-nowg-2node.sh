@@ -18,6 +18,11 @@
 # FAIL; otherwise the positive result would not be attributable to seeding
 # the peer's key (peer_node_admission).
 #
+# Underlay-follows-FIB (stage 7b): the forward Geneve leg only sets the tunnel
+# remote, so node-a's route to node-b's address picks the egress device. A GRE
+# device gives a second path; flipping the route moves the outer packets to it
+# with no loader restart, and flipping back returns them (control).
+#
 # Usage: scripts/smoke-nowg-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
 # Same host/VM prerequisites as smoke-eth-ingress-2node.sh (minus wireguard-tools).
 set -euo pipefail
@@ -81,6 +86,9 @@ cleanup() {
   remote_retry "$VM_A" cleanup || true
   remote_retry "$VM_B" cleanup || true
   limactl shell "$VM_B" -- sudo ip addr del "${POD_IP}/32" dev lo 2>/dev/null || true
+  for vm in "$VM_A" "$VM_B"; do
+    limactl shell "$vm" -- sudo ip link del beepul0 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
 
@@ -213,6 +221,74 @@ if echo "$BACKEND_LOG" | grep -q "Connection received on ${IP_CLIENT} "; then
 else
   echo "CLIENT-IP-PRESERVATION: FAIL (backend log: $BACKEND_LOG)" >&2
   OK=false
+fi
+
+echo "==> [7b/8] forward Geneve underlay follows the FIB: flip node-a's route to $IP_B between two paths, no loader restart"
+# Path 1 is eth0. Path 2 is a GRE device bound to eth0 (so its own outer
+# packets skip the override route below) -- the VMs have one NIC, and a
+# second routable L3 device to the same peer is all the FIB needs to choose
+# between. Outer Geneve packets (udp/6081, dst IP_B) are told apart by
+# device: seen on eth0 directly = path 1; seen on $ALT_IFACE (inside GRE on
+# eth0, which an eth0 'udp' filter does not match) = path 2.
+ALT_IFACE="beepul0"
+GENEVE_PORT="6081"
+ul() { limactl shell "$1" -- sudo ip "${@:2}"; }
+
+for pair in "$VM_A:$IP_A:$IP_B" "$VM_B:$IP_B:$IP_A"; do
+  IFS=: read -r vm lip rip <<<"$pair"
+  ul "$vm" tunnel add "$ALT_IFACE" mode gre local "$lip" remote "$rip" dev "$UPLINK_IFACE"
+  ul "$vm" link set "$ALT_IFACE" up
+  limactl shell "$vm" -- sudo sysctl -w "net.ipv4.conf.${ALT_IFACE}.rp_filter=0" >/dev/null
+done
+
+geneve_fwd_count() { # geneve_fwd_count <iface> <file>: outer forward packets seen on node-a's <iface>
+  grep -c " > ${IP_B}\.${GENEVE_PORT}:" "$2" || true
+}
+
+round_trip_capturing() { # round_trip_capturing <tag>; sets CLIENT_RC/CLIENT_BODY, CAP_ETH0, CAP_ALT
+  local tag="$1" f_eth f_alt
+  f_eth="$(mktemp)"; f_alt="$(mktemp)"
+  remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
+  limactl shell "$VM_A" -- sudo timeout 10 tcpdump -ni "$UPLINK_IFACE" -l "udp dst port $GENEVE_PORT and dst host $IP_B" >"$f_eth" 2>/dev/null &
+  limactl shell "$VM_A" -- sudo timeout 10 tcpdump -ni "$ALT_IFACE" -l "udp dst port $GENEVE_PORT and dst host $IP_B" >"$f_alt" 2>/dev/null &
+  sleep 3
+  curl_front 8
+  wait
+  CAP_ETH0="$(geneve_fwd_count "$UPLINK_IFACE" "$f_eth")"
+  CAP_ALT="$(geneve_fwd_count "$ALT_IFACE" "$f_alt")"
+  rm -f "$f_eth" "$f_alt"
+  echo "UNDERLAY[$tag]: route=$(limactl shell "$VM_A" -- ip route get "$IP_B" | head -1) curl rc=$CLIENT_RC; forward geneve pkts $VM_A $UPLINK_IFACE=$CAP_ETH0 $ALT_IFACE=$CAP_ALT"
+}
+
+underlay_expect() { # underlay_expect <tag> <eth0|alt>
+  if [ "$CLIENT_RC" -ne 0 ] || [ "$CLIENT_BODY" != "OK" ]; then
+    echo "UNDERLAY[$1]: FAIL (round trip broke: rc=$CLIENT_RC body='$CLIENT_BODY')" >&2; OK=false; return
+  fi
+  if [ "$2" = eth0 ] && [ "$CAP_ETH0" -gt 0 ] && [ "$CAP_ALT" -eq 0 ]; then
+    echo "UNDERLAY[$1]: PASS (forward leg on $UPLINK_IFACE only)"
+  elif [ "$2" = alt ] && [ "$CAP_ALT" -gt 0 ] && [ "$CAP_ETH0" -eq 0 ]; then
+    echo "UNDERLAY[$1]: PASS (forward leg on $ALT_IFACE only)"
+  else
+    echo "UNDERLAY[$1]: FAIL (expected $2 only; $UPLINK_IFACE=$CAP_ETH0 $ALT_IFACE=$CAP_ALT)" >&2; OK=false
+  fi
+}
+
+LOADER_PID_A="$(limactl shell "$VM_A" -- pgrep -x "$BIN_NAME")"
+round_trip_capturing baseline
+underlay_expect baseline eth0
+
+ul "$VM_A" route replace "${IP_B}/32" dev "$ALT_IFACE" src "$IP_A"
+round_trip_capturing flipped
+underlay_expect flipped alt
+
+ul "$VM_A" route del "${IP_B}/32" dev "$ALT_IFACE"
+round_trip_capturing control
+underlay_expect control eth0
+
+if [ "$(limactl shell "$VM_A" -- pgrep -x "$BIN_NAME")" = "$LOADER_PID_A" ]; then
+  echo "NO-RESTART: PASS (loader pid $LOADER_PID_A unchanged across both route changes)"
+else
+  echo "NO-RESTART: FAIL (loader pid changed)" >&2; OK=false
 fi
 
 echo "==> [8/8] verdict"
