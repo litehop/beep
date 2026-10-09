@@ -616,6 +616,11 @@ pub fn parse_iface_name(name: &str) -> Result<String, String> {
     if name.contains('/') {
         return Err(format!("interface name {name:?} must not contain '/'"));
     }
+    if name.contains(|c: char| c.is_ascii_whitespace() || c == ':') {
+        return Err(format!(
+            "interface name {name:?} must not contain whitespace or ':'"
+        ));
+    }
     if name == "." || name == ".." {
         return Err(format!("interface name {name:?} is not a valid name"));
     }
@@ -795,6 +800,15 @@ fn check_uplink_count(count: usize, capacity: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn uplink_config_capacity() -> anyhow::Result<u32> {
+    Ok(aya_obj::Object::parse(ebpf_object())
+        .map_err(|e| anyhow!("parsing the beep-ebpf object's map definitions: {e}"))?
+        .maps
+        .get("UPLINK_CONFIG")
+        .ok_or_else(|| anyhow!("map UPLINK_CONFIG is missing from the beep-ebpf object"))?
+        .max_entries())
+}
+
 /// Resolves each uplink's ifindex and L2 header length (a WireGuard/tun
 /// uplink has no Ethernet header, unlike a real NIC/veth -- see
 /// `uplink_l2_header_len`'s doc comment) and writes one `UPLINK_CONFIG`
@@ -802,13 +816,7 @@ fn check_uplink_count(count: usize, capacity: u32) -> anyhow::Result<()> {
 /// admission gate for multi-uplink client traffic
 /// (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
 pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyhow::Result<()> {
-    let capacity = aya_obj::Object::parse(ebpf_object())
-        .map_err(|e| anyhow!("parsing the beep-ebpf object's map definitions: {e}"))?
-        .maps
-        .get("UPLINK_CONFIG")
-        .ok_or_else(|| anyhow!("map UPLINK_CONFIG is missing from the beep-ebpf object"))?
-        .max_entries();
-    check_uplink_count(uplink_ifaces.len(), capacity)?;
+    check_uplink_count(uplink_ifaces.len(), uplink_config_capacity()?)?;
     let mut uplink_config: AyaHashMap<_, u32, UplinkConfig> = AyaHashMap::try_from(
         ebpf.map_mut("UPLINK_CONFIG")
             .ok_or_else(|| anyhow!("no map named `UPLINK_CONFIG` in the eBPF object"))?,
@@ -918,6 +926,15 @@ mod tests {
     }
 
     #[test]
+    fn embedded_object_uplink_config_capacity_reads_as_8() {
+        assert_eq!(
+            uplink_config_capacity().unwrap(),
+            8,
+            "the cap check reads UPLINK_CONFIG from the ELF; a rename/resize must update it"
+        );
+    }
+
+    #[test]
     fn iface_name_accepts_normal_and_15_byte_names() {
         assert_eq!(parse_iface_name("eth0").unwrap(), "eth0");
         assert!(
@@ -928,7 +945,18 @@ mod tests {
 
     #[test]
     fn iface_name_rejects_forms_that_would_become_sysfs_paths_or_never_exist() {
-        for bad in ["", "1234567890123456", "../eth0", "a/b", ".", ".."] {
+        for bad in [
+            "",
+            "1234567890123456",
+            "../eth0",
+            "a/b",
+            ".",
+            "..",
+            "eth 0",
+            "eth0\n",
+            "\teth0",
+            "eth0:1",
+        ] {
             assert!(
                 parse_iface_name(bad).is_err(),
                 "{bad:?} must be rejected at parse, not read as a sysfs path"
