@@ -397,6 +397,33 @@ pub union FlowValue {
     pub port_memo: PortMemoValue,
 }
 
+/// Constructors are the only sanctioned way to build a `FlowValue`: each starts
+/// from all-zero bytes, so no uninitialized eBPF stack reaches the map when
+/// the chosen arm is smaller than the union.
+impl FlowValue {
+    const fn zeroed() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+
+    pub const fn from_forward(forward: ForwardFlowValue) -> Self {
+        let mut v = Self::zeroed();
+        v.forward = forward;
+        v
+    }
+
+    pub const fn from_reverse(reverse: RevFlowValue) -> Self {
+        let mut v = Self::zeroed();
+        v.reverse = reverse;
+        v
+    }
+
+    pub const fn from_port_memo(port_memo: PortMemoValue) -> Self {
+        let mut v = Self::zeroed();
+        v.port_memo = port_memo;
+        v
+    }
+}
+
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
 /// ingress node and the original front to echo, since by the time it runs the
@@ -1198,6 +1225,46 @@ mod tests {
             core::mem::size_of::<RevFlowValue>()
         );
         assert_eq!(core::mem::size_of::<FlowValue>(), 36);
+    }
+
+    fn flow_value_bytes(v: &FlowValue) -> [u8; 36] {
+        unsafe { core::mem::transmute_copy(v) }
+    }
+
+    #[test]
+    fn port_memo_flow_value_tail_is_zero_so_no_kernel_stack_leaks_into_the_map() {
+        // The port_memo arm is 2 of 36 bytes; the other 34 land in
+        // userspace-visible FLOW_TABLE entries (eviction scans, bpftool
+        // dumps). They must be deterministic zeros, not eBPF stack residue.
+        let v = FlowValue::from_port_memo(PortMemoValue {
+            backend_src_port: 0xBEEF,
+        });
+        let bytes = flow_value_bytes(&v);
+        assert_eq!(&bytes[..2], &0xBEEFu16.to_ne_bytes());
+        assert!(
+            bytes[2..].iter().all(|&b| b == 0),
+            "port_memo tail leaked non-zero bytes: {:?}",
+            &bytes[2..]
+        );
+    }
+
+    #[test]
+    fn forward_and_reverse_flow_values_round_trip_through_their_constructors() {
+        let fwd = ForwardFlowValue {
+            backend: LbFrontBackend {
+                backend_node_ip: [3; 16],
+                pod_ip: [7; 16],
+            },
+            ingress_ifindex: 9,
+        };
+        let rev = RevFlowValue {
+            ingress_node_ip: [1; 16],
+            front_ip: [2; 16],
+            front_port: 80,
+            original_client_port: 1234,
+        };
+        assert_eq!(unsafe { FlowValue::from_forward(fwd).forward }, fwd);
+        assert!(unsafe { FlowValue::from_reverse(rev).reverse } == rev);
     }
 
     #[test]
