@@ -215,6 +215,10 @@ pub struct Endpoint {
     pub node_addrs: Vec<IpAddr>,
     pub ready: bool,
     pub ports: Vec<u16>,
+    /// `endpoints[].targetRef.uid`: the owning pod's identity, absent when the
+    /// slice carries no `targetRef`. Lets the controller notice a pod IP
+    /// handed to a different pod (`pod_target_uids_for_node`).
+    pub pod_uid: Option<String>,
 }
 
 /// One `EndpointSlice` object. A Service can be backed by more than one of
@@ -250,6 +254,10 @@ pub struct DesiredEntries {
     /// (`beep::front_swap`).
     pub fronts: HashMap<LbFrontKey, DesiredFront>,
     pub pod_targets: HashSet<[u8; 16]>,
+    /// Owning pod uid of each `pod_targets` IP that has one
+    /// (`pod_target_uids_for_node`). Drives the reuse sweep in
+    /// `PinnedMaps::apply`.
+    pub pod_target_uids: HashMap<[u8; 16], String>,
     /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
     /// `tunnel_remote_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
     /// host-native value -- the same convention `LbFrontBackend::
@@ -382,6 +390,26 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
         }
     }
     pod_targets
+}
+
+/// For each `pod_targets_for_node` member whose endpoint carries a pod uid,
+/// that uid. Endpoints without a `targetRef` are absent (identity unknown, so
+/// never treated as a reuse).
+pub fn pod_target_uids_for_node(
+    slices: &[EndpointSliceView],
+    node: &NodeContext,
+) -> HashMap<[u8; 16], String> {
+    let mut uids = HashMap::new();
+    for slice in slices {
+        for ep in &slice.endpoints {
+            if let Some(uid) = &ep.pod_uid {
+                if ep.ready && ep.node_addrs.contains(&node.node_ip) && is_admitted(ep, node) {
+                    uids.insert(wire_ip_v6(ep.pod_ip), uid.clone());
+                }
+            }
+        }
+    }
+    uids
 }
 
 /// The observational complement of `pod_targets_for_node`: every ready,
@@ -546,6 +574,7 @@ mod tests {
             node_addrs: vec![IpAddr::V4(node_ip)],
             ready: true,
             ports,
+            pod_uid: None,
         }
     }
 
@@ -556,6 +585,7 @@ mod tests {
             node_addrs: vec![IpAddr::V6(node_ip)],
             ready: true,
             ports,
+            pod_uid: None,
         }
     }
 
@@ -962,6 +992,7 @@ mod tests {
             node_addrs,
             ready: true,
             ports: vec![8080],
+            pod_uid: None,
         }
     }
 

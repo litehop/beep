@@ -92,6 +92,7 @@ struct RawEndpoint {
     pod_ip: IpAddr,
     node_name: Option<String>,
     ready: bool,
+    pod_uid: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -278,6 +279,7 @@ fn parse_endpoint_slice(obj: &Value) -> Option<RawEndpointSlice> {
                 pod_ip,
                 node_name: e["nodeName"].as_str().map(str::to_owned),
                 ready: e["conditions"]["ready"].as_bool().unwrap_or(true),
+                pod_uid: e["targetRef"]["uid"].as_str().map(str::to_owned),
             })
         })
         .collect();
@@ -741,6 +743,7 @@ impl WatchState {
                                 node_addrs,
                                 ready: e.ready,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
+                                pod_uid: e.pod_uid.clone(),
                             })
                         })
                         .collect(),
@@ -750,6 +753,9 @@ impl WatchState {
             aggregate
                 .pod_targets
                 .extend(reconcile::pod_targets_for_node(&endpoint_slices, node));
+            aggregate
+                .pod_target_uids
+                .extend(reconcile::pod_target_uids_for_node(&endpoint_slices, node));
             aggregate
                 .rejected
                 .extend(reconcile::rejected_endpoints_for_node(
@@ -944,6 +950,21 @@ mod tests {
     use beep_common::unmap_ipv4;
 
     use super::*;
+
+    #[test]
+    fn endpoint_slice_parse_carries_target_ref_uid_and_tolerates_its_absence() {
+        // The pod uid is the only signal that an IP changed owner; an
+        // endpoint without a targetRef must still parse (uid unknown).
+        let slice = parse_endpoint_slice(&serde_json::json!({
+            "endpoints": [
+                {"addresses": ["10.244.0.5"], "targetRef": {"kind": "Pod", "uid": "u-1"}},
+                {"addresses": ["10.244.0.6"]},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(slice.endpoints[0].pod_uid.as_deref(), Some("u-1"));
+        assert_eq!(slice.endpoints[1].pod_uid, None);
+    }
 
     fn node(ip: Ipv4Addr) -> NodeContext {
         NodeContext {

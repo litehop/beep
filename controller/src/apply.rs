@@ -17,7 +17,11 @@
 //! Every tick also deletes endpoint generations other than current and `g-1`,
 //! which is what cleans up after a crashed predecessor on startup.
 
-use std::{collections::HashSet, net::Ipv4Addr, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    net::Ipv4Addr,
+    path::Path,
+};
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
@@ -48,6 +52,11 @@ pub struct PinnedMaps {
     /// `NODE_ALLOW` needs its own sticky latch instead of just reading
     /// `desired.fronts_known` directly on each tick.
     fronts_ever_known: bool,
+    /// Pod uid owning each POD_TARGETS IP as of the last successful reuse
+    /// sweep. In-memory only: a pod IP reused across a controller restart is
+    /// not detected (nothing to compare against, and sweeping every installed
+    /// IP on each start would reset all live flows).
+    installed_pod_uids: HashMap<[u8; 16], String>,
 }
 
 fn open_hash_map<K: aya::Pod, V: aya::Pod>(
@@ -79,6 +88,7 @@ impl PinnedMaps {
             fwd_pending: open_hash_map(pin_dir, "FWD_PENDING")?,
             flow_table: open_hash_map(pin_dir, "FLOW_TABLE")?,
             fronts_ever_known: false,
+            installed_pod_uids: HashMap::new(),
         })
     }
 
@@ -106,6 +116,18 @@ impl PinnedMaps {
     /// entry instead of the whole list (`DesiredEntries::pod_targets_known`'s
     /// doc comment).
     pub fn apply(&mut self, desired: &DesiredEntries) -> anyhow::Result<()> {
+        // A pod IP handed to a different pod is swept BEFORE any of the new
+        // pod's state (front endpoints, POD_TARGETS) is written; on a failed
+        // sweep nothing new is installed and the next tick retries.
+        if desired.pod_targets_known {
+            let (fwd_pending, flow_table) = (&mut self.fwd_pending, &mut self.flow_table);
+            sweep_reused_pod_ips(
+                &mut self.installed_pod_uids,
+                &desired.pod_target_uids,
+                |pods| beep::evict_pod_flows(fwd_pending, flow_table, pods),
+            )
+            .context("sweeping flows of reused pod IPs")?;
+        }
         let fronts_result = if desired.fronts_known {
             apply_front_maps(&mut self.front_meta, &mut self.front_endpoints, desired)
         } else {
@@ -130,6 +152,11 @@ impl PinnedMaps {
         } else {
             Ok(())
         };
+
+        if desired.pod_targets_known && pod_targets_result.is_ok() {
+            self.installed_pod_uids
+                .retain(|ip, _| desired.pod_targets.contains(ip));
+        }
 
         fronts_result?;
         node_allow_result?;
@@ -225,6 +252,40 @@ fn apply_pod_targets(
             beep::capacity_hint("POD_TARGETS")
         );
     }
+    Ok(())
+}
+
+/// Pod IPs present in both maps under different uids: the IP now belongs to a
+/// different pod, so conntrack rows pinned for the old owner would steer its
+/// in-flight packets to the new one. New IPs, unchanged uids, and IPs without
+/// a known uid on either side are never reused.
+fn reused_pod_ips(
+    installed: &HashMap<[u8; 16], String>,
+    desired: &HashMap<[u8; 16], String>,
+) -> HashSet<[u8; 16]> {
+    desired
+        .iter()
+        .filter(|(ip, uid)| installed.get(*ip).is_some_and(|old| old != *uid))
+        .map(|(ip, _)| *ip)
+        .collect()
+}
+
+/// Sweeps the flows of every reused IP, then records `desired`'s identities.
+/// A failed sweep leaves `installed` untouched so the IPs are still seen as
+/// reused on the next tick. Entries absent from `desired` are kept (a
+/// departed pod whose own sweep is still pending must be recognised if its IP
+/// comes back under a new uid); `apply` prunes them once POD_TARGETS has
+/// caught up.
+fn sweep_reused_pod_ips(
+    installed: &mut HashMap<[u8; 16], String>,
+    desired: &HashMap<[u8; 16], String>,
+    evict: impl FnOnce(&HashSet<[u8; 16]>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let reused = reused_pod_ips(installed, desired);
+    if !reused.is_empty() {
+        evict(&reused)?;
+    }
+    installed.extend(desired.iter().map(|(ip, uid)| (*ip, uid.clone())));
     Ok(())
 }
 
@@ -371,6 +432,78 @@ fn node_allow_stale_peers(
 mod tests {
     use super::*;
     use beep_common::ipv4_mapped_v6;
+
+    fn uids(pairs: &[(u32, &str)]) -> HashMap<[u8; 16], String> {
+        pairs
+            .iter()
+            .map(|(ip, uid)| (ipv4_mapped_v6(*ip), (*uid).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn uid_change_on_same_ip_is_swept_before_the_new_pod_state_is_installed() {
+        // Without the sweep the old pod's pinned flows keep steering its
+        // in-flight packets to the new (possibly different-workload) pod.
+        let mut installed = uids(&[(1, "old")]);
+        let mut swept = None;
+        sweep_reused_pod_ips(&mut installed, &uids(&[(1, "new")]), |pods| {
+            swept = Some(pods.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(swept, Some([ipv4_mapped_v6(1)].into_iter().collect()));
+        assert_eq!(installed, uids(&[(1, "new")]));
+    }
+
+    #[test]
+    fn same_uid_or_new_ip_or_unknown_uid_never_sweeps() {
+        // A sweep resets live flows; it must only fire on a real identity change.
+        let mut installed = uids(&[(1, "a"), (2, "b")]);
+        let desired = uids(&[(1, "a"), (3, "c")]);
+        sweep_reused_pod_ips(&mut installed, &desired, |_| {
+            panic!("no IP changed owner, nothing may be swept")
+        })
+        .unwrap();
+        // Endpoint lost its targetRef: identity unknown, behaves as before.
+        sweep_reused_pod_ips(&mut installed, &HashMap::new(), |_| {
+            panic!("endpoint without targetRef must not sweep")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_reuse_sweep_stays_pending_until_it_succeeds() {
+        // If the failure forgot the reuse, the retry would see "same uid" and
+        // the old pod's flows would stay pinned to the new pod forever.
+        let mut installed = uids(&[(1, "old")]);
+        let desired = uids(&[(1, "new")]);
+        let err = sweep_reused_pod_ips(&mut installed, &desired, |_| anyhow::bail!("iter failed"));
+        assert!(err.is_err(), "apply must stop before installing new state");
+        assert_eq!(installed, uids(&[(1, "old")]));
+        let mut swept = 0;
+        sweep_reused_pod_ips(&mut installed, &desired, |_| {
+            swept += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(swept, 1, "retry sweeps the still-pending IP");
+        assert_eq!(installed, desired);
+    }
+
+    #[test]
+    fn departed_pod_whose_sweep_is_pending_is_still_recognised_when_its_ip_returns() {
+        // The original hole: IP leaves, comes back under a new pod before the
+        // departed sweep lands. `installed` must keep the departed entry.
+        let mut installed = uids(&[(1, "old")]);
+        sweep_reused_pod_ips(&mut installed, &HashMap::new(), |_| Ok(())).unwrap();
+        let mut swept = false;
+        sweep_reused_pod_ips(&mut installed, &uids(&[(1, "new")]), |_| {
+            swept = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(swept);
+    }
 
     #[test]
     fn failed_sweep_keeps_departed_pod_rows_so_next_tick_retries() {
