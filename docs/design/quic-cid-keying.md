@@ -62,8 +62,9 @@ B is the only option that addresses the operator's cross-node concern.
 
 ## Interaction with multi-endpoint selection
 
-`ai/findings/2026-09-19-beep-5lw-multipod-lb-plan.md` picks a slot by tuple
-hash modulo ready count, and makes ingress steer from the stored pin.
+The multi-endpoint plan (bead beep-5lw: .2 pin-steering, .3 node-local
+preference) picks a slot by tuple hash modulo ready count, and makes ingress
+steer from the stored pin.
 
 - A hash of the tuple is the wrong selector for a migrating client, which is
   exactly why B bypasses it: on a decodable CID, the server_id wins and the
@@ -86,7 +87,7 @@ hash modulo ready count, and makes ingress steer from the stored pin.
   verifier pressure from the v4/v6 duplication.
 - Decode: plaintext is a byte copy. Encrypted variants need AES; whether the
   deployed kernels expose usable crypto kfuncs to tc programs is unverified.
-- Maps: `SERVER_IDS` is `server_id -> LbFrontBackend`-sized (about 40 B) per
+- Maps: `SERVER_IDS` is `server_id -> LbFrontBackend`-sized (32 B) per
   endpoint, tiny next to `FRONT_ENDPOINTS` (8192). Option A would instead
   contest the 16384-entry `FLOW_TABLE` (`main.rs:360`) with per-CID entries.
 
