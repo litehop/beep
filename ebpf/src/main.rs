@@ -629,98 +629,59 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // outside of the packet"). Every `load_direct` offset in
     // `try_uplink_ingress_headers` needs to fold to a literal at compile
     // time, which only a const generic guarantees.
-    match l2_hlen {
-        0 => try_uplink_ingress_headers::<0>(ctx, ingress_ifindex),
-        ETH_HLEN => try_uplink_ingress_headers::<ETH_HLEN>(ctx, ingress_ifindex),
-        _ => Some(TC_ACT_OK),
+    let flow = match l2_hlen {
+        0 => try_uplink_ingress_headers::<0>(ctx),
+        ETH_HLEN => try_uplink_ingress_headers::<ETH_HLEN>(ctx),
+        _ => None,
+    };
+    // The steering/encap tail takes only register/stack values (no packet
+    // pointers), so it is inlined once here instead of once per
+    // family x L2 parse variant.
+    match flow {
+        Some(flow) => uplink_ingress_encap(ctx, ingress_ifindex, flow, l2_hlen == 0),
+        None => Some(TC_ACT_OK),
     }
 }
 
-/// Dispatches on the inner packet's own address family before parsing any
-/// family-specific header field -- an Ethernet-framed uplink has an
-/// EtherType to read (offset 12); an L3-only uplink (L2_HLEN==0) has none,
-/// so the IP-version nibble at offset 0 is the only signal. Two siblings,
-/// not one runtime-branched body: `load_direct`'s offsets must be compile-
-/// time literals (its own doc comment), and v4/v6 header layouts differ in
-/// both width and field offsets.
-#[inline(always)]
-fn try_uplink_ingress_headers<const L2_HLEN: usize>(
-    ctx: &TcContext,
-    ingress_ifindex: u32,
-) -> Option<i32> {
-    if L2_HLEN == ETH_HLEN {
-        match load_direct::<u16>(ctx, 12)? {
-            ETH_P_IPV4 => try_uplink_ingress_headers_v4::<L2_HLEN>(ctx, ingress_ifindex),
-            ETH_P_IPV6 => try_uplink_ingress_headers_v6::<L2_HLEN>(ctx, ingress_ifindex),
-            _ => Some(TC_ACT_OK),
-        }
-    } else {
-        let ver: u8 = ctx.load(0).ok()?;
-        match ver >> 4 {
-            4 => try_uplink_ingress_headers_v4::<L2_HLEN>(ctx, ingress_ifindex),
-            6 => try_uplink_ingress_headers_v6::<L2_HLEN>(ctx, ingress_ifindex),
-            _ => Some(TC_ACT_OK),
-        }
-    }
+/// What the per-family parse hands the shared steering/encap tail.
+#[derive(Clone, Copy)]
+struct IngressFlow {
+    front: LbFrontKey,
+    client_ip: [u8; 16],
+    client_port: u16,
+    ethertype: u16,
 }
 
+/// Steers `flow` to a backend and Geneve-encapsulates toward it. `l3_only`
+/// uplinks (no MAC header) get a synthesized one stamped with
+/// `flow.ethertype`.
 #[inline(always)]
-fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
+fn uplink_ingress_encap(
     ctx: &TcContext,
     ingress_ifindex: u32,
+    flow: IngressFlow,
+    l3_only: bool,
 ) -> Option<i32> {
-    // `load_direct`'s doc comment: offset 0 (the L3-only/WireGuard branch,
-    // L2_HLEN==0) can't go through it, so this one field on that branch
-    // stays on the helper call; every other read on both branches has a
-    // nonzero literal offset and gets direct access.
-    let ver_ihl: u8 = if L2_HLEN == 0 {
-        ctx.load(0).ok()?
-    } else {
-        load_direct(ctx, L2_HLEN)?
-    };
-    if ver_ihl >> 4 != 4 || ver_ihl & 0x0f != 5 {
-        return Some(TC_ACT_OK);
-    }
-    let ip_proto = L2_HLEN + 9;
-    let ip_src = L2_HLEN + 12;
-    let ip_dst = L2_HLEN + 16;
-    let l4_off = L2_HLEN + IP_HLEN;
-    let l4_sport = l4_off;
-    let l4_dport = l4_off + 2;
-
-    let proto: u8 = load_direct(ctx, ip_proto)?;
-    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
-        return Some(TC_ACT_OK);
-    }
-
-    let dst_ip: u32 = load_direct(ctx, ip_dst)?;
-    let dst_port: u16 = load_direct(ctx, l4_dport)?;
-    let front_ip_v6 = ipv4_mapped_v6(dst_ip);
-    let key = LbFrontKey {
-        front_ip: front_ip_v6,
-        front_port: dst_port,
-        proto,
-        _pad: 0,
-    };
-
-    let src_ip: u32 = load_direct(ctx, ip_src)?;
-    let src_port: u16 = load_direct(ctx, l4_sport)?;
-    let client_ip_v6 = ipv4_mapped_v6(src_ip);
-    // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
-    // comment) uses this shape.
-    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, front_ip_v6, dst_port, proto);
+    let key = flow.front;
+    let flow_key = encode_tcp_flow_key(
+        flow.client_ip,
+        flow.client_port,
+        key.front_ip,
+        key.front_port,
+        key.proto,
+    );
     let fwd_key = encode_flow_key(
-        client_ip_v6,
-        src_port,
-        front_ip_v6,
-        dst_port,
-        proto,
+        flow.client_ip,
+        flow.client_port,
+        key.front_ip,
+        key.front_port,
+        key.proto,
         FlowDirection::Forward,
     );
     let backend = match ingress_backend(
         key,
-        client_ip_v6,
-        src_port,
+        flow.client_ip,
+        flow.client_port,
         flow_key,
         fwd_key,
         ingress_ifindex,
@@ -771,15 +732,15 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
     // geneve0's inner frame is always "real" Ethernet from its point of
     // view) would otherwise silently no-op on a live-captured all-zero
     // EtherType (confirmed via a raw packet capture on the peer's wg0).
-    if L2_HLEN == 0 {
+    if l3_only {
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
         }
-        // A stack local, not `&ETH_P_IPV4` directly: referencing the const
+        // A stack local, not a const reference: referencing the const
         // promotes it into a shared `.rodata` allocation, which bpftool's
         // map-discovery walk (and the CI memory-smoke gate) counts as a 9th
         // "map".
-        let ethertype = ETH_P_IPV4;
+        let ethertype = flow.ethertype;
         if ctx.store(12, &ethertype, 0).is_err() {
             return Some(TC_ACT_SHOT);
         }
@@ -791,6 +752,74 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
     Some(TC_ACT_REDIRECT)
 }
 
+/// Dispatches on the inner packet's own address family before parsing any
+/// family-specific header field -- an Ethernet-framed uplink has an
+/// EtherType to read (offset 12); an L3-only uplink (L2_HLEN==0) has none,
+/// so the IP-version nibble at offset 0 is the only signal. Two siblings,
+/// not one runtime-branched body: `load_direct`'s offsets must be compile-
+/// time literals (its own doc comment), and v4/v6 header layouts differ in
+/// both width and field offsets.
+#[inline(always)]
+fn try_uplink_ingress_headers<const L2_HLEN: usize>(ctx: &TcContext) -> Option<IngressFlow> {
+    if L2_HLEN == ETH_HLEN {
+        match load_direct::<u16>(ctx, 12)? {
+            ETH_P_IPV4 => try_uplink_ingress_headers_v4::<L2_HLEN>(ctx),
+            ETH_P_IPV6 => try_uplink_ingress_headers_v6::<L2_HLEN>(ctx),
+            _ => None,
+        }
+    } else {
+        let ver: u8 = ctx.load(0).ok()?;
+        match ver >> 4 {
+            4 => try_uplink_ingress_headers_v4::<L2_HLEN>(ctx),
+            6 => try_uplink_ingress_headers_v6::<L2_HLEN>(ctx),
+            _ => None,
+        }
+    }
+}
+
+#[inline(always)]
+fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) -> Option<IngressFlow> {
+    // `load_direct`'s doc comment: offset 0 (the L3-only/WireGuard branch,
+    // L2_HLEN==0) can't go through it, so this one field on that branch
+    // stays on the helper call; every other read on both branches has a
+    // nonzero literal offset and gets direct access.
+    let ver_ihl: u8 = if L2_HLEN == 0 {
+        ctx.load(0).ok()?
+    } else {
+        load_direct(ctx, L2_HLEN)?
+    };
+    if ver_ihl >> 4 != 4 || ver_ihl & 0x0f != 5 {
+        return None;
+    }
+    let ip_proto = L2_HLEN + 9;
+    let ip_src = L2_HLEN + 12;
+    let ip_dst = L2_HLEN + 16;
+    let l4_off = L2_HLEN + IP_HLEN;
+    let l4_sport = l4_off;
+    let l4_dport = l4_off + 2;
+
+    let proto: u8 = load_direct(ctx, ip_proto)?;
+    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return None;
+    }
+
+    let dst_ip: u32 = load_direct(ctx, ip_dst)?;
+    let dst_port: u16 = load_direct(ctx, l4_dport)?;
+    let src_ip: u32 = load_direct(ctx, ip_src)?;
+    let src_port: u16 = load_direct(ctx, l4_sport)?;
+    Some(IngressFlow {
+        front: LbFrontKey {
+            front_ip: ipv4_mapped_v6(dst_ip),
+            front_port: dst_port,
+            proto,
+            _pad: 0,
+        },
+        client_ip: ipv4_mapped_v6(src_ip),
+        client_port: src_port,
+        ethertype: ETH_P_IPV4,
+    })
+}
+
 /// IPv6 sibling of `try_uplink_ingress_headers_v4` -- same steps, IPv6
 /// header shape (module doc): a 16-byte address at a different offset, no
 /// IHL/options check (v6's base header is always exactly `IP6_HLEN`), Next
@@ -798,17 +827,14 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(
 /// `ipv4_mapped_v6` embedding -- a genuine v6 address's own octets already
 /// are the dual-stack `[u8; 16]` shape every map below keys on.
 #[inline(always)]
-fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
-    ctx: &TcContext,
-    ingress_ifindex: u32,
-) -> Option<i32> {
+fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) -> Option<IngressFlow> {
     let ver: u8 = if L2_HLEN == 0 {
         ctx.load(0).ok()?
     } else {
         load_direct(ctx, L2_HLEN)?
     };
     if ver >> 4 != 6 {
-        return Some(TC_ACT_OK);
+        return None;
     }
     let ip6_next_hdr = L2_HLEN + 6;
     let ip6_src = L2_HLEN + 8;
@@ -819,89 +845,24 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(
 
     let proto: u8 = load_direct(ctx, ip6_next_hdr)?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
-        return Some(TC_ACT_OK);
+        return None;
     }
 
     let front_ip_v6: [u8; 16] = load_direct(ctx, ip6_dst)?;
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
-    let key = LbFrontKey {
-        front_ip: front_ip_v6,
-        front_port: dst_port,
-        proto,
-        _pad: 0,
-    };
-
     let client_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
-    // Untagged: only FWD_PENDING (never merged into FLOW_TABLE, see its doc
-    // comment) uses this shape.
-    let flow_key = encode_tcp_flow_key(client_ip_v6, src_port, front_ip_v6, dst_port, proto);
-    let fwd_key = encode_flow_key(
-        client_ip_v6,
-        src_port,
-        front_ip_v6,
-        dst_port,
-        proto,
-        FlowDirection::Forward,
-    );
-    let backend = match ingress_backend(
-        key,
-        client_ip_v6,
-        src_port,
-        flow_key,
-        fwd_key,
-        ingress_ifindex,
-    ) {
-        Ok(backend) => backend,
-        Err(verdict) => return Some(verdict),
-    };
-
-    let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
-
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    let tkey_flags = set_tunnel_remote(&mut tkey, &backend.backend_node_ip);
-    tkey.tunnel_id = VNI_FWD;
-    tkey.tunnel_ttl = 64;
-    if unsafe {
-        bpf_skb_set_tunnel_key(
-            ctx.skb.skb,
-            &mut tkey,
-            core::mem::size_of::<bpf_tunnel_key>() as u32,
-            tkey_flags,
-        )
-    } != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
-
-    let mut opt = [0u8; 20];
-    opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
-    opt[2] = GENEVE_OPT_TYPE_POD_ID;
-    opt[3] = 4; // opt_data length in 4-byte words (16 bytes, dual-stack pod_ip).
-    opt[4..20].copy_from_slice(&backend.pod_ip);
-    if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
-
-    // See try_uplink_ingress_headers_v4's matching comment: an L3-only
-    // uplink's synthesized MAC header needs its EtherType stamped
-    // explicitly, this inner packet's own family this time.
-    if L2_HLEN == 0 {
-        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
-            return Some(TC_ACT_SHOT);
-        }
-        let ethertype = ETH_P_IPV6;
-        if ctx.store(12, &ethertype, 0).is_err() {
-            return Some(TC_ACT_SHOT);
-        }
-    }
-
-    if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
-        return Some(TC_ACT_SHOT);
-    }
-    Some(TC_ACT_REDIRECT)
+    Some(IngressFlow {
+        front: LbFrontKey {
+            front_ip: front_ip_v6,
+            front_port: dst_port,
+            proto,
+            _pad: 0,
+        },
+        client_ip: client_ip_v6,
+        client_port: src_port,
+        ethertype: ETH_P_IPV6,
+    })
 }
 
 /// Hook 2+4 merged: ingress classifier on `geneve0`, dispatched by the
