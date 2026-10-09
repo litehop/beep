@@ -186,8 +186,8 @@ fn describe_lb_front_key(key: &LbFrontKey) -> String {
 /// own `populate_fixtures`, reusing the already-tested `beep::stale_pod_targets`.
 /// Continues past an individual write failure, like the front writes.
 ///
-/// Each stale (departed) pod IP also runs `beep::evict_pod_flows` against
-/// `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
+/// All of a tick's stale (departed) pod IPs also run ONE `beep::evict_pod_flows`
+/// pass against `fwd_pending`/`flow_table` -- a departed pod's forward/reverse/port-memo
 /// conntrack rows would otherwise pin routing to a dead backend, or
 /// misroute a FUTURE, unrelated owner of that pod IP if it's reused. Run
 /// even if the `POD_TARGETS` delete itself failed: a write error on this one map
@@ -201,21 +201,24 @@ fn apply_pod_targets(
     let existing: Vec<[u8; 16]> = map.keys().collect::<Result<_, _>>()?;
     let live: Vec<[u8; 16]> = desired.iter().copied().collect();
     let mut failed = 0;
-    for stale in beep::stale_pod_targets(&existing, &live) {
-        if let Err(e) = map.remove(&stale) {
+    let departed: HashSet<[u8; 16]> = beep::stale_pod_targets(&existing, &live)
+        .into_iter()
+        .collect();
+    for stale in &departed {
+        if let Err(e) = map.remove(stale) {
             failed += 1;
             eprintln!(
                 "controller: POD_TARGETS delete for pod {} failed: {e:#}",
-                describe_pod_target_ip(stale)
+                describe_pod_target_ip(*stale)
             );
         }
-        if let Err(e) = beep::evict_pod_flows(fwd_pending, flow_table, stale) {
-            failed += 1;
-            eprintln!(
-                "controller: conntrack eviction sweep for departed pod {} failed: {e:#}",
-                describe_pod_target_ip(stale)
-            );
-        }
+    }
+    if let Err(e) = beep::evict_pod_flows(fwd_pending, flow_table, &departed) {
+        failed += 1;
+        eprintln!(
+            "controller: conntrack eviction sweep for {} departed pod(s) failed: {e:#}",
+            departed.len()
+        );
     }
     for ip in &live {
         if let Err(e) = map.insert(ip, 1u8, 0) {

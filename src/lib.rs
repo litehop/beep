@@ -8,7 +8,7 @@
 
 pub mod front_swap;
 
-use std::{net::IpAddr, path::Path};
+use std::{collections::HashSet, net::IpAddr, path::Path};
 
 use anyhow::{anyhow, Context};
 use aya::{
@@ -220,7 +220,7 @@ pub fn local_pod_ips(fixtures: &[Fixture], node_ip: IpAddr) -> Vec<[u8; 16]> {
 /// `NODE_ALLOW`) rather than duplicated per map: both are the identical
 /// prune-then-insert set diff.
 pub fn stale_pod_targets<T: Copy + Eq + std::hash::Hash>(existing: &[T], live: &[T]) -> Vec<T> {
-    let live: std::collections::HashSet<T> = live.iter().copied().collect();
+    let live: HashSet<T> = live.iter().copied().collect();
     existing
         .iter()
         .copied()
@@ -247,24 +247,24 @@ pub fn flow_key_direction(key: &FlowKey) -> Option<FlowDirection> {
 /// Forward-role rows (`FWD_PENDING` entries, or `FLOW_TABLE` rows the caller
 /// has already confirmed are `FlowDirection::Forward`-tagged via
 /// `flow_key_direction` and read with `FlowValue::as_forward`) whose backend
-/// points at `departed_pod` -- the eviction sweep's Forward case. Forward is
+/// points at any of `departed_pods` -- the eviction sweep's Forward case. Forward is
 /// the ONLY role where pod identity lives in the VALUE rather than the key: the
 /// key is `(client, front, proto)`, which never carries pod identity at all.
 /// Generic over `K` so the identical filter serves both `FWD_PENDING`'s
 /// `TcpFlowKey` and `FLOW_TABLE`'s wider `FlowKey`.
 pub fn stale_forward_entries<K: Copy>(
     entries: &[(K, ForwardFlowValue)],
-    departed_pod: [u8; 16],
+    departed_pods: &HashSet<[u8; 16]>,
 ) -> Vec<K> {
     entries
         .iter()
-        .filter(|(_, value)| value.backend.pod_ip == departed_pod)
+        .filter(|(_, value)| departed_pods.contains(&value.backend.pod_ip))
         .map(|(key, _)| *key)
         .collect()
 }
 
 /// `FLOW_TABLE` keys tagged `Reverse` or `PortMemo` whose key embeds
-/// `departed_pod` in bytes 16..32 (`decode_tcp_flow_key`'s `other_ip`) --
+/// any of `departed_pods` in bytes 16..32 (`decode_tcp_flow_key`'s `other_ip`) --
 /// the eviction sweep's Reverse/PortMemo case. Both roles key on
 /// `(client, ..., pod_ip, ...)`, the exact opposite of Forward's value-based
 /// match above, and share this identical match: PortMemo's key shape is
@@ -272,19 +272,21 @@ pub fn stale_forward_entries<K: Copy>(
 /// memo for a reused pod IP is the same misrouting hazard a stale reverse
 /// entry is. Caller must pass only already tag-filtered keys (via
 /// `flow_key_direction`) -- this function does not itself check the tag.
-pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pod: [u8; 16]) -> Vec<FlowKey> {
+pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pods: &HashSet<[u8; 16]>) -> Vec<FlowKey> {
     keys.iter()
         .copied()
         .filter(|key| {
             let tcp_key: TcpFlowKey = key[..TCP_FLOW_KEY_LEN].try_into().unwrap();
             let (_, _, other_ip, _, _) = decode_tcp_flow_key(&tcp_key);
-            other_ip == departed_pod
+            departed_pods.contains(&other_ip)
         })
         .collect()
 }
 
-/// Runs the full conntrack eviction sweep for one departed pod IP against
-/// the live pinned `FWD_PENDING`/`FLOW_TABLE` maps -- shared by the
+/// Runs the full conntrack eviction sweep for ALL of a tick's departed pod IPs
+/// in one pass over each map (set-membership per row), so a mass scale-down
+/// costs two table walks, not two per pod, against the live pinned
+/// `FWD_PENDING`/`FLOW_TABLE` maps -- shared by the
 /// controller's per-reconcile `POD_TARGETS` prune (`apply_pod_targets`) and
 /// the loader's hidden `evict-pod` one-shot test trigger, so
 /// `scripts/smoke.sh` exercises the exact sweep logic production runs.
@@ -299,11 +301,14 @@ pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pod: [u8; 16]) -> Vec<Fl
 pub fn evict_pod_flows(
     fwd_pending: &mut AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
     flow_table: &mut AyaHashMap<MapData, FlowKey, FlowValue>,
-    departed_pod: [u8; 16],
+    departed_pods: &HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
+    if departed_pods.is_empty() {
+        return Ok(());
+    }
     let pending_entries: Vec<(TcpFlowKey, ForwardFlowValue)> =
         fwd_pending.iter().collect::<Result<_, _>>()?;
-    let stale_pending = stale_forward_entries(&pending_entries, departed_pod);
+    let stale_pending = stale_forward_entries(&pending_entries, departed_pods);
 
     let mut forward_entries = Vec::new();
     let mut reverse_and_port_memo_keys = Vec::new();
@@ -317,10 +322,10 @@ pub fn evict_pod_flows(
             None => {}
         }
     }
-    let mut stale_flow_table = stale_forward_entries(&forward_entries, departed_pod);
+    let mut stale_flow_table = stale_forward_entries(&forward_entries, departed_pods);
     stale_flow_table.extend(stale_flow_table_keys(
         &reverse_and_port_memo_keys,
-        departed_pod,
+        departed_pods,
     ));
 
     let mut failed = 0;
@@ -1139,7 +1144,7 @@ mod tests {
         ];
 
         assert_eq!(
-            stale_forward_entries(&entries, departed_pod),
+            stale_forward_entries(&entries, &HashSet::from([departed_pod])),
             vec![departed_key],
             "only the departed pod's FWD_PENDING row must be selected -- an unrelated pod's \
              pending row must survive"
@@ -1168,7 +1173,7 @@ mod tests {
         ];
 
         assert_eq!(
-            stale_forward_entries(&entries, departed_pod),
+            stale_forward_entries(&entries, &HashSet::from([departed_pod])),
             vec![departed_key],
             "only the departed pod's FLOW_TABLE Forward-tagged row must be selected -- an \
              unrelated pod's established forward entry must survive"
@@ -1192,7 +1197,7 @@ mod tests {
             encode_flow_key(client_ip, 1, other_pod, 8080, 6, FlowDirection::Reverse);
 
         assert_eq!(
-            stale_flow_table_keys(&[departed_key, other_key], departed_pod),
+            stale_flow_table_keys(&[departed_key, other_key], &HashSet::from([departed_pod])),
             vec![departed_key],
             "only the departed pod's Reverse-tagged key must be selected -- an unrelated pod's \
              reverse conntrack entry must survive"
@@ -1217,11 +1222,58 @@ mod tests {
             encode_flow_key(client_ip, 1, other_pod, 8080, 6, FlowDirection::PortMemo);
 
         assert_eq!(
-            stale_flow_table_keys(&[departed_key, other_key], departed_pod),
+            stale_flow_table_keys(&[departed_key, other_key], &HashSet::from([departed_pod])),
             vec![departed_key],
             "only the departed pod's PortMemo-tagged key must be selected -- an unrelated pod's \
              port-remap memo must survive"
         );
+    }
+
+    #[test]
+    fn one_batched_selection_covers_every_departed_pod_across_all_three_roles() {
+        // A rolling deploy departs several pods in one tick and the sweep
+        // walks each map once. If selection only honoured one pod of the
+        // set (or one role), the other departed pods' Forward/Reverse/
+        // PortMemo rows would be orphaned and keep routing to -- or
+        // un-DNATing for -- dead pod IPs.
+        let pod = |n: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, n)));
+        let (gone_a, gone_b, live) = (pod(9), pod(10), pod(11));
+        let departed = HashSet::from([gone_a, gone_b]);
+        let client = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)));
+        let front = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        let fwd = |port| encode_flow_key(client, port, front, 80, 6, FlowDirection::Forward);
+
+        let forward = [
+            (fwd(1), forward_flow_value_for(gone_a)),
+            (fwd(2), forward_flow_value_for(gone_b)),
+            (fwd(3), forward_flow_value_for(live)),
+        ];
+        assert_eq!(
+            stale_forward_entries(&forward, &departed),
+            vec![fwd(1), fwd(2)],
+            "every departed pod's forward row must be selected and the live pod's kept"
+        );
+
+        for role in [FlowDirection::Reverse, FlowDirection::PortMemo] {
+            let key = |p| encode_flow_key(client, 1, p, 8080, 6, role);
+            assert_eq!(
+                stale_flow_table_keys(&[key(gone_a), key(live), key(gone_b)], &departed),
+                vec![key(gone_a), key(gone_b)],
+                "every departed pod's {role:?} key must be selected and the live pod's kept"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_departed_set_selects_nothing() {
+        // Guards the no-departures reconcile tick: selecting anything here
+        // would evict healthy flows on every tick.
+        let pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9)));
+        let client = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)));
+        let key = encode_flow_key(client, 1, pod, 80, 6, FlowDirection::Reverse);
+        let none = HashSet::new();
+        assert!(stale_forward_entries(&[(key, forward_flow_value_for(pod))], &none).is_empty());
+        assert!(stale_flow_table_keys(&[key], &none).is_empty());
     }
 
     #[test]
