@@ -53,12 +53,14 @@ pub struct PinnedMaps {
     /// `desired.fronts_known` directly on each tick.
     fronts_ever_known: bool,
     /// Every cluster backend (and its pod uid, if known) as of the last tick
-    /// whose sweep finished. In-memory only: a remote pod that departs, or an
-    /// IP reused, while the controller is down is not detected (nothing to
-    /// compare against, and sweeping every pin on each start would reset all
-    /// live flows). Local departures survive a restart via the `POD_TARGETS`
-    /// rows.
+    /// whose sweep finished. In-memory only, so it cannot see a pod that
+    /// departed while the controller was down; `orphans_swept` covers that.
+    /// Local departures also survive a restart via the `POD_TARGETS` rows.
     known_backends: HashMap<[u8; 16], Option<String>>,
+    /// Whether this process has done its one walk of the conntrack pins for
+    /// backends absent from every slice (pods that left while the controller
+    /// was down). Stays `false` until it succeeds.
+    orphans_swept: bool,
 }
 
 fn open_hash_map<K: aya::Pod, V: aya::Pod>(
@@ -91,6 +93,7 @@ impl PinnedMaps {
             flow_table: open_hash_map(pin_dir, "FLOW_TABLE")?,
             fronts_ever_known: false,
             known_backends: HashMap::new(),
+            orphans_swept: false,
         })
     }
 
@@ -130,16 +133,34 @@ impl PinnedMaps {
         } else {
             Ok(Vec::new())
         };
+        let orphan_walk = if orphan_sweep_due(desired, self.orphans_swept) {
+            let live: HashSet<[u8; 16]> = desired.cluster_backends.keys().copied().collect();
+            Some(
+                beep::orphaned_pin_backends(&self.fwd_pending, &self.flow_table, &live)
+                    .context("walking conntrack for pins to departed backends"),
+            )
+        } else {
+            None
+        };
+        let (orphans, orphan_walk_error) = match orphan_walk {
+            Some(Ok(orphans)) => (Some(orphans), None),
+            Some(Err(e)) => (None, Some(e)),
+            None => (None, None),
+        };
         let (fwd_pending, flow_table) = (&mut self.fwd_pending, &mut self.flow_table);
         let mut plan = plan_tick(
             desired,
             installed_pod_targets.as_deref().unwrap_or_default(),
             &mut self.known_backends,
+            orphans.as_ref(),
             |pods| beep::evict_pod_flows(fwd_pending, flow_table, pods),
         );
+        if orphans.is_some() && plan.sweep_error.is_none() {
+            self.orphans_swept = true;
+        }
         let sweep_result = match plan.sweep_error.take() {
             Some(e) => Err(e.context("sweeping flows of departed or reused backend pods")),
-            None => Ok(()),
+            None => orphan_walk_error.map_or(Ok(()), Err),
         };
         let fronts_result = if desired.fronts_known {
             apply_front_maps(
@@ -278,8 +299,18 @@ fn reused_pod_ips(
         .collect()
 }
 
+/// Whether this tick should walk the conntrack pins for orphaned backends:
+/// once per process, only after Services, EndpointSlices and Nodes have all
+/// been listed (`fronts_known`), and never against an empty backend set. The
+/// relist guards cannot protect a first list (nothing is held to compare), so
+/// an empty `cluster_backends` is treated as "not trustworthy yet" rather than
+/// "every pin is an orphan"; the walk waits for a non-empty one.
+fn orphan_sweep_due(desired: &DesiredEntries, already_swept: bool) -> bool {
+    desired.fronts_known && !already_swept && !desired.cluster_backends.is_empty()
+}
+
 /// What one reconcile tick may write after its conntrack sweep.
-struct TickPlan {
+pub(crate) struct TickPlan {
     /// The sweep's failure, if any; the caller reports it after every map has
     /// converged.
     sweep_error: Option<anyhow::Error>,
@@ -306,14 +337,17 @@ struct TickPlan {
 /// under a different uid -- including remote pods, whose pins live on this
 /// (ingress) node but which `POD_TARGETS` never holds. On failure only the
 /// swept IPs stay pending (in `known`, and out of the installs); everything
-/// else converges.
-fn plan_tick(
+/// else converges. `orphans` (once per process, `orphan_sweep_due`) adds the
+/// pins found to name a backend no slice carries, i.e. one that left while the
+/// controller was down.
+pub(crate) fn plan_tick(
     desired: &DesiredEntries,
     installed_pod_targets: &[[u8; 16]],
     known: &mut HashMap<[u8; 16], Option<String>>,
+    orphans: Option<&HashSet<[u8; 16]>>,
     evict: impl FnOnce(&HashSet<[u8; 16]>) -> anyhow::Result<()>,
 ) -> TickPlan {
-    let mut sweep = HashSet::new();
+    let mut sweep: HashSet<[u8; 16]> = orphans.cloned().unwrap_or_default();
     let mut delete_rows = HashSet::new();
     if desired.pod_targets_known {
         let live: Vec<[u8; 16]> = desired.pod_targets.iter().copied().collect();
@@ -546,9 +580,19 @@ mod tests {
         known: &mut Known,
         fail: bool,
     ) -> (TickPlan, Vec<HashSet<[u8; 16]>>) {
+        tick_with_orphans(d, installed, known, None, fail)
+    }
+
+    fn tick_with_orphans(
+        d: &DesiredEntries,
+        installed: &[u32],
+        known: &mut Known,
+        orphans: Option<&HashSet<[u8; 16]>>,
+        fail: bool,
+    ) -> (TickPlan, Vec<HashSet<[u8; 16]>>) {
         let installed: Vec<[u8; 16]> = installed.iter().map(|n| ip(*n)).collect();
         let mut calls = Vec::new();
-        let plan = plan_tick(d, &installed, known, |pods| {
+        let plan = plan_tick(d, &installed, known, orphans, |pods| {
             calls.push(pods.clone());
             if fail {
                 anyhow::bail!("map iter failed")
@@ -610,6 +654,50 @@ mod tests {
         let (plan, calls) = tick(&d, &[5], &mut known, false);
         assert_eq!(calls, vec![set(&[5])]);
         assert_eq!(plan.delete_rows, set(&[5]));
+    }
+
+    #[test]
+    fn remote_backend_that_left_while_the_controller_was_down_is_swept_after_restart() {
+        // `known` is empty after a restart and the pod is remote, so neither
+        // `known` nor POD_TARGETS remembers it: only the orphan walk's result
+        // can get its pins swept, and without it they blackhole at the
+        // backend's decap until LRU eviction.
+        let mut known = Known::new();
+        let d = desired(backends(&[(1, Some("live"))]), &[], &[(80, 1)]);
+        let (plan, calls) = tick_with_orphans(&d, &[], &mut known, Some(&set(&[7])), false);
+        assert_eq!(calls, vec![set(&[7])]);
+        assert!(plan.sweep_error.is_none());
+        assert_eq!(plan.fronts.len(), 1, "live fronts are unaffected");
+    }
+
+    #[test]
+    fn failed_orphan_sweep_is_reported_so_the_next_tick_retries_it() {
+        let mut known = Known::new();
+        let d = desired(backends(&[(1, None)]), &[], &[]);
+        let (plan, calls) = tick_with_orphans(&d, &[], &mut known, Some(&set(&[7])), true);
+        assert_eq!(calls, vec![set(&[7])]);
+        assert!(plan.sweep_error.is_some());
+    }
+
+    #[test]
+    fn orphan_sweep_waits_for_a_full_listing_and_a_non_empty_backend_set_and_runs_once() {
+        let d = desired(backends(&[(1, None)]), &[], &[]);
+        assert!(orphan_sweep_due(&d, false));
+        assert!(
+            !orphan_sweep_due(&d, true),
+            "a second walk would reset flows pinned since the first"
+        );
+        let mut partial = desired(backends(&[(1, None)]), &[], &[]);
+        partial.fronts_known = false;
+        assert!(
+            !orphan_sweep_due(&partial, false),
+            "before the full listing every pin looks orphaned"
+        );
+        let empty = desired(Known::new(), &[], &[]);
+        assert!(
+            !orphan_sweep_due(&empty, false),
+            "an empty first list is untrusted: sweeping against it would reset every live flow"
+        );
     }
 
     #[test]

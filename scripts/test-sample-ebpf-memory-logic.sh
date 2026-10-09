@@ -24,8 +24,8 @@
 #      data row each, never a second header line (a repeated snapshot must
 #      stay parseable by a single-header CSV reader).
 #   5. assert-ebpf-map-memory.sh — the CI gate this whole family of scripts
-#      feeds: a single-tick CSV with the exact 9 known maps passes; one that
-#      silently dropped a map (an "8 of 9 found" discovery regression) is
+#      feeds: a single-tick CSV with the exact 10 known maps passes; one that
+#      silently dropped a map (an "9 of 10 found" discovery regression) is
 #      caught, not averaged into a smaller-but-still-passing byte sum. This
 #      directly replicates PR #1568's critical-review repro (a constructed
 #      multi-tick CSV that the OLD tick-count-inference logic silently
@@ -199,7 +199,7 @@ assert_eq "loader-rss.csv also writes its header exactly once across two once ca
 # ===========================================================================
 # 5. assert-ebpf-map-memory.sh: the CI gate. A correct single-tick 9-map CSV
 #    passes; a single-tick CSV missing one map (the real-world shape of "map
-#    discovery silently breaks and finds 8 of 9 maps") is caught. This is
+#    discovery silently breaks and finds 9 of 10 maps") is caught. This is
 #    fix (2)'s actual mechanism: the CI job now feeds this script a FRESH,
 #    single-`once`-call CSV instead of extracting "the latest tick" out of a
 #    multi-tick file, so the ambiguity PR #1568's review found (a
@@ -221,14 +221,15 @@ GOOD_CSV="$TMPDIR_TEST/good.csv"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
+  echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$GOOD_CSV"
 set +e
 bash "$ASSERT_SCRIPT" "$GOOD_CSV" >/dev/null 2>&1
 GOOD_EXIT=$?
 set -e
-assert_true "a correct single-tick CSV with all 9 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
+assert_true "a correct single-tick CSV with all 10 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
 
-# A single tick that dropped FRONT_ENDPOINTS — the actual shape an "8 of 9 maps
+# A single tick that dropped FRONT_ENDPOINTS — the actual shape an "9 of 10 maps
 # found" discovery regression produces against the fixed CI invocation.
 DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
 {
@@ -241,13 +242,14 @@ DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
+  echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$DROPPED_CSV"
 set +e
 DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" 2>&1)"
 DROPPED_EXIT=$?
 set -e
 if [ "$DROPPED_EXIT" -ne 0 ]; then
-  echo "PASS: a single-tick CSV missing one map (8 of 9) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
+  echo "PASS: a single-tick CSV missing one map (9 of 10) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
   PASS=$(( PASS + 1 ))
 else
   echo "FAIL: an 8-of-9-map CSV must not pass — got exit 0: $DROPPED_OUT"

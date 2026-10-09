@@ -35,12 +35,13 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-pub const MAP_NAMES: [&str; 9] = [
+pub const MAP_NAMES: [&str; 10] = [
     "CONFIG",
     "UPLINK_CONFIG",
     "FRONT_META",
     "FRONT_ENDPOINTS",
     "FRONT_MISSES",
+    "REJECT_BUCKET",
     "POD_TARGETS",
     "NODE_ALLOW",
     "FWD_PENDING",
@@ -281,6 +282,27 @@ pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pods: &HashSet<[u8; 16]>
             departed_pods.contains(&other_ip)
         })
         .collect()
+}
+
+/// Backend pod IPs named by a forward pin (`FWD_PENDING` entries and
+/// `FLOW_TABLE` Forward rows) that are absent from `live`: pins whose pod left
+/// every EndpointSlice while no controller was running to sweep them.
+pub fn orphaned_pin_backends(
+    fwd_pending: &AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
+    flow_table: &AyaHashMap<MapData, FlowKey, FlowValue>,
+    live: &HashSet<[u8; 16]>,
+) -> anyhow::Result<HashSet<[u8; 16]>> {
+    let mut pinned = HashSet::new();
+    for entry in fwd_pending.iter() {
+        pinned.insert(entry?.1.backend.pod_ip);
+    }
+    for entry in flow_table.iter() {
+        let (key, value) = entry?;
+        if flow_key_direction(&key) == Some(FlowDirection::Forward) {
+            pinned.insert(value.as_forward().backend.pod_ip);
+        }
+    }
+    Ok(pinned.difference(live).copied().collect())
 }
 
 /// Runs the full conntrack eviction sweep for ALL of a tick's departed pod IPs

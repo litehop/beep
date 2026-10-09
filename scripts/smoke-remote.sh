@@ -928,6 +928,45 @@ fi
 pkill -f "nc -[46] -l -N ${FRONT_IP}" 2>/dev/null || true
 echo "REJECT: PASS (owned count-0 fronts refuse TCP and UDP on v4+v6 immediately; non-owned fronts still pass to the host)"
 
+echo "==> reject rate limit: a UDP flood at a count-0 front must draw a bounded number of ICMP replies, and a probe after the flood must still be answered"
+# The bucket is per CPU, and the veth delivers each flood packet to beep on
+# the sender's CPU, so `taskset -c 0` makes one bucket (burst 25, 100/s) serve
+# the whole flood. On a multi-CPU runner CPU 0 must be the only CPU the flood
+# lands on (the bound below is for one bucket; it does not scale with nproc),
+# which holds because the sender is pinned, not because nproc is 1. Replies
+# are counted as frames received on the client veth; the only traffic on it
+# during the flood is beep's replies. Unbounded, every flood packet would be
+# answered.
+FLOOD_PACKETS=3000
+FLOOD_BURST=25
+FLOOD_RATE=100
+rx_packets() { ip netns exec smoke-client cat /sys/class/net/smoke-veth1/statistics/rx_packets; }
+rx_before=$(rx_packets)
+flood_start=$(date +%s%N)
+ip netns exec smoke-client taskset -c 0 bash -c 'for ((i = 0; i < $2; i++)); do echo x >"/dev/udp/$0/$1"; done' "$FRONT_IP" "$REJECT_UDP4_PORT" "$FLOOD_PACKETS" 2>/dev/null || true
+flood_end=$(date +%s%N)
+sleep 1
+rx_after=$(rx_packets)
+flood_ms=$(((flood_end - flood_start) / 1000000))
+flood_replies=$((rx_after - rx_before))
+# Allowed: the burst plus the refill earned while the flood ran (nothing
+# refills once it stops), plus slack for a rounding token and unrelated link
+# traffic (neighbour discovery). Tight on purpose: a gate with burst 100 must
+# fail.
+flood_max=$((FLOOD_BURST + FLOOD_RATE * flood_ms / 1000 + 10))
+echo "FLOOD: sent $FLOOD_PACKETS UDP packets in ${flood_ms}ms, client received $flood_replies frames (allowed <= $flood_max)"
+[ "$flood_replies" -le "$flood_max" ] || {
+  echo "FAIL: $flood_replies replies to $FLOOD_PACKETS flood packets exceeds the reject budget of $flood_max -- a spoofed-source flood at an empty front would be reflected at the victim packet for packet" >&2
+  exit 1
+}
+[ "$flood_replies" -ge 1 ] || {
+  echo "FAIL: the flood drew no replies at all -- the bounded count above proves nothing" >&2
+  exit 1
+}
+sleep 1
+assert_udp_refused "v4 after flood" "$FRONT_IP" "$REJECT_UDP4_PORT"
+echo "REJECT-RATELIMIT: PASS (flood answered with $flood_replies of $FLOOD_PACKETS; a later probe was still refused)"
+
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
 # This fixture is a self-loop (FRONT_IP is also this node's own address, and
 # `--node-ip $FRONT_IP` seeded NODE_ALLOW with it), so every Geneve packet

@@ -284,26 +284,26 @@ pub struct DesiredEntries {
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
     /// nothing here changes `pod_targets` itself.
     pub rejected: Vec<RejectedEndpoint>,
-    /// Whether `fronts`/`node_allow` were computed from a
-    /// fully-known node set. `WatchState::desired` (the only real producer
-    /// of an aggregate `DesiredEntries`) sets this to `false` while the
-    /// initial Node LIST hasn't completed yet, so `PinnedMaps::apply` knows
-    /// an empty `fronts` here means "node set not known
+    /// Whether `fronts`/`node_allow` were computed from fully-listed
+    /// Services, EndpointSlices and Nodes. `WatchState::desired` (the only
+    /// real producer of an aggregate `DesiredEntries`) sets this to `false`
+    /// until each initial LIST has completed, so `PinnedMaps::apply` knows
+    /// an empty or count-0 `fronts` here means "not known
     /// yet", not "no fronts should exist" -- diffing against the latter
     /// would delete every already-programmed front that survived a
     /// controller restart. `node_allow` is upserted every tick regardless
     /// (`node_allow` field's doc comment); this flag only latches ON the
     /// destructive half of ITS sync once true, never back off.
     pub fronts_known: bool,
-    /// Whether `pod_targets` was computed with THIS node's own address
-    /// already resolvable in `WatchState::desired`'s endpoint->node_ip
+    /// Whether everything is listed (`fronts_known`) and `pod_targets` was
+    /// computed with THIS node's own address already resolvable in `WatchState::desired`'s endpoint->node_ip
     /// lookup (`pod_targets_for_node` can only admit an endpoint whose
     /// node reports `NodeContext::node_ip` among its addresses). `false` means
     /// "this node's own Node LIST/watch entry hasn't landed yet", not
     /// "this node hosts no backends" -- in a multi-node cluster, whichever
     /// position THIS node's own entry lands at in the startup Node LIST is
     /// unrelated to every OTHER node's position, so gating this on the
-    /// full list (`fronts_known`) would still let an already-pinned local
+    /// full list alone would still let an already-pinned local
     /// backend get wiped while unrelated nodes are still being listed.
     /// `PinnedMaps::apply` skips the destructive POD_TARGETS full-sync
     /// while this is `false`.
@@ -402,12 +402,14 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
 /// when the endpoint leaves every slice. Unlike `pod_targets_for_node` this is
 /// cluster-wide: the conntrack pins a node holds for a flow name the backend
 /// pod, which is usually on another node.
-pub fn cluster_backends(slices: &[EndpointSliceView]) -> HashMap<[u8; 16], Option<String>> {
+pub fn cluster_backends(
+    endpoints: impl IntoIterator<Item = (IpAddr, Option<String>)>,
+) -> HashMap<[u8; 16], Option<String>> {
     let mut backends: HashMap<[u8; 16], Option<String>> = HashMap::new();
-    for ep in slices.iter().flat_map(|s| s.endpoints.iter()) {
-        let uid = backends.entry(wire_ip_v6(ep.pod_ip)).or_default();
+    for (pod_ip, pod_uid) in endpoints {
+        let uid = backends.entry(wire_ip_v6(pod_ip)).or_default();
         if uid.is_none() {
-            uid.clone_from(&ep.pod_uid);
+            *uid = pod_uid;
         }
     }
     backends
@@ -472,27 +474,32 @@ pub fn reconcile_service(
         // fixture-driven test can assert a specific outcome. It does not
         // spread load across endpoints.
         candidates.sort_by_key(|e| e.pod_ip);
-        let Some(backend) = candidates.first() else {
-            continue;
-        };
+        // No candidate still yields the front, with zero endpoints: the front
+        // stays owned (FRONT_META count 0), so new clients are rejected and
+        // pinned flows to draining backends keep their conntrack path.
+        let endpoints = candidates
+            .first()
+            .map(|backend| FrontEndpoint {
+                backend: LbFrontBackend {
+                    // Host-native, not wire_ip: the kernel's own
+                    // bpf_tunnel_key.remote_ipv4 set/get converts this
+                    // field itself (`src/main.rs`'s `fixture_fronts`
+                    // comment) -- `tunnel_remote_v6` is that
+                    // convention's dual-stack widening (`src/lib.rs`).
+                    backend_node_ip: tunnel_remote_v6(backend.node_ip),
+                    pod_ip: wire_ip_v6(backend.pod_ip),
+                },
+                target_port: wire_port(port.target_port),
+                _pad: [0; 6],
+            })
+            .into_iter()
+            .collect();
 
         desired.fronts.insert(
             front_key(svc.front_ip, port),
             DesiredFront {
                 flags: 0,
-                endpoints: vec![FrontEndpoint {
-                    backend: LbFrontBackend {
-                        // Host-native, not wire_ip: the kernel's own
-                        // bpf_tunnel_key.remote_ipv4 set/get converts this
-                        // field itself (`src/main.rs`'s `fixture_fronts`
-                        // comment) -- `tunnel_remote_v6` is that
-                        // convention's dual-stack widening (`src/lib.rs`).
-                        backend_node_ip: tunnel_remote_v6(backend.node_ip),
-                        pod_ip: wire_ip_v6(backend.pod_ip),
-                    },
-                    target_port: wire_port(port.target_port),
-                    _pad: [0; 6],
-                }],
+                endpoints,
             },
         );
     }
@@ -939,9 +946,11 @@ mod tests {
         unready.ready = false;
         let anonymous = ready_endpoint(Ipv4Addr::new(10, 244, 1, 11), other_node, vec![8080]);
 
-        let backends = cluster_backends(&[EndpointSliceView {
-            endpoints: vec![local, remote, unready, anonymous],
-        }]);
+        let backends = cluster_backends(
+            [local, remote, unready, anonymous]
+                .into_iter()
+                .map(|ep| (ep.pod_ip, ep.pod_uid)),
+        );
 
         let wire =
             |third: u8, last: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, third, last)));
@@ -1247,7 +1256,7 @@ mod tests {
     // not resolve to a stale backend -- FRONT_META keeping a PREVIOUS entry
     // here would misroute client traffic to a pod that's no longer healthy.
     #[test]
-    fn service_with_no_ready_endpoints_produces_no_entries() {
+    fn service_with_no_ready_endpoints_keeps_its_front_with_zero_endpoints() {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         let mut not_ready = ready_endpoint(Ipv4Addr::new(10, 244, 0, 9), node_ip, vec![8080]);
@@ -1258,10 +1267,14 @@ mod tests {
 
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
+        let front = desired
+            .fronts
+            .get(&front_key(svc.front_ip, &svc.ports[0]))
+            .expect("an owned front with no ready endpoint must stay in FRONT_META");
         assert!(
-            desired.fronts.is_empty(),
-            "no ready endpoint exists, so FRONT_META must get no entry for this front -- \
-             fabricating one would route to an unready pod"
+            front.endpoints.is_empty(),
+            "no ready endpoint exists, so the front must carry none -- new clients get \
+             rejected instead of routed to an unready pod"
         );
     }
 
@@ -1313,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_stack_service_with_only_v4_endpoints_gets_no_v6_front_entry() {
+    fn dual_stack_service_with_only_v4_endpoints_gets_an_empty_v6_front() {
         let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
         let slices = vec![EndpointSliceView {
             endpoints: vec![ready_endpoint(
@@ -1327,14 +1340,14 @@ mod tests {
         let desired = reconcile_service(&v6_front, &slices, &node(node_v4));
 
         assert!(
-            desired.fronts.is_empty(),
+            desired.fronts.values().all(|f| f.endpoints.is_empty()),
             "a v6 front with no v6 endpoint must fail closed; a cross-family backend would \
              silently time out every v6 client"
         );
         assert_eq!(
             ports_without_same_family_endpoint(&v6_front, &slices).len(),
             1,
-            "this front is unprogrammed because of a family mismatch, so the caller must be \
+            "this front sits at count 0 because of a family mismatch, so the caller must be \
              told to WARN -- otherwise a v6 front silently never routes"
         );
     }

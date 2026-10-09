@@ -358,6 +358,47 @@ fn publish_ingress(
     });
 }
 
+/// Publishes `key`'s ingress from the current state.
+fn publish_ingress_for(
+    client: &Arc<HyperApiClient>,
+    state: &Mutex<WatchState>,
+    node: &NodeContext,
+    key: ServiceKey,
+) {
+    let (own_ips, desired_ips) = {
+        let state = state.lock().unwrap();
+        (
+            state.own_node_ips(node.node_ip),
+            state.ips_to_publish(&key, node.node_ip),
+        )
+    };
+    publish_ingress(client, key, own_ips, desired_ips);
+}
+
+/// Re-publishes every tracked Service's ingress when this node's own address
+/// set differs from `before` (e.g. its second family just resolved): a
+/// Service added before that resolution never gets another chance to
+/// publish the newly-resolved family.
+fn republish_if_own_ips_changed(
+    client: &Arc<HyperApiClient>,
+    state: &Mutex<WatchState>,
+    node: &NodeContext,
+    before: &[IpAddr],
+) {
+    let after = state.lock().unwrap().own_node_ips(node.node_ip);
+    if !own_node_ips_changed(before, &after) {
+        return;
+    }
+    // Bound to a `let` rather than locked inline in the `for` head: a
+    // `for`-loop scrutinee's temporaries live for the whole loop, so an
+    // inline lock would be held across every iteration and deadlock on the
+    // lock inside `publish_ingress_for`.
+    let keys = state.lock().unwrap().service_keys();
+    for key in keys {
+        publish_ingress_for(client, state, node, key);
+    }
+}
+
 /// Runs the three list-watches (Service/EndpointSlice/Node) concurrently on
 /// this task, forever -- there is no persistent proxy loop to hand control
 /// back to (`ebpf-lb-dataplane.md`'s "Userspace control plane" section). In
@@ -379,15 +420,22 @@ async fn run_controller_loop(
             let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
             if let Some(key) = changed {
-                let (own_ips, desired_ips) = {
-                    let state = state.lock().unwrap();
-                    (
-                        state.own_node_ips(node.node_ip),
-                        state.ips_to_publish(&key, node.node_ip),
-                    )
-                };
-                publish_ingress(&client, key, own_ips, desired_ips);
+                publish_ingress_for(&client, &state, &node, key);
             }
+        }
+    };
+    let on_services_relist = {
+        let state = Arc::clone(&state);
+        let maps = Arc::clone(&maps);
+        let retry = Arc::clone(&retry);
+        let client = Arc::clone(&client);
+        move |items: Vec<Value>| {
+            let keys = state.lock().unwrap().replace_services(&items)?;
+            apply_reconcile(&state, &maps, &retry, &node);
+            for key in keys {
+                publish_ingress_for(&client, &state, &node, key);
+            }
+            Ok(())
         }
     };
     let on_endpoint_slice = {
@@ -399,6 +447,16 @@ async fn run_controller_loop(
             apply_reconcile(&state, &maps, &retry, &node);
         }
     };
+    let on_endpoint_slices_relist = {
+        let state = Arc::clone(&state);
+        let maps = Arc::clone(&maps);
+        let retry = Arc::clone(&retry);
+        move |items: Vec<Value>| {
+            state.lock().unwrap().replace_endpoint_slices(&items)?;
+            apply_reconcile(&state, &maps, &retry, &node);
+            Ok(())
+        }
+    };
     let on_node = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
@@ -408,44 +466,24 @@ async fn run_controller_loop(
             let before = state.lock().unwrap().own_node_ips(node.node_ip);
             state.lock().unwrap().apply_node_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
-            let after = state.lock().unwrap().own_node_ips(node.node_ip);
-            // This node's own address set actually changed (e.g. its second
-            // family just resolved) -- re-publish every tracked Service's
-            // ingress, not just the one Service watch would otherwise
-            // target, since a Service added before this resolution never
-            // gets another chance to publish the newly-resolved family.
-            if own_node_ips_changed(&before, &after) {
-                // Bound to a `let` rather than locked inline in the `for`
-                // head: a `for`-loop scrutinee's temporaries live for the
-                // whole loop, so an inline `state.lock().unwrap()` here
-                // would hold the Mutex across every iteration and deadlock
-                // on the `state.lock()` calls inside the loop body below.
-                let keys = state.lock().unwrap().service_keys();
-                for key in keys {
-                    let (own_ips, desired_ips) = {
-                        let state = state.lock().unwrap();
-                        (
-                            state.own_node_ips(node.node_ip),
-                            state.ips_to_publish(&key, node.node_ip),
-                        )
-                    };
-                    publish_ingress(&client, key, own_ips, desired_ips);
-                }
-            }
+            republish_if_own_ips_changed(&client, &state, &node, &before);
         }
     };
-    // Fires once the initial Node LIST has fully delivered -- flips
-    // `nodes_listed` so `desired` stops suppressing front programming, then
-    // immediately reconciles so a genuinely node-less cluster's correct
-    // (destructive) diff runs right away instead of waiting on the next
-    // event (`WatchState::desired`'s doc comment).
-    let on_nodes_listed = {
+    // Every Node LIST replaces the node set and marks it known
+    // (`nodes_listed`), then reconciles immediately so a genuinely node-less
+    // cluster's correct (destructive) diff runs right away instead of
+    // waiting on the next event (`WatchState::desired`'s doc comment).
+    let on_nodes_relist = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
-        move || {
-            state.lock().unwrap().mark_nodes_listed();
+        let client = Arc::clone(&client);
+        move |items: Vec<Value>| {
+            let before = state.lock().unwrap().own_node_ips(node.node_ip);
+            state.lock().unwrap().replace_nodes(&items, node.node_ip)?;
             apply_reconcile(&state, &maps, &retry, &node);
+            republish_if_own_ips_changed(&client, &state, &node, &before);
+            Ok(())
         }
     };
 
@@ -453,14 +491,14 @@ async fn run_controller_loop(
     // error (if any) wins here never matters at runtime -- `and` just gives
     // the whole function a single `Result` to return.
     let (services, endpoint_slices, nodes, retrier) = tokio::join!(
-        run_list_watch(&client, "/api/v1/services", on_service, || {}),
+        run_list_watch(&client, "/api/v1/services", on_service, on_services_relist),
         run_list_watch(
             &client,
             "/apis/discovery.k8s.io/v1/endpointslices",
             on_endpoint_slice,
-            || {},
+            on_endpoint_slices_relist,
         ),
-        run_list_watch(&client, "/api/v1/nodes", on_node, on_nodes_listed),
+        run_list_watch(&client, "/api/v1/nodes", on_node, on_nodes_relist),
         run_retry_loop(state, maps, retry, node),
     );
     services.and(endpoint_slices).and(nodes).and(retrier)
