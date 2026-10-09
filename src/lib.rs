@@ -354,6 +354,8 @@ pub fn bump_memlock_rlimit() {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
+    // SAFETY: `&rlim` points to a live, fully initialised local `rlimit`
+    // that setrlimit only reads for the duration of the call.
     let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
     if ret != 0 {
         eprintln!(
@@ -607,16 +609,19 @@ pub fn iface_arphrd_type(name: &str) -> anyhow::Result<u16> {
         .with_context(|| format!("parsing ARPHRD type from {path} (got {raw:?})"))
 }
 
+/// Resolves an interface's ifindex from sysfs in the caller's network
+/// namespace; a missing interface fails naming its sysfs path.
 pub fn iface_index(name: &str) -> anyhow::Result<u32> {
-    let c_name = std::ffi::CString::new(name).context("interface name contains a NUL byte")?;
-    let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if ifindex == 0 {
-        return Err(anyhow!(
-            "if_nametoindex({name}) failed: {}",
-            std::io::Error::last_os_error()
-        ));
+    let path = format!("/sys/class/net/{name}/ifindex");
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+    parse_ifindex(&raw).with_context(|| format!("parsing ifindex from {path} (got {raw:?})"))
+}
+
+fn parse_ifindex(raw: &str) -> anyhow::Result<u32> {
+    match raw.trim().parse::<u32>()? {
+        0 => Err(anyhow!("ifindex 0 is not a valid interface")),
+        n => Ok(n),
     }
-    Ok(ifindex)
 }
 
 /// Creates `iface` as an external-mode ("collect metadata") Geneve device
@@ -835,6 +840,31 @@ mod tests {
     use super::*;
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn parse_ifindex_accepts_sysfs_newline_and_rejects_garbage_and_zero() {
+        assert_eq!(
+            parse_ifindex("7\n").unwrap(),
+            7,
+            "sysfs ends with a newline"
+        );
+        assert_eq!(parse_ifindex("42").unwrap(), 42);
+        for bad in ["", "\n", "eth0", "-1", "0\n", "4294967296"] {
+            assert!(
+                parse_ifindex(bad).is_err(),
+                "{bad:?} must not become an ifindex: attaching to the wrong device is worse than failing"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_iface_error_names_the_interface() {
+        let err = iface_index("beep-nonexistent0").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("beep-nonexistent0"),
+            "operators need the interface name in the failure: {err:#}"
+        );
+    }
 
     const _: () = assert!(
         DEFAULT_NODE_ALLOW_MAX_ENTRIES >= 16 * 2,
