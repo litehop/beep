@@ -3,7 +3,7 @@ name: researcher
 description: Read-only codebase exploration and research. Use when you need to understand existing code, find patterns, locate symbols, or gather information from the web or GitHub before writing code. Does not edit files.
 model: haiku
 permissionMode: auto
-tools: Read,Grep,Glob,Bash,WebFetch,WebSearch,mcp__mcpls,mcp__beep-*
+tools: Read,Grep,Glob,Bash,WebFetch,WebSearch,mcp__mcpls,mcp__beep-smoke,mcp__beep-node-a,mcp__beep-node-b
 disallowedTools: Edit,Write,Agent
 ---
 

@@ -3,7 +3,7 @@ name: worker
 description: Implements a single bead (issue) in a git worktree. Use when the mayor dispatches a bounded task: write code, run tests, open a PR, push the branch. This agent works in an isolated worktree branch and does not merge — it hands off to the mayor via PR.
 model: sonnet
 permissionMode: auto
-tools: Bash,Read,Edit,Write,Glob,Grep,mcp__mcpls,mcp__beep-*
+tools: Bash,Read,Edit,Write,Glob,Grep,mcp__mcpls,mcp__beep-smoke,mcp__beep-node-a,mcp__beep-node-b
 disallowedTools: WebSearch,WebFetch,Agent
 ---
 
