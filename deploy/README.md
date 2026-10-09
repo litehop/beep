@@ -20,7 +20,12 @@ Manifest skeleton for the beep servicelb controller.
   ```
 - **RBAC is scoped to exactly what the design calls for:** list/watch/get on
   `Service`, `discovery.k8s.io/EndpointSlice`, and `Node` (the last needed to
-  resolve an `EndpointSlice` endpoint's hosting-node IP). Nothing broader.
+  resolve an `EndpointSlice` endpoint's hosting-node IP), plus, in
+  `kube-system` only, `create` on Secrets and `get` on the single Secret
+  `servicelb-flow-hash-seed` (the cluster-wide backend-selection seed: the first
+  controller to start creates it, the rest read it; every node must share it
+  or ingress-node changes re-steer flows). Treat that Secret as sensitive:
+  anyone who can read it can precompute which source ports hit which backend.
 
 ## Required per-cluster configuration & gotchas
 
@@ -98,8 +103,8 @@ the first time, then confirm with "Verify your deployment" below.
   privileged `node-prep` initContainer runs first for the one step that
   needs it (disabling `rp_filter`) — see
   `docs/decisions/servicelb-rp-filter-init-container.md`.
-- `rbac.yaml` — `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` for
-  the above.
+- `rbac.yaml` — `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` (plus
+  a `Role`/`RoleBinding` for the flow-hash seed Secret) for the above.
 
 ## Deployment model
 
@@ -162,6 +167,8 @@ kubectl get csr beep-controller -o jsonpath='{.status.certificate}' \
 #    cert's CN), never as the DaemonSet's own ServiceAccount.
 kubectl create clusterrolebinding beep-controller-csr \
   --clusterrole=servicelb-controller --user=beep-controller
+kubectl create rolebinding beep-controller-csr-flow-hash-seed -n kube-system \
+  --role=servicelb-controller-flow-hash-seed --user=beep-controller
 
 # 4. Assemble a kubeconfig with exactly the 4 fields beep-kubeconfig reads
 kubectl config set-cluster beep --server=https://<api-server>:6443 \

@@ -26,6 +26,7 @@ use beep::{
 use beep_controller::{
     apply::PinnedMaps,
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
+    seed::load_or_create_seed,
     status::ensure_node_ingress,
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -97,6 +98,13 @@ struct Args {
     /// Path to a kubeconfig with credentials for this DaemonSet's watch.
     #[arg(long, required_unless_present = "node_prep")]
     kubeconfig: Option<String>,
+
+    /// Namespace holding the `servicelb-flow-hash-seed` Secret: the cluster-wide
+    /// key for backend selection, created by the first controller to start
+    /// and read by the rest. Must be the namespace `deploy/rbac.yaml` grants
+    /// Secret access in.
+    #[arg(long, default_value = "kube-system")]
+    seed_namespace: String,
 
     /// `FWD_PENDING` max_entries (see `beep-ebpf`'s doc comment); a
     /// load-time DaemonSet config knob, not baked into the eBPF object.
@@ -487,7 +495,27 @@ async fn main() -> anyhow::Result<()> {
     // and a clear error instead of a silent skip if it somehow didn't run.
     ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
 
-    populate_config(&mut ebpf, &args.geneve_iface).context("populating CONFIG map")?;
+    let kubeconfig = args
+        .kubeconfig
+        .as_deref()
+        .expect("clap requires --kubeconfig unless --node-prep, which already returned above");
+    let creds = parse_kubeconfig(kubeconfig).context("parsing kubeconfig")?;
+    let connector =
+        build_tls_connector(&creds).context("building TLS connector from kubeconfig")?;
+    let client = Arc::new(HyperApiClient {
+        server: creds.server,
+        connector,
+        bearer: None,
+    });
+
+    // Before attach: a classifier must never run with a seed other nodes
+    // don't share. Failing here (apiserver down, RBAC missing) restarts the
+    // pod rather than serving with a private seed.
+    let flow_hash_seed = load_or_create_seed(&client, &args.seed_namespace)
+        .await
+        .context("loading cluster flow-hash seed")?;
+    populate_config(&mut ebpf, &args.geneve_iface, flow_hash_seed)
+        .context("populating CONFIG map")?;
     populate_uplink_config(&mut ebpf, &args.uplink_ifaces)
         .context("populating UPLINK_CONFIG map")?;
 
@@ -532,19 +560,6 @@ async fn main() -> anyhow::Result<()> {
     unsafe {
         libc::malloc_trim(0);
     }
-
-    let kubeconfig = args
-        .kubeconfig
-        .as_deref()
-        .expect("clap requires --kubeconfig unless --node-prep, which already returned above");
-    let creds = parse_kubeconfig(kubeconfig).context("parsing kubeconfig")?;
-    let connector =
-        build_tls_connector(&creds).context("building TLS connector from kubeconfig")?;
-    let client = Arc::new(HyperApiClient {
-        server: creds.server,
-        connector,
-        bearer: None,
-    });
 
     let node = NodeContext {
         node_ip: args

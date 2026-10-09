@@ -10,5 +10,6 @@
 
 pub mod apply;
 pub mod reconcile;
+pub mod seed;
 pub mod status;
 pub mod watch;

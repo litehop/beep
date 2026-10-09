@@ -286,6 +286,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "aya",
+ "base64",
  "beep",
  "beep-common",
  "beep-kubeconfig",

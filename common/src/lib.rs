@@ -346,6 +346,10 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
 #[derive(Clone, Copy)]
 pub struct Config {
     pub geneve_ifindex: u32,
+    pub _pad: u32,
+    /// Cluster-wide secret keying `flow_hash`; every node must hold the same
+    /// value or backend selection disagrees across ingress nodes. Never log.
+    pub flow_hash_seed: u64,
 }
 
 /// `UPLINK_CONFIG`'s value, keyed by ifindex: a hit is simultaneously
@@ -930,15 +934,20 @@ fn le_words(b: &[u8; 16]) -> [u32; 4] {
     ]
 }
 
-/// 32-bit hash of a flow's (client ip, client port, front) tuple. Fixed-length
-/// and little-endian word reads so every node and CPU computes the same value
-/// for the same flow. Hash once, then reduce with `slot_in_range` for as many
-/// ranges as needed (e.g. all endpoints, then only node-local ones) without
-/// re-hashing.
-pub fn flow_hash(client_ip: [u8; 16], client_port: u16, front: &LbFrontKey) -> u32 {
+/// 32-bit hash of a flow's (client ip, client port, front) tuple, keyed by the
+/// cluster-wide `Config::flow_hash_seed` so a client cannot precompute which
+/// source ports land on one backend. The seed is mixed into the initial state
+/// (not just XORed at the end), so it changes every intermediate value. This
+/// is a cheap seeded mixer, not a PRF. Fixed-length and little-endian word
+/// reads so every node and CPU computes the same value for the same flow and
+/// seed. Hash once, then reduce with `slot_in_range` for as many ranges as
+/// needed (e.g. all endpoints, then only node-local ones) without re-hashing.
+pub fn flow_hash(seed: u64, client_ip: [u8; 16], client_port: u16, front: &LbFrontKey) -> u32 {
     let c = le_words(&client_ip);
     let f = le_words(&front.front_ip);
     let mut h = 0x811C_9DC5_u32;
+    h = mix32(h, seed as u32);
+    h = mix32(h, (seed >> 32) as u32);
     h = mix32(h, c[0]);
     h = mix32(h, f[0]);
     h = mix32(h, c[1]);
@@ -967,12 +976,13 @@ pub fn slot_in_range(hash: u32, n: u32) -> Option<u32> {
 
 /// Backend slot in `[0, n)` for a flow; `None` when `n == 0`.
 pub fn select_backend_slot(
+    seed: u64,
     client_ip: [u8; 16],
     client_port: u16,
     front: &LbFrontKey,
     n: u32,
 ) -> Option<u32> {
-    slot_in_range(flow_hash(client_ip, client_port, front), n)
+    slot_in_range(flow_hash(seed, client_ip, client_port, front), n)
 }
 
 /// Whether `try_geneve_decap_forward` should reuse a previously-committed
@@ -1055,13 +1065,16 @@ mod tests {
     }
 
     #[test]
-    fn config_value_layout_is_one_u32_and_rewritten_every_load() {
+    fn config_layout_has_no_padding_and_seed_at_offset_8_or_ebpf_reads_a_wrong_seed() {
         // CONFIG is fully rewritten by the loader on every start, so only
         // its size matters for pin reuse -- and a size change is caught by
-        // the pinned-map value_size check. Growing/reshaping Config must
-        // revisit that: a same-size field swap would be absorbed by the
-        // rewrite, but a field the loader does not rewrite would not.
-        assert_eq!(core::mem::size_of::<Config>(), 4);
+        // the pinned-map value_size check (an old 4-byte pin is recreated).
+        // Implicit padding would be uninitialized bytes in the map value.
+        assert_eq!(core::mem::size_of::<Config>(), 16);
+        assert_eq!(core::mem::align_of::<Config>(), 8);
+        assert_eq!(core::mem::offset_of!(Config, geneve_ifindex), 0);
+        assert_eq!(core::mem::offset_of!(Config, _pad), 4);
+        assert_eq!(core::mem::offset_of!(Config, flow_hash_seed), 8);
     }
 
     // Every checksum update and tunnel-key field the eBPF side touches
@@ -2379,15 +2392,19 @@ mod tests {
         ipv4_mapped_v6(u32::from_ne_bytes((0x0a00_0000 + i).to_be_bytes()))
     }
 
+    const SEED: u64 = 0x0123_4567_89AB_CDEF;
+    const PINNED_SEEDED_HASH: u32 = 3_215_820_629;
+
     // Structured (sequential) inputs on purpose: real clients are sequential
     // addresses and ephemeral ports, which is what weak hashes bunch up on.
-    fn chi_square(client: fn(u32) -> [u8; 16], n: u32) -> f64 {
+    fn chi_square(seed: u64, client: fn(u32) -> [u8; 16], n: u32) -> f64 {
         let front = test_front();
         let total = 20_000u32;
         let mut counts = [0u32; 8];
         for i in 0..total {
             let slot =
-                select_backend_slot(client(i / 40), 32768 + (i % 40) as u16, &front, n).unwrap();
+                select_backend_slot(seed, client(i / 40), 32768 + (i % 40) as u16, &front, n)
+                    .unwrap();
             counts[slot as usize] += 1;
         }
         let expected = total as f64 / n as f64;
@@ -2400,20 +2417,57 @@ mod tests {
     #[test]
     fn same_flow_always_picks_same_slot_or_established_tcp_sessions_split() {
         let front = test_front();
-        let first = select_backend_slot(v4_client(7), 40000, &front, 5);
+        let first = select_backend_slot(SEED, v4_client(7), 40000, &front, 5);
         for _ in 0..100 {
-            assert_eq!(select_backend_slot(v4_client(7), 40000, &front, 5), first);
+            assert_eq!(
+                select_backend_slot(SEED, v4_client(7), 40000, &front, 5),
+                first
+            );
         }
         assert_eq!(
-            flow_hash(v6_client(7), 40000, &front),
-            flow_hash(v6_client(7), 40000, &front)
+            flow_hash(SEED, v6_client(7), 40000, &front),
+            flow_hash(SEED, v6_client(7), 40000, &front)
         );
     }
 
     #[test]
     fn hash_value_is_pinned_so_nodes_and_releases_agree_on_flow_placement() {
         let front = test_front();
-        assert_eq!(flow_hash(v4_client(1), 1234, &front), 529_365_140);
+        assert_eq!(
+            flow_hash(SEED, v4_client(1), 1234, &front),
+            PINNED_SEEDED_HASH
+        );
+    }
+
+    #[test]
+    fn different_seeds_reassign_most_flows_or_a_client_can_precompute_backends_offline() {
+        let front = test_front();
+        let (a, b) = (SEED, SEED ^ 1);
+        let total = 1000u32;
+        let moved = (0..total)
+            .filter(|&i| {
+                let pick = |s| {
+                    select_backend_slot(s, v4_client(i / 40), 32768 + (i % 40) as u16, &front, 8)
+                };
+                pick(a) != pick(b)
+            })
+            .count();
+        // Independent uniform placement over 8 slots moves ~7/8 of flows.
+        assert!(
+            moved > total as usize * 3 / 4,
+            "only {moved}/{total} flows moved between seeds"
+        );
+    }
+
+    #[test]
+    fn seed_high_and_low_halves_both_matter_or_half_the_secret_is_ignored() {
+        let front = test_front();
+        let base = flow_hash(SEED, v4_client(1), 1234, &front);
+        assert_ne!(flow_hash(SEED ^ 1, v4_client(1), 1234, &front), base);
+        assert_ne!(
+            flow_hash(SEED ^ (1 << 63), v4_client(1), 1234, &front),
+            base
+        );
     }
 
     #[test]
@@ -2421,7 +2475,8 @@ mod tests {
         let front = test_front();
         for n in 1..=64u32 {
             for i in 0..500u32 {
-                let s = select_backend_slot(v6_client(i), 1000 + i as u16, &front, n).unwrap();
+                let s =
+                    select_backend_slot(SEED, v6_client(i), 1000 + i as u16, &front, n).unwrap();
                 assert!(s < n, "slot {s} out of range for n={n}");
             }
         }
@@ -2433,7 +2488,7 @@ mod tests {
     #[test]
     fn zero_endpoints_yields_none_instead_of_a_bogus_slot() {
         let front = test_front();
-        assert_eq!(select_backend_slot(v4_client(1), 1, &front, 0), None);
+        assert_eq!(select_backend_slot(SEED, v4_client(1), 1, &front, 0), None);
         assert_eq!(slot_in_range(u32::MAX, 0), None);
     }
 
@@ -2442,7 +2497,7 @@ mod tests {
         let front = test_front();
         for i in 0..1000u32 {
             assert_eq!(
-                select_backend_slot(v4_client(i), i as u16, &front, 1),
+                select_backend_slot(SEED, v4_client(i), i as u16, &front, 1),
                 Some(0)
             );
         }
@@ -2450,55 +2505,59 @@ mod tests {
 
     #[test]
     fn v4_clients_spread_evenly_or_one_pod_is_overloaded() {
-        for n in 2..=8 {
-            let x = chi_square(v4_client, n);
-            // df<=7; 30 is beyond the p=0.001 critical value (24.3).
-            assert!(x < 30.0, "n={n} chi-square {x}");
+        for seed in [0, SEED, u64::MAX] {
+            for n in 2..=8 {
+                let x = chi_square(seed, v4_client, n);
+                // df<=7; 30 is beyond the p=0.001 critical value (24.3).
+                assert!(x < 30.0, "seed={seed:#x} n={n} chi-square {x}");
+            }
         }
     }
 
     #[test]
     fn v6_clients_spread_evenly_or_one_pod_is_overloaded() {
-        for n in 2..=8 {
-            let x = chi_square(v6_client, n);
-            assert!(x < 30.0, "n={n} chi-square {x}");
+        for seed in [0, SEED, u64::MAX] {
+            for n in 2..=8 {
+                let x = chi_square(seed, v6_client, n);
+                assert!(x < 30.0, "seed={seed:#x} n={n} chi-square {x}");
+            }
         }
     }
 
     #[test]
     fn every_tuple_field_influences_the_hash_or_those_flows_pile_onto_one_pod() {
         let front = test_front();
-        let base = flow_hash(v4_client(1), 1000, &front);
+        let base = flow_hash(SEED, v4_client(1), 1000, &front);
         let mut other_front = front;
         other_front.front_port = 81;
         let mut other_proto = front;
         other_proto.proto = 17;
         let mut other_front_ip = front;
         other_front_ip.front_ip[15] ^= 1;
-        assert_ne!(flow_hash(v4_client(2), 1000, &front), base);
-        assert_ne!(flow_hash(v4_client(1), 1001, &front), base);
-        assert_ne!(flow_hash(v4_client(1), 1000, &other_front), base);
-        assert_ne!(flow_hash(v4_client(1), 1000, &other_proto), base);
-        assert_ne!(flow_hash(v4_client(1), 1000, &other_front_ip), base);
+        assert_ne!(flow_hash(SEED, v4_client(2), 1000, &front), base);
+        assert_ne!(flow_hash(SEED, v4_client(1), 1001, &front), base);
+        assert_ne!(flow_hash(SEED, v4_client(1), 1000, &other_front), base);
+        assert_ne!(flow_hash(SEED, v4_client(1), 1000, &other_proto), base);
+        assert_ne!(flow_hash(SEED, v4_client(1), 1000, &other_front_ip), base);
     }
 
     #[test]
     fn every_ip_byte_influences_the_hash_or_ips_sharing_a_suffix_pile_onto_one_pod() {
         let front = test_front();
         let client = v6_client(0x0102_0304);
-        let base = flow_hash(client, 1000, &front);
+        let base = flow_hash(SEED, client, 1000, &front);
         for i in 0..16 {
             let mut c = client;
             c[i] ^= 0x80;
             assert_ne!(
-                flow_hash(c, 1000, &front),
+                flow_hash(SEED, c, 1000, &front),
                 base,
                 "client_ip byte {i} ignored"
             );
             let mut f = front;
             f.front_ip[i] ^= 0x80;
             assert_ne!(
-                flow_hash(client, 1000, &f),
+                flow_hash(SEED, client, 1000, &f),
                 base,
                 "front_ip byte {i} ignored"
             );
@@ -2508,17 +2567,17 @@ mod tests {
     #[test]
     fn one_hash_serves_full_and_local_subrange_or_local_preference_needs_a_second_hash() {
         let front = test_front();
-        let h = flow_hash(v4_client(3), 5555, &front);
+        let h = flow_hash(SEED, v4_client(3), 5555, &front);
         let all = slot_in_range(h, 6).unwrap();
         let local = slot_in_range(h, 2).unwrap();
         assert!(all < 6 && local < 2);
         assert_eq!(
             Some(all),
-            select_backend_slot(v4_client(3), 5555, &front, 6)
+            select_backend_slot(SEED, v4_client(3), 5555, &front, 6)
         );
         assert_eq!(
             Some(local),
-            select_backend_slot(v4_client(3), 5555, &front, 2)
+            select_backend_slot(SEED, v4_client(3), 5555, &front, 2)
         );
     }
 }
