@@ -37,10 +37,10 @@ use aya::{
 use beep::{
     attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
     front_swap::{apply_fronts, DesiredFront},
-    load_ebpf, local_pod_ips, parse_fixture, populate_config, populate_uplink_config, random_seed,
-    stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
-    DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
-    DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
+    load_ebpf, local_pod_ips, parse_fixture, parse_iface_name, populate_config,
+    populate_uplink_config, random_seed, stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture,
+    DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES, DEFAULT_FRONT_META_MAX_ENTRIES,
+    DEFAULT_NODE_ALLOW_MAX_ENTRIES, DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
 };
 use beep_common::{
     wire_port, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
@@ -134,11 +134,11 @@ struct Args {
     /// uplinks (e.g. `eth0` + `wg0`) admits, and symmetrically returns, client
     /// traffic on any of them
     /// (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
-    #[arg(long = "uplink-iface", required = true)]
+    #[arg(long = "uplink-iface", required = true, value_parser = parse_iface_name)]
     uplink_ifaces: Vec<String>,
 
     /// Geneve tunnel interface (hook: geneve ingress, both directions).
-    #[arg(long, default_value = "geneve0")]
+    #[arg(long, default_value = "geneve0", value_parser = parse_iface_name)]
     geneve_iface: String,
 
     /// Directory on a bpffs mount where programs/links are pinned.
@@ -878,6 +878,18 @@ mod tests {
         "--node-ip",
         "10.0.0.6",
     ];
+
+    #[test]
+    fn bad_iface_flags_fail_at_parse_not_as_sysfs_paths() {
+        for flag in ["--uplink-iface", "--geneve-iface"] {
+            let mut argv = REQUIRED_ARGS.to_vec();
+            argv.extend([flag, "../eth0"]);
+            assert!(
+                Args::try_parse_from(argv).is_err(),
+                "{flag} ../eth0 must be rejected before it is read as /sys/class/net/../eth0"
+            );
+        }
+    }
 
     // The 17th dual-stack node (or 65th dual-stack pod) is silently
     // unreachable if the caps regress below the sized defaults.

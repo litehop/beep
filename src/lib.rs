@@ -597,6 +597,31 @@ fn recreate_mismatched_pins(
     Ok(removed)
 }
 
+/// Kernel `IFNAMSIZ` includes the trailing NUL, so a name is at most 15 bytes.
+const IFNAME_MAX_BYTES: usize = 15;
+
+/// clap `value_parser` for interface-name flags: names are interpolated into
+/// `/sys/class/net/<name>/...`, so anything the kernel would not accept as a
+/// name (and any path component like `/`, `.`, `..`) must be rejected up front.
+pub fn parse_iface_name(name: &str) -> Result<String, String> {
+    if name.is_empty() {
+        return Err("interface name must not be empty".into());
+    }
+    if name.len() > IFNAME_MAX_BYTES {
+        return Err(format!(
+            "interface name {name:?} is {} bytes; the kernel limit is {IFNAME_MAX_BYTES}",
+            name.len()
+        ));
+    }
+    if name.contains('/') {
+        return Err(format!("interface name {name:?} must not contain '/'"));
+    }
+    if name == "." || name == ".." {
+        return Err(format!("interface name {name:?} is not a valid name"));
+    }
+    Ok(name.to_owned())
+}
+
 /// Reads the uplink's Linux ARPHRD_* hardware type from sysfs -- the no_std
 /// `beep-ebpf` classifiers have no syscall of their own to tell a real
 /// NIC/veth apart from an L3-only overlay like WireGuard, so the loader
@@ -863,6 +888,25 @@ mod tests {
     use super::*;
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn iface_name_accepts_normal_and_15_byte_names() {
+        assert_eq!(parse_iface_name("eth0").unwrap(), "eth0");
+        assert!(
+            parse_iface_name("123456789012345").is_ok(),
+            "a 15-byte name is valid (IFNAMSIZ 16 includes the NUL)"
+        );
+    }
+
+    #[test]
+    fn iface_name_rejects_forms_that_would_become_sysfs_paths_or_never_exist() {
+        for bad in ["", "1234567890123456", "../eth0", "a/b", ".", ".."] {
+            assert!(
+                parse_iface_name(bad).is_err(),
+                "{bad:?} must be rejected at parse, not read as a sysfs path"
+            );
+        }
+    }
 
     #[test]
     fn parse_ifindex_accepts_sysfs_newline_and_rejects_garbage_and_zero() {

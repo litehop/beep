@@ -19,7 +19,7 @@ use anyhow::Context;
 use aya::programs::TcAttachType;
 use beep::{
     attach_and_pin, bump_memlock_rlimit, disable_rp_filter, ensure_geneve_iface, load_ebpf,
-    populate_config, populate_uplink_config, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
+    parse_iface_name, populate_config, populate_uplink_config, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
     DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
     DEFAULT_POD_TARGETS_MAX_ENTRIES,
 };
@@ -59,11 +59,11 @@ struct Args {
     /// a backend node routes the client reply out its client-facing NIC, not
     /// the tunnel -- attaching this to the tunnel device would leak a raw
     /// backend-sourced reply out the real uplink unencapsulated.
-    #[arg(long = "uplink-iface", required_unless_present = "node_prep")]
+    #[arg(long = "uplink-iface", required_unless_present = "node_prep", value_parser = parse_iface_name)]
     uplink_ifaces: Vec<String>,
 
     /// Geneve tunnel interface (hook: geneve ingress, both directions).
-    #[arg(long, default_value = "geneve0")]
+    #[arg(long, default_value = "geneve0", value_parser = parse_iface_name)]
     geneve_iface: String,
 
     /// Directory on a bpffs mount where programs/links/maps are pinned.
