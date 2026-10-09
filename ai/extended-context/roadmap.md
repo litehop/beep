@@ -19,9 +19,9 @@ on it; this file is a snapshot.
 | # | Gate | Status | What remains | Tracking |
 | --- | --- | --- | --- | --- |
 | 1 | Multi-interface | Shipped as multi-symmetric-uplink in v0.2.0 | Only deferred P4 items remain | `beep-eix` |
-| 2 | Dual-stack IPv6, incl. IPv6-only nodes (no NAT64/DNS64) | Implemented; controller-driven dual-stack and IPv6-only-node round trips pass on the Lima k3s rig (#168) | IPv6-only validated cross-node on a real fleet, which depends on gate 3; perf `beep-7qm.15` | `beep-7qm` |
+| 2 | Dual-stack IPv6, incl. IPv6-only nodes (no NAT64/DNS64) | Implemented; controller-driven dual-stack and IPv6-only-node round trips pass on the Lima k3s rig (#168) | IPv6-only validated cross-node on a real fleet, which depends on gate 3 | `beep-7qm` |
 | 3 | Tests on actual VPS / real hardware | Not started; needs operator-provisioned nodes | Real-fleet round trip: genuinely external client IP, provider uRPF/NAT, MTU, IPv6-only, native-v6 registry pull, documented k3s+u7s real-hardware deploy | `beep-903` |
-| 4 | Performance + code-quality audit | Started: `unsafe` audit done (#182); follow-ons filed | `beep-a32h`, `beep-l8xn`, `beep-noak`, `beep-9si3`; perf `beep-xfa.5` (measure-first) | `beep-xfa.5`, `beep-7qm.15` |
+| 4 | Performance + code-quality audit | Started: `unsafe` audit done (#182); follow-ons filed | `beep-a32h`, `beep-l8xn`, `beep-noak`, `beep-9si3`; perf (measure-first) `beep-xfa.5`, `beep-7qm.15` | `beep-xfa` |
 | 5 | Red-team security audit | Not started | No bead yet; file when gate 3 is underway | none |
 | 6 | Documentation refinement | Not started | Last by design | none |
 
@@ -29,8 +29,8 @@ Also a v1.0 functional requirement: selective conntrack eviction on endpoint
 removal (firm, operator 2026-09-19). Single-node eviction is smoke-proven
 (`beep-03i`, batched in #179, reconcile retry in #183). OPEN P1: `beep-eto0` --
 the ingress-side sweep misses remote backends, so flows to a departed remote
-pod blackhole since pin-steering landed. Its fix, plus `beep-b6qw` (sweep on
-pod-IP reuse, operator option C), is in PR #200.
+pod blackhole since pin-steering landed. Fix pending in PR #200 (not merged), with `beep-b6qw` (sweep on
+pod-IP reuse, operator option C).
 
 ## Critical path
 
@@ -48,7 +48,7 @@ in-repo functional tail below, then gate 4.
    36 -> 40 B) -> `.3` (node-local preference) -> `beep-vksr` (size
    `FRONT_ENDPOINTS`, re-derive the map-memory tripwire; blocks `.6`) ->
    `.6` controller emits all ready endpoints -> `.7` smoke -> `.8` docs.
-3. Gate 4 follow-ons above, then `beep-xfa.5` and `beep-7qm.15`.
+3. Gate 4 items above.
 
 Open for the operator: `mayor-xjy5o` (QUIC CID keying ADR, Proposed);
 `beep-wtx5` (worker MCP tools; verify after a session restart).
