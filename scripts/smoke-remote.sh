@@ -695,6 +695,62 @@ flow_table_has_pod "$POD_IP" || {
 }
 echo "POD-IP-REUSE ROUND-TRIP: PASS (fresh flow through reused pod IP ${POD_IP} routes correctly; provably NOT a resurrected stale entry, since the EVICTION ASSERTION above already proved zero rows for this pod survived before this new flow was ever established)"
 
+echo "==> pin steering: a flow held open while its front is re-pointed at another pod must keep reaching the pod that holds its state"
+PIN_STEER_FIFO="/tmp/beep-smoke-pin-steer-fifo"
+PIN_STEER_BACKEND_IN="/tmp/beep-smoke-pin-steer-backend.in"
+PIN_STEER_MSG="PINMSG"
+rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
+mkfifo "$PIN_STEER_FIFO"
+pin_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
+nohup bash -c "sleep 20 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
+disown
+sleep 0.5
+nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG} ) | timeout 20 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
+disown
+for _ in $(seq 1 30); do
+  pin_flows_now=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
+  [ -n "$pin_flows_now" ] && [ "$pin_flows_now" -ge "$((pin_flows_before + 2))" ] && break
+  sleep 0.2
+done
+[ -n "$pin_flows_now" ] && [ "$pin_flows_now" -ge "$((pin_flows_before + 2))" ] || {
+  echo "FAIL: pin-steering flow never established in FLOW_TABLE (before $pin_flows_before, saw $pin_flows_now)" >&2
+  exit 1
+}
+pin_want=$(pod_ip_v6_json_bytes "$POD_IP")
+echo "FLOW_TABLE forward entries pinned to ${POD_IP} (bpftool):"
+map_json "$PIN_DIR/FLOW_TABLE" | jq -c --argjson want "$pin_want" '.[] | select(.key[37] == "0x00" and .value[16:32] == $want)' | tail -n 2
+
+EVICT_FRONT_POD_IP="$REPLACEMENT_POD_IP"
+stop_loader
+start_loader "$EVICT_LOADER_LOG_REPLACEMENT"
+wait_for_attach "$EVICT_LOADER_LOG_REPLACEMENT"
+printf '\n' 1<>"$PIN_STEER_FIFO"
+for _ in $(seq 1 25); do
+  grep -q "$PIN_STEER_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
+  sleep 0.2
+done
+grep -q "$PIN_STEER_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null || {
+  echo "FAIL: after the front was re-pointed at ${REPLACEMENT_POD_IP}, a packet of the established flow did not reach its pinned pod ${POD_IP} (backend received: '$(cat "$PIN_STEER_BACKEND_IN" 2>/dev/null)'). Ingress re-resolved the front instead of following the pin, so a live connection would land on a pod with no state for it." >&2
+  exit 1
+}
+echo "PIN-STEERING (established): PASS (flow kept pod ${POD_IP} after its front was re-pointed at ${REPLACEMENT_POD_IP})"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nREPLACEMENT' > "$REPLACEMENT_RESPONSE_FILE"
+nohup nc -l -N "$REPLACEMENT_POD_IP" "$EVICT_TARGET_PORT" < "$REPLACEMENT_RESPONSE_FILE" >"$REPLACEMENT_BACKEND_LOG" 2>&1 &
+disown
+sleep 0.5
+pin_new_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
+[ "$pin_new_body" = "REPLACEMENT" ] || {
+  echo "FAIL: a NEW flow after the re-point must reach ${REPLACEMENT_POD_IP}, got: $pin_new_body" >&2
+  exit 1
+}
+echo "PIN-STEERING (new flow): PASS (a fresh flow followed the new endpoint ${REPLACEMENT_POD_IP})"
+EVICT_FRONT_POD_IP="$POD_IP"
+stop_loader
+start_loader "$EVICT_LOADER_LOG_REUSE"
+wait_for_attach "$EVICT_LOADER_LOG_REUSE"
+pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
+rm -f "$PIN_STEER_FIFO" "$PIN_STEER_BACKEND_IN"
+
 echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hostNetwork backend), a fresh outbound connection from it must still leave the uplink"
 # A hostNetwork backend's pod IP IS the node's address, so POD_TARGETS holds
 # it; the node's own SSH/kubelet/apiserver connections then pass the hook-3

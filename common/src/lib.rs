@@ -985,6 +985,53 @@ pub fn select_backend_slot(
     slot_in_range(flow_hash(seed, client_ip, client_port, front), n)
 }
 
+/// What ingress does with a packet addressed to a front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressSteer {
+    /// Front has no endpoints: not provably servable, leave the packet alone.
+    Pass,
+    /// The front has endpoints but the chosen row is unreadable: fail closed
+    /// rather than leak a front-addressed packet to the host stack.
+    Drop,
+    /// Send to this backend; the caller pins it only if the flow has no pin.
+    Forward(LbFrontBackend),
+}
+
+/// Ingress backend choice for one packet of a front. An existing pin
+/// (`established` from `FLOW_TABLE`, else `pending` from `FWD_PENDING`) always
+/// wins over the hash: a changed endpoint count or slot order must never move
+/// a live connection to a pod holding no state for it. Only a flow with no pin
+/// reduces `hash` (a `flow_hash` of the flow) over `meta.count` and reads the
+/// chosen row through `endpoint_at`.
+pub fn ingress_steer(
+    meta: FrontMeta,
+    established: Option<LbFrontBackend>,
+    pending: Option<LbFrontBackend>,
+    hash: u32,
+    front: LbFrontKey,
+    endpoint_at: impl FnOnce(FrontEndpointKey) -> Option<FrontEndpoint>,
+) -> IngressSteer {
+    if meta.count == 0 {
+        return IngressSteer::Pass;
+    }
+    if let Some(backend) = established.or(pending) {
+        return IngressSteer::Forward(backend);
+    }
+    let Some(slot) = slot_in_range(hash, meta.count as u32) else {
+        return IngressSteer::Drop;
+    };
+    let key = FrontEndpointKey {
+        front,
+        generation: meta.generation,
+        slot: slot as u16,
+        _pad: 0,
+    };
+    match endpoint_at(key) {
+        Some(endpoint) => IngressSteer::Forward(endpoint.backend),
+        None => IngressSteer::Drop,
+    }
+}
+
 /// Whether `try_geneve_decap_forward` should reuse a previously-committed
 /// backend-src-port for this flow, or run `resolve_backend_src_port`'s probe
 /// fresh. `resolve_backend_src_port`'s occupancy check only proves
@@ -2579,5 +2626,158 @@ mod tests {
             Some(local),
             select_backend_slot(SEED, v4_client(3), 5555, &front, 2)
         );
+    }
+
+    fn backend_n(n: u8) -> LbFrontBackend {
+        LbFrontBackend {
+            backend_node_ip: [n; 16],
+            pod_ip: [n.wrapping_add(100); 16],
+        }
+    }
+
+    fn meta(generation: u32, count: u16) -> FrontMeta {
+        FrontMeta {
+            generation,
+            count,
+            flags: 0,
+        }
+    }
+
+    // Endpoint table for one front: slot i -> backend_n(order[i]).
+    fn table(order: &[u8]) -> impl Fn(FrontEndpointKey) -> Option<FrontEndpoint> + '_ {
+        move |k| {
+            order.get(k.slot as usize).map(|&n| FrontEndpoint {
+                backend: backend_n(n),
+                target_port: 0,
+                _pad: [0; 6],
+            })
+        }
+    }
+
+    fn steer_new_flow(client: [u8; 16], port: u16, order: &[u8]) -> IngressSteer {
+        let front = test_front();
+        ingress_steer(
+            meta(1, order.len() as u16),
+            None,
+            None,
+            flow_hash(SEED, client, port, &front),
+            front,
+            table(order),
+        )
+    }
+
+    #[test]
+    fn established_flow_keeps_its_pod_when_endpoints_change_or_reorder_or_live_tcp_breaks() {
+        let front = test_front();
+        for client in [v4_client as fn(u32) -> [u8; 16], v6_client] {
+            for i in 0..200u32 {
+                let port = 32768 + i as u16;
+                let hash = flow_hash(SEED, client(i), port, &front);
+                let IngressSteer::Forward(pinned) = steer_new_flow(client(i), port, &[1, 2, 3, 4])
+                else {
+                    panic!("new flow must forward");
+                };
+                for after in [&[1u8, 2, 3, 4, 5][..], &[4, 3, 2, 1], &[9], &[7, 8]] {
+                    let steered = ingress_steer(
+                        meta(2, after.len() as u16),
+                        Some(pinned),
+                        None,
+                        hash,
+                        front,
+                        table(after),
+                    );
+                    assert_eq!(steered, IngressSteer::Forward(pinned));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_flow_keeps_its_pod_when_endpoints_change_or_first_reply_lands_elsewhere() {
+        let front = test_front();
+        let pending = backend_n(3);
+        let steered = ingress_steer(
+            meta(2, 2),
+            None,
+            Some(pending),
+            flow_hash(SEED, v4_client(1), 4000, &front),
+            front,
+            table(&[8, 9]),
+        );
+        assert_eq!(steered, IngressSteer::Forward(pending));
+    }
+
+    #[test]
+    fn established_pin_beats_stale_pending_pin() {
+        let front = test_front();
+        let steered = ingress_steer(
+            meta(1, 2),
+            Some(backend_n(1)),
+            Some(backend_n(2)),
+            0,
+            front,
+            table(&[5, 6]),
+        );
+        assert_eq!(steered, IngressSteer::Forward(backend_n(1)));
+    }
+
+    #[test]
+    fn new_flows_spread_across_endpoints_v4_and_v6_or_one_pod_takes_all_load() {
+        for client in [v4_client as fn(u32) -> [u8; 16], v6_client] {
+            let mut seen = [0u32; 4];
+            for i in 0..2000u32 {
+                match steer_new_flow(client(i / 40), 32768 + (i % 40) as u16, &[0, 1, 2, 3]) {
+                    IngressSteer::Forward(b) => seen[b.backend_node_ip[0] as usize] += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert!(seen.iter().all(|&c| c > 300), "skewed spread: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn new_flow_uses_the_row_at_its_hashed_slot() {
+        let front = test_front();
+        let hash = flow_hash(SEED, v6_client(9), 5000, &front);
+        let want = slot_in_range(hash, 5).unwrap() as u16;
+        let mut asked = None;
+        let _ = ingress_steer(meta(7, 5), None, None, hash, front, |k| {
+            asked = Some(k);
+            None
+        });
+        assert_eq!(
+            asked,
+            Some(FrontEndpointKey {
+                front,
+                generation: 7,
+                slot: want,
+                _pad: 0
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_row_miss_drops_instead_of_leaking_front_traffic_to_the_host() {
+        let front = test_front();
+        for client in [v4_client(1), v6_client(1)] {
+            let steered = ingress_steer(
+                meta(1, 3),
+                None,
+                None,
+                flow_hash(SEED, client, 1234, &front),
+                front,
+                |_| None,
+            );
+            assert_eq!(steered, IngressSteer::Drop);
+        }
+    }
+
+    #[test]
+    fn front_without_endpoints_passes_untouched_even_with_a_stale_pin() {
+        let front = test_front();
+        let steered = ingress_steer(meta(1, 0), Some(backend_n(1)), None, 0, front, |_| {
+            panic!("no row may be read when count is 0")
+        });
+        assert_eq!(steered, IngressSteer::Pass);
     }
 }
