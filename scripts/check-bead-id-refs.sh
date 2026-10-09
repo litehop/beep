@@ -18,6 +18,10 @@
 # BEEP_NAME_ALLOWED_TOKENS below filters those back out, so only a real
 # `beep-` bead ID (e.g. beep-xxx) trips this guard.
 #
+# The `beep-` arm additionally requires the token to be an existing bead ID
+# (one `bd list` call) so identifiers like beep-flow-hash-seed pass; if bd is
+# unavailable it falls back to flagging every shape match.
+#
 # Exclusions:
 #   .beads/  -- bd's own JSONL export legitimately contains bead IDs.
 #   ai/      -- findings/decisions docs legitimately cite the bead they came from.
@@ -138,6 +142,27 @@ if [ -n "$beep_raw" ]; then
   beep_matches=$(printf '%s' "$beep_raw" | grep -vE ":${BEEP_NAME_ALLOWED_TOKENS}" || true)
 else
   beep_matches=""
+fi
+
+# The shape alone also matches ordinary identifiers (beep-flow-hash-seed ->
+# beep-flow). When the tracker is reachable, only a token that is an existing
+# bead ID rots; otherwise (bd missing/failing/empty) keep every shape match.
+if [ -n "$beep_matches" ]; then
+  if bead_ids=$(bd list --all --flat --no-pager -n 0 --brief --json 2>/dev/null \
+      | grep -oE '^ {4}"id": "[^"]+"' | sed -E 's/^ +"id": "([^"]+)"/\1/') \
+      && [ -n "$bead_ids" ]; then
+    real_matches=""
+    while IFS= read -r line; do
+      token=${line##*:}
+      if printf '%s\n' "$bead_ids" | grep -qxF -- "${token%%.*}"; then
+        real_matches="${real_matches:+$real_matches
+}$line"
+      fi
+    done <<EOF
+$beep_matches
+EOF
+    beep_matches=$real_matches
+  fi
 fi
 if [ -n "$beep_matches" ]; then
   matches="${matches:+$matches
