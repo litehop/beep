@@ -217,7 +217,7 @@ pub struct Endpoint {
     pub ports: Vec<u16>,
     /// `endpoints[].targetRef.uid`: the owning pod's identity, absent when the
     /// slice carries no `targetRef`. Lets the controller notice a pod IP
-    /// handed to a different pod (`pod_target_uids_for_node`).
+    /// handed to a different pod (`cluster_backends`).
     pub pod_uid: Option<String>,
 }
 
@@ -254,10 +254,10 @@ pub struct DesiredEntries {
     /// (`beep::front_swap`).
     pub fronts: HashMap<LbFrontKey, DesiredFront>,
     pub pod_targets: HashSet<[u8; 16]>,
-    /// Owning pod uid of each `pod_targets` IP that has one
-    /// (`pod_target_uids_for_node`). Drives the reuse sweep in
-    /// `PinnedMaps::apply`.
-    pub pod_target_uids: HashMap<[u8; 16], String>,
+    /// Every ready backend pod IP in the cluster with its owning pod uid, if
+    /// known (`cluster_backends`). Drives the departed/reused sweep in
+    /// `PinnedMaps::apply`; `pod_targets` stays this node's local subset.
+    pub cluster_backends: HashMap<[u8; 16], Option<String>>,
     /// Desired `NODE_ALLOW` contents: every known node's address, wrapped in
     /// `tunnel_remote_v6` (`NODE_ALLOW`'s key is `[u8; 16]`) over the
     /// host-native value -- the same convention `LbFrontBackend::
@@ -392,24 +392,24 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
     pod_targets
 }
 
-/// For each `pod_targets_for_node` member whose endpoint carries a pod uid,
-/// that uid. Endpoints without a `targetRef` are absent (identity unknown, so
-/// never treated as a reuse).
-pub fn pod_target_uids_for_node(
-    slices: &[EndpointSliceView],
-    node: &NodeContext,
-) -> HashMap<[u8; 16], String> {
-    let mut uids = HashMap::new();
-    for slice in slices {
-        for ep in &slice.endpoints {
-            if let Some(uid) = &ep.pod_uid {
-                if ep.ready && ep.node_addrs.contains(&node.node_ip) && is_admitted(ep, node) {
-                    uids.insert(wire_ip_v6(ep.pod_ip), uid.clone());
-                }
-            }
+/// Every ready endpoint any front of this node can route to, wherever it is
+/// hosted, keyed by wire pod IP with its owning pod uid when the slice carries
+/// a `targetRef`. Unlike `pod_targets_for_node` this is cluster-wide: the
+/// conntrack pins a node holds for a flow name the backend pod, which is
+/// usually on another node.
+pub fn cluster_backends(slices: &[EndpointSliceView]) -> HashMap<[u8; 16], Option<String>> {
+    let mut backends: HashMap<[u8; 16], Option<String>> = HashMap::new();
+    for ep in slices
+        .iter()
+        .flat_map(|s| s.endpoints.iter())
+        .filter(|e| e.ready)
+    {
+        let uid = backends.entry(wire_ip_v6(ep.pod_ip)).or_default();
+        if uid.is_none() {
+            uid.clone_from(&ep.pod_uid);
         }
     }
-    uids
+    backends
 }
 
 /// The observational complement of `pod_targets_for_node`: every ready,
@@ -919,6 +919,38 @@ mod tests {
             HashSet::from([wire_ip_v6(IpAddr::V4(local_pod))]),
             "POD_TARGETS must contain only pods THIS node hosts -- a remote node's pod leaking \
              in here would misclassify that node's traffic as this node's own backend"
+        );
+    }
+
+    // The ingress node pins flows to backends hosted anywhere, so its departed/
+    // reused sweep must see every ready backend, not just the local ones.
+    #[test]
+    fn cluster_backends_spans_nodes_skips_not_ready_and_keeps_known_uids() {
+        let this_node = Ipv4Addr::new(10, 0, 0, 5);
+        let other_node = Ipv4Addr::new(10, 0, 0, 6);
+        let mut local = ready_endpoint(Ipv4Addr::new(10, 244, 0, 9), this_node, vec![8080]);
+        local.pod_uid = Some("local".to_owned());
+        let mut remote = ready_endpoint(Ipv4Addr::new(10, 244, 1, 9), other_node, vec![8080]);
+        remote.pod_uid = Some("remote".to_owned());
+        let mut unready = ready_endpoint(Ipv4Addr::new(10, 244, 1, 10), other_node, vec![8080]);
+        unready.ready = false;
+        let anonymous = ready_endpoint(Ipv4Addr::new(10, 244, 1, 11), other_node, vec![8080]);
+
+        let backends = cluster_backends(&[EndpointSliceView {
+            endpoints: vec![local, remote, unready, anonymous],
+        }]);
+
+        let wire =
+            |third: u8, last: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, third, last)));
+        assert_eq!(
+            backends,
+            HashMap::from([
+                (wire(0, 9), Some("local".to_owned())),
+                (wire(1, 9), Some("remote".to_owned())),
+                (wire(1, 11), None),
+            ]),
+            "a remote ready pod must be tracked or its pins on this node outlive it; a not-ready \
+             pod must not, or it never counts as departed"
         );
     }
 

@@ -753,9 +753,12 @@ impl WatchState {
             aggregate
                 .pod_targets
                 .extend(reconcile::pod_targets_for_node(&endpoint_slices, node));
-            aggregate
-                .pod_target_uids
-                .extend(reconcile::pod_target_uids_for_node(&endpoint_slices, node));
+            for (ip, uid) in reconcile::cluster_backends(&endpoint_slices) {
+                let known = aggregate.cluster_backends.entry(ip).or_default();
+                if known.is_none() {
+                    *known = uid;
+                }
+            }
             aggregate
                 .rejected
                 .extend(reconcile::rejected_endpoints_for_node(
@@ -1249,6 +1252,83 @@ mod tests {
             [10, 244, 0, 9],
             "slice_a's endpoint must survive slice_b's deletion -- losing it too would \
              blackhole this front instead of just narrowing its candidate set"
+        );
+    }
+
+    // Conntrack pins to a backend live on the ingress node, but POD_TARGETS only
+    // holds this node's own pods: the departed/reused sweep needs the
+    // cluster-wide set, or a remote pod's pins outlive the pod.
+    #[test]
+    fn desired_tracks_remote_backends_cluster_wide_but_pod_targets_stay_local() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        for (name, ip) in [("node-a", "10.0.0.5"), ("node-b", "10.0.0.6")] {
+            state.apply_node_event(&serde_json::json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": name},
+                    "status": {"addresses": [{"type": "InternalIP", "address": ip}]},
+                },
+            }));
+        }
+        state.mark_nodes_listed();
+        let slice = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "svc-a-aaaaa",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [
+                    {"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true},
+                     "targetRef": {"kind": "Pod", "uid": "local"}},
+                    {"addresses": ["10.244.1.9"], "nodeName": "node-b", "conditions": {"ready": true},
+                     "targetRef": {"kind": "Pod", "uid": "remote"}},
+                    {"addresses": ["10.244.1.10"], "nodeName": "node-b", "conditions": {"ready": false}},
+                ],
+            },
+        });
+        state.apply_endpoint_slice_event(&slice);
+        let ingress = node(Ipv4Addr::new(10, 0, 0, 5));
+        let wire = |ip: Ipv4Addr| wire_ip_v6(IpAddr::V4(ip));
+
+        let desired = state.desired(&ingress);
+        assert_eq!(
+            desired.pod_targets,
+            [wire(Ipv4Addr::new(10, 244, 0, 9))].into_iter().collect(),
+            "decap admission stays this node's own pods only"
+        );
+        assert_eq!(
+            desired.cluster_backends,
+            HashMap::from([
+                (wire(Ipv4Addr::new(10, 244, 0, 9)), Some("local".to_owned())),
+                (
+                    wire(Ipv4Addr::new(10, 244, 1, 9)),
+                    Some("remote".to_owned())
+                ),
+            ]),
+            "every ready backend cluster-wide, with its uid; not-ready pods excluded"
+        );
+
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "DELETED",
+            "object": slice["object"],
+        }));
+        assert!(
+            state.desired(&ingress).cluster_backends.is_empty(),
+            "a departed backend must leave the set so the sweep sees it go"
         );
     }
 
