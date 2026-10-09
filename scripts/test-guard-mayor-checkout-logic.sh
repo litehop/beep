@@ -75,6 +75,40 @@ done
 run_hook agent-1 "$MAYOR" "gh pr comment 1 --body 'run git checkout main'"
 expect "git checkout mentioned inside a comment body is not a git invocation" 0
 
+run_hook agent-1 "$MAYOR" "gh pr comment 1 --body \"ok; git checkout x && git reset --hard | done\""
+expect "separators inside quotes do not split (reviewers' comments must not be blocked)" 0
+
+run_hook agent-1 "$MAYOR" "gh pr comment 1 --body \"say \\\"hi; there\\\"\" ; git checkout x"
+expect "a real command after a quoted argument is still checked (quote tracking must not swallow the rest)" 2
+
+run_hook agent-1 "$MAYOR" "echo \"\$(git checkout x)\""
+expect "command substitution inside double quotes still runs git and is blocked" 2
+
+run_hook agent-1 "$MAYOR" "echo \"\`git reset --hard\`\""
+expect "backtick substitution inside double quotes is blocked" 2
+
+for ro in "git stash list" "git stash show -p" "git restore --staged f" "git restore -S f"; do
+  run_hook agent-1 "$MAYOR" "$ro"
+  expect "read-only '$ro' in mayor checkout is allowed (does not touch HEAD or worktree)" 0
+done
+
+for rw in "git stash" "git stash pop" "git stash push" "git restore f" "git restore --staged --worktree f" "git restore -SW f"; do
+  run_hook agent-1 "$MAYOR" "$rw"
+  expect "'$rw' in mayor checkout is still blocked (rewrites the mayor's working tree)" 2
+done
+
+run_hook agent-1 "$WT" "cd - && git reset --hard"
+expect "cd - leaves an unknown dir, so a following reset fails closed (could land in the mayor checkout)" 2
+
+run_hook agent-1 "$WT" "cd \$MAYOR_DIR && git checkout main"
+expect "cd to an unexpanded variable fails closed" 2
+
+run_hook agent-1 "$WT" "cd - && git status"
+expect "read-only git after cd - is still allowed" 0
+
+HOME="$MAYOR" run_hook agent-1 "$WT" "cd && git reset --hard"
+expect "bare cd goes to HOME (the mayor checkout here) and is blocked" 2
+
 run_hook "" "$MAYOR" "git checkout main"
 expect "mayor session (no agent_id) can still move its own HEAD" 0
 
