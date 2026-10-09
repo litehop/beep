@@ -435,6 +435,7 @@ async fn run_controller_loop(
             for key in keys {
                 publish_ingress_for(&client, &state, &node, key);
             }
+            Ok(())
         }
     };
     let on_endpoint_slice = {
@@ -451,8 +452,9 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         move |items: Vec<Value>| {
-            state.lock().unwrap().replace_endpoint_slices(&items);
+            state.lock().unwrap().replace_endpoint_slices(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
+            Ok(())
         }
     };
     let on_node = {
@@ -478,9 +480,10 @@ async fn run_controller_loop(
         let client = Arc::clone(&client);
         move |items: Vec<Value>| {
             let before = state.lock().unwrap().own_node_ips(node.node_ip);
-            state.lock().unwrap().replace_nodes(&items);
+            state.lock().unwrap().replace_nodes(&items, node.node_ip)?;
             apply_reconcile(&state, &maps, &retry, &node);
             republish_if_own_ips_changed(&client, &state, &node, &before);
+            Ok(())
         }
     };
 
