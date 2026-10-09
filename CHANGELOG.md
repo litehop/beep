@@ -7,27 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-09
+
 ### Upgrade notes / operator action required
 
 - **Controller RBAC.** The controller now creates and reads a cluster-wide
-  flow-hash seed Secret, `servicelb-flow-hash-seed`, in its own namespace
-  (`--seed-namespace`, default `kube-system`). `deploy/` ships a namespaced
-  `Role`/`RoleBinding` (`create` on secrets, `get` on that one Secret). If the
-  controller runs as the CSR-minted `beep-controller` user rather than the
-  ServiceAccount, add the extra rolebinding described in the README. Without
-  it the controller exits at startup (fail closed). Treat the Secret as
-  sensitive: anyone who can read it can precompute backend placement (#190).
+  flow-hash seed Secret, `servicelb-flow-hash-seed`, in `--seed-namespace`
+  (default `kube-system`). `deploy/` ships a namespaced `Role`/`RoleBinding`
+  (`create` on secrets, `get` on that one Secret) for the ServiceAccount. The
+  default deployment runs the controller as the CSR-minted `beep-controller`
+  user, which needs its own binding (`deploy/README.md`):
+
+  ```sh
+  kubectl create rolebinding beep-controller-csr-flow-hash-seed -n kube-system \
+    --role=servicelb-controller-flow-hash-seed --user=beep-controller
+  ```
+
+  Without it the controller exits at startup (fail closed). Treat the Secret
+  as sensitive: anyone who can read it can precompute backend placement
+  (#190).
 - **Loader `--pin-dir` is now required.** There is no default. Fixture mode
   (`--fixture`) now prunes fronts and `UPLINK_CONFIG` rows absent from the
   new invocation, and refuses the controller's pin directory (#198, #204).
 - **Pinned maps are recreated on upgrade, flushing conntrack.** Pinned maps
   whose type, key size, value size or `max_entries` differ from the new
   definition are deleted and recreated at load time (one log line per map).
-  This applies to this release: `CONFIG` grows from 4 to 16 bytes (#190), the
-  front maps are consolidated into `FRONT_META` and a generation-tagged
-  `FRONT_ENDPOINTS` (#167), `FLOW_TABLE` values change (#134), and the
-  `NODE_ALLOW`/`POD_TARGETS` defaults rise to 32/128 (#158, #171). In-flight
-  connections are reset once; plan the rollout accordingly.
+  This release changes: `CONFIG` 4 to 16 bytes (#190); `NODE_ALLOW` 16 to 32
+  and `POD_TARGETS` 32 to 128 default entries (#158); the front maps are
+  consolidated into `FRONT_META` and a generation-tagged `FRONT_ENDPOINTS`
+  (#167); `TARGET_PORTS`, `LB_FRONT_MAP` and `EGRESS_DROPS` are removed (#156,
+  #167); `REJECT_BUCKET` is added (#206). In-flight connections are reset
+  once; plan the rollout accordingly.
 - **CLI changes.**
   - `--uplink-iface`/`--geneve-iface` reject names that are empty, contain
     whitespace or `:`, or are otherwise invalid for an interface (#192, #197).
@@ -44,13 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header length of 0 (#171).
 - **Behaviour change:** traffic to a front this node owns that has no ready
   backends is now answered with a TCP RST or ICMP/ICMPv6 port-unreachable
-  instead of being passed to the host (#202).
+  instead of being passed to the host (#202). Replies are rate-limited
+  (#206) and the front stays in place at count 0 so pinned flows drain
+  (#208).
 
 ### Added
 
 - Reject path for owned fronts with no ready backends: TCP RST, or ICMP type
   3/code 3 (v4) / ICMPv6 type 1/code 4 (UDP), so clients fail fast. Traffic
   to fronts this node does not own is unchanged (#202).
+- Reject replies are rate-limited by a per-CPU token bucket (`REJECT_BUCKET`):
+  100 replies/s with a burst of 25 per CPU, so the node-wide budget scales
+  with CPU count. Over budget the packet is dropped, never passed to the
+  host, so a spoofed-source flood is not reflected at the victim (#206).
 - Ingress pin-steering and seeded flow-hash backend selection in the
   dataplane; selection is keyed by a cluster-wide seed so a client cannot
   precompute source ports that pile onto one backend (#178, #190, #195).
@@ -94,21 +110,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flows until they leave the slice (graceful drain); new flows select ready
   endpoints only (#200). Draining backends are not swept early, and
   cluster-wide departures wait for a complete slice set.
+- An owned front whose Service has no ready backends is kept at count 0
+  instead of being deleted, so new connections are refused while pinned flows
+  to draining pods keep working; the front is removed only when its Service
+  goes away. Repeated count-0 reconciles do not bump the generation (#208).
+- An EndpointSlice update that omits `endpoints` (sent once the last pod is
+  gone) now empties the slice instead of being ignored, so the departed
+  endpoint and its pins are removed (#208).
 - Relists replace the watched set, so EndpointSlices deleted while the watch
-  was disconnected are removed, and an unresolved peer Node or implausibly
-  small relist is not treated as a mass departure (#203, open at time of
-  writing).
-- Conntrack eviction is batched into one sweep per map; departed pods stay
-  pending until their flows are swept (#179).
+  was disconnected are removed. Implausible relists (empty Services or
+  slices, a Node list without this node, a paginated list) are refused and
+  retried, and an unresolved peer Node is not treated as a mass departure
+  (#203).
+- After a controller restart, no front, endpoint or pod-target rewrites occur
+  until Services, EndpointSlices and Nodes have all been listed, so live
+  fronts no longer drop to count 0 on a DaemonSet rollout. Once listed, a
+  one-time sweep removes pins to backends that left while the controller was
+  down (#209).
+- Departed pods stay pending until their flows are swept (#179).
 - A failed reconcile is retried with backoff, and an armed retry is not
   postponed by later events (#183).
 - The flow-hash seed converges on the stored Secret value after the Secret
   changes (#193).
 - Pins are honoured before a count-0 front is rejected, and decap resolves a
   drained front's target port from the prior generation (#202).
-- Pinned-map shape mismatches (type, key/value size, `max_entries`) are
-  recreated instead of silently keeping the old shape; `CONFIG` layout and
-  per-link-type uplink L2 header length are guarded (#171).
+- `CONFIG` layout and per-link-type uplink L2 header length are guarded; a
+  pinned map whose shape differs is recreated rather than silently kept
+  (#171, see upgrade notes).
 - The embedded eBPF object is rebuilt when `common/` changes.
 - Stale `UPLINK_CONFIG` rows and fixture fronts are pruned on loader restart
   (#198).
@@ -126,20 +154,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - One backend per front: the selection plumbing (hash, seed, pin-steering,
   generation-tagged endpoints) is in, but multi-endpoint selection is not
   enabled yet.
-- A remote backend that departs, or whose IP is reused, while the controller
-  is down is not detected on restart; its pinned flows age out on their own
-  (the in-memory ip-to-pod map is not persisted).
 - Decap resolves a drained front's target port from the prior generation as
-  an interim measure until the final design lands.
-- The reject path has no reply rate limiting (see placeholder below).
-
-<!-- PLACEHOLDER: owned 0-backend front kept as count 0 so the reject and
-graceful drain take effect end-to-end (in flight). Add entry under Fixed and
-drop the corresponding limitation when merged. -->
-
-<!-- PLACEHOLDER: rate limit for RST/ICMP rejects (in flight). Add entry
-under Added/Security and remove the "no rate limiting" limitation when
-merged. -->
+  an interim measure until the final design lands. It is reachable only on
+  count-0 fronts and survives one generation swap.
+- The reject rate limit is a compile-time constant (not a flag) and is per
+  CPU; the node-wide reply budget grows with CPU count.
+- The post-restart orphaned-pin sweep waits for a non-empty backend set, so
+  pins to departed backends persist while the cluster has no backends at
+  all.
 
 ## [0.3.0] - 2026-09-21
 
