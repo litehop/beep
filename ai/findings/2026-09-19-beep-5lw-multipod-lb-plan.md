@@ -6,7 +6,7 @@ Bead: beep-5lw
 
 Bead: beep-5lw
 Date: 2026-09-19
-As of 2026-10-08 (line numbers cite main at 0e75d0f)
+As of 2026-10-09 (line numbers cite main at 0e75d0f; operator decisions settled)
 Kind: findings (Phase 1 of audit -> operator-decides -> apply)
 
 ## Recommendation (read this first)
@@ -24,14 +24,24 @@ family. Keep **per-front dense slot renumbering** with backend identity
 "a deterministic hash over the ready set" at single-digit endpoint counts,
 and Maglev is the later upgrade only if churn proves to matter.
 
-**Estimate:** xfa.1 shape increment **~8-12h** on top of its consolidation;
-beep-5lw remainder **~23-37h** over 6 beads. The old 21-34h total was
-lower because it missed two items found on this refresh: ingress does not
-steer from the pin, and decap cannot find a per-endpoint `target_port` once
-a front has more than one endpoint.
+**Settled by the operator (2026-10-08/09):**
 
-Must be decided **before xfa.1**: Q2 (where `target_port` lives, and how
-decap finds it) and Q1's confirmation. Everything else gates only 5lw.
+- **Selection with locality.** Prefer ready same-family endpoints on the
+  ingress node when any exist (controller marks locality); otherwise
+  `hash(flow) mod N` over all ready endpoints of the front. Weights beyond
+  that: none.
+- **Terminating-but-serving endpoints** are excluded from new selections;
+  pinned flows continue until eviction.
+- **Owned front with 0 ready backends** is rejected (TCP RST / ICMP
+  unreachable). A `FRONT_META` miss still passes to the host.
+- **`target_port`** rides the forward-leg Geneve POD_ID option, 20 -> 24
+  bytes (2-byte port + 2-byte pad, like the return leg's VIP_ECHO option).
+  VNI packing and a decap `(front, pod_ip)` map were rejected.
+
+**Estimate:** xfa.1 shape increment **~8-12h** on top of its consolidation;
+beep-5lw remainder **~28-45h** over 8 beads (locality and 0-backend reject
+are new; ingress pin-steering and decap `target_port` were found on the
+2026-10-08 refresh).
 
 ## 1. Current state (main, 2026-10-08)
 
@@ -130,6 +140,13 @@ Deterministic, stateless, same answer on any CPU/node; round-robin needs a
 shared mutable cursor and Maglev's permutation table buys little at beep's
 scale because the pin carries stability.
 
+**Locality:** the endpoint value's `_pad` becomes a flags field with
+`IS_LOCAL` (pod on this ingress node; distinct from `FrontMeta.flags`
+`IS_LOCAL`, which means the node owns the front). `FrontMeta` also carries
+`local_count`, and the controller sorts local endpoints first, so slots
+`0..local_count` are local. Selection: `local_count > 0` -> hash mod
+`local_count`; else hash mod `ready_count`. No scan loop.
+
 **Verified: the pin stores the backend, not the slot -- but ingress does not
 steer from it.** `ForwardFlowValue.backend` (`common/src/lib.rs:301-304`)
 holds `{backend_node_ip, pod_ip}`; no slot index exists anywhere in
@@ -170,14 +187,18 @@ proves it on a live kernel. Consequences for this plan:
 
 `reconcile_service` (`controller/src/reconcile.rs:389`) already has every
 ready endpoint in `candidates`. 5lw replaces the pick-one with: filter to
-the front's address family (beep-39a), sort by `pod_ip` (stable slots for the
-same input), emit `FRONT_ENDPOINTS[(front, i)]` per candidate and
-`FRONT_META[front].ready_count = len`. `diff`/`MapOp` are generic over
+the front's address family (beep-39a), drop terminating endpoints, sort local endpoints first
+then by `pod_ip` (stable slots for the same input), emit `FRONT_ENDPOINTS[(front, i)]` per candidate and
+`FRONT_META[front].ready_count = len` and `local_count`. Locality is
+`nodeName` matched against the node identity set (#157). A front with no
+ready endpoint keeps its `FRONT_META` row with `ready_count = 0` (the
+reject case), rather than deleting it. `diff`/`MapOp` are generic over
 key/value and `lb_front_backend_eq` (:494) compares the backend part; the
 endpoint-value comparison must include `target_port`. The existing tests
 encode pick-one and need rewriting. The watch layer parses only the first
 address per endpoint, `nodeName` and `conditions.ready`
-(`controller/src/watch.rs:262-266`); it does not parse `targetRef`.
+(`controller/src/watch.rs:262-266`); it does not parse `targetRef` or
+`conditions.terminating`, which 5lw must add.
 
 ## 6. Bead breakdown
 
@@ -213,19 +234,25 @@ temptation that causes the creep:
   literal is the likeliest source of diff bloat -- split it if it exceeds
   the shape change itself.
 
-**(b) beep-5lw -- behaviour (~23-37h):**
+**(b) beep-5lw -- behaviour (~28-45h), one child bead each:**
 
 1. common: `select_backend_slot` + determinism/distribution tests (S, 2-3h).
 2. ebpf: pin-steering at ingress, hash on miss, v4+v6 (M, 6-9h). Largest
    verifier/correctness surface; needs the established-flow stability test.
-3. decap target_port per endpoint (Geneve option or slot match), v4+v6
-   (M, 5-8h); only if Q2 resolves to per-endpoint.
-4. controller: emit all ready endpoints per front-family, two-map diff
-   ordering, rewrite pick-one tests (M/L, 6-10h).
-5. smoke: 2+ pods behind one front, assert traffic lands on more than one
-   and that endpoint removal re-homes only the removed pod's flows (M, 3-5h;
-   Linux/Lima only).
-6. docs: sizing table, packet-flow note (`ebpf-lb-dataplane.md:55`) (S, 1-2h).
+   Must land before any front has N > 1.
+3. node-local preference: `local_count` + endpoint `IS_LOCAL`, selection
+   prefers the local prefix (common + ebpf, M, 3-5h); after 2.
+4. decap `target_port` via the +4B forward option, v4+v6; confirm the +4B
+   fits geneve0's inner-MTU budget for full-size packets (M, 5-8h).
+5. ebpf: owned front with `ready_count == 0` -> TCP RST / ICMP unreachable,
+   v4+v6 (M, 3-5h); `FRONT_META` miss still passes to host.
+6. controller: emit all ready endpoints per front-family with locality,
+   terminating excluded, two-map diff ordering, rewrite pick-one tests
+   (M/L, 7-11h); after 1, 2, 3, 4.
+7. smoke: 2+ pods behind one front, assert traffic lands on more than one,
+   local preference holds, endpoint removal re-homes only the removed pod's
+   flows, 0 backends yields RST (M, 3-5h; Linux/Lima only).
+8. docs: sizing table, packet-flow note (`ebpf-lb-dataplane.md:55`) (S, 1-2h).
 
 Suggested priority: P2 -- a load balancer that fronts one backend per
 Service is not yet doing what its name promises.
@@ -254,31 +281,26 @@ Service is not yet doing what its name promises.
 - Caveat: "renumbering only re-maps new flows" holds only after 5lw's
   pin-steering lands (section 3); until then it is false.
 
-**2. Where does `target_port` live, and how does decap find it? (Before
-xfa.1.)** Operator direction puts it in the endpoint value. At count 1 decap
-reads slot 0. At N the backend node only knows the front and `pod_ip`, not
-the slot, and named ports can resolve differently per pod. Options: (a)
-carry `target_port` in the Geneve option beside `pod_ip` (removes decap's
-front lookup entirely; recommended, 5lw); (b) require all endpoints of a
-front to share one port and drop disagreeing ones (simple, loses named-port
-semantics); (c) scan slots for the `pod_ip` match (a loop; avoid). xfa.1 only
-needs agreement that `target_port` is in the endpoint value and decap uses
-slot 0 for now.
+**2. Where does `target_port` live? SETTLED (operator 2026-10-08):** the
+forward-leg Geneve POD_ID option grows 20 -> 24 bytes (see top). At count 1
+xfa.1 still stores it in the endpoint value and decap reads slot 0; the wire
+change lands in 5lw, which must confirm the +4B fits the inner-MTU budget.
 
 **3. Same pod behind several fronts? (Before xfa.1; answer: no dedup.)**
 Each front owns its own rows. Acceptable at the declared scale; eviction
 already sweeps by pod address. Schema-neutral.
 
-**4. Weights. (Before 5lw only.)** `Endpoint`
-(`controller/src/reconcile.rs:212`) has no weight. Recommend unweighted for
-v1; `FrontEndpoint._pad` can hold a weight later without a size change, so
-this is not schema-affecting now.
+**4. Weights. SETTLED (operator 2026-10-09):** node-local preference in v1
+(see top), no numeric weights. `Endpoint` (`controller/src/reconcile.rs:212`)
+gains a locality flag.
 
-**5. Terminating-but-serving endpoints. (Before 5lw only.)** Only
-`conditions.ready` is tracked (`watch.rs:265`, defaulting to true).
-Recommend excluding terminating endpoints from the selectable set; already
-pinned flows are unaffected by that choice (pin-steering) and are cleaned up
-by eviction when the pod goes away. No per-endpoint flag needed.
+**5. Terminating-but-serving endpoints. SETTLED (operator 2026-10-09):**
+excluded from new selections; pinned flows continue until eviction. Only
+`conditions.ready` is tracked today (`watch.rs:265`, defaulting to true).
+
+**7. Owned front with 0 ready backends. SETTLED (operator 2026-10-09):**
+reject with TCP RST / ICMP unreachable so clients fail fast; not pass-to-host
+(the host stack could answer misleadingly), not silent drop (client hangs).
 
 **6. `max_entries` defaults. Resolved:** follow the `--*-max-entries`
 pattern (section 2) unless the memory re-measure rules a default out.
