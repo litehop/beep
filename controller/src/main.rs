@@ -12,6 +12,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -168,11 +169,70 @@ fn parse_ip_cidr(s: &str) -> Result<IpCidr, String> {
     }
 }
 
-fn apply_reconcile(state: &Mutex<WatchState>, maps: &Mutex<PinnedMaps>, node: &NodeContext) {
+/// First retry delay after a failed apply. A failed eviction sweep leaves
+/// flows pinned to a departed pod, so the first retry is quick.
+const RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the doubling delay: a persistent failure (e.g. a full map) costs one
+/// cheap map read-back per 30s, while a transient one still heals within 30s.
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// How often the retry task checks whether a retry is due.
+const RETRY_POLL: Duration = Duration::from_secs(1);
+
+/// Bounded exponential backoff for re-running a failed reconcile without
+/// waiting for a watch event (a quiet cluster may never send one).
+#[derive(Default)]
+struct RetryBackoff {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl RetryBackoff {
+    fn record(&mut self, ok: bool, now: Instant) {
+        if ok {
+            *self = Self::default();
+            return;
+        }
+        let delay = RETRY_INITIAL
+            .saturating_mul(1u32.checked_shl(self.failures).unwrap_or(u32::MAX))
+            .min(RETRY_MAX);
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + delay);
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|at| now >= at)
+    }
+}
+
+fn apply_reconcile(
+    state: &Mutex<WatchState>,
+    maps: &Mutex<PinnedMaps>,
+    retry: &Mutex<RetryBackoff>,
+    node: &NodeContext,
+) {
     let desired = state.lock().unwrap().desired(node);
     warn_on_rejected_endpoints(&desired, node);
-    if let Err(e) = maps.lock().unwrap().apply(&desired) {
-        eprintln!("controller: applying reconciled maps failed: {e:#}");
+    let result = maps.lock().unwrap().apply(&desired);
+    if let Err(e) = &result {
+        eprintln!("controller: applying reconciled maps failed (will retry): {e:#}");
+    }
+    retry.lock().unwrap().record(result.is_ok(), Instant::now());
+}
+
+/// Re-runs the full reconcile whenever `retry` says a failed apply is due.
+/// Never returns; `Result` only so it joins with the watches.
+async fn run_retry_loop(
+    state: Arc<Mutex<WatchState>>,
+    maps: Arc<Mutex<PinnedMaps>>,
+    retry: Arc<Mutex<RetryBackoff>>,
+    node: NodeContext,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::time::sleep(RETRY_POLL).await;
+        let due = retry.lock().unwrap().due(Instant::now());
+        if due {
+            apply_reconcile(&state, &maps, &retry, &node);
+        }
     }
 }
 
@@ -255,13 +315,15 @@ async fn run_controller_loop(
     maps: Arc<Mutex<PinnedMaps>>,
     node: NodeContext,
 ) -> anyhow::Result<()> {
+    let retry = Arc::new(Mutex::new(RetryBackoff::default()));
     let on_service = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
+        let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
         move |event: Value| {
             let changed = state.lock().unwrap().apply_service_event(&event);
-            apply_reconcile(&state, &maps, &node);
+            apply_reconcile(&state, &maps, &retry, &node);
             if let Some(key) = changed {
                 let (own_ips, desired_ips) = {
                     let state = state.lock().unwrap();
@@ -277,19 +339,21 @@ async fn run_controller_loop(
     let on_endpoint_slice = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
+        let retry = Arc::clone(&retry);
         move |event: Value| {
             state.lock().unwrap().apply_endpoint_slice_event(&event);
-            apply_reconcile(&state, &maps, &node);
+            apply_reconcile(&state, &maps, &retry, &node);
         }
     };
     let on_node = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
+        let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
         move |event: Value| {
             let before = state.lock().unwrap().own_node_ips(node.node_ip);
             state.lock().unwrap().apply_node_event(&event);
-            apply_reconcile(&state, &maps, &node);
+            apply_reconcile(&state, &maps, &retry, &node);
             let after = state.lock().unwrap().own_node_ips(node.node_ip);
             // This node's own address set actually changed (e.g. its second
             // family just resolved) -- re-publish every tracked Service's
@@ -321,15 +385,20 @@ async fn run_controller_loop(
     // immediately reconciles so a genuinely node-less cluster's correct
     // (destructive) diff runs right away instead of waiting on the next
     // event (`WatchState::desired`'s doc comment).
-    let on_nodes_listed = move || {
-        state.lock().unwrap().mark_nodes_listed();
-        apply_reconcile(&state, &maps, &node);
+    let on_nodes_listed = {
+        let state = Arc::clone(&state);
+        let maps = Arc::clone(&maps);
+        let retry = Arc::clone(&retry);
+        move || {
+            state.lock().unwrap().mark_nodes_listed();
+            apply_reconcile(&state, &maps, &retry, &node);
+        }
     };
 
-    // None of the three branches actually complete in practice, so which
+    // None of the branches actually complete in practice, so which
     // error (if any) wins here never matters at runtime -- `and` just gives
     // the whole function a single `Result` to return.
-    let (services, endpoint_slices, nodes) = tokio::join!(
+    let (services, endpoint_slices, nodes, retrier) = tokio::join!(
         run_list_watch(&client, "/api/v1/services", on_service, || {}),
         run_list_watch(
             &client,
@@ -338,8 +407,9 @@ async fn run_controller_loop(
             || {},
         ),
         run_list_watch(&client, "/api/v1/nodes", on_node, on_nodes_listed),
+        run_retry_loop(state, maps, retry, node),
     );
-    services.and(endpoint_slices).and(nodes)
+    services.and(endpoint_slices).and(nodes).and(retrier)
 }
 
 // current_thread, not the default multi-thread runtime: this process's
@@ -618,6 +688,63 @@ mod tests {
                 Ipv6Addr::new(0xfd00, 0x10, 0x244, 0, 0, 0, 0, 0),
                 56
             )))
+        );
+    }
+
+    // A failed eviction sweep keeps departed pods' POD_TARGETS rows, but only
+    // a later reconcile re-sweeps them. On a quiet cluster no watch event
+    // arrives, so the retry must be due purely from elapsed time.
+    #[test]
+    fn failed_apply_is_retried_within_backoff_window_without_a_new_event() {
+        let t0 = Instant::now();
+        let mut b = RetryBackoff::default();
+        assert!(!b.due(t0 + Duration::from_secs(3600)), "nothing to retry");
+        b.record(false, t0);
+        assert!(!b.due(t0), "retry must wait out the backoff");
+        assert!(
+            b.due(t0 + RETRY_INITIAL),
+            "a failed apply must be retried after the initial delay with no watch event, or \
+             flows stay pinned to departed pods on a quiet cluster"
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps_so_a_persistent_failure_does_not_hammer_the_maps() {
+        let t0 = Instant::now();
+        let mut b = RetryBackoff::default();
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            b.record(false, t0);
+            delays.push(b.retry_at.unwrap() - t0);
+        }
+        let secs: Vec<u64> = delays.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+        for _ in 0..200 {
+            b.record(false, t0);
+        }
+        assert_eq!(
+            b.retry_at.unwrap() - t0,
+            RETRY_MAX,
+            "no overflow past the cap"
+        );
+    }
+
+    #[test]
+    fn success_clears_pending_retry_and_resets_backoff() {
+        let t0 = Instant::now();
+        let mut b = RetryBackoff::default();
+        b.record(false, t0);
+        b.record(false, t0);
+        b.record(true, t0);
+        assert!(
+            !b.due(t0 + RETRY_MAX),
+            "a healthy apply must not keep retrying"
+        );
+        b.record(false, t0);
+        assert_eq!(
+            b.retry_at.unwrap() - t0,
+            RETRY_INITIAL,
+            "a new failure after recovery must start from the initial delay"
         );
     }
 
