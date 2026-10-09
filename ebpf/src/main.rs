@@ -54,17 +54,17 @@ use aya_ebpf::{
         TC_ACT_SHOT,
     },
     helpers::{
-        bpf_csum_diff, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_change_tail,
-        bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_load_bytes,
-        bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt, bpf_skb_store_bytes,
+        bpf_csum_diff, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head,
+        bpf_skb_change_tail, bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt,
+        bpf_skb_load_bytes, bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt, bpf_skb_store_bytes,
     },
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use beep_common::reject::{
-    icmp6_unreachable_in_place, icmp_unreachable_in_place_v4, tcp_rst_in_place_v4,
-    tcp_rst_in_place_v6, ICMP6_QUOTE_LEN, ICMP6_UNREACH_LEN, ICMP_QUOTE_V4_LEN,
+    icmp6_unreachable_in_place, icmp_unreachable_in_place_v4, reject_admit, tcp_rst_in_place_v4,
+    tcp_rst_in_place_v6, RejectBucket, ICMP6_QUOTE_LEN, ICMP6_UNREACH_LEN, ICMP_QUOTE_V4_LEN,
     ICMP_UNREACH_V4_LEN, TCP_RST_V4_IN_LEN, TCP_RST_V4_LEN, TCP_RST_V6_IN_LEN, TCP_RST_V6_LEN,
 };
 use beep_common::{
@@ -578,11 +578,22 @@ fn reject_udp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
     }
 }
 
+/// Per-CPU budget for reject replies. Over budget the packet is dropped,
+/// never passed to the host.
+#[map]
+static REJECT_BUCKET: PerCpuArray<RejectBucket> = PerCpuArray::with_max_entries(1, 0);
+
 /// Replaces everything from the L3 header on with `reply` and sends it back
 /// out the ingress interface. A failed resize leaves the packet untouched,
 /// so it passes to the host; once rewritten, failure can only drop.
 #[inline(always)]
 fn send_reply(ctx: &TcContext, ingress_ifindex: u32, l3: usize, reply: &[u8]) -> i32 {
+    let Some(bucket) = REJECT_BUCKET.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    if !reject_admit(unsafe { &mut *bucket }, unsafe { bpf_ktime_get_ns() }) {
+        return TC_ACT_SHOT;
+    }
     if !resize_packet(ctx, l3 + reply.len()) {
         return TC_ACT_OK;
     }
