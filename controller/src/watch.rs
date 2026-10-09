@@ -590,10 +590,8 @@ impl WatchState {
         for item in items {
             fresh.apply_node_event(&added(item));
             if let Some(name) = metadata_name(item) {
-                if !fresh.node_ips.contains_key(&name) {
-                    if let Some(prev) = self.node_ips.get(&name) {
-                        fresh.node_ips.insert(name, prev.clone());
-                    }
+                if let Some(prev) = self.node_ips.get(&name) {
+                    fresh.node_ips.entry(name).or_insert_with(|| prev.clone());
                 }
             }
         }
