@@ -5,6 +5,7 @@
 //! start creates and every other controller reads; the seed itself is never
 //! logged or placed in an error message.
 
+use std::future::Future;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context};
@@ -159,29 +160,69 @@ pub async fn load_or_create_seed(client: &HyperApiClient, namespace: &str) -> an
 }
 
 /// One convergence pass for a running controller whose CONFIG holds
-/// `current`. Returns the seed to switch to, if it differs. A recreate
-/// republishes `current`, so a deleted Secret re-homes nothing unless another
-/// controller won the create with a different value.
-pub async fn converge_seed(
-    client: &HyperApiClient,
-    namespace: &str,
+/// `current`; returns the seed CONFIG holds afterwards. A recreate republishes
+/// `current`, so a deleted Secret re-homes nothing unless another controller
+/// won the create with a different value. Any failure keeps `current` so the
+/// next tick retries, including a failed CONFIG write of an adopted seed.
+pub async fn seed_tick<FetchFut, CreateFut>(
     current: u64,
-) -> anyhow::Result<Option<u64>> {
-    let mut action = seed_action(current, read_seed(client, namespace).await?);
+    fetch: impl FnOnce() -> FetchFut,
+    create: impl FnOnce(u64) -> CreateFut,
+    write: impl FnOnce(u64) -> anyhow::Result<()>,
+) -> u64
+where
+    FetchFut: Future<Output = anyhow::Result<Observed>>,
+    CreateFut: Future<Output = anyhow::Result<u64>>,
+{
+    let observed = match fetch().await {
+        Ok(observed) => observed,
+        Err(e) => {
+            eprintln!("controller: WARN flow-hash seed re-read failed: {e:#}");
+            return current;
+        }
+    };
+    let mut action = seed_action(current, observed);
     if let Some(line) = action_log(&action) {
         eprintln!("{line}");
     }
     if action == SeedAction::Recreate {
-        let stored = create_or_read(client, namespace, current).await?;
-        action = seed_action(current, Observed::Stored(stored));
+        match create(current).await {
+            Ok(stored) => action = seed_action(current, Observed::Stored(stored)),
+            Err(e) => {
+                eprintln!("controller: WARN flow-hash seed recreate failed: {e:#}");
+                return current;
+            }
+        }
         if let Some(line) = action_log(&action) {
             eprintln!("{line}");
         }
     }
-    Ok(match action {
-        SeedAction::Adopt(seed) => Some(seed),
-        SeedAction::Keep | SeedAction::Recreate => None,
-    })
+    match action {
+        SeedAction::Adopt(seed) => match write(seed) {
+            Ok(()) => seed,
+            Err(e) => {
+                eprintln!("controller: WARN writing adopted flow-hash seed failed: {e:#}");
+                current
+            }
+        },
+        SeedAction::Keep | SeedAction::Recreate => current,
+    }
+}
+
+/// `seed_tick` against the apiserver and the pinned CONFIG map.
+pub async fn converge_seed(
+    client: &HyperApiClient,
+    namespace: &str,
+    pin_dir: &Path,
+    current: u64,
+) -> u64 {
+    seed_tick(
+        current,
+        || read_seed(client, namespace),
+        |candidate| create_or_read(client, namespace, candidate),
+        |seed| write_config_seed(pin_dir, seed),
+    )
+    .await
 }
 
 /// Rewrites only `CONFIG.flow_hash_seed` in the pinned map, leaving the
@@ -284,6 +325,117 @@ mod tests {
                 "{status}: starting with an unshared seed would split flows across nodes"
             );
         }
+    }
+
+    use std::cell::{Cell, RefCell};
+
+    struct Fakes {
+        created_with: Cell<Option<u64>>,
+        written: RefCell<Vec<u64>>,
+    }
+
+    impl Fakes {
+        fn new() -> Self {
+            Fakes {
+                created_with: Cell::new(None),
+                written: RefCell::new(vec![]),
+            }
+        }
+
+        async fn tick(
+            &self,
+            observed: anyhow::Result<Observed>,
+            create_result: u64,
+            write_ok: bool,
+        ) -> u64 {
+            seed_tick(
+                OLD,
+                || async { observed },
+                |candidate| async move {
+                    self.created_with.set(Some(candidate));
+                    Ok(create_result)
+                },
+                |seed| {
+                    self.written.borrow_mut().push(seed);
+                    if write_ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("map write failed"))
+                    }
+                },
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn rotated_secret_is_written_and_returned_or_this_node_hashes_with_a_stale_seed() {
+        let f = Fakes::new();
+        assert_eq!(f.tick(Ok(Observed::Stored(NEW)), 0, true).await, NEW);
+        assert_eq!(*f.written.borrow(), [NEW]);
+        assert_eq!(f.created_with.get(), None);
+    }
+
+    #[tokio::test]
+    async fn unchanged_secret_touches_nothing() {
+        let f = Fakes::new();
+        assert_eq!(f.tick(Ok(Observed::Stored(OLD)), 0, true).await, OLD);
+        assert!(f.written.borrow().is_empty());
+        assert_eq!(f.created_with.get(), None);
+    }
+
+    #[tokio::test]
+    async fn recreate_republishes_current_seed_so_a_deleted_secret_re_homes_nothing() {
+        let f = Fakes::new();
+        assert_eq!(f.tick(Ok(Observed::Absent), OLD, true).await, OLD);
+        assert_eq!(
+            f.created_with.get(),
+            Some(OLD),
+            "the create candidate must be the running seed, not a fresh random one"
+        );
+        assert!(
+            f.written.borrow().is_empty(),
+            "winning the create changes no CONFIG"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_recreate_race_adopts_the_winners_seed_or_nodes_disagree() {
+        let f = Fakes::new();
+        assert_eq!(f.tick(Ok(Observed::Absent), NEW, true).await, NEW);
+        assert_eq!(f.created_with.get(), Some(OLD));
+        assert_eq!(*f.written.borrow(), [NEW]);
+    }
+
+    #[tokio::test]
+    async fn failed_read_keeps_the_seed_and_writes_nothing() {
+        let f = Fakes::new();
+        assert_eq!(f.tick(Err(anyhow!("apiserver down")), NEW, true).await, OLD);
+        assert!(f.written.borrow().is_empty());
+        assert_eq!(f.created_with.get(), None, "a read error is not a deletion");
+    }
+
+    #[tokio::test]
+    async fn failed_create_keeps_the_seed() {
+        let kept = seed_tick(
+            OLD,
+            || async { Ok(Observed::Absent) },
+            |_| async { Err(anyhow!("POST failed")) },
+            |_| panic!("nothing to write"),
+        )
+        .await;
+        assert_eq!(kept, OLD);
+    }
+
+    #[tokio::test]
+    async fn failed_adopt_write_returns_old_seed_so_the_next_tick_retries() {
+        let f = Fakes::new();
+        assert_eq!(
+            f.tick(Ok(Observed::Stored(NEW)), 0, false).await,
+            OLD,
+            "reporting NEW would make the next tick see Keep and never write CONFIG"
+        );
+        assert_eq!(*f.written.borrow(), [NEW]);
     }
 
     #[test]

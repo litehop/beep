@@ -26,7 +26,7 @@ use beep::{
 use beep_controller::{
     apply::PinnedMaps,
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
-    seed::{converge_seed, load_or_create_seed, write_config_seed},
+    seed::{converge_seed, load_or_create_seed},
     status::ensure_node_ingress,
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -286,16 +286,7 @@ async fn run_seed_loop(
 ) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(SEED_POLL).await;
-        match converge_seed(&client, &namespace, current).await {
-            Ok(Some(seed)) => match write_config_seed(&pin_dir, seed) {
-                Ok(()) => current = seed,
-                Err(e) => {
-                    eprintln!("controller: WARN writing adopted flow-hash seed failed: {e:#}")
-                }
-            },
-            Ok(None) => {}
-            Err(e) => eprintln!("controller: WARN flow-hash seed re-read failed: {e:#}"),
-        }
+        current = converge_seed(&client, &namespace, &pin_dir, current).await;
     }
 }
 
