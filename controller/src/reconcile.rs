@@ -474,27 +474,32 @@ pub fn reconcile_service(
         // fixture-driven test can assert a specific outcome. It does not
         // spread load across endpoints.
         candidates.sort_by_key(|e| e.pod_ip);
-        let Some(backend) = candidates.first() else {
-            continue;
-        };
+        // No candidate still yields the front, with zero endpoints: the front
+        // stays owned (FRONT_META count 0), so new clients are rejected and
+        // pinned flows to draining backends keep their conntrack path.
+        let endpoints = candidates
+            .first()
+            .map(|backend| FrontEndpoint {
+                backend: LbFrontBackend {
+                    // Host-native, not wire_ip: the kernel's own
+                    // bpf_tunnel_key.remote_ipv4 set/get converts this
+                    // field itself (`src/main.rs`'s `fixture_fronts`
+                    // comment) -- `tunnel_remote_v6` is that
+                    // convention's dual-stack widening (`src/lib.rs`).
+                    backend_node_ip: tunnel_remote_v6(backend.node_ip),
+                    pod_ip: wire_ip_v6(backend.pod_ip),
+                },
+                target_port: wire_port(port.target_port),
+                _pad: [0; 6],
+            })
+            .into_iter()
+            .collect();
 
         desired.fronts.insert(
             front_key(svc.front_ip, port),
             DesiredFront {
                 flags: 0,
-                endpoints: vec![FrontEndpoint {
-                    backend: LbFrontBackend {
-                        // Host-native, not wire_ip: the kernel's own
-                        // bpf_tunnel_key.remote_ipv4 set/get converts this
-                        // field itself (`src/main.rs`'s `fixture_fronts`
-                        // comment) -- `tunnel_remote_v6` is that
-                        // convention's dual-stack widening (`src/lib.rs`).
-                        backend_node_ip: tunnel_remote_v6(backend.node_ip),
-                        pod_ip: wire_ip_v6(backend.pod_ip),
-                    },
-                    target_port: wire_port(port.target_port),
-                    _pad: [0; 6],
-                }],
+                endpoints,
             },
         );
     }
@@ -1251,7 +1256,7 @@ mod tests {
     // not resolve to a stale backend -- FRONT_META keeping a PREVIOUS entry
     // here would misroute client traffic to a pod that's no longer healthy.
     #[test]
-    fn service_with_no_ready_endpoints_produces_no_entries() {
+    fn service_with_no_ready_endpoints_keeps_its_front_with_zero_endpoints() {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         let mut not_ready = ready_endpoint(Ipv4Addr::new(10, 244, 0, 9), node_ip, vec![8080]);
@@ -1262,10 +1267,14 @@ mod tests {
 
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
+        let front = desired
+            .fronts
+            .get(&front_key(svc.front_ip, &svc.ports[0]))
+            .expect("an owned front with no ready endpoint must stay in FRONT_META");
         assert!(
-            desired.fronts.is_empty(),
-            "no ready endpoint exists, so FRONT_META must get no entry for this front -- \
-             fabricating one would route to an unready pod"
+            front.endpoints.is_empty(),
+            "no ready endpoint exists, so the front must carry none -- new clients get \
+             rejected instead of routed to an unready pod"
         );
     }
 
@@ -1317,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_stack_service_with_only_v4_endpoints_gets_no_v6_front_entry() {
+    fn dual_stack_service_with_only_v4_endpoints_gets_an_empty_v6_front() {
         let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
         let slices = vec![EndpointSliceView {
             endpoints: vec![ready_endpoint(
@@ -1331,7 +1340,7 @@ mod tests {
         let desired = reconcile_service(&v6_front, &slices, &node(node_v4));
 
         assert!(
-            desired.fronts.is_empty(),
+            desired.fronts.values().all(|f| f.endpoints.is_empty()),
             "a v6 front with no v6 endpoint must fail closed; a cross-family backend would \
              silently time out every v6 client"
         );

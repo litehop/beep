@@ -913,8 +913,8 @@ impl WatchState {
                 for port in reconcile::ports_without_same_family_endpoint(&view, &endpoint_slices) {
                     other_family_only.insert(format!(
                         "controller: WARN service {}/{} front {front_ip}:{} has no ready {} \
-                         endpoint, only endpoints of the other family; the front is left \
-                         unprogrammed",
+                         endpoint, only endpoints of the other family; the front rejects \
+                         new connections",
                         key.namespace,
                         key.name,
                         port.port,
@@ -3486,6 +3486,34 @@ mod tests {
             before,
             "a refused Service relist must leave fronts programmed"
         );
+    }
+
+    // Every endpoint going not-ready (rolling update, failing probe) must keep
+    // the Service's front owned at zero endpoints: new clients are rejected and
+    // flows pinned to the draining pod keep working. Dropping the front would
+    // pass new SYNs to the host (hang) and cut the pinned flows.
+    #[test]
+    fn all_endpoints_not_ready_keeps_an_empty_front_and_does_not_sweep_the_draining_pod() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        let mut known = known_after(&state);
+        let mut draining = slice_obj("s1", pods);
+        draining["endpoints"][0]["conditions"]["ready"] = false.into();
+
+        state.replace_endpoint_slices(&[draining]).unwrap();
+
+        let desired = state.desired(&node(SELF_IP));
+        assert_eq!(desired.fronts.len(), 2, "one front per node address");
+        assert!(
+            desired.fronts.values().all(|f| f.endpoints.is_empty()),
+            "a not-ready endpoint must never be selected for new flows"
+        );
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::new(),
+            "the not-ready pod is still in the slice, so its pinned flows must not be swept"
+        );
+        assert!(desired.cluster_backends.contains_key(&pod_wire(9)));
     }
 
     // Deleting one of two Services is legitimate and must withdraw only it.

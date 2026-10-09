@@ -61,8 +61,9 @@ fn endpoint_key(front: LbFrontKey, generation: u32, slot: usize) -> FrontEndpoin
 }
 
 /// Plans the writes that take `(current_meta, current_endpoints)` to
-/// `desired`. A desired front with no endpoints is treated as absent.
-/// With `prune_absent`, fronts (and orphan endpoints) not in `desired` are
+/// `desired`. A desired front with no endpoints is kept as `count == 0`
+/// (the dataplane rejects new flows to it and lets pinned ones drain); only a
+/// front absent from `desired` is deleted. With `prune_absent`, fronts (and orphan endpoints) not in `desired` are
 /// removed; without it, only fronts named in `desired` are touched.
 pub fn plan_front_writes(
     current_meta: &HashMap<LbFrontKey, FrontMeta>,
@@ -90,7 +91,7 @@ pub fn plan_front_writes(
         let meta = current_meta.get(&front);
         let mut steps = Vec::new();
 
-        match desired.get(&front).filter(|d| !d.endpoints.is_empty()) {
+        match desired.get(&front) {
             None => {
                 if !prune_absent {
                     continue;
@@ -444,6 +445,70 @@ mod tests {
             }
         });
         assert!(!meta_present_without_endpoint);
+        assert!(store.meta.is_empty() && store.endpoints.is_empty());
+    }
+
+    fn drained() -> DesiredFront {
+        DesiredFront {
+            flags: 0,
+            endpoints: vec![],
+        }
+    }
+
+    #[test]
+    fn a_front_with_no_ready_endpoints_keeps_its_meta_at_count_zero_and_the_previous_rows() {
+        // Deleting the meta makes ingress pass the packet to the host: new
+        // clients hang instead of being refused, and pinned flows to a
+        // draining pod are cut. Count 0 plus the prior generation's rows keeps
+        // both the reject and the decap-side drain working.
+        let f = front(1, 443);
+        let old = endpoint(7, 8443);
+        let mut store = Store::default();
+        let first = store.plan(&desired(&[(f, want(old))]), true);
+        store.apply_all(&first, |_| {});
+        let plans = store.plan(&desired(&[(f, drained())]), true);
+        store.apply_all(&plans, |_| {});
+
+        let m = store.meta[&f];
+        assert_eq!((m.generation, m.count), (2, 0));
+        assert_eq!(
+            store.endpoints.get(&endpoint_key(f, 1, 0)),
+            Some(&old),
+            "the previous generation's rows must survive for decap of pinned flows"
+        );
+    }
+
+    #[test]
+    fn repeated_count_zero_reconciles_do_not_bump_the_generation() {
+        // A second bump while at count 0 would delete the previous
+        // generation's rows and cut the pinned flows still draining.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let first = store.plan(&desired(&[(f, want(endpoint(7, 8443)))]), true);
+        store.apply_all(&first, |_| {});
+        for _ in 0..3 {
+            let plans = store.plan(&desired(&[(f, drained())]), true);
+            store.apply_all(&plans, |_| {});
+        }
+
+        assert_eq!(store.meta[&f].generation, 2);
+        assert!(store.plan(&desired(&[(f, drained())]), true).is_empty());
+        assert!(store.endpoints.contains_key(&endpoint_key(f, 1, 0)));
+    }
+
+    #[test]
+    fn a_service_deleted_while_drained_removes_its_meta() {
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let first = store.plan(&desired(&[(f, drained())]), true);
+        store.apply_all(&first, |_| {});
+        assert_eq!(
+            store.meta[&f].count, 0,
+            "a never-served front is still owned"
+        );
+        let plans = store.plan(&HashMap::new(), true);
+        store.apply_all(&plans, |_| {});
+
         assert!(store.meta.is_empty() && store.endpoints.is_empty());
     }
 
