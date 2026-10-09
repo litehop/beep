@@ -173,7 +173,7 @@ remote "$VM_A" check-uplink "$UPLINK_IFACE_A"
 
 echo "==> [6/7] loading beep-ebpf: $VM_A and $VM_B both uplink=$UPLINK_IFACE_A (their shared real underlay NIC; wg0 is pure Geneve transport substrate on top of it, not either node's client/return-facing device)"
 FIXTURE="${IP_A}:${FRONT_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
-remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$IP_A"
+remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_A"
 # --uplink-iface must match $VM_A's (not the wg0 default): the backend
 # node's kernel routes a reply to a client on the shared user-v2 subnet
 # out its real NIC (eth0), not out wg0 (which only has a connected route
@@ -184,6 +184,17 @@ remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE
 # un-un-DNAT'd (confirmed via tcpdump: `198.51.100.60.PORT >
 # <client>.PORT` on $VM_B's real eth0, never entering geneve0 at all).
 remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
+
+# A bare loader attests only its own --node-ip (NODE_ALLOW), so each node
+# must be told about the other or its Geneve decap drops the peer's packets
+# (forward leg at $VM_B's geneve_ingress, return leg at $VM_A's). Both
+# --node-ip values are the wg0 addresses because the Geneve outer source is
+# the wg0 address, not eth0's. Mimics a controller's Node watch; each key is
+# copied raw from the peer's own loader.
+NODE_A_KEY="$(remote "$VM_A" dump-node-allow-key)"
+NODE_B_KEY="$(remote "$VM_B" dump-node-allow-key)"
+remote "$VM_B" seed-node-allow --key-hex "$NODE_A_KEY"
+remote "$VM_A" seed-node-allow --key-hex "$NODE_B_KEY"
 
 remote "$VM_B" setup-backend --pod-ip "$POD_IP"
 remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
