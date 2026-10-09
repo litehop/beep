@@ -566,14 +566,25 @@ impl WatchState {
     /// from the list and must stop fronting traffic, which per-item ADDED
     /// replays can never express. Returns the keys left tracked, for the
     /// caller's status publish.
-    pub fn replace_services(&mut self, items: &[Value]) -> Vec<ServiceKey> {
+    ///
+    /// Refuses (keeping the held set) an empty list while Services are held:
+    /// the list is cluster-wide, so it always contains at least the default
+    /// `kubernetes` Service, and an empty one would withdraw every front and
+    /// pass all traffic through to the host.
+    pub fn replace_services(&mut self, items: &[Value]) -> anyhow::Result<Vec<ServiceKey>> {
+        if items.is_empty() && !self.services.is_empty() {
+            anyhow::bail!(
+                "refusing empty Service relist: keeping the previous {} tracked Service(s)",
+                self.services.len()
+            );
+        }
         let mut fresh = WatchState::default();
         let keys = items
             .iter()
             .filter_map(|item| fresh.apply_service_event(&added(item)))
             .collect();
         self.services = fresh.services;
-        keys
+        Ok(keys)
     }
 
     /// Replaces every tracked EndpointSlice with a complete LIST's items in
@@ -3149,7 +3160,7 @@ mod tests {
     /// Self + peer nodes known, svc-a with one slice per `(slice, pods)`.
     fn relist_state(slices: &[(&str, &[(&str, &str)])]) -> WatchState {
         let mut state = WatchState::default();
-        state.replace_services(&[svc_obj("svc-a")]);
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
         state
             .replace_nodes(
                 &[
@@ -3321,7 +3332,7 @@ mod tests {
     fn listed_node_that_never_had_an_address_keeps_its_backends_pinned() {
         let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
         let mut state = WatchState::default();
-        state.replace_services(&[svc_obj("svc-a")]);
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
         let nodes = [
             node_obj("node-a", "10.0.0.5"),
             serde_json::json!({"metadata": {"name": "node-b"}, "status": {}}),
@@ -3386,7 +3397,7 @@ mod tests {
         let mut state = relist_state(&[("s1", peer)]);
         let mut known = known_after(&state);
 
-        state.replace_services(&[]);
+        state.replace_services(&[cluster_ip_svc()]).unwrap();
         state.replace_endpoint_slices(&[]).unwrap();
 
         assert_eq!(
@@ -3415,12 +3426,71 @@ mod tests {
         let mut state = relist_state(&[("s1", pods)]);
         assert!(!state.desired(&node(SELF_IP)).fronts.is_empty());
 
-        let keys = state.replace_services(&[]);
+        let keys = state.replace_services(&[cluster_ip_svc()]).unwrap();
 
         assert!(keys.is_empty());
         assert!(
             state.desired(&node(SELF_IP)).fronts.is_empty(),
             "a Service absent from the relist is deleted; its fronts must be withdrawn"
+        );
+    }
+
+    fn cluster_ip_svc() -> Value {
+        serde_json::json!({
+            "metadata": {"namespace": "default", "name": "kubernetes"},
+            "spec": {"type": "ClusterIP", "ports": [{"port": 443}]},
+        })
+    }
+
+    // An empty cluster-wide Service LIST is never real (`kubernetes` always
+    // exists); applying it would withdraw every front and pass all traffic
+    // through to the host.
+    #[test]
+    fn empty_service_relist_is_refused_and_keeps_every_front() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        let before = state.desired(&node(SELF_IP)).fronts.len();
+        assert!(before > 0);
+
+        assert!(state.replace_services(&[]).is_err());
+
+        assert_eq!(
+            state.desired(&node(SELF_IP)).fronts.len(),
+            before,
+            "a refused Service relist must leave fronts programmed"
+        );
+    }
+
+    // Deleting one of two Services is legitimate and must withdraw only it.
+    #[test]
+    fn relist_dropping_one_of_two_services_withdraws_only_its_front() {
+        let mut state = relist_state(&[]);
+        let mut svc_b = svc_obj("svc-b");
+        svc_b["spec"]["ports"][0]["port"] = 81.into();
+        let slice_b = {
+            let mut s = slice_obj("sb", &[("10.244.1.9", "node-b")]);
+            s["metadata"]["labels"]["kubernetes.io/service-name"] = "svc-b".into();
+            s
+        };
+        let slice_a = slice_obj("sa", &[("10.244.1.8", "node-b")]);
+        state.replace_services(&[svc_obj("svc-a"), svc_b]).unwrap();
+        state.replace_endpoint_slices(&[slice_a, slice_b]).unwrap();
+        let ports = |s: &WatchState| -> HashSet<u16> {
+            let desired = s.desired(&node(SELF_IP));
+            desired
+                .fronts
+                .keys()
+                .map(|k| u16::from_be(k.front_port))
+                .collect()
+        };
+        assert_eq!(ports(&state), HashSet::from([80, 81]));
+
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
+
+        assert_eq!(
+            ports(&state),
+            HashSet::from([80]),
+            "only the deleted Service's front goes"
         );
     }
 }

@@ -430,7 +430,7 @@ async fn run_controller_loop(
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
         move |items: Vec<Value>| {
-            let keys = state.lock().unwrap().replace_services(&items);
+            let keys = state.lock().unwrap().replace_services(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
             for key in keys {
                 publish_ingress_for(&client, &state, &node, key);
