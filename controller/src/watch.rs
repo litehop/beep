@@ -574,7 +574,7 @@ impl WatchState {
     pub fn replace_services(&mut self, items: &[Value]) -> anyhow::Result<Vec<ServiceKey>> {
         if items.is_empty() && !self.services.is_empty() {
             anyhow::bail!(
-                "refusing empty Service relist: keeping the previous {} tracked Service(s)",
+                "relist refused: empty Service relist: keeping the previous {} tracked Service(s)",
                 self.services.len()
             );
         }
@@ -615,7 +615,7 @@ impl WatchState {
         );
         if held > 0 && listed == 0 {
             anyhow::bail!(
-                "refusing EndpointSlice relist of {} item(s): none belongs to a tracked Service \
+                "relist refused: EndpointSlice relist of {} item(s): none belongs to a tracked Service \
                  while {held} tracked Service(s) hold slices; keeping the previous set",
                 items.len()
             );
@@ -631,9 +631,11 @@ impl WatchState {
     /// with none.
     ///
     /// Refuses (keeping the held set) a list in which this node's own Node
-    /// (matched by `local_node_ip`) is missing: this node is running, so its
-    /// Node object exists, and a list without it is empty or truncated;
-    /// accepting it would read every peer's backends as departed.
+    /// (matched by `local_node_ip`) is missing while a non-empty Node set is
+    /// already held: this node is running, so its Node object exists, and
+    /// such a list is empty or truncated; accepting it would read every
+    /// peer's backends as departed. With nothing held the list is accepted,
+    /// so a `--node-ip` that matches no Node cannot wedge startup.
     pub fn replace_nodes(&mut self, items: &[Value], local_node_ip: IpAddr) -> anyhow::Result<()> {
         let mut fresh = WatchState::default();
         for item in items {
@@ -645,11 +647,18 @@ impl WatchState {
             }
         }
         if fresh.own_node_addrs(local_node_ip).is_none() {
-            anyhow::bail!(
-                "refusing Node relist of {} item(s): none carries this node's address \
-                 {local_node_ip}; keeping the previous set of {} node(s)",
-                items.len(),
-                self.node_names.len()
+            if !self.node_names.is_empty() {
+                anyhow::bail!(
+                    "relist refused: Node relist of {} item(s): none carries this node's address \
+                     {local_node_ip}; keeping the previous set of {} node(s)",
+                    items.len(),
+                    self.node_names.len()
+                );
+            }
+            eprintln!(
+                "controller: WARNING: accepted Node list of {} item(s) none of which carries \
+                 this node's address {local_node_ip}; check --node-ip",
+                items.len()
             );
         }
         self.node_ips = fresh.node_ips;
@@ -3373,6 +3382,24 @@ mod tests {
             );
         }
         assert!(known.contains_key(&pod_wire(9)));
+    }
+
+    // With no Node set held yet, refusing a self-less first LIST would leave
+    // `nodes_listed` unlatched forever (a mistyped --node-ip), suppressing
+    // every front.
+    #[test]
+    fn first_node_list_without_this_node_is_accepted_so_startup_is_not_wedged() {
+        let mut state = WatchState::default();
+
+        state
+            .replace_nodes(&[node_obj("node-b", "10.0.0.6")], IpAddr::V4(SELF_IP))
+            .expect("the first LIST must be accepted even when --node-ip matches no Node");
+
+        assert!(
+            state.nodes_listed,
+            "an unlatched Node set would suppress every front forever"
+        );
+        assert!(state.node_names.contains("node-b"));
     }
 
     // An empty-but-successful EndpointSlice LIST while Services hold slices
