@@ -133,6 +133,83 @@ expect "cd to a command-substituted dir is unknown, so a following checkout fail
 run_hook agent-1 "$WT" "cd \`echo $MAYOR\` && git checkout x"
 expect "cd to a backtick-substituted dir is unknown, so a following checkout fails closed" 2
 
+run_hook agent-1 "$MAYOR" "git ls-files | xargs git checkout --"
+expect "xargs-wrapped git checkout is blocked (rewrites the mayor's tree)" 2
+
+run_hook agent-1 "$MAYOR" "git ls-files | xargs -I{} git status {}"
+expect "xargs-wrapped read-only git stays allowed" 0
+
+run_hook agent-1 "$MAYOR" "ls | xargs echo"
+expect "xargs without git stays allowed" 0
+
+run_hook agent-1 "$WT" "pushd $MAYOR && git checkout x"
+expect "pushd <mayor> then checkout is blocked like cd" 2
+
+run_hook agent-1 "$WT" "pushd $MAYOR && git status"
+expect "read-only git after pushd <mayor> stays allowed" 0
+
+run_hook agent-1 "$WT" "popd && git checkout x"
+expect "popd leaves an unknown dir, so a following checkout fails closed" 2
+
+run_hook agent-1 "$WT" "pushd && git checkout x"
+expect "pushd with no operand swaps to an unknown dir, so checkout fails closed" 2
+
+for cdform in "cd -P" "cd -L" "cd --" "cd -P --" "builtin cd" "command cd"; do
+  run_hook agent-1 "$WT" "$cdform $MAYOR && git checkout x"
+  expect "'$cdform <mayor>' then checkout is blocked (cd flags must not hide the target)" 2
+done
+
+run_hook agent-1 "$MAYOR" "cd -P $WT && git checkout -b y"
+expect "cd -P into a linked worktree keeps the checkout allowed" 0
+
+run_hook agent-1 "$WT" "GIT_DIR=$MAYOR/.git GIT_WORK_TREE=$MAYOR git checkout x"
+expect "GIT_DIR/GIT_WORK_TREE env redirects the target to the mayor, so checkout is blocked" 2
+
+run_hook agent-1 "$WT" "env GIT_DIR=$MAYOR/.git git reset --hard"
+expect "env GIT_DIR=... git reset is blocked" 2
+
+run_hook agent-1 "$WT" "GIT_DIR=$MAYOR/.git git status"
+expect "read-only git with GIT_DIR stays allowed" 0
+
+run_hook agent-1 "$WT" "git --git-dir=$MAYOR/.git --work-tree=$MAYOR checkout x"
+expect "--git-dir=/--work-tree= redirect to the mayor is blocked" 2
+
+run_hook agent-1 "$WT" "git --git-dir $MAYOR/.git --work-tree $MAYOR checkout x"
+expect "space-separated --git-dir/--work-tree redirect is blocked" 2
+
+run_hook agent-1 "$WT" "git --git-dir=$MAYOR/.git log -1"
+expect "read-only git with --git-dir stays allowed" 0
+
+run_hook agent-1 "$MAYOR" "git -c alias.co=checkout co x"
+expect "-c alias.co=checkout hides the real subcommand, so it is resolved and blocked" 2
+
+run_hook agent-1 "$MAYOR" "git -c alias.sw='switch -f' sw main"
+expect "alias with arguments resolves to its first word and is blocked" 2
+
+run_hook agent-1 "$MAYOR" "git -c alias.x='!rm -rf .' x"
+expect "shell alias fails closed in the mayor checkout" 2
+
+run_hook agent-1 "$MAYOR" "git -c alias.l=log l"
+expect "alias to read-only log stays allowed" 0
+
+run_hook agent-1 "$WT" "git -c alias.co=checkout co -b z"
+expect "alias checkout in a linked worktree stays allowed" 0
+
+run_hook agent-1 "$MAYOR" "echo \"\$(echo hi; git checkout x)\""
+expect "separator inside quoted \$(...) must not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" "echo \"\`echo hi; git checkout x\`\""
+expect "separator inside quoted backticks must not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" "echo \"\$(echo hi) ; git checkout x is text\""
+expect "text after a closed substitution is quoted again (no false positive)" 0
+
+run_hook agent-1 "$MAYOR" "echo \"\$(echo hi)\" ; git checkout x"
+expect "a real command after a closed quoted substitution is still checked" 2
+
+run_hook agent-1 "$MAYOR" "echo \"\$(git status; git log)\""
+expect "read-only git inside quoted substitution stays allowed" 0
+
 run_hook "" "$MAYOR" "git checkout main"
 expect "mayor session (no agent_id) can still move its own HEAD" 0
 
