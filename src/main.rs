@@ -195,7 +195,9 @@ struct Args {
     /// Backend-selection hash seed (decimal u64). If absent, a random seed is
     /// generated at start: correct only for a single-node rig, since nodes
     /// must share one seed to agree on a flow's backend. The cluster
-    /// controller reads it from a Secret instead.
+    /// controller reads it from a Secret instead. For single-node test rigs
+    /// only: a command-line value is visible to other users in ps and
+    /// /proc/<pid>/cmdline.
     #[arg(long = "flow-hash-seed")]
     flow_hash_seed: Option<u64>,
 
