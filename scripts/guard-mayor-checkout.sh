@@ -38,11 +38,21 @@ is_main_checkout() {
   [ "$abs" = "$common" ]
 }
 
+UNKNOWN_DIR="?"
+
 resolve_dir() { # $1 base, $2 path
   case "$2" in
+    -|*'$'*|*'`'*) printf '%s' "$UNKNOWN_DIR" ;;
+    "") printf '%s' "$1" ;;
     /*) printf '%s' "$2" ;;
     "~"*) printf '%s' "$HOME${2#\~}" ;;
-    *) printf '%s/%s' "$1" "$2" ;;
+    *)
+      if [ "$1" = "$UNKNOWN_DIR" ]; then
+        printf '%s' "$UNKNOWN_DIR"
+      else
+        printf '%s/%s' "$1" "$2"
+      fi
+      ;;
   esac
 }
 
@@ -51,6 +61,37 @@ strip_quotes() {
   s="${s#[\"\']}"
   s="${s%[\"\']}"
   printf '%s' "$s"
+}
+
+is_read_only() { # $1 subcommand, rest: its args
+  local sub="$1" a
+  shift
+  case "$sub" in
+    stash)
+      a=$(strip_quotes "${1:-}")
+      [ "$a" = list ] || [ "$a" = show ] || return 1
+      shift
+      for a in "$@"; do
+        case "$(strip_quotes "$a")" in
+          -p | --patch | --stat | --oneline | --name-only | --name-status) ;;
+          -*) return 1 ;;
+        esac
+      done
+      ;;
+    restore)
+      local staged=1
+      for a in "$@"; do
+        a=$(strip_quotes "$a")
+        case "$a" in
+          --) break ;;
+          --staged | -S) staged=0 ;;
+          -*) return 1 ;;
+        esac
+      done
+      return "$staged"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 block() { # $1 subcommand, $2 dir
@@ -62,15 +103,53 @@ block() { # $1 subcommand, $2 dir
   exit 2
 }
 
+split_segments() { # $1 command line, $2 "raw" to ignore quoting -> newline-separated segments
+  local s="$1" raw="${2:-}" out="" c q="" bt=0 i=0 n=${#1}
+  # ANSI-C quoting ($'..') has escape rules this tracker does not model.
+  case "$s" in *"\$'"*) raw=raw ;; esac
+  while [ "$i" -lt "$n" ]; do
+    c=${s:i:1}
+    if [ "$c" = "\\" ] && [ "$q" != "'" ] && [ -z "$raw" ]; then
+      out+="$c${s:i+1:1}"
+      i=$((i + 2))
+      continue
+    fi
+    if [ -n "$q" ]; then
+      if [ "$q" = '"' ] && [ "$c" = '$' ] && [ "${s:i+1:1}" = "(" ]; then
+        out+=$'$\n'
+        i=$((i + 2))
+        continue
+      fi
+      if [ "$q" = '"' ] && [ "$c" = '`' ]; then
+        if [ "$bt" -eq 0 ]; then out+=$'$\n'; else out+=$'\n'; fi
+        bt=$((1 - bt))
+      else
+        out+="$c"
+      fi
+      [ "$c" = "$q" ] && q=""
+    else
+      case "$c" in
+        \'|\") [ -z "$raw" ] && q="$c"; out+="$c" ;;
+        '`')
+          if [ "$bt" -eq 0 ]; then out+=$'$\n'; else out+=$'\n'; fi
+          bt=$((1 - bt))
+          ;;
+        ';' | '|' | '&' | '(' | ')') out+=$'\n' ;;
+        *) out+="$c" ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  if [ -n "$q" ] && [ -z "$raw" ]; then
+    split_segments "$s" raw
+    return
+  fi
+  printf '%s' "$out"
+}
+
 check_cmdline() { # $1 command line, $2 starting dir
-  local line="$1" dir="$2" seg
-  line=${line//&&/$'\n'}
-  line=${line//||/$'\n'}
-  line=${line//;/$'\n'}
-  line=${line//|/$'\n'}
-  line=${line//\(/$'\n'}
-  line=${line//\)/$'\n'}
-  line=${line//\`/$'\n'}
+  local line dir="$2" seg
+  line=$(split_segments "$1")
   while IFS= read -r seg; do
     check_segment "$seg" "$dir"
     dir="$SEG_DIR"
@@ -101,6 +180,8 @@ check_segment() { # $1 segment, $2 dir; sets SEG_DIR (dir after any `cd`)
     cd)
       if [ $((i + 1)) -lt "$n" ]; then
         SEG_DIR=$(resolve_dir "$dir" "$(strip_quotes "${t[$((i + 1))]}")")
+      else
+        SEG_DIR="$HOME"
       fi
       return 0
       ;;
@@ -137,7 +218,8 @@ check_segment() { # $1 segment, $2 dir; sets SEG_DIR (dir after any `cd`)
   sub=$(strip_quotes "${t[$i]}")
   case "$BLOCKED_SUBCMDS" in
     *" $sub "*)
-      if is_main_checkout "$gdir"; then block "$sub" "$gdir"; fi
+      if is_read_only "$sub" "${t[@]:$((i + 1))}"; then return 0; fi
+      if [ "$gdir" = "$UNKNOWN_DIR" ] || is_main_checkout "$gdir"; then block "$sub" "$gdir"; fi
       ;;
   esac
   return 0
