@@ -402,12 +402,14 @@ pub fn pod_targets_for_node(slices: &[EndpointSliceView], node: &NodeContext) ->
 /// when the endpoint leaves every slice. Unlike `pod_targets_for_node` this is
 /// cluster-wide: the conntrack pins a node holds for a flow name the backend
 /// pod, which is usually on another node.
-pub fn cluster_backends(slices: &[EndpointSliceView]) -> HashMap<[u8; 16], Option<String>> {
+pub fn cluster_backends(
+    endpoints: impl IntoIterator<Item = (IpAddr, Option<String>)>,
+) -> HashMap<[u8; 16], Option<String>> {
     let mut backends: HashMap<[u8; 16], Option<String>> = HashMap::new();
-    for ep in slices.iter().flat_map(|s| s.endpoints.iter()) {
-        let uid = backends.entry(wire_ip_v6(ep.pod_ip)).or_default();
+    for (pod_ip, pod_uid) in endpoints {
+        let uid = backends.entry(wire_ip_v6(pod_ip)).or_default();
         if uid.is_none() {
-            uid.clone_from(&ep.pod_uid);
+            *uid = pod_uid;
         }
     }
     backends
@@ -939,9 +941,11 @@ mod tests {
         unready.ready = false;
         let anonymous = ready_endpoint(Ipv4Addr::new(10, 244, 1, 11), other_node, vec![8080]);
 
-        let backends = cluster_backends(&[EndpointSliceView {
-            endpoints: vec![local, remote, unready, anonymous],
-        }]);
+        let backends = cluster_backends(
+            [local, remote, unready, anonymous]
+                .into_iter()
+                .map(|ep| (ep.pod_ip, ep.pod_uid)),
+        );
 
         let wire =
             |third: u8, last: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, third, last)));

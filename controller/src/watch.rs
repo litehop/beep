@@ -119,14 +119,17 @@ pub struct WatchState {
     // `front_ips`/`NODE_ALLOW` below (`desired`'s doc comments) even though
     // the node genuinely serves it.
     node_ips: HashMap<String, NodeAddrs>,
+    // Every Node known to exist, including one whose addresses have never
+    // parsed (absent from `node_ips`): such a Node is present, so its
+    // backends have not departed.
+    node_names: std::collections::HashSet<String>,
     // Whether the initial Node LIST has completed at least once. `false`
     // means `node_ips` is empty (or partial) purely because the LIST hasn't
     // delivered its results yet, NOT because the cluster genuinely has no
     // nodes -- `desired`'s doc comment on `front_ips` explains why that
-    // distinction matters. A one-way latch: `mark_nodes_listed` also fires
-    // on every 410-Gone relist (`run_list_watch`'s `on_list_complete`), not
-    // just the very first LIST, but setting an already-`true` bool to `true`
-    // again is a no-op, so that's harmless.
+    // distinction matters. A one-way latch: `replace_nodes` also runs
+    // on every 410-Gone relist, not just the very first LIST, but setting an
+    // already-`true` bool to `true` again is a no-op, so that's harmless.
     nodes_listed: bool,
     // The other-family-only warnings `desired` last reported, so a condition
     // that persists across reconcile ticks is logged once, not every tick.
@@ -148,6 +151,10 @@ fn newly_warned(
 enum EventKind {
     Upsert,
     Delete,
+}
+
+fn added(object: &Value) -> Value {
+    serde_json::json!({"type": "ADDED", "object": object})
 }
 
 fn event_kind(event: &Value) -> Option<EventKind> {
@@ -537,8 +544,10 @@ impl WatchState {
         match kind {
             EventKind::Delete => {
                 self.node_ips.remove(&name);
+                self.node_names.remove(&name);
             }
             EventKind::Upsert => {
+                self.node_names.insert(name.clone());
                 let addrs = parse_node_addrs(obj);
                 // Only overwrite on a successful parse -- a Node update
                 // that reports zero parseable Internal/ExternalIP entries
@@ -550,6 +559,112 @@ impl WatchState {
                 }
             }
         }
+    }
+
+    /// Replaces every tracked Service with a complete LIST's items in one
+    /// step: a Service deleted while the watch was disconnected is absent
+    /// from the list and must stop fronting traffic, which per-item ADDED
+    /// replays can never express. Returns the keys left tracked, for the
+    /// caller's status publish.
+    ///
+    /// Refuses (keeping the held set) an empty list while Services are held:
+    /// the list is cluster-wide, so it always contains at least the default
+    /// `kubernetes` Service, and an empty one would withdraw every front and
+    /// pass all traffic through to the host.
+    pub fn replace_services(&mut self, items: &[Value]) -> anyhow::Result<Vec<ServiceKey>> {
+        if items.is_empty() && !self.services.is_empty() {
+            anyhow::bail!(
+                "relist refused: empty Service relist: keeping the previous {} tracked Service(s)",
+                self.services.len()
+            );
+        }
+        let mut fresh = WatchState::default();
+        let keys = items
+            .iter()
+            .filter_map(|item| fresh.apply_service_event(&added(item)))
+            .collect();
+        self.services = fresh.services;
+        Ok(keys)
+    }
+
+    /// Replaces every tracked EndpointSlice with a complete LIST's items in
+    /// one step (see `replace_services`). Never clear-then-refill: reconciling
+    /// between the two would read every backend as departed.
+    ///
+    /// Refuses (keeping the held set) a list that carries no slice for any
+    /// tracked Service when slices for tracked Services are held: every live
+    /// LoadBalancer Service keeps an EndpointSlice object even with zero
+    /// endpoints, so that shape is a truncated or empty-but-successful LIST,
+    /// and accepting it would sweep every backend. A deleted Service is not
+    /// affected: it is absent from `services`, so its slices do not count.
+    pub fn replace_endpoint_slices(&mut self, items: &[Value]) -> anyhow::Result<()> {
+        let mut fresh = WatchState::default();
+        for item in items {
+            fresh.apply_endpoint_slice_event(&added(item));
+        }
+        let tracked_with_slices =
+            |slices: &HashMap<ServiceKey, HashMap<String, RawEndpointSlice>>| {
+                slices
+                    .iter()
+                    .filter(|(key, set)| self.services.contains_key(key) && !set.is_empty())
+                    .count()
+            };
+        let (held, listed) = (
+            tracked_with_slices(&self.slices),
+            tracked_with_slices(&fresh.slices),
+        );
+        if held > 0 && listed == 0 {
+            anyhow::bail!(
+                "relist refused: EndpointSlice relist of {} item(s): none belongs to a tracked Service \
+                 while {held} tracked Service(s) hold slices; keeping the previous set",
+                items.len()
+            );
+        }
+        self.slices = fresh.slices;
+        Ok(())
+    }
+
+    /// Replaces the Node set with a complete LIST's items in one step and
+    /// marks the Node set known (`nodes_listed`). A Node still listed but
+    /// without a parseable address keeps its previous addresses, as
+    /// `apply_node_event` does for the same update, and stays present even
+    /// with none.
+    ///
+    /// Refuses (keeping the held set) a list in which this node's own Node
+    /// (matched by `local_node_ip`) is missing while a non-empty Node set is
+    /// already held: this node is running, so its Node object exists, and
+    /// such a list is empty or truncated; accepting it would read every
+    /// peer's backends as departed. With nothing held the list is accepted,
+    /// so a `--node-ip` that matches no Node cannot wedge startup.
+    pub fn replace_nodes(&mut self, items: &[Value], local_node_ip: IpAddr) -> anyhow::Result<()> {
+        let mut fresh = WatchState::default();
+        for item in items {
+            fresh.apply_node_event(&added(item));
+            if let Some(name) = metadata_name(item) {
+                if let Some(prev) = self.node_ips.get(&name) {
+                    fresh.node_ips.entry(name).or_insert_with(|| prev.clone());
+                }
+            }
+        }
+        if fresh.own_node_addrs(local_node_ip).is_none() {
+            if !self.node_names.is_empty() {
+                anyhow::bail!(
+                    "relist refused: Node relist of {} item(s): none carries this node's address \
+                     {local_node_ip}; keeping the previous set of {} node(s)",
+                    items.len(),
+                    self.node_names.len()
+                );
+            }
+            eprintln!(
+                "controller: WARNING: accepted Node list of {} item(s) none of which carries \
+                 this node's address {local_node_ip}; check --node-ip",
+                items.len()
+            );
+        }
+        self.node_ips = fresh.node_ips;
+        self.node_names = fresh.node_names;
+        self.nodes_listed = true;
+        Ok(())
     }
 
     /// Signals that the initial Node LIST has fully delivered (called once
@@ -753,7 +868,21 @@ impl WatchState {
             aggregate
                 .pod_targets
                 .extend(reconcile::pod_targets_for_node(&endpoint_slices, node));
-            for (ip, uid) in reconcile::cluster_backends(&endpoint_slices) {
+            // Tracked independently of node resolution: an endpoint whose
+            // Node is merely unresolved (Node list not complete yet) has not
+            // departed, and reading it as departed would sweep a live peer's
+            // pins. Only a Node absent from a complete Node set -- deleted --
+            // ends its backends.
+            let tracked = slices
+                .values()
+                .flat_map(|slice| slice.endpoints.iter())
+                .filter(|e| {
+                    e.node_name
+                        .as_deref()
+                        .is_some_and(|n| !self.nodes_listed || self.node_names.contains(n))
+                })
+                .map(|e| (e.pod_ip, e.pod_uid.clone()));
+            for (ip, uid) in reconcile::cluster_backends(tracked) {
                 let known = aggregate.cluster_backends.entry(ip).or_default();
                 if known.is_none() {
                     *known = uid;
@@ -853,7 +982,20 @@ async fn list(client: &HyperApiClient, path: &str) -> anyhow::Result<(Vec<Value>
     if !status.is_success() {
         anyhow::bail!("list {path} returned HTTP {status}");
     }
-    let parsed: Value = serde_json::from_str(&body).context("parse list response")?;
+    parse_list(&body).with_context(|| format!("list {path}"))
+}
+
+/// Parses a LIST body into its items and `resourceVersion`. A non-empty
+/// `metadata.continue` means the items are one page, and a page handed to a
+/// relist would read as the whole set, so it is an error.
+fn parse_list(body: &str) -> anyhow::Result<(Vec<Value>, String)> {
+    let parsed: Value = serde_json::from_str(body).context("parse list response")?;
+    if parsed["metadata"]["continue"]
+        .as_str()
+        .is_some_and(|c| !c.is_empty())
+    {
+        anyhow::bail!("list response is paginated (metadata.continue set); not a complete set");
+    }
     let resource_version = list_resource_version(&parsed)
         .context("list response missing metadata.resourceVersion")?
         .to_owned();
@@ -863,11 +1005,12 @@ async fn list(client: &HyperApiClient, path: &str) -> anyhow::Result<(Vec<Value>
 
 /// Lists `resource_path` (e.g. `/api/v1/services`, no query string) once,
 /// then watches it from the list's `resourceVersion` forever, feeding every
-/// object (list items wrapped as a synthetic `ADDED`, so callers have one
-/// ingestion point) to `on_event`. Calls `on_list_complete` once every list
-/// item has been folded into `on_event` -- the Node watch's caller uses this
-/// to flip `WatchState::mark_nodes_listed`, so `desired` can tell "no nodes
-/// seen yet" apart from "genuinely no nodes" (that doc comment).
+/// watch event to `on_event`. Every successful LIST (the first, and each
+/// relist after a 410 Gone) is handed whole to `on_relist`, which must treat
+/// it as the complete current set -- objects deleted while the watch was
+/// disconnected are only visible as absent from it. A failed LIST delivers
+/// nothing, and an `on_relist` error (a list it judged implausible) is
+/// treated like a failed LIST: back off and list again.
 /// On a watch failure, relists (fresh `resourceVersion`) if the failure was
 /// a 410 Gone, otherwise reconnects at the same `resourceVersion`; either
 /// way, backs off exponentially between attempts. In practice this never
@@ -879,20 +1022,19 @@ pub async fn run_list_watch(
     client: &HyperApiClient,
     resource_path: &str,
     mut on_event: impl FnMut(Value),
-    mut on_list_complete: impl FnMut(),
+    mut on_relist: impl FnMut(Vec<Value>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut backoff = INITIAL_BACKOFF;
     let mut resource_version: Option<String> = None;
     loop {
         if resource_version.is_none() {
-            match list(client, resource_path).await {
-                Ok((items, rv)) => {
-                    for item in items {
-                        on_event(serde_json::json!({"type": "ADDED", "object": item}));
-                    }
+            match list(client, resource_path)
+                .await
+                .and_then(|(items, rv)| on_relist(items).map(|()| rv))
+            {
+                Ok(rv) => {
                     resource_version = Some(rv);
                     backoff = INITIAL_BACKOFF;
-                    on_list_complete();
                 }
                 Err(e) => {
                     eprintln!("controller: list {resource_path} failed: {e:#}");
@@ -1419,13 +1561,19 @@ mod tests {
             "an endpoint removed from its slice has departed"
         );
 
-        let mut replay = slice("s1", serde_json::json!([remote]));
-        replay["type"] = "ADDED".into();
-        state.apply_endpoint_slice_event(&replay);
+        state
+            .replace_endpoint_slices(&[
+                slice("s1", serde_json::json!([remote]))["object"].clone(),
+                slice("s2", serde_json::json!([other]))["object"].clone(),
+            ])
+            .unwrap();
         assert!(
-            state.desired(&ingress).cluster_backends.contains_key(&wire(1, 20)),
-            "a relist replays slices additively; slices not yet replayed must not read as departed, \
-             or a relist would sweep every other slice's flows"
+            state
+                .desired(&ingress)
+                .cluster_backends
+                .contains_key(&wire(1, 20)),
+            "a relist that still contains a slice must keep its backends, or every relist \
+             would sweep live flows"
         );
     }
 
@@ -2971,6 +3119,405 @@ mod tests {
             vec![local],
             "before this node's own Node object has resolved, own_node_ips must still return \
              its CLI-configured --node-ip alone"
+        );
+    }
+
+    fn svc_obj(name: &str) -> Value {
+        serde_json::json!({
+            "metadata": {"namespace": "default", "name": name},
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{"port": 80, "protocol": "TCP"}],
+                "ipFamilies": ["IPv4"],
+            },
+        })
+    }
+
+    fn node_obj(name: &str, ip: &str) -> Value {
+        serde_json::json!({
+            "metadata": {"name": name},
+            "status": {"addresses": [{"type": "InternalIP", "address": ip}]},
+        })
+    }
+
+    fn slice_obj(name: &str, pods: &[(&str, &str)]) -> Value {
+        let endpoints: Vec<Value> = pods
+            .iter()
+            .map(|(ip, node)| {
+                serde_json::json!({
+                    "addresses": [ip], "nodeName": node, "conditions": {"ready": true},
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "metadata": {
+                "namespace": "default",
+                "name": name,
+                "labels": {"kubernetes.io/service-name": "svc-a"},
+            },
+            "ports": [{"port": 8080, "protocol": "TCP"}],
+            "endpoints": endpoints,
+        })
+    }
+
+    fn pod_wire(last: u8) -> [u8; 16] {
+        wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, last)))
+    }
+
+    const SELF_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+
+    /// Self + peer nodes known, svc-a with one slice per `(slice, pods)`.
+    fn relist_state(slices: &[(&str, &[(&str, &str)])]) -> WatchState {
+        let mut state = WatchState::default();
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
+        state
+            .replace_nodes(
+                &[
+                    node_obj("node-a", "10.0.0.5"),
+                    node_obj("node-b", "10.0.0.6"),
+                ],
+                IpAddr::V4(SELF_IP),
+            )
+            .unwrap();
+        let items: Vec<Value> = slices.iter().map(|(n, p)| slice_obj(n, p)).collect();
+        state.replace_endpoint_slices(&items).unwrap();
+        state
+    }
+
+    /// Runs one real `plan_tick` over `state`'s desired set, returning the
+    /// pod IPs the conntrack sweep was asked to evict.
+    fn swept(
+        state: &WatchState,
+        known: &mut HashMap<[u8; 16], Option<String>>,
+    ) -> HashSet<[u8; 16]> {
+        let desired = state.desired(&node(SELF_IP));
+        let mut evicted = HashSet::new();
+        crate::apply::plan_tick(&desired, &[], known, |pods| {
+            evicted.extend(pods.iter().copied());
+            Ok(())
+        });
+        evicted
+    }
+
+    fn known_after(state: &WatchState) -> HashMap<[u8; 16], Option<String>> {
+        state.desired(&node(SELF_IP)).cluster_backends
+    }
+
+    // A 410-Gone relist is the only way the controller learns of a slice
+    // deleted while disconnected; if it only adds, the dead pod keeps
+    // receiving new flows and its pins are never swept.
+    #[test]
+    fn slice_deleted_during_disconnect_is_removed_and_swept_when_the_relist_lands() {
+        let gone: &[(&str, &str)] = &[("10.244.1.8", "node-b")];
+        let kept: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s-gone", gone), ("s-kept", kept)]);
+        let mut known = known_after(&state);
+        assert_eq!(swept(&state, &mut known), HashSet::new());
+
+        state
+            .replace_endpoint_slices(&[slice_obj("s-kept", kept)])
+            .unwrap();
+
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::from([pod_wire(8)]),
+            "the pod of a slice absent from the relist is gone: its pins must be swept"
+        );
+        let desired = state.desired(&node(SELF_IP));
+        assert!(
+            desired.backends().values().all(|b| b.pod_ip == pod_wire(9)),
+            "new flows must stop being routed to the deleted slice's pod"
+        );
+    }
+
+    // Before the relist completes the held set is untouched, and a relist
+    // carrying the same set changes nothing: neither may read as departure,
+    // or every 410 would sweep every live flow.
+    #[test]
+    fn relist_of_an_unchanged_set_sweeps_nothing() {
+        let s1: &[(&str, &str)] = &[("10.244.1.8", "node-b")];
+        let s2: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", s1), ("s2", s2)]);
+        let mut known = known_after(&state);
+
+        assert!(
+            known.contains_key(&pod_wire(8)) && known.contains_key(&pod_wire(9)),
+            "both pods are known before the relist"
+        );
+        state
+            .replace_endpoint_slices(&[slice_obj("s2", s2), slice_obj("s1", s1)])
+            .unwrap();
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::new(),
+            "an identical relist must not sweep live flows"
+        );
+    }
+
+    // A peer's Node not (yet) resolved is not that peer's departure; sweeping
+    // here would cut live flows to a healthy remote pod.
+    #[test]
+    fn peer_backend_with_unresolved_node_keeps_its_pins() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+        assert!(known.contains_key(&pod_wire(9)));
+
+        // Node set not complete (e.g. a restarted watch): node-b unresolved.
+        state.nodes_listed = false;
+        state.node_ips.remove("node-b");
+
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::new(),
+            "an unresolved peer node must not read as a departure"
+        );
+        assert!(known.contains_key(&pod_wire(9)));
+    }
+
+    // Once the Node set is complete, a node absent from it is deleted and its
+    // pods are dead: their pins are swept.
+    #[test]
+    fn backends_of_a_deleted_node_are_swept() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+
+        state.apply_node_event(&serde_json::json!({
+            "type": "DELETED", "object": node_obj("node-b", "10.0.0.6"),
+        }));
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::from([pod_wire(9)]),
+            "a deleted node's pods are dead; their pins must be swept"
+        );
+    }
+
+    // Same, discovered via a node relist after a disconnect.
+    #[test]
+    fn node_absent_from_a_node_relist_is_deleted_and_its_backends_swept() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+
+        state
+            .replace_nodes(&[node_obj("node-a", "10.0.0.5")], IpAddr::V4(SELF_IP))
+            .unwrap();
+
+        assert_eq!(swept(&state, &mut known), HashSet::from([pod_wire(9)]));
+        assert!(
+            !state
+                .desired(&node(SELF_IP))
+                .node_allow
+                .contains(&tunnel_remote_v6(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)))),
+            "a deleted node must stop being an allowed tunnel peer"
+        );
+    }
+
+    // A still-listed Node whose update carries no parseable address is a
+    // transient gap, not a deletion.
+    #[test]
+    fn node_relist_keeps_a_listed_node_whose_addresses_did_not_parse() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+
+        state
+            .replace_nodes(
+                &[
+                    node_obj("node-a", "10.0.0.5"),
+                    serde_json::json!({"metadata": {"name": "node-b"}, "status": {"addresses": []}}),
+                ],
+                IpAddr::V4(SELF_IP),
+            )
+            .unwrap();
+
+        assert_eq!(swept(&state, &mut known), HashSet::new());
+    }
+
+    // A peer Node listed without ever having had a parseable address is
+    // present, not deleted: sweeping its pods would cut live flows to it.
+    #[test]
+    fn listed_node_that_never_had_an_address_keeps_its_backends_pinned() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = WatchState::default();
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
+        let nodes = [
+            node_obj("node-a", "10.0.0.5"),
+            serde_json::json!({"metadata": {"name": "node-b"}, "status": {}}),
+        ];
+        state.replace_nodes(&nodes, IpAddr::V4(SELF_IP)).unwrap();
+        state
+            .replace_endpoint_slices(&[slice_obj("s1", peer)])
+            .unwrap();
+        let mut known = known_after(&state);
+        assert!(
+            known.contains_key(&pod_wire(9)),
+            "a listed node's pod is a tracked backend even before its address resolves"
+        );
+
+        state.replace_nodes(&nodes, IpAddr::V4(SELF_IP)).unwrap();
+
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::new(),
+            "a listed-but-unaddressed node is not a departure"
+        );
+    }
+
+    // A Node LIST without this node's own Node is empty or truncated, never
+    // real; applying it would sweep every peer backend on the node.
+    #[test]
+    fn node_relist_missing_this_node_is_refused_and_sweeps_nothing() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+
+        for items in [vec![], vec![node_obj("node-b", "10.0.0.6")]] {
+            assert!(state.replace_nodes(&items, IpAddr::V4(SELF_IP)).is_err());
+            assert_eq!(
+                swept(&state, &mut known),
+                HashSet::new(),
+                "a refused Node relist must leave the held set, and every pin, intact"
+            );
+        }
+        assert!(known.contains_key(&pod_wire(9)));
+    }
+
+    // With no Node set held yet, refusing a self-less first LIST would leave
+    // `nodes_listed` unlatched forever (a mistyped --node-ip), suppressing
+    // every front.
+    #[test]
+    fn first_node_list_without_this_node_is_accepted_so_startup_is_not_wedged() {
+        let mut state = WatchState::default();
+
+        state
+            .replace_nodes(&[node_obj("node-b", "10.0.0.6")], IpAddr::V4(SELF_IP))
+            .expect("the first LIST must be accepted even when --node-ip matches no Node");
+
+        assert!(
+            state.nodes_listed,
+            "an unlatched Node set would suppress every front forever"
+        );
+        assert!(state.node_names.contains("node-b"));
+    }
+
+    // An empty-but-successful EndpointSlice LIST while Services hold slices
+    // is implausible; accepting it would sweep every backend.
+    #[test]
+    fn empty_slice_relist_with_tracked_services_is_refused_and_sweeps_nothing() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+
+        assert!(state.replace_endpoint_slices(&[]).is_err());
+
+        assert_eq!(swept(&state, &mut known), HashSet::new());
+        assert!(!state.desired(&node(SELF_IP)).fronts.is_empty());
+    }
+
+    // The guard must not block the real case: the Service was deleted, so
+    // its slices are legitimately gone and its backends must be swept.
+    #[test]
+    fn empty_slice_relist_after_the_service_was_deleted_still_sweeps_its_backends() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+
+        state.replace_services(&[cluster_ip_svc()]).unwrap();
+        state.replace_endpoint_slices(&[]).unwrap();
+
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::from([pod_wire(9)]),
+            "a deleted Service's backends are dead; their pins must be swept"
+        );
+    }
+
+    // A page handed to a relist would read as the whole set and sweep every
+    // backend on the next page.
+    #[test]
+    fn paginated_list_response_is_an_error_not_a_relist() {
+        let paged = r#"{"metadata":{"resourceVersion":"5","continue":"abc"},"items":[]}"#;
+        assert!(parse_list(paged).is_err());
+
+        let whole = r#"{"metadata":{"resourceVersion":"5","continue":""},"items":[{}]}"#;
+        let (items, rv) = parse_list(whole).unwrap();
+        assert_eq!((items.len(), rv.as_str()), (1, "5"));
+    }
+
+    // A Service deleted while disconnected must stop fronting traffic.
+    #[test]
+    fn service_deleted_during_disconnect_stops_fronting_when_the_relist_lands() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        assert!(!state.desired(&node(SELF_IP)).fronts.is_empty());
+
+        let keys = state.replace_services(&[cluster_ip_svc()]).unwrap();
+
+        assert!(keys.is_empty());
+        assert!(
+            state.desired(&node(SELF_IP)).fronts.is_empty(),
+            "a Service absent from the relist is deleted; its fronts must be withdrawn"
+        );
+    }
+
+    fn cluster_ip_svc() -> Value {
+        serde_json::json!({
+            "metadata": {"namespace": "default", "name": "kubernetes"},
+            "spec": {"type": "ClusterIP", "ports": [{"port": 443}]},
+        })
+    }
+
+    // An empty cluster-wide Service LIST is never real (`kubernetes` always
+    // exists); applying it would withdraw every front and pass all traffic
+    // through to the host.
+    #[test]
+    fn empty_service_relist_is_refused_and_keeps_every_front() {
+        let pods: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", pods)]);
+        let before = state.desired(&node(SELF_IP)).fronts.len();
+        assert!(before > 0);
+
+        assert!(state.replace_services(&[]).is_err());
+
+        assert_eq!(
+            state.desired(&node(SELF_IP)).fronts.len(),
+            before,
+            "a refused Service relist must leave fronts programmed"
+        );
+    }
+
+    // Deleting one of two Services is legitimate and must withdraw only it.
+    #[test]
+    fn relist_dropping_one_of_two_services_withdraws_only_its_front() {
+        let mut state = relist_state(&[]);
+        let mut svc_b = svc_obj("svc-b");
+        svc_b["spec"]["ports"][0]["port"] = 81.into();
+        let slice_b = {
+            let mut s = slice_obj("sb", &[("10.244.1.9", "node-b")]);
+            s["metadata"]["labels"]["kubernetes.io/service-name"] = "svc-b".into();
+            s
+        };
+        let slice_a = slice_obj("sa", &[("10.244.1.8", "node-b")]);
+        state.replace_services(&[svc_obj("svc-a"), svc_b]).unwrap();
+        state.replace_endpoint_slices(&[slice_a, slice_b]).unwrap();
+        let ports = |s: &WatchState| -> HashSet<u16> {
+            let desired = s.desired(&node(SELF_IP));
+            desired
+                .fronts
+                .keys()
+                .map(|k| u16::from_be(k.front_port))
+                .collect()
+        };
+        assert_eq!(ports(&state), HashSet::from([80, 81]));
+
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
+
+        assert_eq!(
+            ports(&state),
+            HashSet::from([80]),
+            "only the deleted Service's front goes"
         );
     }
 }

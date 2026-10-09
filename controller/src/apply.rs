@@ -279,7 +279,7 @@ fn reused_pod_ips(
 }
 
 /// What one reconcile tick may write after its conntrack sweep.
-struct TickPlan {
+pub(crate) struct TickPlan {
     /// The sweep's failure, if any; the caller reports it after every map has
     /// converged.
     sweep_error: Option<anyhow::Error>,
@@ -307,7 +307,7 @@ struct TickPlan {
 /// (ingress) node but which `POD_TARGETS` never holds. On failure only the
 /// swept IPs stay pending (in `known`, and out of the installs); everything
 /// else converges.
-fn plan_tick(
+pub(crate) fn plan_tick(
     desired: &DesiredEntries,
     installed_pod_targets: &[[u8; 16]],
     known: &mut HashMap<[u8; 16], Option<String>>,
