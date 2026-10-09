@@ -1086,11 +1086,9 @@ fn try_geneve_decap_forward_v4(
                     FLOW_TABLE
                         .insert(
                             port_memo_key,
-                            FlowValue {
-                                port_memo: PortMemoValue {
-                                    backend_src_port: synthetic_port,
-                                },
-                            },
+                            FlowValue::from_port_memo(PortMemoValue {
+                                backend_src_port: synthetic_port,
+                            }),
                             0,
                         )
                         .ok()?;
@@ -1119,7 +1117,7 @@ fn try_geneve_decap_forward_v4(
     // when it would be a byte-for-byte no-op.
     if flow_table_get_reverse(rev_key) != Some(rev_value) {
         FLOW_TABLE
-            .insert(rev_key, FlowValue { reverse: rev_value }, 0)
+            .insert(rev_key, FlowValue::from_reverse(rev_value), 0)
             .ok()?;
     }
 
@@ -1252,11 +1250,9 @@ fn try_geneve_decap_forward_v6(
                     FLOW_TABLE
                         .insert(
                             port_memo_key,
-                            FlowValue {
-                                port_memo: PortMemoValue {
-                                    backend_src_port: synthetic_port,
-                                },
-                            },
+                            FlowValue::from_port_memo(PortMemoValue {
+                                backend_src_port: synthetic_port,
+                            }),
                             0,
                         )
                         .ok()?;
@@ -1275,7 +1271,7 @@ fn try_geneve_decap_forward_v6(
     };
     if flow_table_get_reverse(rev_key) != Some(rev_value) {
         FLOW_TABLE
-            .insert(rev_key, FlowValue { reverse: rev_value }, 0)
+            .insert(rev_key, FlowValue::from_reverse(rev_value), 0)
             .ok()?;
     }
 
@@ -1432,7 +1428,7 @@ fn try_geneve_decap_return_v4(
             ReturnAuthorization::Promote => {
                 let value = pending_value?;
                 FLOW_TABLE
-                    .insert(fwd_key, FlowValue { forward: value }, 0)
+                    .insert(fwd_key, FlowValue::from_forward(value), 0)
                     .ok()?;
                 let _ = FWD_PENDING.remove(key);
                 Some(value)
@@ -1528,7 +1524,7 @@ fn try_geneve_decap_return_v6(
             ReturnAuthorization::Promote => {
                 let value = pending_value?;
                 FLOW_TABLE
-                    .insert(fwd_key, FlowValue { forward: value }, 0)
+                    .insert(fwd_key, FlowValue::from_forward(value), 0)
                     .ok()?;
                 let _ = FWD_PENDING.remove(key);
                 Some(value)
