@@ -81,8 +81,12 @@ mkdir -p "$BD_STUB_DIR"
 cat > "$BD_STUB_DIR/bd" <<'STUBEOF'
 #!/usr/bin/env bash
 [ -n "${BD_STUB_IDS:-}" ] || exit 1
+ids="$BD_STUB_IDS"
+for a in "$@"; do
+  [ "$a" = "--all" ] && ids="$ids ${BD_STUB_CLOSED_IDS:-}"
+done
 echo '['
-for id in $BD_STUB_IDS; do
+for id in $ids; do
   printf '  {\n    "id": "%s",\n    "title": "t",\n    "dependencies": [\n      {\n        "issue_id": "%s",\n        "depends_on_id": "beep-flow"\n      }\n    ]\n  },\n' "$id" "$id"
 done
 echo ']'
@@ -405,6 +409,18 @@ assert "real bead IDs (beep-xyz, dotted beep-5lw.2) are still rejected when bd i
   "$([ "$RC13_ROT" -ne 0 ] && echo 1 || echo 0)"
 assert "...naming both real ids but not the identifier" \
   "$(grep -qF 'beep-xyz' "$S13_ROT/.gate-out" && grep -qF 'beep-5lw.2' "$S13_ROT/.gate-out" && ! grep -qE 'beep-flow$' "$S13_ROT/.gate-out" && echo 1 || echo 0)"
+
+# 14. Closed beads are still beads: a source ref to a closed id must be
+#     rejected, which only holds if the gate asks bd for --all. Without it the
+#     rot-prone refs (the work is done, the id lingers) would pass.
+S14="$SANDBOX_ROOT/14-closed-id"
+new_sandbox "$S14"
+mkdir -p "$S14/src"
+printf '// fixed by beep-cl0\nfn f() {}\n' > "$S14/src/lib.rs"
+commit_tree "$S14"
+RC14=$(BD_STUB_IDS="beep-xyz" BD_STUB_CLOSED_IDS="beep-cl0" run_gate "$S14")
+assert "closed bead id in source is still rejected (gate must pass --all to bd list)" \
+  "$([ "$RC14" -ne 0 ] && grep -qF 'beep-cl0' "$S14/.gate-out" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

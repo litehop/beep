@@ -251,6 +251,18 @@ expect "plain arithmetic with a read-only git line stays allowed" 0
 run_hook agent-1 "$MAYOR" $'echo $((1<<2)); cat <<EOF\ngit checkout x is text\nEOF'
 expect "a real heredoc after arithmetic on the same line is still stripped" 0
 
+run_hook agent-1 "$MAYOR" $'(( x = 1<<EOF ))\ngit checkout x\nEOF'
+expect "<< inside a bare (( ... )) command is a shift, so it must not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" $'echo $[1<<EOF]\ngit checkout x\nEOF'
+expect "<< inside legacy \$[ ... ] arithmetic is a shift, so it must not hide a checkout" 2
+
+run_hook agent-1 "$MAYOR" $'(( x = 1<<2 )); cat <<EOF\ngit checkout x is text\nEOF'
+expect "a real heredoc after a bare (( )) on the same line is still stripped" 0
+
+run_hook agent-1 "$MAYOR" $'echo $[1<<2]; cat <<EOF\ngit checkout x is text\nEOF'
+expect "a real heredoc after \$[ ] on the same line is still stripped" 0
+
 run_hook agent-1 "$MAYOR" $'if true; then git checkout x; fi'
 expect "if/then compound does not hide a checkout" 2
 
