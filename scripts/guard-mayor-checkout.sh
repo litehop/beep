@@ -226,18 +226,40 @@ extract_substs() { # $1 heredoc body -> its substitutions, one per line
   printf '%s' "$out"
 }
 
-# `<<` inside $(( ... )) is a shift, not a heredoc opener; blank its `<`s so
-# the opener regex cannot swallow later lines.
+# `<<` inside $(( ... )), a bare (( ... )) command or legacy $[ ... ] is a
+# shift, not a heredoc opener; blank its `<`s so the opener regex cannot
+# swallow later lines.
 mask_arith() { # $1 line
-  local s="$1" out="" c i=0 n=${#1} d=0
+  local s="$1" out="" c i=0 n=${#1} d=0 b=0 prev=""
   while [ "$i" -lt "$n" ]; do
     c=${s:i:1}
-    if [ "$d" -eq 0 ]; then
+    if [ "$d" -eq 0 ] && [ "$b" -eq 0 ]; then
       if [ "${s:i:3}" = '$((' ]; then
         d=2
         out+='$(('
         i=$((i + 3))
+        prev='('
         continue
+      elif [ "${s:i:2}" = '((' ] && [ "$prev" != '$' ]; then
+        d=2
+        out+='(('
+        i=$((i + 2))
+        prev='('
+        continue
+      elif [ "${s:i:2}" = '$[' ]; then
+        b=1
+        out+='$['
+        i=$((i + 2))
+        prev='['
+        continue
+      fi
+    elif [ "$b" -gt 0 ]; then
+      if [ "$c" = "[" ]; then
+        b=$((b + 1))
+      elif [ "$c" = "]" ]; then
+        b=$((b - 1))
+      elif [ "$c" = "<" ]; then
+        c="_"
       fi
     else
       if [ "$c" = "(" ]; then
@@ -248,6 +270,7 @@ mask_arith() { # $1 line
         c="_"
       fi
     fi
+    prev="$c"
     out+="$c"
     i=$((i + 1))
   done
