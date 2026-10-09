@@ -22,6 +22,38 @@ rules:
     resources: ["nodes"]
     verbs: ["list", "watch", "get"]
 ---
+# Cluster-wide flow-hash seed Secret: the first controller to start creates
+# it, the rest read it. `create` cannot be limited by resourceNames (the
+# apiserver does not know the name at authorization time), so it is scoped
+# to this namespace; `get` is limited to the one Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: servicelb-controller-flow-hash-seed
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["servicelb-flow-hash-seed"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: servicelb-controller-flow-hash-seed
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: servicelb-controller-flow-hash-seed
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:

@@ -689,17 +689,40 @@ pub fn disable_rp_filter(iface: &str) -> anyhow::Result<()> {
 /// Resolves the Geneve device's ifindex (unknown until this host's `ip link`
 /// state is inspected, so it can't be a compile-time constant in the eBPF
 /// program) and writes it to the single-entry `CONFIG` map the classifiers
-/// read at runtime. Per-uplink data (ifindex, L2 header length) is a
+/// read at runtime, together with the cluster-wide `flow_hash_seed`.
+/// Per-uplink data (ifindex, L2 header length) is a
 /// separate map -- see `populate_uplink_config`.
-pub fn populate_config(ebpf: &mut Ebpf, geneve_iface: &str) -> anyhow::Result<()> {
+pub fn populate_config(
+    ebpf: &mut Ebpf,
+    geneve_iface: &str,
+    flow_hash_seed: u64,
+) -> anyhow::Result<()> {
     let geneve_ifindex = iface_index(geneve_iface)
         .with_context(|| format!("resolving ifindex for {geneve_iface}"))?;
     let mut config: AyaArray<_, Config> = AyaArray::try_from(
         ebpf.map_mut("CONFIG")
             .ok_or_else(|| anyhow!("no map named `CONFIG` in the eBPF object"))?,
     )?;
-    config.set(0, Config { geneve_ifindex }, 0)?;
+    config.set(
+        0,
+        Config {
+            geneve_ifindex,
+            _pad: 0,
+            flow_hash_seed,
+        },
+        0,
+    )?;
     Ok(())
+}
+
+/// A random 64-bit flow-hash seed from the OS CSPRNG.
+pub fn random_seed() -> anyhow::Result<u64> {
+    use std::io::Read;
+    let mut bytes = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn arphrd_name(arphrd: u16) -> &'static str {

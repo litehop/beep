@@ -37,7 +37,7 @@ use aya::{
 use beep::{
     attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
     front_swap::{apply_fronts, DesiredFront},
-    load_ebpf, local_pod_ips, parse_fixture, populate_config, populate_uplink_config,
+    load_ebpf, local_pod_ips, parse_fixture, populate_config, populate_uplink_config, random_seed,
     stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
     DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
     DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
@@ -191,6 +191,13 @@ struct Args {
     /// regardless of which node hosts the backend.
     #[arg(long = "node-ip")]
     node_ip: IpAddr,
+
+    /// Backend-selection hash seed (decimal u64). If absent, a random seed is
+    /// generated at start: correct only for a single-node rig, since nodes
+    /// must share one seed to agree on a flow's backend. The cluster
+    /// controller reads it from a Secret instead.
+    #[arg(long = "flow-hash-seed")]
+    flow_hash_seed: Option<u64>,
 
     /// `FWD_PENDING` max_entries -- the only flood-exposed conntrack tier
     /// (admission control mints every new flow here; see `beep-ebpf`'s
@@ -428,6 +435,7 @@ fn main() -> anyhow::Result<()> {
         pod_cidr,
         service_cidr,
         node_ip,
+        flow_hash_seed,
         fwd_pending_max_entries,
         flow_table_max_entries,
         front_meta_max_entries,
@@ -462,7 +470,11 @@ fn main() -> anyhow::Result<()> {
     )
     .context("loading beep-ebpf")?;
 
-    populate_config(&mut ebpf, &geneve_iface).context("populating CONFIG map")?;
+    let flow_hash_seed = match flow_hash_seed {
+        Some(seed) => seed,
+        None => random_seed()?,
+    };
+    populate_config(&mut ebpf, &geneve_iface, flow_hash_seed).context("populating CONFIG map")?;
     populate_uplink_config(&mut ebpf, &uplink_ifaces).context("populating UPLINK_CONFIG map")?;
     populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
         .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
