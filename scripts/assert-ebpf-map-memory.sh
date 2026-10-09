@@ -15,8 +15,8 @@
 # ambiguity a fresh single-tick file avoids by construction rather than by
 # parsing around it.
 #
-# Asserts the discovered map set is EXACTLY the 9 known beep maps, not
-# just a byte-count ceiling: a partial-discovery regression (e.g. only 8 of 9
+# Asserts the discovered map set is EXACTLY the 10 known beep maps, not
+# just a byte-count ceiling: a partial-discovery regression (e.g. only 9 of 10
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
 # is > 0 and under a gross-regression ceiling (not a tight bound, just a
