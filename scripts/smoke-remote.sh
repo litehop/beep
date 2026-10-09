@@ -749,7 +749,11 @@ echo "PIN-STEERING (new flow): PASS (a fresh flow followed the new endpoint ${RE
 
 # Drain: the front's ready count drops to 0 (rolling update) while the pinned
 # flow is still open. It must keep forwarding; only a NEW connection is refused.
-bpftool map update pinned "$PIN_DIR/FRONT_META" key 0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ') $((EVICT_FRONT_PORT >> 8)) $((EVICT_FRONT_PORT & 255)) 6 0 value 0 0 0 0 0 0 0 0 || {
+# Mirrors the controller's swap to an empty set: next generation, count 0, the
+# previous generation's rows left in FRONT_ENDPOINTS.
+DRAIN_FRONT_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ') $((EVICT_FRONT_PORT >> 8)) $((EVICT_FRONT_PORT & 255)) 6 0"
+drain_gen=$(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0]')
+bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((drain_gen + 1)) 0 0 0 0 0 0 0 || {
   echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
   exit 1
 }

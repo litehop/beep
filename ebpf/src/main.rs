@@ -68,9 +68,9 @@ use beep_common::reject::{
     ICMP_UNREACH_V4_LEN, TCP_RST_V4_IN_LEN, TCP_RST_V4_LEN, TCP_RST_V6_IN_LEN, TCP_RST_V6_LEN,
 };
 use beep_common::{
-    address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
-    egress_return_admission, egress_return_outcome, encode_flow_key, encode_tcp_flow_key,
-    flow_hash, forward_admission, front_endpoint_key, fwd_pending_affinity_pin, ingress_steer,
+    address_rewrite_checksums, backend_port_resolution, decap_endpoint_key,
+    decap_forward_pod_admission, egress_return_admission, egress_return_outcome, encode_flow_key,
+    encode_tcp_flow_key, flow_hash, forward_admission, fwd_pending_affinity_pin, ingress_steer,
     ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts, peer_node_admission,
     resolve_backend_src_port, return_authorization, tunnel_remote_addr, unmap_ipv4,
     AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
@@ -395,8 +395,7 @@ fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
 #[inline(always)]
 fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
     let meta = *unsafe { FRONT_META.get(front) }?;
-    let endpoint = front_endpoint_key(front, meta)
-        .and_then(|key| unsafe { FRONT_ENDPOINTS.get(key) }.copied());
+    let endpoint = unsafe { FRONT_ENDPOINTS.get(decap_endpoint_key(front, meta)) }.copied();
     if endpoint.is_none() {
         count_front_miss();
     }

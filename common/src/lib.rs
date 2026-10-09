@@ -337,6 +337,20 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
     })
 }
 
+/// The `FRONT_ENDPOINTS` key decap reads for the target port of a front. At
+/// `count == 0` that is slot 0 of the previous generation, which the write
+/// protocol leaves in place: flows pinned before the front drained must keep
+/// resolving their target port, or they would be dropped on the backend node
+/// even though ingress still forwards them.
+pub fn decap_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> FrontEndpointKey {
+    front_endpoint_key(front, meta).unwrap_or(FrontEndpointKey {
+        front,
+        generation: meta.generation.wrapping_sub(1),
+        slot: FRONT_SLOT_FIRST,
+        _pad: 0,
+    })
+}
+
 /// Host-specific runtime config the loader fills in after attach (an
 /// ifindex isn't known until then). Single entry (`CONFIG` map). Per-uplink
 /// data (ifindex, L2 header length) lives in `UplinkConfig`/`UPLINK_CONFIG`
@@ -1425,6 +1439,28 @@ mod tests {
             "a front advertising zero endpoints must not read a slot: it would forward to an \
              endpoint that belongs to no live generation"
         );
+    }
+
+    #[test]
+    fn decap_reads_the_prior_generation_when_the_front_drained_so_pinned_flows_survive() {
+        let drained = FrontMeta {
+            generation: 4,
+            count: 0,
+            flags: 0,
+        };
+        let key = decap_endpoint_key(sample_front(), drained);
+        assert_eq!(
+            (key.generation, key.slot, key._pad),
+            (3, FRONT_SLOT_FIRST, 0),
+            "a drained front's rows live under the previous generation; reading the empty live \
+             one drops every pinned flow on the backend node"
+        );
+        let live = FrontMeta {
+            generation: 4,
+            count: 2,
+            flags: 0,
+        };
+        assert_eq!(decap_endpoint_key(sample_front(), live).generation, 4);
     }
 
     // LbFrontKey/LbFrontBackend/RevFlowValue's address fields widened from
