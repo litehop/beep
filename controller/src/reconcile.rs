@@ -284,26 +284,26 @@ pub struct DesiredEntries {
     /// check -- see `RejectedEndpoint`'s doc comment. Purely observational:
     /// nothing here changes `pod_targets` itself.
     pub rejected: Vec<RejectedEndpoint>,
-    /// Whether `fronts`/`node_allow` were computed from a
-    /// fully-known node set. `WatchState::desired` (the only real producer
-    /// of an aggregate `DesiredEntries`) sets this to `false` while the
-    /// initial Node LIST hasn't completed yet, so `PinnedMaps::apply` knows
-    /// an empty `fronts` here means "node set not known
+    /// Whether `fronts`/`node_allow` were computed from fully-listed
+    /// Services, EndpointSlices and Nodes. `WatchState::desired` (the only
+    /// real producer of an aggregate `DesiredEntries`) sets this to `false`
+    /// until each initial LIST has completed, so `PinnedMaps::apply` knows
+    /// an empty or count-0 `fronts` here means "not known
     /// yet", not "no fronts should exist" -- diffing against the latter
     /// would delete every already-programmed front that survived a
     /// controller restart. `node_allow` is upserted every tick regardless
     /// (`node_allow` field's doc comment); this flag only latches ON the
     /// destructive half of ITS sync once true, never back off.
     pub fronts_known: bool,
-    /// Whether `pod_targets` was computed with THIS node's own address
-    /// already resolvable in `WatchState::desired`'s endpoint->node_ip
+    /// Whether everything is listed (`fronts_known`) and `pod_targets` was
+    /// computed with THIS node's own address already resolvable in `WatchState::desired`'s endpoint->node_ip
     /// lookup (`pod_targets_for_node` can only admit an endpoint whose
     /// node reports `NodeContext::node_ip` among its addresses). `false` means
     /// "this node's own Node LIST/watch entry hasn't landed yet", not
     /// "this node hosts no backends" -- in a multi-node cluster, whichever
     /// position THIS node's own entry lands at in the startup Node LIST is
     /// unrelated to every OTHER node's position, so gating this on the
-    /// full list (`fronts_known`) would still let an already-pinned local
+    /// full list alone would still let an already-pinned local
     /// backend get wiped while unrelated nodes are still being listed.
     /// `PinnedMaps::apply` skips the destructive POD_TARGETS full-sync
     /// while this is `false`.
@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(
             ports_without_same_family_endpoint(&v6_front, &slices).len(),
             1,
-            "this front is unprogrammed because of a family mismatch, so the caller must be \
+            "this front sits at count 0 because of a family mismatch, so the caller must be \
              told to WARN -- otherwise a v6 front silently never routes"
         );
     }

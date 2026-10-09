@@ -131,7 +131,13 @@ pub struct WatchState {
     // on every 410-Gone relist, not just the very first LIST, but setting an
     // already-`true` bool to `true` again is a no-op, so that's harmless.
     nodes_listed: bool,
-    // The other-family-only warnings `desired` last reported, so a condition
+    // The same one-way latch for the Service and EndpointSlice sets. A
+    // restart that programmed fronts from Services alone, before the slices
+    // arrived, would write every live front at count 0 and refuse new flows;
+    // see `fully_listed`.
+    services_listed: bool,
+    slices_listed: bool,
+    // The warnings `desired` last reported (other-family-only, not fully listed), so a condition
     // that persists across reconcile ticks is logged once, not every tick.
     other_family_warned: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
@@ -586,6 +592,7 @@ impl WatchState {
             .filter_map(|item| fresh.apply_service_event(&added(item)))
             .collect();
         self.services = fresh.services;
+        self.services_listed = true;
         Ok(keys)
     }
 
@@ -623,6 +630,7 @@ impl WatchState {
             );
         }
         self.slices = fresh.slices;
+        self.slices_listed = true;
         Ok(())
     }
 
@@ -669,13 +677,22 @@ impl WatchState {
         Ok(())
     }
 
-    /// Signals that the initial Node LIST has fully delivered (called once
-    /// `run_list_watch`'s list phase for `/api/v1/nodes` returns, before it
-    /// starts watching) -- see `nodes_listed`'s doc comment for why this,
-    /// rather than `node_ips.is_empty()`, is what `desired` gates front
-    /// programming on.
-    pub fn mark_nodes_listed(&mut self) {
+    /// Whether the first successful LIST of Services, EndpointSlices and
+    /// Nodes has completed. Until then `desired` withholds every map rewrite
+    /// (`fronts_known`/`pod_targets_known`): the pinned maps stay as the
+    /// previous process left them, so live fronts keep serving. A LIST that
+    /// keeps failing therefore never wedges anything -- existing pins keep
+    /// working and `run_list_watch` logs each failure.
+    fn fully_listed(&self) -> bool {
+        self.nodes_listed && self.services_listed && self.slices_listed
+    }
+
+    /// Marks every initial LIST complete, as the three relists do.
+    #[cfg(test)]
+    pub fn mark_fully_listed(&mut self) {
         self.nodes_listed = true;
+        self.services_listed = true;
+        self.slices_listed = true;
     }
 
     /// Resolves a Service port's numeric target port against its
@@ -711,14 +728,31 @@ impl WatchState {
         // full-sync FREEZES (stops updating) rather than wiping -- worse
         // than staying current, but self-healing on relist and strictly
         // better than the pre-fix full-wipe.
+        let fully_listed = self.fully_listed();
         let self_node_known = self.own_node_addrs(node.node_ip).is_some();
         let mut aggregate = DesiredEntries {
-            fronts_known: self.nodes_listed,
-            pod_targets_known: self_node_known,
+            fronts_known: fully_listed,
+            pod_targets_known: fully_listed && self_node_known,
             ..DesiredEntries::default()
         };
+        let mut warnings = std::collections::BTreeSet::new();
+        if !fully_listed {
+            let missing: Vec<&str> = [
+                ("Services", self.services_listed),
+                ("EndpointSlices", self.slices_listed),
+                ("Nodes", self.nodes_listed),
+            ]
+            .into_iter()
+            .filter(|(_, listed)| !listed)
+            .map(|(name, _)| name)
+            .collect();
+            warnings.insert(format!(
+                "controller: WARN initial LIST of {} has not completed; leaving FRONT_META, \
+                 FRONT_ENDPOINTS and POD_TARGETS as the previous process left them",
+                missing.join(", ")
+            ));
+        }
         let no_slices = HashMap::new();
-        let mut other_family_only = std::collections::BTreeSet::new();
         // The front-IP model (ebpf-lb-dataplane.md's "Packet flow" step 1):
         // every node's own address is a valid front for every Service, so
         // FRONT_META/FRONT_ENDPOINTS need one entry per KNOWN node address, not
@@ -897,7 +931,7 @@ impl WatchState {
                     node,
                 ));
 
-            if !self.nodes_listed {
+            if !fully_listed {
                 continue;
             }
             // Scoped to THIS Service's own spec.ipFamilies: a SingleStack
@@ -913,7 +947,7 @@ impl WatchState {
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
                 for port in reconcile::ports_without_same_family_endpoint(&view, &endpoint_slices) {
-                    other_family_only.insert(format!(
+                    warnings.insert(format!(
                         "controller: WARN service {}/{} front {front_ip}:{} has no ready {} \
                          endpoint, only endpoints of the other family; the front rejects \
                          new connections",
@@ -926,10 +960,7 @@ impl WatchState {
                 aggregate.fronts.extend(desired.fronts);
             }
         }
-        for msg in newly_warned(
-            &mut self.other_family_warned.lock().unwrap(),
-            other_family_only,
-        ) {
+        for msg in newly_warned(&mut self.other_family_warned.lock().unwrap(), warnings) {
             eprintln!("{msg}");
         }
         aggregate
@@ -1307,7 +1338,7 @@ mod tests {
                 "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
         for (slice_name, pod_ip) in [
             ("svc-a-abcde", "10.244.0.20"),
             ("svc-a-fghij", "10.244.0.2"),
@@ -1369,7 +1400,7 @@ mod tests {
                 "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
         let slice_a = serde_json::json!({
             "type": "ADDED",
             "object": {
@@ -1442,7 +1473,7 @@ mod tests {
                 },
             }));
         }
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
         let slice = serde_json::json!({
             "type": "ADDED",
             "object": {
@@ -1524,7 +1555,7 @@ mod tests {
                 },
             }));
         }
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
         let slice = |name: &str, endpoints: serde_json::Value| {
             serde_json::json!({
                 "type": "MODIFIED",
@@ -1633,7 +1664,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert_eq!(
@@ -1697,7 +1728,7 @@ mod tests {
                 }],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert_eq!(desired.fronts.len(), 2);
@@ -1801,7 +1832,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-b", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         // Reconciling from node-b's own perspective (the backend node) --
         // the ingress node in this flow is node-a, a DIFFERENT node.
@@ -1846,7 +1877,7 @@ mod tests {
         }));
         // A Node event has already landed (the Node watch's own list races
         // the Service watch), but the initial Node LIST as a whole has not
-        // completed -- mark_nodes_listed() deliberately not called. svc-a
+        // completed -- mark_fully_listed() deliberately not called. svc-a
         // already has a ready backend, so this WOULD produce a front if
         // programmed.
         state.apply_node_event(&serde_json::json!({
@@ -1886,22 +1917,16 @@ mod tests {
         );
     }
 
-    // POD_TARGETS is EndpointSlice/local-node-derived, not Node-LIST-derived,
-    // so the `nodes_listed` gate above must NOT zero it out too. THIS node's
-    // own entry ("node-a", matching `node.node_ip` below) has already
-    // landed, so `pod_targets_known` is true here even though the whole
-    // list hasn't completed -- if `desired` reported an empty pod_targets
-    // (or `pod_targets_known == false`) in this scenario, a controller
-    // restart would wipe the already-pinned entry for this node's own
-    // backend Pod before the Node LIST completes, and its decap path would
-    // blackhole until the LIST catches up. Broadening the whole-
-    // `DesiredEntries` early return that this test guards against would
-    // fail it. The companion bug -- THIS node's own entry landing LATE,
-    // unrelated to whether the list as a whole is done -- is covered by
+    // POD_TARGETS is slice-derived, so a rewrite from a partial view (slices
+    // or Services still being listed) would delete the pinned rows of
+    // backends the view has not caught up on. THIS node's own entry has
+    // landed here, yet the initial LIST has not completed, so it must wait.
+    // The companion case -- the full list done but THIS node's own entry
+    // missing -- is covered by
     // `desired_with_a_not_yet_resolved_local_node_reports_pod_targets_unknown_not_empty`
     // below.
     #[test]
-    fn desired_before_node_list_completes_still_computes_pod_targets() {
+    fn desired_before_every_list_completes_withholds_pod_targets() {
         let mut state = WatchState::default();
         state.apply_service_event(&serde_json::json!({
             "type": "ADDED",
@@ -1921,7 +1946,7 @@ mod tests {
                 "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
             },
         }));
-        // mark_nodes_listed() deliberately not called -- this is the
+        // mark_fully_listed() deliberately not called -- this is the
         // pre-LIST restart window.
         state.apply_endpoint_slice_event(&serde_json::json!({
             "type": "ADDED",
@@ -1944,16 +1969,10 @@ mod tests {
              untouched until the Node LIST completes"
         );
         assert!(
-            !desired.pod_targets.is_empty(),
-            "a controller restart must not blackhole backend-Pod decap by wiping POD_TARGETS \
-             before the Node LIST completes -- pod_targets is local-node/EndpointSlice-derived \
-             and must be computed even while fronts_known is false"
-        );
-        assert!(
-            desired.pod_targets_known,
-            "this node's own address (node-a, 10.0.0.5) has already resolved, so \
-             pod_targets_known must be true even though the whole Node LIST hasn't completed \
-             -- it must not piggyback on fronts_known's whole-list gate"
+            !desired.pod_targets_known,
+            "POD_TARGETS must not be rewritten before every initial LIST has completed, even \
+             with this node's own entry resolved: a partial view would delete the pinned rows \
+             of backends whose slices have not arrived and blackhole their decap"
         );
     }
 
@@ -2069,6 +2088,8 @@ mod tests {
             },
         }));
 
+        state.mark_fully_listed();
+
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert!(
             !desired.pod_targets_known,
@@ -2106,7 +2127,7 @@ mod tests {
             },
         }));
         // The Node LIST completed and genuinely found zero Node objects.
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
         assert!(
@@ -2147,7 +2168,7 @@ mod tests {
                 "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
         state.apply_endpoint_slice_event(&serde_json::json!({
             "type": "ADDED",
             "object": {
@@ -2277,7 +2298,7 @@ mod tests {
                 "endpoints": [{"addresses": ["2001:db8::9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 9)));
 
@@ -2332,7 +2353,7 @@ mod tests {
                 ]},
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -2488,7 +2509,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let local = node(Ipv4Addr::new(10, 0, 0, 5));
         let desired = state.desired(&local);
@@ -2553,7 +2574,7 @@ mod tests {
                 "endpoints": [{"addresses": [v6_pod_ip.to_string()], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -2696,7 +2717,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -2753,7 +2774,7 @@ mod tests {
                 "endpoints": [{"addresses": ["2001:db8::9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -2814,7 +2835,7 @@ mod tests {
                 ],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -2862,7 +2883,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -2912,7 +2933,7 @@ mod tests {
                 "endpoints": [{"addresses": ["10.244.0.9"], "nodeName": "node-a", "conditions": {"ready": true}}],
             },
         }));
-        state.mark_nodes_listed();
+        state.mark_fully_listed();
 
         let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
 
@@ -3100,6 +3121,7 @@ mod tests {
                 ],
             },
         }));
+        state.mark_fully_listed();
         let local = node(Ipv4Addr::new(203, 0, 113, 5));
         let desired = state.desired(&local);
         assert!(
@@ -3211,11 +3233,172 @@ mod tests {
     ) -> HashSet<[u8; 16]> {
         let desired = state.desired(&node(SELF_IP));
         let mut evicted = HashSet::new();
-        crate::apply::plan_tick(&desired, &[], known, |pods| {
+        crate::apply::plan_tick(&desired, &[], known, None, |pods| {
             evicted.extend(pods.iter().copied());
             Ok(())
         });
         evicted
+    }
+
+    /// What `PinnedMaps::apply` would sweep on its first fully-listed tick:
+    /// `pinned` stands in for the backend IPs the conntrack walk found.
+    fn swept_as_orphans(
+        state: &WatchState,
+        installed: &[[u8; 16]],
+        pinned: &[[u8; 16]],
+    ) -> HashSet<[u8; 16]> {
+        let desired = state.desired(&node(SELF_IP));
+        let live: HashSet<[u8; 16]> = desired.cluster_backends.keys().copied().collect();
+        let orphans: HashSet<[u8; 16]> = pinned
+            .iter()
+            .copied()
+            .filter(|ip| !live.contains(ip))
+            .collect();
+        let mut evicted = HashSet::new();
+        crate::apply::plan_tick(
+            &desired,
+            installed,
+            &mut HashMap::new(),
+            Some(&orphans),
+            |pods| {
+                evicted.extend(pods.iter().copied());
+                Ok(())
+            },
+        );
+        evicted
+    }
+
+    // After a restart the Service watch can deliver before the slices do.
+    // Fronts built from Services alone would all sit at count 0 and refuse
+    // new flows until the slices land.
+    #[test]
+    fn restart_with_services_listed_but_slices_pending_leaves_fronts_untouched() {
+        let mut state = WatchState::default();
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
+        state
+            .replace_nodes(&[node_obj("node-a", "10.0.0.5")], IpAddr::V4(SELF_IP))
+            .unwrap();
+
+        let desired = state.desired(&node(SELF_IP));
+        assert!(
+            !desired.fronts_known && !desired.pod_targets_known,
+            "front and POD_TARGETS rewrites must wait for the slices, or live fronts drop \
+             to count 0 and new flows are refused"
+        );
+        assert!(desired.fronts.is_empty());
+
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-a")];
+        state
+            .replace_endpoint_slices(&[slice_obj("s1", peer)])
+            .unwrap();
+        let desired = state.desired(&node(SELF_IP));
+        assert!(
+            desired.fronts_known && desired.pod_targets_known,
+            "once every resource is listed the normal reconcile resumes"
+        );
+        assert!(
+            desired.backends().values().all(|b| b.pod_ip == pod_wire(9))
+                && !desired.fronts.is_empty(),
+            "fronts are programmed from the full view"
+        );
+    }
+
+    #[test]
+    fn restart_with_slices_listed_but_services_or_nodes_pending_leaves_fronts_untouched() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-a")];
+        let mut no_services = WatchState::default();
+        no_services
+            .replace_nodes(&[node_obj("node-a", "10.0.0.5")], IpAddr::V4(SELF_IP))
+            .unwrap();
+        no_services
+            .replace_endpoint_slices(&[slice_obj("s1", peer)])
+            .unwrap();
+        let mut no_nodes = WatchState::default();
+        no_nodes.replace_services(&[svc_obj("svc-a")]).unwrap();
+        no_nodes
+            .replace_endpoint_slices(&[slice_obj("s1", peer)])
+            .unwrap();
+        for state in [no_services, no_nodes] {
+            let desired = state.desired(&node(SELF_IP));
+            assert!(!desired.fronts_known && !desired.pod_targets_known);
+        }
+    }
+
+    // The orphan walk only runs after the full listing; a remote backend that
+    // left while the controller was down appears in neither `known` nor
+    // POD_TARGETS, so only the walk can free its pins.
+    #[test]
+    fn remote_backend_that_departed_while_down_is_swept_once_fully_listed() {
+        let live: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let state = relist_state(&[("s1", live)]);
+
+        assert_eq!(
+            swept_as_orphans(&state, &[], &[pod_wire(8), pod_wire(9)]),
+            HashSet::from([pod_wire(8)]),
+            "the departed pod's pins are swept; the live pod's flows are not reset"
+        );
+    }
+
+    // A terminating pod stays in its slice (ready=false) until it is removed;
+    // sweeping its pins would cut the graceful-drain flows the operator chose
+    // to keep.
+    #[test]
+    fn draining_backend_still_in_a_slice_is_not_swept_as_an_orphan() {
+        let mut slice = slice_obj("s1", &[("10.244.1.9", "node-b"), ("10.244.1.10", "node-b")]);
+        slice["endpoints"][1]["conditions"]["ready"] = serde_json::json!(false);
+        let mut state = WatchState::default();
+        state.replace_services(&[svc_obj("svc-a")]).unwrap();
+        state
+            .replace_nodes(
+                &[
+                    node_obj("node-a", "10.0.0.5"),
+                    node_obj("node-b", "10.0.0.6"),
+                ],
+                IpAddr::V4(SELF_IP),
+            )
+            .unwrap();
+        state.replace_endpoint_slices(&[slice]).unwrap();
+
+        assert_eq!(
+            swept_as_orphans(&state, &[], &[pod_wire(9), pod_wire(10)]),
+            HashSet::new(),
+            "a draining endpoint is still in the slice: its pinned flows continue"
+        );
+    }
+
+    #[test]
+    fn local_backend_that_departed_while_down_is_still_swept_via_its_pod_targets_row() {
+        let live: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let state = relist_state(&[("s1", live)]);
+
+        assert_eq!(
+            swept_as_orphans(&state, &[pod_wire(5)], &[]),
+            HashSet::from([pod_wire(5)])
+        );
+    }
+
+    // An EndpointSlice with every endpoint removed is serialized without an
+    // `endpoints` key; the relist must read that as an emptied slice, not as
+    // a malformed one that keeps the old pods.
+    #[test]
+    fn relist_where_every_slice_omits_endpoints_empties_them_and_sweeps_their_pods() {
+        let peer: &[(&str, &str)] = &[("10.244.1.9", "node-b")];
+        let mut state = relist_state(&[("s1", peer)]);
+        let mut known = known_after(&state);
+        assert!(known.contains_key(&pod_wire(9)));
+
+        let mut emptied = slice_obj("s1", peer);
+        emptied.as_object_mut().unwrap().remove("endpoints");
+        state.replace_endpoint_slices(&[emptied]).unwrap();
+
+        assert_eq!(
+            swept(&state, &mut known),
+            HashSet::from([pod_wire(9)]),
+            "the slice has no endpoints left, so its former pod's pins must be swept"
+        );
+        let desired = state.desired(&node(SELF_IP));
+        assert!(desired.cluster_backends.is_empty());
+        assert!(desired.fronts.values().all(|f| f.endpoints.is_empty()));
     }
 
     fn known_after(state: &WatchState) -> HashMap<[u8; 16], Option<String>> {

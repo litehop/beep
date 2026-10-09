@@ -284,6 +284,27 @@ pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pods: &HashSet<[u8; 16]>
         .collect()
 }
 
+/// Backend pod IPs named by a forward pin (`FWD_PENDING` entries and
+/// `FLOW_TABLE` Forward rows) that are absent from `live`: pins whose pod left
+/// every EndpointSlice while no controller was running to sweep them.
+pub fn orphaned_pin_backends(
+    fwd_pending: &AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
+    flow_table: &AyaHashMap<MapData, FlowKey, FlowValue>,
+    live: &HashSet<[u8; 16]>,
+) -> anyhow::Result<HashSet<[u8; 16]>> {
+    let mut pinned = HashSet::new();
+    for entry in fwd_pending.iter() {
+        pinned.insert(entry?.1.backend.pod_ip);
+    }
+    for entry in flow_table.iter() {
+        let (key, value) = entry?;
+        if flow_key_direction(&key) == Some(FlowDirection::Forward) {
+            pinned.insert(value.as_forward().backend.pod_ip);
+        }
+    }
+    Ok(pinned.difference(live).copied().collect())
+}
+
 /// Runs the full conntrack eviction sweep for ALL of a tick's departed pod IPs
 /// in one pass over each map (set-membership per row), so a mass scale-down
 /// costs two table walks, not two per pod, against the live pinned
