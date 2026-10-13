@@ -20,8 +20,8 @@ use hyper::Method;
 use serde_json::Value;
 
 use crate::reconcile::{
-    self, DesiredEntries, Endpoint, EndpointSliceView, NodeContext, Protocol, ServicePort,
-    ServiceView,
+    self, DesiredEntries, Endpoint, EndpointPolicy, EndpointSliceView, NodeContext, Protocol,
+    ServicePort, ServiceView,
 };
 
 /// Namespace+name identity for a Service and the EndpointSlices that back
@@ -70,6 +70,7 @@ struct RawService {
     // Service whose `spec.ipFamilies` is missing/empty, so this struct is
     // never constructed with no families to front.
     ip_families: Vec<Family>,
+    policy: EndpointPolicy,
 }
 
 impl RawService {
@@ -93,6 +94,7 @@ struct RawEndpoint {
     node_name: Option<String>,
     ready: bool,
     terminating: bool,
+    serving: bool,
     pod_uid: Option<String>,
 }
 
@@ -263,7 +265,15 @@ fn parse_service(obj: &Value) -> Option<RawService> {
         );
         return None;
     };
-    Some(RawService { ports, ip_families })
+    let policy = EndpointPolicy::from_spec(
+        obj["spec"]["externalTrafficPolicy"].as_str(),
+        obj["spec"]["trafficDistribution"].as_str(),
+    );
+    Some(RawService {
+        ports,
+        ip_families,
+        policy,
+    })
 }
 
 /// Parses an `EndpointSlice` object. `conditions.ready` defaults to `true`
@@ -293,10 +303,12 @@ fn parse_endpoint_slice(obj: &Value) -> RawEndpointSlice {
         .iter()
         .filter_map(|e| {
             let pod_ip = e["addresses"].as_array()?.first()?.as_str()?.parse().ok()?;
+            let ready = e["conditions"]["ready"].as_bool().unwrap_or(true);
             Some(RawEndpoint {
                 pod_ip,
                 node_name: e["nodeName"].as_str().map(str::to_owned),
-                ready: e["conditions"]["ready"].as_bool().unwrap_or(true),
+                ready,
+                serving: e["conditions"]["serving"].as_bool().unwrap_or(ready),
                 terminating: e["conditions"]["terminating"].as_bool().unwrap_or(false),
                 pod_uid: e["targetRef"]["uid"].as_str().map(str::to_owned),
             })
@@ -506,10 +518,68 @@ impl WatchState {
             Some(addrs) => addrs.fronts.clone(),
             None => vec![local_node_ip],
         };
+        // Only `externalTrafficPolicy: Local` narrows the set further: this
+        // node is listed only while it hosts a usable local pod. Until this
+        // node's own Node entry resolves, locality is unknowable, so it is not
+        // pruned.
+        let own_known = self.own_node_addrs(local_node_ip).is_some();
+        let endpoints: Vec<Endpoint> = self
+            .slices
+            .get(key)
+            .into_iter()
+            .flat_map(|slices| slices.values())
+            .flat_map(|slice| slice.endpoints.iter())
+            .map(|e| {
+                let node_addrs = e
+                    .node_name
+                    .as_deref()
+                    .and_then(|n| self.node_ips.get(n))
+                    .map(|a| a.underlay.iter().chain(&a.fronts).copied().collect())
+                    .unwrap_or_default();
+                Endpoint {
+                    pod_ip: e.pod_ip,
+                    node_ip: local_node_ip,
+                    node_addrs,
+                    ready: e.ready,
+                    terminating: e.terminating,
+                    serving: e.serving,
+                    ports: Vec::new(),
+                    pod_uid: None,
+                }
+            })
+            .collect();
+        let endpoints: Vec<&Endpoint> = endpoints.iter().collect();
         fronts
             .into_iter()
             .filter(|ip| svc.fronts_family(Family::of(*ip)))
+            .filter(|ip| {
+                !own_known
+                    || reconcile::publishes_ingress(
+                        svc.policy,
+                        &endpoints,
+                        local_node_ip,
+                        ip.is_ipv4(),
+                    )
+            })
             .collect()
+    }
+
+    /// Keys of the Services whose published ingress depends on which pods
+    /// this node hosts (`externalTrafficPolicy: Local`), so an endpoint or
+    /// Node change must re-evaluate them.
+    pub fn local_policy_service_keys(&self) -> Vec<ServiceKey> {
+        self.services
+            .iter()
+            .filter(|(_, svc)| svc.policy == EndpointPolicy::OnlyLocal)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Whether the Service `key` is tracked with `externalTrafficPolicy: Local`.
+    pub fn is_local_policy(&self, key: &ServiceKey) -> bool {
+        self.services
+            .get(key)
+            .is_some_and(|svc| svc.policy == EndpointPolicy::OnlyLocal)
     }
 
     /// Every currently-tracked Service's key -- used to republish
@@ -520,14 +590,13 @@ impl WatchState {
         self.services.keys().cloned().collect()
     }
 
-    pub fn apply_endpoint_slice_event(&mut self, event: &Value) {
-        let Some(kind) = event_kind(event) else {
-            return;
-        };
+    /// Returns the owning Service's key when its ingress depends on local
+    /// pods (`externalTrafficPolicy: Local`), so the caller can re-publish it.
+    pub fn apply_endpoint_slice_event(&mut self, event: &Value) -> Option<ServiceKey> {
+        let kind = event_kind(event)?;
         let obj = &event["object"];
-        let (Some(owner), Some(slice_name)) = (owning_service_key(obj), metadata_name(obj)) else {
-            return;
-        };
+        let (owner, slice_name) = (owning_service_key(obj)?, metadata_name(obj)?);
+        let local_policy = self.is_local_policy(&owner);
         match kind {
             EventKind::Delete => {
                 if let Some(slices) = self.slices.get_mut(&owner) {
@@ -536,11 +605,12 @@ impl WatchState {
             }
             EventKind::Upsert => {
                 self.slices
-                    .entry(owner)
+                    .entry(owner.clone())
                     .or_default()
                     .insert(slice_name, parse_endpoint_slice(obj));
             }
         }
+        local_policy.then_some(owner)
     }
 
     pub fn apply_node_event(&mut self, event: &Value) {
@@ -898,6 +968,7 @@ impl WatchState {
                                 node_addrs,
                                 ready: e.ready,
                                 terminating: e.terminating,
+                                serving: e.serving,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
                                 pod_uid: e.pod_uid.clone(),
                             })
@@ -948,6 +1019,7 @@ impl WatchState {
             {
                 let view = ServiceView {
                     front_ip: *front_ip,
+                    policy: svc.policy,
                     ports: ports.clone(),
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
@@ -1542,6 +1614,7 @@ mod tests {
                 "metadata": {"namespace": "default", "name": "svc-a"},
                 "spec": {
                     "type": "LoadBalancer",
+                    "trafficDistribution": "PreferSameNode",
                     "ports": [{"port": 80, "protocol": "TCP"}],
                     "ipFamilies": ["IPv4"],
                 },
@@ -3815,5 +3888,154 @@ mod tests {
             HashSet::from([80]),
             "only the deleted Service's front goes"
         );
+    }
+
+    fn policy_service(name: &str, spec_extra: serde_json::Value) -> Value {
+        let mut spec = serde_json::json!({
+            "type": "LoadBalancer",
+            "ports": [{"port": 80, "protocol": "TCP"}],
+            "ipFamilies": ["IPv4"],
+        });
+        spec.as_object_mut()
+            .unwrap()
+            .extend(spec_extra.as_object().unwrap().clone());
+        serde_json::json!({
+            "type": "ADDED",
+            "object": {"metadata": {"namespace": "default", "name": name}, "spec": spec},
+        })
+    }
+
+    fn policy_slice(svc: &str, pods: &[(&str, &str, bool, bool)]) -> Value {
+        let endpoints: Vec<Value> = pods
+            .iter()
+            .map(|(ip, node, ready, serving)| {
+                serde_json::json!({
+                    "addresses": [ip],
+                    "nodeName": node,
+                    "conditions": {"ready": ready, "serving": serving, "terminating": !ready},
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": format!("{svc}-aaaaa"),
+                    "labels": {"kubernetes.io/service-name": svc},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": endpoints,
+            },
+        })
+    }
+
+    // This node's own controller writes only this node's entry, so withholding
+    // it here is what keeps a node without a usable local pod out of
+    // status.loadBalancer.ingress.
+    #[test]
+    fn external_traffic_policy_local_lists_this_node_only_while_it_hosts_a_usable_pod() {
+        let this = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let key = |n: &str| ServiceKey {
+            namespace: "default".to_owned(),
+            name: n.to_owned(),
+        };
+        let mut state = WatchState::default();
+        state.apply_service_event(&policy_service(
+            "local",
+            serde_json::json!({"externalTrafficPolicy": "Local"}),
+        ));
+        state.apply_service_event(&policy_service("cluster", serde_json::json!({})));
+        for (name, ip) in [("node-a", "10.0.0.5"), ("node-b", "10.0.0.6")] {
+            state.apply_node_event(&serde_json::json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": name},
+                    "status": {"addresses": [{"type": "InternalIP", "address": ip}]},
+                },
+            }));
+        }
+        let remote_only = [("10.244.1.9", "node-b", true, true)];
+        for svc in ["local", "cluster"] {
+            state.apply_endpoint_slice_event(&policy_slice(svc, &remote_only));
+        }
+
+        assert!(
+            state.ips_to_publish(&key("local"), this).is_empty(),
+            "eTP=Local with only a remote pod must not advertise this node"
+        );
+        assert_eq!(
+            state.ips_to_publish(&key("cluster"), this),
+            vec![this],
+            "eTP=Cluster advertises every node, which forwards cross-node"
+        );
+
+        let changed = state.apply_endpoint_slice_event(&policy_slice(
+            "local",
+            &[
+                ("10.244.1.9", "node-b", true, true),
+                ("10.244.0.9", "node-a", true, true),
+            ],
+        ));
+        assert_eq!(
+            changed,
+            Some(key("local")),
+            "a slice change under eTP=Local must trigger a re-publish"
+        );
+        assert_eq!(state.ips_to_publish(&key("local"), this), vec![this]);
+
+        let draining = state.apply_endpoint_slice_event(&policy_slice(
+            "local",
+            &[("10.244.0.9", "node-a", false, true)],
+        ));
+        assert_eq!(draining, Some(key("local")));
+        assert_eq!(
+            state.ips_to_publish(&key("local"), this),
+            vec![this],
+            "a serving-terminating local pod still serves, so the node stays listed"
+        );
+
+        state.apply_endpoint_slice_event(&policy_slice(
+            "local",
+            &[("10.244.0.9", "node-a", false, false)],
+        ));
+        assert!(state.ips_to_publish(&key("local"), this).is_empty());
+
+        assert_eq!(
+            state.apply_endpoint_slice_event(&policy_slice("cluster", &remote_only)),
+            None,
+            "eTP=Cluster ingress never depends on slices, so no re-publish"
+        );
+    }
+
+    #[test]
+    fn service_spec_policy_fields_reach_the_published_front() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&policy_service(
+            "pref",
+            serde_json::json!({"trafficDistribution": "PreferSameNode"}),
+        ));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        state.mark_fully_listed();
+        state.apply_endpoint_slice_event(&policy_slice(
+            "pref",
+            &[
+                ("10.244.0.9", "node-a", true, true),
+                ("10.244.0.1", "node-a", true, true),
+            ],
+        ));
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        let front = desired.fronts.values().next().expect("one front");
+        assert!(
+            front.prefer_local,
+            "trafficDistribution is read from the Service spec"
+        );
+        assert_eq!(front.local_count(), 2);
     }
 }

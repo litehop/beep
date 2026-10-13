@@ -407,7 +407,10 @@ fn publish_ingress_for(
 /// Re-publishes every tracked Service's ingress when this node's own address
 /// set differs from `before` (e.g. its second family just resolved): a
 /// Service added before that resolution never gets another chance to
-/// publish the newly-resolved family.
+/// publish the newly-resolved family. Services whose ingress depends on local
+/// pods (`externalTrafficPolicy: Local`) are re-published on every Node event:
+/// resolving this node's own Node entry changes what "local" means without
+/// necessarily changing its address set.
 fn republish_if_own_ips_changed(
     client: &Arc<HyperApiClient>,
     state: &Mutex<WatchState>,
@@ -415,14 +418,15 @@ fn republish_if_own_ips_changed(
     before: &[IpAddr],
 ) {
     let after = state.lock().unwrap().own_node_ips(node.node_ip);
-    if !own_node_ips_changed(before, &after) {
-        return;
-    }
     // Bound to a `let` rather than locked inline in the `for` head: a
     // `for`-loop scrutinee's temporaries live for the whole loop, so an
     // inline lock would be held across every iteration and deadlock on the
     // lock inside `publish_ingress_for`.
-    let keys = state.lock().unwrap().service_keys();
+    let keys = if own_node_ips_changed(before, &after) {
+        state.lock().unwrap().service_keys()
+    } else {
+        state.lock().unwrap().local_policy_service_keys()
+    };
     for key in keys {
         publish_ingress_for(client, state, node, key);
     }
@@ -471,18 +475,27 @@ async fn run_controller_loop(
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
+        let client = Arc::clone(&client);
         move |event: Value| {
-            state.lock().unwrap().apply_endpoint_slice_event(&event);
+            let local_policy_key = state.lock().unwrap().apply_endpoint_slice_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
+            if let Some(key) = local_policy_key {
+                publish_ingress_for(&client, &state, &node, key);
+            }
         }
     };
     let on_endpoint_slices_relist = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
+        let client = Arc::clone(&client);
         move |items: Vec<Value>| {
             state.lock().unwrap().replace_endpoint_slices(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
+            let keys = state.lock().unwrap().local_policy_service_keys();
+            for key in keys {
+                publish_ingress_for(&client, &state, &node, key);
+            }
             Ok(())
         }
     };

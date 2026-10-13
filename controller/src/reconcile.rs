@@ -193,6 +193,7 @@ pub struct ServicePort {
 #[derive(Clone, Debug)]
 pub struct ServiceView {
     pub front_ip: IpAddr,
+    pub policy: EndpointPolicy,
     pub ports: Vec<ServicePort>,
 }
 
@@ -217,6 +218,9 @@ pub struct Endpoint {
     /// `conditions.terminating`: a shutting-down pod never takes new flows,
     /// even if its `ready` condition has not yet flipped.
     pub terminating: bool,
+    /// `conditions.serving`: still answering although terminating, which
+    /// `externalTrafficPolicy: Local` uses when no local pod is ready.
+    pub serving: bool,
     pub ports: Vec<u16>,
     /// `endpoints[].targetRef.uid`: the owning pod's identity, absent when the
     /// slice carries no `targetRef`. Lets the controller notice a pod IP
@@ -332,6 +336,109 @@ impl DesiredEntries {
     }
 }
 
+/// Which of a Service's endpoints a front uses, and how the dataplane picks
+/// among them. Derived from `spec.externalTrafficPolicy` and
+/// `spec.trafficDistribution` (never from EndpointSlice hints).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndpointPolicy {
+    /// Every ready endpoint, hashed uniformly (`local_count = 0`).
+    #[default]
+    Uniform,
+    /// Every ready endpoint, local ones preferred while any exist.
+    PreferLocal,
+    /// Only endpoints on this node (`externalTrafficPolicy: Local`).
+    OnlyLocal,
+}
+
+impl EndpointPolicy {
+    /// `externalTrafficPolicy: Local` wins and ignores `trafficDistribution`.
+    /// beep has no zone model, so `PreferClose`/`PreferSameZone` are
+    /// approximated by node-local preference. An unknown distribution falls
+    /// back to uniform.
+    pub fn from_spec(
+        external_traffic_policy: Option<&str>,
+        traffic_distribution: Option<&str>,
+    ) -> Self {
+        if external_traffic_policy == Some("Local") {
+            return Self::OnlyLocal;
+        }
+        match traffic_distribution {
+            None => Self::Uniform,
+            Some("PreferSameNode" | "PreferClose" | "PreferSameZone") => Self::PreferLocal,
+            Some(other) => {
+                eprintln!(
+                    "controller: WARN unknown spec.trafficDistribution {other:?}; \
+                     spreading uniformly over all ready endpoints"
+                );
+                Self::Uniform
+            }
+        }
+    }
+}
+
+/// The endpoints `policy` lets a front use, in slot order. `candidates` must
+/// already match the front's port and address family.
+///
+/// `OnlyLocal` mirrors kube-proxy's `CategorizeEndpoints`: ready local
+/// endpoints, else serving-but-terminating local ones (so a rolling update of
+/// a single local pod does not black-hole), else none. Other policies use
+/// ready, non-terminating endpoints only. Slot order is local-first only when
+/// the policy prefers local; otherwise by pod IP alone, so every node derives
+/// the same slots and one flow hashes to the same pod on any ingress node.
+fn eligible_endpoints<'a>(
+    policy: EndpointPolicy,
+    candidates: &[&'a Endpoint],
+    node_ip: IpAddr,
+) -> Vec<&'a Endpoint> {
+    let ready = |e: &&Endpoint| e.ready && !e.terminating;
+    let mut chosen: Vec<&Endpoint> = match policy {
+        EndpointPolicy::OnlyLocal => {
+            let local_ready: Vec<_> = candidates
+                .iter()
+                .copied()
+                .filter(|e| is_local(e, node_ip) && ready(e))
+                .collect();
+            if local_ready.is_empty() {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|e| is_local(e, node_ip) && e.serving && e.terminating)
+                    .collect()
+            } else {
+                local_ready
+            }
+        }
+        _ => candidates.iter().copied().filter(ready).collect(),
+    };
+    if policy == EndpointPolicy::PreferLocal {
+        chosen.sort_by_key(|e| (!is_local(e, node_ip), e.pod_ip));
+    } else {
+        chosen.sort_by_key(|e| e.pod_ip);
+    }
+    chosen
+}
+
+/// Whether this node should list its own address in a Service's
+/// `status.loadBalancer.ingress`. Only `OnlyLocal` narrows it: a node with no
+/// usable local pod would silently drop every connection. Every other policy
+/// forwards cross-node, so any node running beep qualifies.
+pub fn publishes_ingress(
+    policy: EndpointPolicy,
+    endpoints: &[&Endpoint],
+    node_ip: IpAddr,
+    family_is_v4: bool,
+) -> bool {
+    if policy != EndpointPolicy::OnlyLocal {
+        return true;
+    }
+    let same_family: Vec<&Endpoint> = endpoints
+        .iter()
+        .copied()
+        .filter(|e| e.pod_ip.is_ipv4() == family_is_v4)
+        .collect();
+    !eligible_endpoints(policy, &same_family, node_ip).is_empty()
+}
+
 fn front_key(front_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
     LbFrontKey {
         front_ip: wire_ip_v6(front_ip),
@@ -362,8 +469,8 @@ fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
 
 /// Whether `ep` runs on this node: its hosting node's address set contains
 /// this node's own address, the same identity test `pod_targets_for_node` uses.
-fn is_local(ep: &Endpoint, node: &NodeContext) -> bool {
-    ep.node_addrs.contains(&node.node_ip)
+fn is_local(ep: &Endpoint, node_ip: IpAddr) -> bool {
+    ep.node_addrs.contains(&node_ip)
 }
 
 /// POD_TARGETS is this node's own local serving-set, port-agnostic by
@@ -461,20 +568,16 @@ pub fn reconcile_service(
     // front's own address family qualify: the Geneve inner packet keeps the
     // client's family, so a cross-family pod can never answer.
     for port in &svc.ports {
-        let mut candidates: Vec<&Endpoint> = endpoints
+        let matching: Vec<&Endpoint> = endpoints
             .iter()
             .copied()
             .filter(|e| {
-                e.ready
-                    && !e.terminating
-                    && e.ports.contains(&port.target_port)
-                    && e.pod_ip.is_ipv4() == svc.front_ip.is_ipv4()
+                e.ports.contains(&port.target_port) && e.pod_ip.is_ipv4() == svc.front_ip.is_ipv4()
             })
             .collect();
-        // Local endpoints first (the dataplane hashes over that prefix), then
-        // by pod IP, so slots depend only on the endpoint set and two
-        // reconciles over the same input agree.
-        candidates.sort_by_key(|e| (!is_local(e, node), e.pod_ip));
+        // Slots depend only on the endpoint set, so two reconciles over the
+        // same input agree.
+        let candidates = eligible_endpoints(svc.policy, &matching, node.node_ip);
         // No candidate still yields the front, with zero endpoints: the front
         // stays owned (FRONT_META count 0), so new clients are rejected and
         // pinned flows to draining backends keep their conntrack path.
@@ -491,7 +594,7 @@ pub fn reconcile_service(
                     pod_ip: wire_ip_v6(backend.pod_ip),
                 },
                 target_port: wire_port(port.target_port),
-                flags: if is_local(backend, node) {
+                flags: if is_local(backend, node.node_ip) {
                     ENDPOINT_FLAG_IS_LOCAL
                 } else {
                     0
@@ -504,6 +607,7 @@ pub fn reconcile_service(
             front_key(svc.front_ip, port),
             DesiredFront {
                 flags: 0,
+                prefer_local: svc.policy != EndpointPolicy::Uniform,
                 endpoints,
             },
         );
@@ -562,6 +666,7 @@ mod tests {
     fn single_port_service(front_ip: Ipv4Addr, port: u16, target_port: u16) -> ServiceView {
         ServiceView {
             front_ip: IpAddr::V4(front_ip),
+            policy: EndpointPolicy::PreferLocal,
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -573,6 +678,7 @@ mod tests {
     fn single_port_service_v6(front_ip: Ipv6Addr, port: u16, target_port: u16) -> ServiceView {
         ServiceView {
             front_ip: IpAddr::V6(front_ip),
+            policy: EndpointPolicy::PreferLocal,
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -588,6 +694,7 @@ mod tests {
             node_addrs: vec![IpAddr::V4(node_ip)],
             ready: true,
             terminating: false,
+            serving: true,
             ports,
             pod_uid: None,
         }
@@ -600,6 +707,7 @@ mod tests {
             node_addrs: vec![IpAddr::V6(node_ip)],
             ready: true,
             terminating: false,
+            serving: true,
             ports,
             pod_uid: None,
         }
@@ -842,6 +950,7 @@ mod tests {
         let pod_ip = Ipv4Addr::new(10, 244, 0, 9);
         let svc = ServiceView {
             front_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            policy: EndpointPolicy::PreferLocal,
             ports: vec![
                 ServicePort {
                     port: 80,
@@ -1427,6 +1536,7 @@ mod tests {
             node_addrs,
             ready: true,
             terminating: false,
+            serving: true,
             ports: vec![8080],
             pod_uid: None,
         }
@@ -1766,5 +1876,270 @@ mod tests {
             assert_eq!(f.endpoints[0].target_port, wire_port(8080));
             assert_eq!(f.endpoints[0].backend.pod_ip, wire_ip_v6(expected_pod));
         }
+    }
+
+    const THIS: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 5);
+    const OTHER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 6);
+
+    fn with_policy(policy: EndpointPolicy) -> ServiceView {
+        let mut svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        svc.policy = policy;
+        svc
+    }
+
+    fn ep_on(node_ip: Ipv4Addr, octet: u8) -> Endpoint {
+        ready_endpoint(Ipv4Addr::new(10, 244, 0, octet), node_ip, vec![8080])
+    }
+
+    fn terminating_ep_on(node_ip: Ipv4Addr, octet: u8, serving: bool) -> Endpoint {
+        let mut e = ep_on(node_ip, octet);
+        e.ready = false;
+        e.terminating = true;
+        e.serving = serving;
+        e
+    }
+
+    fn reconcile_on(policy: EndpointPolicy, endpoints: Vec<Endpoint>) -> DesiredEntries {
+        reconcile_service(
+            &with_policy(policy),
+            &[EndpointSliceView { endpoints }],
+            &node(THIS),
+        )
+    }
+
+    #[test]
+    fn spec_fields_map_to_policy_with_local_traffic_policy_winning() {
+        use EndpointPolicy::*;
+        let cases = [
+            (None, None, Uniform),
+            (Some("Cluster"), None, Uniform),
+            (None, Some("PreferSameNode"), PreferLocal),
+            (None, Some("PreferClose"), PreferLocal),
+            (None, Some("PreferSameZone"), PreferLocal),
+            (None, Some("NoSuchDistribution"), Uniform),
+            (Some("Local"), None, OnlyLocal),
+            (Some("Local"), Some("PreferSameNode"), OnlyLocal),
+        ];
+        for (etp, td, want) in cases {
+            assert_eq!(EndpointPolicy::from_spec(etp, td), want, "{etp:?}/{td:?}");
+        }
+    }
+
+    // Cluster with no trafficDistribution must spread over every pod, which
+    // needs local_count 0 even though local rows exist and stay flagged.
+    #[test]
+    fn uniform_policy_publishes_local_count_zero_while_flags_stay_accurate() {
+        let desired = reconcile_on(
+            EndpointPolicy::Uniform,
+            vec![ep_on(THIS, 1), ep_on(OTHER, 2), ep_on(OTHER, 3)],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(front.endpoints.len(), 3, "uniform uses every ready pod");
+        assert_eq!(
+            front.local_count(),
+            0,
+            "a nonzero local_count would pin flows to the local pod instead of spreading them"
+        );
+        let local: Vec<bool> = front
+            .endpoints
+            .iter()
+            .map(|e| e.flags & ENDPOINT_FLAG_IS_LOCAL != 0)
+            .collect();
+        assert_eq!(
+            local,
+            vec![true, false, false],
+            "IS_LOCAL still marks the local pod"
+        );
+        let plans = plan_for(&DesiredEntries::default(), &desired);
+        assert!(
+            matches!(plans[0].steps.last(), Some(beep::front_swap::FrontWrite::PutMeta(_, m))
+                if m.count == 3 && m.local_count == 0),
+            "FRONT_META must publish local_count 0; got {:?}",
+            plans[0].steps
+        );
+    }
+
+    #[test]
+    fn uniform_slots_ignore_which_node_computes_them() {
+        let eps = || vec![ep_on(OTHER, 1), ep_on(THIS, 2), ep_on(OTHER, 3)];
+        let on_this = slot_pods(only_front(&reconcile_on(EndpointPolicy::Uniform, eps())));
+        let on_other = reconcile_service(
+            &with_policy(EndpointPolicy::Uniform),
+            &[EndpointSliceView { endpoints: eps() }],
+            &node(OTHER),
+        );
+        assert_eq!(
+            on_this,
+            slot_pods(only_front(&on_other)),
+            "every ingress node must map one flow to the same pod"
+        );
+    }
+
+    #[test]
+    fn prefer_local_policy_orders_local_first_and_publishes_the_local_count() {
+        let desired = reconcile_on(
+            EndpointPolicy::PreferLocal,
+            vec![ep_on(OTHER, 1), ep_on(THIS, 2), ep_on(OTHER, 3)],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(2), pod_wire(1), pod_wire(3)]
+        );
+        assert_eq!(front.local_count(), 1, "prefer local, fall back to all");
+    }
+
+    #[test]
+    fn prefer_local_with_no_local_pod_falls_back_to_all() {
+        let desired = reconcile_on(
+            EndpointPolicy::PreferLocal,
+            vec![ep_on(OTHER, 1), ep_on(OTHER, 3)],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(front.endpoints.len(), 2);
+        assert_eq!(front.local_count(), 0);
+    }
+
+    #[test]
+    fn only_local_policy_emits_only_local_endpoints() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![
+                ep_on(OTHER, 1),
+                ep_on(THIS, 2),
+                ep_on(THIS, 4),
+                ep_on(OTHER, 3),
+            ],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(2), pod_wire(4)],
+            "a remote pod would carry the client across nodes, which eTP=Local forbids"
+        );
+        assert_eq!(front.local_count(), 2);
+    }
+
+    #[test]
+    fn only_local_with_a_ready_local_pod_ignores_terminating_local_pods() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![ep_on(THIS, 2), terminating_ep_on(THIS, 4, true)],
+        );
+
+        assert_eq!(slot_pods(only_front(&desired)), vec![pod_wire(2)]);
+    }
+
+    // kube-proxy topology.go: with no ready local endpoint, serving+terminating
+    // local ones keep a single-replica rollout from black-holing.
+    #[test]
+    fn only_local_falls_back_to_serving_terminating_local_pods() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![
+                ep_on(OTHER, 1),
+                terminating_ep_on(THIS, 4, true),
+                terminating_ep_on(THIS, 5, false),
+                terminating_ep_on(OTHER, 6, true),
+            ],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(4)],
+            "only the local pod that is still serving may take traffic"
+        );
+        assert_eq!(front.local_count(), 1);
+    }
+
+    #[test]
+    fn only_local_without_any_usable_local_pod_is_a_count_zero_front() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![ep_on(OTHER, 1), terminating_ep_on(THIS, 5, false)],
+        );
+
+        let front = only_front(&desired);
+        assert!(
+            front.endpoints.is_empty(),
+            "the front stays owned at count 0 so it drops instead of passing to the host"
+        );
+    }
+
+    // Eviction and pinned-flow admission read POD_TARGETS, never the policy, so
+    // flipping Cluster<->Local must leave established flows to drain.
+    #[test]
+    fn switching_policy_does_not_change_the_pod_targets_that_pinned_flows_use() {
+        let eps = || {
+            vec![
+                ep_on(OTHER, 1),
+                ep_on(THIS, 2),
+                terminating_ep_on(THIS, 4, true),
+            ]
+        };
+        let uniform = reconcile_on(EndpointPolicy::Uniform, eps());
+        let local = reconcile_on(EndpointPolicy::OnlyLocal, eps());
+
+        assert_eq!(uniform.pod_targets, local.pod_targets);
+        assert!(
+            local.pod_targets.contains(&pod_wire(4)),
+            "a terminating local pod keeps decap admission for its pinned flows"
+        );
+    }
+
+    #[test]
+    fn ingress_is_published_for_every_policy_but_only_local_needs_a_local_pod() {
+        let remote_only = [ep_on(OTHER, 1)];
+        let refs: Vec<&Endpoint> = remote_only.iter().collect();
+        let this = IpAddr::V4(THIS);
+        for policy in [EndpointPolicy::Uniform, EndpointPolicy::PreferLocal] {
+            assert!(
+                publishes_ingress(policy, &refs, this, true),
+                "{policy:?} forwards cross-node, so any beep node is a valid ingress"
+            );
+        }
+        assert!(
+            !publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, true),
+            "listing a node with no local pod would send clients to a silent drop"
+        );
+
+        let local = [ep_on(THIS, 2)];
+        let refs: Vec<&Endpoint> = local.iter().collect();
+        assert!(publishes_ingress(
+            EndpointPolicy::OnlyLocal,
+            &refs,
+            this,
+            true
+        ));
+        assert!(
+            !publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
+            "a v4 local pod gives a v6 front nothing to serve it"
+        );
+    }
+
+    #[test]
+    fn ingress_counts_a_serving_terminating_local_pod_as_usable() {
+        let this = IpAddr::V4(THIS);
+        let draining = [terminating_ep_on(THIS, 4, true)];
+        let refs: Vec<&Endpoint> = draining.iter().collect();
+        assert!(publishes_ingress(
+            EndpointPolicy::OnlyLocal,
+            &refs,
+            this,
+            true
+        ));
+        let dead = [terminating_ep_on(THIS, 4, false)];
+        let refs: Vec<&Endpoint> = dead.iter().collect();
+        assert!(!publishes_ingress(
+            EndpointPolicy::OnlyLocal,
+            &refs,
+            this,
+            true
+        ));
     }
 }

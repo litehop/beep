@@ -41,14 +41,22 @@ use beep_common::{FrontEndpoint, FrontEndpointKey, FrontMeta, LbFrontKey, ENDPOI
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesiredFront {
     pub flags: u16,
+    /// Whether new flows prefer the local endpoints. `false` publishes
+    /// `local_count = 0` so the dataplane hashes over every endpoint, however
+    /// the rows are flagged.
+    pub prefer_local: bool,
     pub endpoints: Vec<FrontEndpoint>,
 }
 
 impl DesiredFront {
-    /// Length of the leading run of `ENDPOINT_FLAG_IS_LOCAL` slots. The
-    /// dataplane hashes over exactly that prefix, so callers must order local
-    /// endpoints first.
+    /// The `FRONT_META.local_count`: the length of the leading run of
+    /// `ENDPOINT_FLAG_IS_LOCAL` slots when `prefer_local`, else 0. The
+    /// dataplane hashes over exactly that prefix, so callers preferring local
+    /// must order local endpoints first.
     pub fn local_count(&self) -> u16 {
+        if !self.prefer_local {
+            return 0;
+        }
         self.endpoints
             .iter()
             .take_while(|e| e.flags & ENDPOINT_FLAG_IS_LOCAL != 0)
@@ -498,6 +506,7 @@ mod tests {
 
     fn want(ep: FrontEndpoint) -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![ep],
         }
@@ -678,6 +687,7 @@ mod tests {
 
     fn many(eps: Vec<FrontEndpoint>) -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: eps,
         }
@@ -707,6 +717,26 @@ mod tests {
         );
         assert_eq!(store.meta[&f].local_count, 1);
         assert_eq!(store.meta[&f].count, 2);
+    }
+
+    #[test]
+    fn a_front_not_preferring_local_publishes_zero_local_count_despite_local_rows() {
+        // Cluster policy must hash over every endpoint even when a local row
+        // exists; flipping the preference alone must republish the meta.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let mut uniform = many(vec![local(endpoint(7, 8443)), endpoint(8, 8443)]);
+        uniform.prefer_local = false;
+        let first = store.plan(&desired(&[(f, uniform.clone())]), true);
+        store.apply_all(&first, |_| {});
+        assert_eq!(store.meta[&f].local_count, 0);
+
+        let mut preferring = uniform;
+        preferring.prefer_local = true;
+        let plans = store.plan(&desired(&[(f, preferring)]), true);
+        store.apply_all(&plans, |_| {});
+
+        assert_eq!(store.meta[&f].local_count, 1);
     }
 
     #[test]
@@ -790,6 +820,7 @@ mod tests {
 
     fn drained() -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![],
         }
@@ -1128,6 +1159,7 @@ mod tests {
 
     fn two(a: u8, b: u8) -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![endpoint(a, 8443), endpoint(b, 8443)],
         }
@@ -1166,6 +1198,7 @@ mod tests {
 
         // 2 -> 3 endpoints needs 3 new rows next to the 2 live ones.
         let three = DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![endpoint(1, 8443), endpoint(2, 8443), endpoint(4, 8443)],
         };

@@ -679,6 +679,7 @@ mod tests {
 
     fn front_to(pod: u32) -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![FrontEndpoint {
                 backend: LbFrontBackend {

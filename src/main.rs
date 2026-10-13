@@ -620,6 +620,7 @@ fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
             (
                 fixture_key(fixture),
                 DesiredFront {
+                    prefer_local: true,
                     flags: 0,
                     endpoints: vec![endpoint],
                 },
