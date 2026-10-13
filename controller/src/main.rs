@@ -281,14 +281,25 @@ async fn run_retry_loop(
         let ran = retry_tick(&retry, Instant::now(), || {
             apply_reconcile(&state, &maps, &retry, &node)
         });
-        if !ran
-            && maps
-                .lock()
-                .unwrap()
-                .previous_generations_due(Instant::now())
-        {
-            apply_reconcile(&state, &maps, &retry, &node);
-        }
+        follow_up_tick(
+            ran,
+            || {
+                maps.lock()
+                    .unwrap()
+                    .previous_generations_due(Instant::now())
+            },
+            || apply_reconcile(&state, &maps, &retry, &node),
+        );
+    }
+}
+
+/// Runs `reconcile` when a swapped front's previous generation has outlived
+/// its grace, unless a retry already reconciled on this tick (that pass has
+/// already deleted whatever was due). `grace_expired` is only asked when no
+/// retry ran.
+fn follow_up_tick(ran: bool, grace_expired: impl FnOnce() -> bool, reconcile: impl FnOnce()) {
+    if !ran && grace_expired() {
+        reconcile();
     }
 }
 
@@ -958,6 +969,44 @@ mod tests {
             "a successful retry must not run again"
         );
         assert_eq!(runs, 1);
+    }
+
+    #[test]
+    fn expired_grace_triggers_a_reconcile_on_a_quiet_cluster() {
+        // No watch event arrives on a quiet cluster, so without this follow-up
+        // the previous generation's rows would sit in the front map forever.
+        let mut reconciles = 0;
+        follow_up_tick(false, || true, || reconciles += 1);
+        assert_eq!(reconciles, 1);
+    }
+
+    #[test]
+    fn unexpired_grace_does_not_reconcile() {
+        let mut reconciles = 0;
+        follow_up_tick(false, || false, || reconciles += 1);
+        assert_eq!(
+            reconciles, 0,
+            "reconciling every tick would hammer the maps"
+        );
+    }
+
+    #[test]
+    fn a_retry_that_ran_already_swept_the_expired_grace() {
+        // A second back-to-back reconcile would double the write load on the
+        // very tick a failing apply is being retried, and the grace is not
+        // even consulted.
+        let mut reconciles = 0;
+        let mut asked = false;
+        follow_up_tick(
+            true,
+            || {
+                asked = true;
+                true
+            },
+            || reconciles += 1,
+        );
+        assert_eq!(reconciles, 0);
+        assert!(!asked);
     }
 
     #[test]
