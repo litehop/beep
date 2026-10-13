@@ -104,6 +104,25 @@ REMAP_FRONT_PORT_A="19106"
 REMAP_FRONT_PORT_B="19107"
 REMAP_TARGET_PORT="18086"
 REMAP_CLIENT_PORT="40000"
+# Pin-steering legs beyond the v4 established flow: a v6 front (v4 outer
+# tunnel, as the dual-stack rigs run) re-pointed from POD6_A to POD6_B, and a
+# UDP front whose only flow stays FWD_PENDING (its original backend node
+# answers to nothing) when the front is re-pointed at this node. Both
+# variables are read by `start_loader` at call time.
+FRONT_IP6="2001:db8:5::1"
+CLIENT_IP6="2001:db8:5::2"
+POD6_A="2001:db8:6::53"
+POD6_B="2001:db8:6::60"
+PIN6_FRONT_PORT="19108"
+PIN6_TARGET_PORT="18087"
+# A second front on POD6_A keeps it in POD_TARGETS across the re-point (the
+# v4 pod is kept by other fronts), so only the pin decides where a packet lands.
+PIN6_KEEP_FRONT_PORT="19110"
+PIN6_FRONT_POD_IP="$POD6_A"
+PEND_FRONT_PORT="19109"
+PEND_TARGET_PORT="18088"
+PEND_CLIENT_PORT="41000"
+PEND_BACKEND_NODE_IP="$FLOOD_BACKEND_NODE_IP"
 EVICT_RESPONSE_FILE="/tmp/beep-smoke-response-evict.http"
 EVICT_BACKEND_LOG="/tmp/beep-smoke-backend-evict.log"
 REPLACEMENT_POD_IP="198.51.100.60"
@@ -147,6 +166,9 @@ cleanup() {
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${REMAP_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -6 -l -N ${POD6_B} ${PIN6_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -u -l ${POD_IP} ${PEND_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
   pkill -f "tcpdump -nn -l -vv -i smoke-veth1" 2>/dev/null || true
   rm -rf "$PIN_DIR"
@@ -161,6 +183,8 @@ cleanup() {
   ip link del geneve0 2>/dev/null || true
   ip addr del "${POD_IP}/32" dev lo 2>/dev/null || true
   ip addr del "${REPLACEMENT_POD_IP}/32" dev lo 2>/dev/null || true
+  ip -6 addr del "${POD6_A}/128" dev lo 2>/dev/null || true
+  ip -6 addr del "${POD6_B}/128" dev lo 2>/dev/null || true
   if [ -f "$RPFILTER_SAVE_FILE" ]; then
     sysctl -w net.ipv4.conf.all.rp_filter="$(cat "$RPFILTER_SAVE_FILE")" >/dev/null 2>&1 || true
     rm -f "$RPFILTER_SAVE_FILE"
@@ -209,6 +233,10 @@ ip addr add "${POD_IP}/32" dev lo
 # this address -- added up front alongside POD_IP so both aliases exist for
 # the whole run, not just from the point they're first used.
 ip addr add "${REPLACEMENT_POD_IP}/32" dev lo
+ip -6 addr add "${POD6_A}/128" dev lo nodad
+ip -6 addr add "${POD6_B}/128" dev lo nodad
+ip addr add "${FRONT_IP6}/64" dev smoke-veth0 nodad
+ip netns exec smoke-client ip addr add "${CLIENT_IP6}/64" dev smoke-veth1 nodad
 
 echo "==> creating $UPLINK2_IFACE/$UPLINK2_PEER_IFACE + $UPLINK2_NETNS netns (second uplink, stands in for e.g. a WireGuard mesh alongside the public NIC above)"
 ip link add "$UPLINK2_IFACE" type veth peer name "$UPLINK2_PEER_IFACE"
@@ -253,6 +281,9 @@ start_loader() {
     --fixture "${FRONT_IP}:${COLD_FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${COLD_TARGET_PORT}" \
     --fixture "${FRONT_IP}:${REMAP_FRONT_PORT_A}:tcp:${FRONT_IP}:${POD_IP}:${REMAP_TARGET_PORT}" \
     --fixture "${FRONT_IP}:${REMAP_FRONT_PORT_B}:tcp:${FRONT_IP}:${POD_IP}:${REMAP_TARGET_PORT}" \
+    --fixture "[${FRONT_IP6}]:${PIN6_FRONT_PORT}:tcp:${FRONT_IP}:[${PIN6_FRONT_POD_IP}]:${PIN6_TARGET_PORT}" \
+    --fixture "[${FRONT_IP6}]:${PIN6_KEEP_FRONT_PORT}:tcp:${FRONT_IP}:[${POD6_A}]:${PIN6_TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${PEND_FRONT_PORT}:udp:${PEND_BACKEND_NODE_IP}:${POD_IP}:${PEND_TARGET_PORT}" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -770,10 +801,61 @@ pin_want=$(pod_ip_v6_json_bytes "$POD_IP")
 echo "FLOW_TABLE forward entries pinned to ${POD_IP} (bpftool):"
 map_json "$PIN_DIR/FLOW_TABLE" | jq -c --argjson want "$pin_want" '.[] | select(.key[37] == "0x00" and .value[16:32] == $want)' | tail -n 2
 
+PIN6_FIFO="/tmp/beep-smoke-pin6-fifo"
+PIN6_BACKEND_IN="/tmp/beep-smoke-pin6-backend.in"
+PIN6_MSG="PIN6MSG"
+PEND_BACKEND_OUT="/tmp/beep-smoke-pend-backend.out"
+rm -f "$PIN6_FIFO" "$PIN6_BACKEND_IN" "$PEND_BACKEND_OUT"
+mkfifo "$PIN6_FIFO"
+pin6_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
+nohup bash -c "sleep 60 | nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT} >${PIN6_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
+disown
+sleep 0.5
+nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN6_FIFO}; printf '%s' ${PIN6_MSG} ) | timeout 60 nc -6 ${FRONT_IP6} ${PIN6_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
+disown
+for _ in $(seq 1 30); do
+  pin6_flows_now=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
+  [ -n "$pin6_flows_now" ] && [ "$pin6_flows_now" -ge "$((pin6_flows_before + 2))" ] && break
+  sleep 0.2
+done
+[ -n "$pin6_flows_now" ] && [ "$pin6_flows_now" -ge "$((pin6_flows_before + 2))" ] || {
+  echo "FAIL: v6 pin-steering flow never established in FLOW_TABLE (before $pin6_flows_before, saw $pin6_flows_now)" >&2
+  exit 1
+}
+
+# One packet of a flow that can never be promoted: its backend node answers to
+# nothing, so the flow stays FWD_PENDING-only.
+pend_before=$(map_entry_count "$PIN_DIR/FWD_PENDING")
+printf 'PENDPKT1' | ip netns exec smoke-client nc -u -q0 -p "$PEND_CLIENT_PORT" "$FRONT_IP" "$PEND_FRONT_PORT" 2>/dev/null || true
+sleep 0.5
+pend_after=$(map_entry_count "$PIN_DIR/FWD_PENDING")
+[ -n "$pend_after" ] && [ "$pend_after" -gt "$pend_before" ] || {
+  echo "FAIL: the pending-pin flow's first packet minted no FWD_PENDING entry ($pend_before -> $pend_after) -- the leg below would not exercise the pending branch" >&2
+  exit 1
+}
+
+forward_rows_for_bytes() {
+  map_json "$PIN_DIR/FLOW_TABLE" | jq --argjson want "$1" '[.[] | select(.key[37] == "0x00" and .value[16:32] == $want)] | length'
+}
+pin6_want='["0x20","0x01","0x0d","0xb8","0x00","0x06","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x53"]'
+pin_v4_rows_before=$(forward_rows_for_bytes "$pin_want")
+pin6_rows_before=$(forward_rows_for_bytes "$pin6_want")
+echo "FLOW_TABLE forward rows pinned to ${POD6_A} (bpftool):"
+map_json "$PIN_DIR/FLOW_TABLE" | jq -c --argjson want "$pin6_want" '.[] | select(.key[37] == "0x00" and .value[16:32] == $want)' | tail -n 2
+[ "$pin6_rows_before" -ge 1 ] || {
+  echo "FAIL: no forward-tagged FLOW_TABLE row pinned to ${POD6_A} -- the v6 flow's pin was never stored, so the v6 leg below proves nothing" >&2
+  exit 1
+}
+
 EVICT_FRONT_POD_IP="$REPLACEMENT_POD_IP"
+PIN6_FRONT_POD_IP="$POD6_B"
+PEND_BACKEND_NODE_IP="$FRONT_IP"
 stop_loader
 start_loader "$EVICT_LOADER_LOG_REPLACEMENT"
 wait_for_attach "$EVICT_LOADER_LOG_REPLACEMENT"
+pin_v4_rows_after=$(forward_rows_for_bytes "$pin_want")
+pin6_rows_after=$(forward_rows_for_bytes "$pin6_want")
+echo "RESTART-EVICTION (log only): forward rows pinned to old pod ${POD_IP} ${pin_v4_rows_before} -> ${pin_v4_rows_after}; to old pod ${POD6_A} ${pin6_rows_before} -> ${pin6_rows_after}"
 printf '\n' 1<>"$PIN_STEER_FIFO"
 for _ in $(seq 1 25); do
   grep -q "$PIN_STEER_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
@@ -794,6 +876,44 @@ pin_new_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EV
   exit 1
 }
 echo "PIN-STEERING (new flow): PASS (a fresh flow followed the new endpoint ${REPLACEMENT_POD_IP})"
+
+printf '\n' 1<>"$PIN6_FIFO"
+for _ in $(seq 1 25); do
+  grep -q "$PIN6_MSG" "$PIN6_BACKEND_IN" 2>/dev/null && break
+  sleep 0.2
+done
+grep -q "$PIN6_MSG" "$PIN6_BACKEND_IN" 2>/dev/null || {
+  echo "FAIL: after the v6 front was re-pointed at ${POD6_B}, a packet of the established v6 flow did not reach its pinned pod ${POD6_A} (backend received: '$(cat "$PIN6_BACKEND_IN" 2>/dev/null)'). The v6 ingress path re-resolved the front instead of following the pin." >&2
+  exit 1
+}
+echo "PIN-STEERING (v6 established): PASS (v6 flow kept pod ${POD6_A} after its front was re-pointed at ${POD6_B})"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nREPLACEMENT6' > /tmp/beep-smoke-response-pin6.http
+nohup nc -6 -l -N "$POD6_B" "$PIN6_TARGET_PORT" < /tmp/beep-smoke-response-pin6.http >/dev/null 2>&1 &
+disown
+sleep 0.5
+pin6_new_body=$(ip netns exec smoke-client curl -sS -g -m 5 "http://[${FRONT_IP6}]:${PIN6_FRONT_PORT}/")
+[ "$pin6_new_body" = "REPLACEMENT6" ] || {
+  echo "FAIL: a NEW v6 flow after the re-point must reach ${POD6_B}, got: $pin6_new_body -- without this the v6 pin check above could pass because the front was never re-pointed" >&2
+  exit 1
+}
+echo "PIN-STEERING (v6 new flow): PASS (a fresh v6 flow followed the new endpoint ${POD6_B})"
+
+nohup nc -u -l "$POD_IP" "$PEND_TARGET_PORT" >"$PEND_BACKEND_OUT" 2>&1 &
+disown
+sleep 0.5
+printf 'PENDPKT2' | ip netns exec smoke-client nc -u -q0 -p "$PEND_CLIENT_PORT" "$FRONT_IP" "$PEND_FRONT_PORT" 2>/dev/null || true
+sleep 1
+! grep -q PENDPKT2 "$PEND_BACKEND_OUT" || {
+  echo "FAIL: after the front was re-pointed at this node, a later packet of a still-FWD_PENDING flow reached the NEW endpoint instead of its pending-pinned backend node ${FLOOD_BACKEND_NODE_IP}. Re-resolving a pre-promotion flow could move it to a backend the first packet never reached." >&2
+  exit 1
+}
+printf 'NEWFLOW' | ip netns exec smoke-client nc -u -q0 -p "$((PEND_CLIENT_PORT + 1))" "$FRONT_IP" "$PEND_FRONT_PORT" 2>/dev/null || true
+sleep 1
+grep -q NEWFLOW "$PEND_BACKEND_OUT" || {
+  echo "FAIL: a NEW flow to the re-pointed UDP front never reached the new endpoint (backend saw: '$(cat "$PEND_BACKEND_OUT" 2>/dev/null)') -- without this the pending-pin check above could pass because the front was never re-pointed" >&2
+  exit 1
+}
+echo "PIN-STEERING (pending): PASS (a still-FWD_PENDING flow kept its original backend node after the re-point; a fresh flow reached the new endpoint)"
 
 # Drain: the front's ready count drops to 0 (rolling update) while the pinned
 # flow is still open. It must keep forwarding; only a NEW connection is refused.
@@ -828,11 +948,13 @@ drain_ms=$((($(date +%s%N) - drain_start) / 1000000))
 }
 echo "PIN-DRAIN (new flow): PASS (new connection refused after ${drain_ms}ms)"
 EVICT_FRONT_POD_IP="$POD_IP"
+PIN6_FRONT_POD_IP="$POD6_A"
+PEND_BACKEND_NODE_IP="$FLOOD_BACKEND_NODE_IP"
 stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"
 wait_for_attach "$EVICT_LOADER_LOG_REUSE"
 pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
-rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN" "$PIN6_FIFO" "$PIN6_BACKEND_IN" "$PEND_BACKEND_OUT"
 
 echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hostNetwork backend), a fresh outbound connection from it must still leave the uplink"
 # A hostNetwork backend's pod IP IS the node's address, so POD_TARGETS holds
@@ -865,8 +987,6 @@ echo "==> reject: an owned front with no ready backends must answer the client (
 # Without the listener the host kernel would itself RST/ICMP and the phase could
 # not tell beep's reply from a pass-through; with it, a pass-through connects (TCP)
 # or is swallowed (UDP), so only beep's own reply produces a refusal.
-FRONT_IP6="2001:db8:5::1"
-CLIENT_IP6="2001:db8:5::2"
 FRONT_IP6_KEY="32 1 13 184 0 5 0 0 0 0 0 0 0 0 0 1"
 FRONT_IP4_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ')"
 REJECT_TCP4_PORT=19300
@@ -876,8 +996,6 @@ REJECT_UDP6_PORT=19303
 CONTROL_TCP4_PORT=19304
 CONTROL_TCP6_PORT=19305
 REJECT_CAPTURE="/tmp/beep-smoke-reject-capture.txt"
-ip addr add "${FRONT_IP6}/64" dev smoke-veth0 nodad
-ip netns exec smoke-client ip addr add "${CLIENT_IP6}/64" dev smoke-veth1 nodad
 
 set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
   bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 || {
