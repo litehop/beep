@@ -1,0 +1,24 @@
+name: zmi6-spike
+on:
+  push:
+    branches: [worker/agent-a9e0ae213108bd620]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: kvm
+        run: |
+          ls -l /dev/kvm || echo "NO /dev/kvm"
+          nproc; free -m; lscpu | grep -iE "model name|virtualization|hypervisor"
+          echo "KERNEL=\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"" | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "STILL NO /dev/kvm"
+      - name: tool availability
+        run: |
+          apt-cache policy virtme-ng qemu-system-x86 | head -20
+          python3 --version
+          uname -r
+          cat /etc/os-release | head -3
+
