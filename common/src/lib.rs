@@ -318,6 +318,57 @@ pub struct FrontEndpoint {
     pub _pad: [u8; 6],
 }
 
+/// Geneve option class for every TLV this dataplane defines. `0xffff` is
+/// IANA's "Experimental" class (RFC 8926 SS3.1). Wire order.
+pub const GENEVE_OPT_CLASS: u16 = 0xffffu16.to_be();
+/// Forward-leg option type: the pod the backend delivers to plus the port it
+/// DNATs to.
+pub const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
+/// Forward-leg option total length: 4-byte TLV header, 16-byte dual-stack
+/// `pod_ip`, 2-byte wire-order `target_port`, 2 bytes of padding (RFC 8926
+/// SS3.4 word multiple). The same length as the return leg's front echo, so
+/// the forward leg never needs more underlay headroom than the return leg.
+pub const POD_ID_OPT_LEN: usize = 24;
+
+/// Builds the forward-leg option. `target_port` is wire-order (`wire_port`),
+/// as stored in `FrontEndpoint`.
+#[inline(always)]
+pub fn encode_pod_id_option(pod_ip: &[u8; 16], target_port: u16) -> [u8; POD_ID_OPT_LEN] {
+    let mut opt = [0u8; POD_ID_OPT_LEN];
+    opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
+    opt[2] = GENEVE_OPT_TYPE_POD_ID;
+    opt[3] = (POD_ID_OPT_LEN as u8 - 4) / 4;
+    opt[4..20].copy_from_slice(pod_ip);
+    opt[20..22].copy_from_slice(&target_port.to_ne_bytes());
+    opt
+}
+
+/// Reads `(pod_ip, target_port)` back out of a forward-leg option; `None`
+/// unless class, type and length word all match.
+#[inline(always)]
+pub fn decode_pod_id_option(opt: &[u8; POD_ID_OPT_LEN]) -> Option<([u8; 16], u16)> {
+    if opt[0..2] != GENEVE_OPT_CLASS.to_ne_bytes()
+        || opt[2] != GENEVE_OPT_TYPE_POD_ID
+        || opt[3] != (POD_ID_OPT_LEN as u8 - 4) / 4
+    {
+        return None;
+    }
+    let pod_ip: [u8; 16] = opt[4..20].try_into().ok()?;
+    let target_port = u16::from_ne_bytes([opt[20], opt[21]]);
+    Some((pod_ip, target_port))
+}
+
+/// Bytes a Geneve-encapsulated inner L3 packet grows by on the underlay: the
+/// inner Ethernet header (geneve0 frames are always Ethernet), outer IP, UDP,
+/// the 8-byte Geneve header, and the options. The kernel's tunnel PMTU check
+/// admits inner L3 packets up to `underlay_mtu - geneve_overhead(..)`; the
+/// loader sets no `geneve0` MTU (an external device defaults to ~64 KiB), so
+/// this is the only size budget.
+pub const fn geneve_overhead(outer_ipv6: bool, opt_len: usize) -> usize {
+    let outer_ip = if outer_ipv6 { 40 } else { 20 };
+    14 + outer_ip + 8 + 8 + opt_len
+}
+
 /// The only slot a front has until multi-endpoint selection exists.
 pub const FRONT_SLOT_FIRST: u16 = 0;
 
@@ -332,26 +383,6 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
     Some(FrontEndpointKey {
         front,
         generation: meta.generation,
-        slot: FRONT_SLOT_FIRST,
-        _pad: 0,
-    })
-}
-
-/// The `FRONT_ENDPOINTS` key decap reads for the target port of a front. At
-/// `count == 0` that is slot 0 of the previous generation, which the write
-/// protocol leaves in place: flows pinned before the front drained must keep
-/// resolving their target port, or they would be dropped on the backend node
-/// even though ingress still forwards them.
-///
-/// INTERIM: remove once the target port travels in the forward Geneve option.
-/// It only covers a front drained by exactly one swap (the next swap deletes
-/// every non-live generation, so a second generation bump at count 0 loses the
-/// rows), and slot 0 may name a different target port than the pinned pod
-/// under named ports.
-pub fn decap_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> FrontEndpointKey {
-    front_endpoint_key(front, meta).unwrap_or(FrontEndpointKey {
-        front,
-        generation: meta.generation.wrapping_sub(1),
         slot: FRONT_SLOT_FIRST,
         _pad: 0,
     })
@@ -404,6 +435,10 @@ pub struct UplinkConfig {
 pub struct ForwardFlowValue {
     pub backend: LbFrontBackend,
     pub ingress_ifindex: u32,
+    /// Wire-order port the backend node DNATs to, pinned with the pod so a
+    /// flow keeps its target port when its front is re-pointed or drained.
+    pub target_port: u16,
+    pub _pad: u16,
 }
 
 /// Union of the three roles `FLOW_TABLE` stores, discriminated by the
@@ -435,6 +470,8 @@ impl FlowValue {
                     pod_ip: [0; 16],
                 },
                 ingress_ifindex: 0,
+                target_port: 0,
+                _pad: 0,
             },
         }
     }
@@ -577,7 +614,9 @@ impl_pod!(FrontEndpoint {
 });
 impl_pod!(ForwardFlowValue {
     backend: LbFrontBackend,
-    ingress_ifindex: u32
+    ingress_ifindex: u32,
+    target_port: u16,
+    _pad: u16
 });
 impl_pod!(Config {
     geneve_ifindex: u32,
@@ -1088,8 +1127,12 @@ pub enum IngressSteer {
     /// The front has endpoints but the chosen row is unreadable: fail closed
     /// rather than leak a front-addressed packet to the host stack.
     Drop,
-    /// Send to this backend; the caller pins it only if the flow has no pin.
-    Forward(LbFrontBackend),
+    /// Send to this backend, stamping `target_port` (wire order) into the
+    /// forward option; the caller pins both only if the flow has no pin.
+    Forward {
+        backend: LbFrontBackend,
+        target_port: u16,
+    },
 }
 
 /// Ingress backend choice for one packet of a front. An existing pin
@@ -1097,19 +1140,23 @@ pub enum IngressSteer {
 /// wins over the hash, and over a zero count: a changed endpoint count or slot
 /// order must never move a live connection to a pod holding no state for it,
 /// and a front draining to zero ready endpoints must not reset live
-/// connections. Only a flow with no pin is rejected at count 0, else it
-/// reduces `hash` (a `flow_hash` of the flow) over `meta.count` and reads the
-/// chosen row through `endpoint_at`.
+/// connections. A pin carries its own target port, so the backend keeps
+/// delivering to the port the pod was chosen with. Only a flow with no pin is
+/// rejected at count 0, else it reduces `hash` (a `flow_hash` of the flow)
+/// over `meta.count` and reads the chosen row through `endpoint_at`.
 pub fn ingress_steer(
     meta: FrontMeta,
-    established: Option<LbFrontBackend>,
-    pending: Option<LbFrontBackend>,
+    established: Option<ForwardFlowValue>,
+    pending: Option<ForwardFlowValue>,
     hash: u32,
     front: LbFrontKey,
     endpoint_at: impl FnOnce(FrontEndpointKey) -> Option<FrontEndpoint>,
 ) -> IngressSteer {
-    if let Some(backend) = established.or(pending) {
-        return IngressSteer::Forward(backend);
+    if let Some(pin) = established.or(pending) {
+        return IngressSteer::Forward {
+            backend: pin.backend,
+            target_port: pin.target_port,
+        };
     }
     if meta.count == 0 {
         return IngressSteer::Reject;
@@ -1124,7 +1171,10 @@ pub fn ingress_steer(
         _pad: 0,
     };
     match endpoint_at(key) {
-        Some(endpoint) => IngressSteer::Forward(endpoint.backend),
+        Some(endpoint) => IngressSteer::Forward {
+            backend: endpoint.backend,
+            target_port: endpoint.target_port,
+        },
         None => IngressSteer::Drop,
     }
 }
@@ -1340,13 +1390,14 @@ mod tests {
     #[test]
     fn forward_flow_value_has_no_padding() {
         // LbFrontBackend (32 bytes: 2x [u8; 16], widened for dual-stack) +
-        // ingress_ifindex (4 bytes) -- LbFrontBackend's
-        // byte-array fields have no alignment requirement above 1, so
-        // ingress_ifindex's own u32 alignment is the only constraint, and it
-        // already falls on a multiple-of-4 offset (32). A regression that
-        // reorders fields around a smaller type would silently reintroduce a
-        // padding gap here.
-        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 36);
+        // ingress_ifindex (4) + target_port (2) + explicit _pad (2) -- the
+        // pad keeps the struct a multiple of its u32 alignment with no
+        // compiler-inserted bytes. A regression that reorders fields around a
+        // smaller type would silently reintroduce a padding gap here.
+        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 40);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, ingress_ifindex), 32);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, target_port), 36);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, _pad), 38);
     }
 
     #[test]
@@ -1371,7 +1422,7 @@ mod tests {
     #[test]
     fn flow_value_size_matches_its_largest_arm_with_no_extra_padding() {
         // FlowValue must be exactly as large as its largest arm
-        // (RevFlowValue, 36 bytes) -- any larger would mean the union picked
+        // (ForwardFlowValue, 40 bytes) -- any larger would mean the union picked
         // up padding bytes FLOW_TABLE's kernel-side write leaves
         // uninitialized, and a userspace `aya::Pod` read of a DIFFERENT arm
         // (e.g. the `port_memo` arm of a slot written as `forward`) would then
@@ -1379,13 +1430,13 @@ mod tests {
         // field data instead of cleanly aliasing the smaller arm's prefix.
         assert_eq!(
             core::mem::size_of::<FlowValue>(),
-            core::mem::size_of::<RevFlowValue>()
+            core::mem::size_of::<ForwardFlowValue>()
         );
-        assert_eq!(core::mem::size_of::<FlowValue>(), 36);
+        assert_eq!(core::mem::size_of::<FlowValue>(), 40);
     }
 
-    fn flow_value_bytes(v: &FlowValue) -> [u8; 36] {
-        // SAFETY: `FlowValue` is exactly 36 bytes (asserted by
+    fn flow_value_bytes(v: &FlowValue) -> [u8; 40] {
+        // SAFETY: `FlowValue` is exactly 40 bytes (asserted by
         // `flow_value_size_matches_its_largest_arm_with_no_extra_padding`) and
         // its constructors zero-initialize it, so every byte is initialized.
         unsafe { core::mem::transmute_copy(v) }
@@ -1393,7 +1444,7 @@ mod tests {
 
     #[test]
     fn port_memo_flow_value_tail_is_zero_so_no_kernel_stack_leaks_into_the_map() {
-        // The port_memo arm is 2 of 36 bytes; the other 34 land in
+        // The port_memo arm is 2 of 40 bytes; the other 38 land in
         // userspace-visible FLOW_TABLE entries (eviction scans, bpftool
         // dumps). They must be deterministic zeros, not eBPF stack residue.
         let v = FlowValue::from_port_memo(PortMemoValue {
@@ -1416,6 +1467,8 @@ mod tests {
                 pod_ip: [7; 16],
             },
             ingress_ifindex: 9,
+            target_port: wire_port(8080),
+            _pad: 0,
         };
         let rev = RevFlowValue {
             ingress_node_ip: [1; 16],
@@ -1524,25 +1577,66 @@ mod tests {
     }
 
     #[test]
-    fn decap_reads_the_prior_generation_when_the_front_drained_so_pinned_flows_survive() {
-        let drained = FrontMeta {
-            generation: 4,
-            count: 0,
-            flags: 0,
-        };
-        let key = decap_endpoint_key(sample_front(), drained);
+    fn pod_id_option_round_trips_pod_ip_and_target_port() {
+        // Decap DNATs to exactly this pod and port with no map lookup, so a
+        // lossy encode/decode misdelivers every flow on the backend node.
+        let v4_pod = ipv4_mapped_v6(wire_ip(u32::from_be_bytes([198, 51, 100, 53])));
+        let v6_pod = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ];
+        for pod in [v4_pod, v6_pod] {
+            let opt = encode_pod_id_option(&pod, wire_port(8443));
+            assert_eq!(decode_pod_id_option(&opt), Some((pod, wire_port(8443))));
+        }
+    }
+
+    #[test]
+    fn pod_id_option_wire_layout_is_24_bytes_with_port_after_the_pod_ip() {
+        // The Geneve length word counts 4-byte words after the 4-byte TLV
+        // header; a wrong value makes the kernel mis-frame the option.
+        let opt = encode_pod_id_option(&[7; 16], 0x1234);
+        assert_eq!(POD_ID_OPT_LEN, 24);
+        assert_eq!(opt.len(), 24);
+        assert_eq!(opt[0..2], [0xff, 0xff]);
+        assert_eq!(opt[2], 0x01);
+        assert_eq!(opt[3], 5);
+        assert_eq!(opt[4..20], [7; 16]);
+        assert_eq!(opt[20..22], 0x1234u16.to_ne_bytes());
+        assert_eq!(opt[22..24], [0, 0], "padding must stay zero on the wire");
+    }
+
+    #[test]
+    fn pod_id_option_decode_rejects_a_wrong_class_type_or_length_word() {
+        // A pre-widening 20-byte option (length word 4) or the return-leg
+        // echo must not be read as a forward option: its port bytes would be
+        // padding or a front port.
+        let good = encode_pod_id_option(&[1; 16], 80);
+        for (idx, bad) in [(0, 0xfe), (2, 0x02), (3, 4)] {
+            let mut opt = good;
+            opt[idx] = bad;
+            assert_eq!(decode_pod_id_option(&opt), None, "byte {idx} = {bad:#x}");
+        }
+    }
+
+    #[test]
+    fn forward_option_needs_no_more_underlay_headroom_than_the_return_echo() {
+        // The return leg already carries a 24-byte option, so a path that
+        // carries replies carries requests: growing the forward option to the
+        // same length lowers no path's usable MTU. Worst case is a v6
+        // underlay: 14 + 40 + 8 + 8 + 24 = 94.
+        const RETURN_ECHO_OPT_LEN: usize = 24;
+        assert_eq!(POD_ID_OPT_LEN, RETURN_ECHO_OPT_LEN);
+        assert_eq!(geneve_overhead(true, POD_ID_OPT_LEN), 94);
+        assert_eq!(geneve_overhead(false, POD_ID_OPT_LEN), 74);
+        // Largest inner L3 packet on a 1500-byte underlay, v4 / v6: 1426 /
+        // 1406, i.e. 4 bytes below the old forward leg and equal to the
+        // return leg's existing limit.
+        assert_eq!(1500 - geneve_overhead(false, POD_ID_OPT_LEN), 1426);
+        assert_eq!(1500 - geneve_overhead(true, POD_ID_OPT_LEN), 1406);
         assert_eq!(
-            (key.generation, key.slot, key._pad),
-            (3, FRONT_SLOT_FIRST, 0),
-            "a drained front's rows live under the previous generation; reading the empty live \
-             one drops every pinned flow on the backend node"
+            geneve_overhead(true, POD_ID_OPT_LEN) - geneve_overhead(true, 20),
+            4
         );
-        let live = FrontMeta {
-            generation: 4,
-            count: 2,
-            flags: 0,
-        };
-        assert_eq!(decap_endpoint_key(sample_front(), live).generation, 4);
     }
 
     // LbFrontKey/LbFrontBackend/RevFlowValue's address fields widened from
@@ -2228,6 +2322,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(100),
             },
             ingress_ifindex: 7,
+            target_port: wire_port(8080),
+            _pad: 0,
         };
         assert_eq!(
             fwd_pending_affinity_pin(None, candidate),
@@ -2248,6 +2344,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(100),
             },
             ingress_ifindex: 7,
+            target_port: wire_port(8080),
+            _pad: 0,
         };
         let candidate = ForwardFlowValue {
             backend: LbFrontBackend {
@@ -2255,6 +2353,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(200),
             },
             ingress_ifindex: 9,
+            target_port: wire_port(9090),
+            _pad: 0,
         };
         assert_eq!(
             fwd_pending_affinity_pin(Some(pinned), candidate),
@@ -2767,12 +2867,33 @@ mod tests {
         }
     }
 
+    // Each backend has its own target port, as with named ports.
+    fn port_n(n: u8) -> u16 {
+        wire_port(8000 + n as u16)
+    }
+
+    fn pin_n(n: u8) -> ForwardFlowValue {
+        ForwardFlowValue {
+            backend: backend_n(n),
+            ingress_ifindex: 2,
+            target_port: port_n(n),
+            _pad: 0,
+        }
+    }
+
+    fn forward_n(n: u8) -> IngressSteer {
+        IngressSteer::Forward {
+            backend: backend_n(n),
+            target_port: port_n(n),
+        }
+    }
+
     // Endpoint table for one front: slot i -> backend_n(order[i]).
     fn table(order: &[u8]) -> impl Fn(FrontEndpointKey) -> Option<FrontEndpoint> + '_ {
         move |k| {
             order.get(k.slot as usize).map(|&n| FrontEndpoint {
                 backend: backend_n(n),
-                target_port: 0,
+                target_port: port_n(n),
                 _pad: [0; 6],
             })
         }
@@ -2797,9 +2918,19 @@ mod tests {
             for i in 0..200u32 {
                 let port = 32768 + i as u16;
                 let hash = flow_hash(SEED, client(i), port, &front);
-                let IngressSteer::Forward(pinned) = steer_new_flow(client(i), port, &[1, 2, 3, 4])
+                let first = steer_new_flow(client(i), port, &[1, 2, 3, 4]);
+                let IngressSteer::Forward {
+                    backend,
+                    target_port,
+                } = first
                 else {
                     panic!("new flow must forward");
+                };
+                let pinned = ForwardFlowValue {
+                    backend,
+                    ingress_ifindex: 2,
+                    target_port,
+                    _pad: 0,
                 };
                 for after in [&[1u8, 2, 3, 4, 5][..], &[4, 3, 2, 1], &[9], &[7, 8]] {
                     let steered = ingress_steer(
@@ -2810,7 +2941,7 @@ mod tests {
                         front,
                         table(after),
                     );
-                    assert_eq!(steered, IngressSteer::Forward(pinned));
+                    assert_eq!(steered, first);
                 }
             }
         }
@@ -2819,16 +2950,15 @@ mod tests {
     #[test]
     fn pending_flow_keeps_its_pod_when_endpoints_change_or_first_reply_lands_elsewhere() {
         let front = test_front();
-        let pending = backend_n(3);
         let steered = ingress_steer(
             meta(2, 2),
             None,
-            Some(pending),
+            Some(pin_n(3)),
             flow_hash(SEED, v4_client(1), 4000, &front),
             front,
             table(&[8, 9]),
         );
-        assert_eq!(steered, IngressSteer::Forward(pending));
+        assert_eq!(steered, forward_n(3));
     }
 
     #[test]
@@ -2836,13 +2966,13 @@ mod tests {
         let front = test_front();
         let steered = ingress_steer(
             meta(1, 2),
-            Some(backend_n(1)),
-            Some(backend_n(2)),
+            Some(pin_n(1)),
+            Some(pin_n(2)),
             0,
             front,
             table(&[5, 6]),
         );
-        assert_eq!(steered, IngressSteer::Forward(backend_n(1)));
+        assert_eq!(steered, forward_n(1));
     }
 
     #[test]
@@ -2851,7 +2981,9 @@ mod tests {
             let mut seen = [0u32; 4];
             for i in 0..2000u32 {
                 match steer_new_flow(client(i / 40), 32768 + (i % 40) as u16, &[0, 1, 2, 3]) {
-                    IngressSteer::Forward(b) => seen[b.backend_node_ip[0] as usize] += 1,
+                    IngressSteer::Forward { backend, .. } => {
+                        seen[backend.backend_node_ip[0] as usize] += 1
+                    }
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -2899,16 +3031,28 @@ mod tests {
     #[test]
     fn pinned_flow_keeps_forwarding_when_front_drains_to_zero_endpoints() {
         let front = test_front();
-        for (established, pending) in [(Some(backend_n(1)), None), (None, Some(backend_n(2)))] {
+        for (n, established, pending) in [(1, Some(pin_n(1)), None), (2, None, Some(pin_n(2)))] {
             let steered = ingress_steer(meta(1, 0), established, pending, 0, front, |_| {
                 panic!("no row may be read for a pinned flow")
             });
             assert_eq!(
                 steered,
-                IngressSteer::Forward(established.or(pending).unwrap()),
+                forward_n(n),
                 "a rolling update can drop the ready count to 0; live connections must drain, not reset"
             );
         }
+    }
+
+    #[test]
+    fn new_flow_forwards_the_target_port_of_its_chosen_endpoint() {
+        // Decap reads this port from the option instead of looking the front
+        // up, so a wrong port here DNATs to a port the pod does not serve.
+        let front = test_front();
+        let hash = flow_hash(SEED, v4_client(4), 6000, &front);
+        let slot = slot_in_range(hash, 3).unwrap() as usize;
+        let order = [4u8, 5, 6];
+        let steered = ingress_steer(meta(1, 3), None, None, hash, front, table(&order));
+        assert_eq!(steered, forward_n(order[slot]));
     }
 
     #[test]

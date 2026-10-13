@@ -1417,6 +1417,8 @@ mod tests {
                 pod_ip,
             },
             ingress_ifindex: 2,
+            target_port: 0,
+            _pad: 0,
         }
     }
 
