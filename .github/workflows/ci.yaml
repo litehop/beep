@@ -272,6 +272,7 @@ jobs:
         run: cargo build --release -p beep -p beep-controller
 
       - name: Upload the loader for kernel-smoke
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: beep-loader
@@ -373,6 +374,7 @@ jobs:
           set -euo pipefail
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y qemu-system-x86 virtme-ng netcat-openbsd
+          vng --version
           cd /tmp
           curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz
           curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz.sha256sum

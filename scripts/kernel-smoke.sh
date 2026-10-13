@@ -98,7 +98,7 @@ for opt in CONFIG_BPF_SYSCALL=y CONFIG_NET_XGRESS=y CONFIG_NET_NS=y CONFIG_DEBUG
   grep -qx "$opt" "/boot/config-$RELEASE" || { echo "FAIL: kernel $RELEASE lacks $opt" >&2; exit 1; }
 done
 
-echo "==> booting $RELEASE"
+echo "==> booting $RELEASE (vng $(vng --version))"
 # The guest command is a plain path list (no shell metacharacters) because vng
 # re-quotes --exec.
 sudo vng --run "$kdir/boot/vmlinuz-$RELEASE" --user root --cpus 2 --memory 2G \
