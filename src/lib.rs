@@ -492,7 +492,14 @@ pub struct MapShape {
     pub key_size: u32,
     pub value_size: u32,
     pub max_entries: u32,
+    pub map_flags: u32,
 }
+
+/// The `map_flags` bits beep itself sets on its maps (`BPF_F_NO_PREALLOC`).
+/// Only these are compared: the kernel may report extra bits on a live map
+/// (e.g. `BPF_F_MMAPABLE`), which must not force a recreate on every restart.
+const COMPARED_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
+const BPF_F_NO_PREALLOC: u32 = 1;
 
 impl MapShape {
     fn from_info(info: &MapInfo) -> anyhow::Result<Self> {
@@ -501,6 +508,7 @@ impl MapShape {
             key_size: info.key_size(),
             value_size: info.value_size(),
             max_entries: info.max_entries(),
+            map_flags: info.map_flags(),
         })
     }
 }
@@ -516,6 +524,11 @@ pub fn map_shape_mismatches(existing: &MapShape, requested: &MapShape) -> Vec<St
         ("key_size", existing.key_size, requested.key_size),
         ("value_size", existing.value_size, requested.value_size),
         ("max_entries", existing.max_entries, requested.max_entries),
+        (
+            "map_flags",
+            existing.map_flags & COMPARED_MAP_FLAGS,
+            requested.map_flags & COMPARED_MAP_FLAGS,
+        ),
     ] {
         if old != new {
             diffs.push(format!("{field} {old} -> {new}"));
@@ -551,6 +564,7 @@ fn requested_shapes(
                     key_size: map.key_size(),
                     value_size: map.value_size(),
                     max_entries: max,
+                    map_flags: map.map_flags(),
                 },
             ))
         })
@@ -1197,7 +1211,39 @@ mod tests {
             key_size: 16,
             value_size: 1,
             max_entries,
+            map_flags: 0,
         }
+    }
+
+    #[test]
+    fn flag_change_is_flagged_so_an_upgrade_does_not_keep_a_preallocated_map() {
+        // aya reuses a pin without comparing flags; a pre-upgrade map created
+        // without BPF_F_NO_PREALLOC would otherwise keep its full
+        // preallocation forever.
+        let no_prealloc = MapShape {
+            map_flags: BPF_F_NO_PREALLOC,
+            ..shape(32)
+        };
+        assert_eq!(
+            map_shape_mismatches(&shape(32), &no_prealloc),
+            ["map_flags 0 -> 1"]
+        );
+    }
+
+    #[test]
+    fn kernel_added_flag_bits_do_not_force_a_recreate() {
+        // The kernel can report bits beep never set; treating them as a
+        // mismatch would recreate the pin (and drop its contents) on every
+        // restart.
+        let reported = MapShape {
+            map_flags: BPF_F_NO_PREALLOC | 1 << 10,
+            ..shape(32)
+        };
+        let requested = MapShape {
+            map_flags: BPF_F_NO_PREALLOC,
+            ..shape(32)
+        };
+        assert!(map_shape_mismatches(&reported, &requested).is_empty());
     }
 
     #[test]
@@ -1223,6 +1269,7 @@ mod tests {
             key_size: 40,
             value_size: 8,
             max_entries: 32,
+            map_flags: 0,
         };
         assert_eq!(
             map_shape_mismatches(&old, &new),
