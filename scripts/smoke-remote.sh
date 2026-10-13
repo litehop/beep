@@ -226,7 +226,7 @@ esac
 trap release_restart_signal EXIT
 
 command -v bpftool >/dev/null || {
-  echo "FAIL: bpftool not found in the VM (install linux-tools-\$(uname -r))" >&2
+  echo "FAIL: bpftool not found in the VM (install bpftool; Debian: bpftool, Ubuntu: linux-tools-\$(uname -r))" >&2
   exit 1
 }
 
@@ -641,6 +641,7 @@ flow_table_has_pod() {
 }
 
 echo "==> port remap: a second front onto the same pod:targetPort from the same client source port must round-trip AND persist a zero-tailed port_memo entry"
+remap_started=$SECONDS
 # Fixed client port 40000 to front A then front B: both flows decap to the same
 # reverse key (client, 40000, pod, target), so front B's flow is remapped and
 # its decision memoized under key tag 02. The memo's value is 2 bytes of a 40
@@ -656,6 +657,9 @@ for remap_leg in A B; do
   # port and curl's explicit bind() cannot reuse it (rc 45, EADDRINUSE).
   # Destroy it if the kernel allows, else wait it out.
   ip netns exec smoke-client ss -K -tan sport = ":${REMAP_CLIENT_PORT}" >/dev/null 2>&1 || true
+  if [ -n "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ]; then
+    echo "WARN: ss -K did not free client port ${REMAP_CLIENT_PORT} (kernel likely lacks CONFIG_INET_DIAG_DESTROY); waiting out TIME_WAIT (up to 70s)" >&2
+  fi
   for _ in $(seq 1 70); do
     [ -z "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ] && break
     sleep 1
@@ -683,7 +687,7 @@ jq -e 'all(.[]; (.value | length) == 40 and all(.value[2:40][]; . == "0x00"))' <
   echo "FAIL: a port_memo value has non-zero bytes in 2..40 (or is not 40 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
   exit 1
 }
-echo "PORT-REMAP: PASS (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero)"
+echo "PORT-REMAP: PASS in $((SECONDS - remap_started))s (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero)"
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
 # The three round trips above (two fronts on the first uplink, one on the

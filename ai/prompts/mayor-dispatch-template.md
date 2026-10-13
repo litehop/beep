@@ -428,7 +428,7 @@ VMs**:
 
 | VM name | OS / kernel | Role | Driven by |
 |---|---|---|---|
-| `beep-smoke` | Debian 13 / 6.12 LTS (`6.12.111+deb13-cloud-arm64`) | single-node smoke gate — a local veth-pair fixture stands in for a client | `scripts/smoke.sh --vm beep-smoke` |
+| `beep-smoke` | Debian 13 / `6.12.x` LTS | single-node smoke gate — a local veth-pair fixture stands in for a client | `scripts/smoke.sh --vm beep-smoke` |
 | `beep-node-a` | Ubuntu 24.04 / 6.8.0-14x | cross-node WireGuard rig, ingress side (owns the front) | `scripts/smoke-wg-2node.sh --vm-a beep-node-a --vm-b beep-node-b` |
 | `beep-node-b` | Ubuntu 24.04 / 6.8.0-14x | cross-node WireGuard rig, backend side (backend Pod + "client") | same as above |
 | `beep-client` | Ubuntu 24.04 / 6.8.0-14x | 3rd-VM client for the cross-node rigs | same as above (`--vm-client`) |
