@@ -9,6 +9,9 @@ use std::process::Command;
 
 use anyhow::{bail, Context as _};
 
+#[path = "build_support/btf_ext.rs"]
+mod btf_ext;
+
 fn main() -> aya_build::Result<()> {
     // aya-build only watches `ebpf/`; the object also embeds `beep-common`.
     println!("cargo:rerun-if-changed=common");
@@ -57,6 +60,42 @@ fn strip_dwarf_keep_btf(object: &Path) -> aya_build::Result<()> {
             objcopy.display(),
             object.display()
         );
+    }
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        strip_line_info(&objcopy, object)?;
+    }
+    Ok(())
+}
+
+/// Release objects drop `.BTF.ext` line_info (source-line annotations in
+/// verifier logs and bpftool dumps); func_info stays because the kernel needs
+/// it for subprogs. Dev builds keep line_info for debugging verifier
+/// rejections.
+fn strip_line_info(objcopy: &Path, object: &Path) -> aya_build::Result<()> {
+    let ext_path = object.with_extension("btf.ext");
+    objcopy_run(
+        objcopy,
+        &format!("--dump-section=.BTF.ext={}", ext_path.display()),
+        object,
+    )?;
+    let ext = std::fs::read(&ext_path).context("reading dumped .BTF.ext")?;
+    std::fs::write(&ext_path, btf_ext::strip_line_info(&ext)?)
+        .context("writing rewritten .BTF.ext")?;
+    objcopy_run(
+        objcopy,
+        &format!("--update-section=.BTF.ext={}", ext_path.display()),
+        object,
+    )
+}
+
+fn objcopy_run(objcopy: &Path, flag: &str, object: &Path) -> aya_build::Result<()> {
+    let status = Command::new(objcopy)
+        .arg(flag)
+        .arg(object)
+        .status()
+        .with_context(|| format!("running {} {flag}", objcopy.display()))?;
+    if !status.success() {
+        bail!("{} {flag} exited with {status}", objcopy.display());
     }
     Ok(())
 }
