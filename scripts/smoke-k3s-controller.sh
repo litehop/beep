@@ -127,7 +127,7 @@ map_entry_count() { # map_entry_count <vm> <map-name> -- entries in a pinned map
 dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 
 cleanup() {
-  kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   # The tarball above is trap-cleaned, but the locally built+tagged image
@@ -530,26 +530,38 @@ RC_A="$(probe_rc "$IP_A" "$P_LOCAL")"
 [ "$RC_A" != 0 ] || leg_fail "LEG-C: FAIL (a connection via $IP_A, which has no local pod, succeeded)"
 echo "LEG-C eTP=Local: PASS (ingress=$ING; $IP_B served by both local pods; $IP_A has no local pod, connection failed rc=$RC_A)"
 
-# (d) deleting one pod re-homes only its flows: long-lived connections to survivors continue.
+# (d) deleting one pod re-homes only its flows: every long-lived flow on a surviving pod continues,
+# and the lost flows are exactly a subset of the victim's. Each flow is one curl connection (two URLs,
+# keepalive reuse): a quick request records the serving pod, the long wait spans the delete. curl
+# silently re-sends on a fresh connection when a reused one dies, so a flow only counts as surviving
+# if both requests report the same client RemoteAddr (ip:port); a reconnect is a lost flow.
 VICTIM="$(awk -v n="$NODE_B_K8S" '$2==n{print $1; exit}' <<<"$CMAP")"
 N_LONG=24
 LONG_OUT="$(mktemp)"
-limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $N_LONG); do ( curl -sS -m 50 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -n 's/^Hostname: //p' | grep . || echo FAIL ) & done; wait" >"$LONG_OUT" &
+limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $N_LONG); do ( out=\$(curl -sS -m 50 'http://$IP_A:$P_CLUSTER/' 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -n 's/^Hostname: //p;s/^RemoteAddr: //p'); echo \$out ) & done; wait" >"$LONG_OUT" &
 LONG_PID=$!
 sleep 8
 kube -n "$NAMESPACE" delete pod "$VICTIM" --grace-period=0 --force >/dev/null 2>&1 || leg_fail "LEG-D: FAIL (could not delete $VICTIM)"
 wait "$LONG_PID" || true
-HITS="$(sort "$LONG_OUT" | uniq -c)"
+FLOWS="$(awk '{print ($1 ? $1 : "FAIL"), ($3 && $4 == $2 ? $3 : "FAIL")}' "$LONG_OUT")"
 rm -f "$LONG_OUT"
-echo "$HITS"
-LONG_FAILED="$(hits_failed "$HITS")"
-LONG_OK="$(hits_total "$HITS")"
-if awk -v v="$VICTIM" '$2==v{f=1} END{exit !f}' <<<"$HITS"; then
-  leg_fail "LEG-D: FAIL (a connection was answered by the deleted pod $VICTIM)"
-fi
-[ "$LONG_FAILED" -ge 1 ] && [ "$LONG_FAILED" -le $((N_LONG / 2)) ] && [ "$LONG_OK" -ge $((N_LONG / 2)) ] && [ "$(hits_pods "$HITS")" -ge 2 ] || \
-  leg_fail "LEG-D: FAIL (want >=1 and <=$((N_LONG / 2)) of $N_LONG flows lost (the victim's) with the rest surviving on >=2 pods; failed=$LONG_FAILED ok=$LONG_OK pods=$(hits_pods "$HITS"))"
-echo "LEG-D pod-delete: PASS (deleted $VICTIM: $LONG_FAILED of $N_LONG long-lived flows lost, $LONG_OK survived on $(hits_pods "$HITS") other pods)"
+echo "LEG-D flows per pod before delete:"
+awk '{print $1}' <<<"$FLOWS" | sort | uniq -c
+echo "LEG-D flows per pod after delete:"
+awk '{print $2}' <<<"$FLOWS" | sort | uniq -c
+[ "$(awk 'END{print NR}' <<<"$FLOWS")" = "$N_LONG" ] && ! awk '$1=="FAIL"{f=1} END{exit !f}' <<<"$FLOWS" || \
+  leg_fail "LEG-D: FAIL (not every flow established before the delete: $FLOWS)"
+VICTIM_FLOWS="$(awk -v v="$VICTIM" '$1==v' <<<"$FLOWS" | wc -l | tr -d ' ')"
+SURV_LOST="$(awk -v v="$VICTIM" '$1!=v && $2=="FAIL"' <<<"$FLOWS" | wc -l | tr -d ' ')"
+SURV_MOVED="$(awk -v v="$VICTIM" '$1!=v && $2!="FAIL" && $2!=$1' <<<"$FLOWS" | wc -l | tr -d ' ')"
+VICTIM_SERVED="$(awk -v v="$VICTIM" '$2==v' <<<"$FLOWS" | wc -l | tr -d ' ')"
+LONG_OK="$(awk '$2!="FAIL"' <<<"$FLOWS" | wc -l | tr -d ' ')"
+echo "LEG-D victim=$VICTIM victim_flows=$VICTIM_FLOWS survivor_flows_lost=$SURV_LOST survivor_flows_moved=$SURV_MOVED survived=$LONG_OK"
+[ "$VICTIM_FLOWS" -ge 1 ] || leg_fail "LEG-D: FAIL (no long-lived flow landed on $VICTIM; the leg proves nothing: $FLOWS)"
+[ "$VICTIM_SERVED" = 0 ] || leg_fail "LEG-D: FAIL (a connection was answered by the deleted pod $VICTIM)"
+[ "$SURV_LOST" = 0 ] && [ "$SURV_MOVED" = 0 ] || \
+  leg_fail "LEG-D: FAIL (flows on surviving pods were disturbed by deleting $VICTIM: lost=$SURV_LOST moved=$SURV_MOVED; flows (before after): $FLOWS)"
+echo "LEG-D pod-delete: PASS (deleted $VICTIM: lost flows are exactly its $VICTIM_FLOWS; all $LONG_OK survivor flows continued unmoved)"
 wait_ready mcluster
 HITS="$(client_hits "$IP_A" "$P_CLUSTER" 40)"
 [ "$(hits_failed "$HITS")" = 0 ] || leg_fail "LEG-D: FAIL (new connections failed after the delete: $HITS)"
