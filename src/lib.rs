@@ -290,8 +290,9 @@ pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pods: &HashSet<[u8; 16]>
 ///
 /// The walks are not atomic against the dataplane, but a pin present for the
 /// whole walk is never skipped: `bpf_map_get_next_key` iterates the hash
-/// buckets, and only a key deleted mid-walk (LRU eviction) makes the kernel
-/// restart from the first key, which yields duplicates, not gaps. A pin
+/// buckets, and only a delete of the walk's current key (LRU eviction or a
+/// TCP-close delete) makes the kernel restart from the first key, which yields
+/// duplicates, not gaps. A pin
 /// inserted mid-walk may be missed, which only leaves it to LRU eviction.
 pub fn orphaned_pin_backends(
     fwd_pending: &AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
