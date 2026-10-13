@@ -271,6 +271,15 @@ jobs:
       - name: Build beep-ebpf + beep + beep-controller
         run: cargo build --release -p beep -p beep-controller
 
+      - name: Upload the loader for kernel-smoke
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: beep-loader
+          path: target/release/beep
+          retention-days: 1
+          if-no-files-found: error
+
       # Guards build.rs's post-link DWARF strip from a
       # silent future revert -- a fresh checkout's target/ has exactly one
       # build.rs invocation, so exactly one OUT_DIR/beep-ebpf to find.
@@ -327,6 +336,59 @@ jobs:
 
       - name: Run beep-controller against k3s and gate its userspace RSS
         run: sudo bash scripts/memory-smoke-controller.sh run
+
+  # ADVISORY (not a required check): runs the same smoke fixture as
+  # memory-smoke, but inside a QEMU/KVM guest booting a pinned stock kernel
+  # (scripts/kernel-smoke.sh), so the 6.6 floor and the next LTS are actually
+  # exercised -- the verifier and TCX can accept on the runner's kernel and
+  # still reject on 6.6. Reuses memory-smoke's loader build. The runner's
+  # /dev/kvm is only reachable after the chmod below.
+  kernel-smoke:
+    name: kernel-smoke (${{ matrix.kernel }})
+    needs: memory-smoke
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6.6", "6.12", latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: beep-loader
+          path: loader
+
+      - name: Cache pinned kernel packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/beep-kernel-cache
+          key: kernel-smoke-${{ matrix.kernel }}-${{ hashFiles('scripts/kernel-smoke.sh') }}
+
+      - name: Install QEMU, virtme-ng, netcat and bpftool
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y qemu-system-x86 virtme-ng netcat-openbsd
+          vng --version
+          cd /tmp
+          curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz
+          curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz.sha256sum
+          sha256sum -c bpftool-v7.7.0-amd64.tar.gz.sha256sum
+          sudo tar -xzf bpftool-v7.7.0-amd64.tar.gz -C /usr/local/bin bpftool
+          sudo chmod +x /usr/local/bin/bpftool
+
+      - name: Make /dev/kvm usable
+        run: |
+          ls -l /dev/kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Run smoke fixture in the ${{ matrix.kernel }} guest
+        run: bash scripts/kernel-smoke.sh "${{ matrix.kernel }}" loader/beep
 
   # Coverage for Dockerfile's iproute2 addition: the two
   # jobs above run the raw beep-controller binary directly on the runner,
