@@ -54,10 +54,13 @@ case "$front_meta_entries$front_endpoints_entries" in
 esac
 [ -n "$front_meta_entries" ] && [ -n "$front_endpoints_entries" ] || { echo "FAIL: $usage" >&2; exit 1; }
 
-# bytes_memlock of the non-front maps, measured in CI run 38385070814
-# (main, 2026-10-13T10:41Z): 4,185,688 total minus the two then-preallocated
-# front maps (393,216 + 1,114,112).
-EXPECTED_PREALLOCATED_BYTES=2678360
+# Summed bytes_memlock of the eight non-front maps (all preallocate their full
+# max_entries, so it is a function of their default caps and the kernel's
+# per-element overhead, which differs between the kernel-smoke legs). Refresh by
+# summing the `bytes_memlock` column of every row except FRONT_META and
+# FRONT_ENDPOINTS in a CI memory-smoke CSV; this is the highest value seen
+# across the memory-smoke runs and a local 6.12 VM reads ~2.67 MB.
+EXPECTED_PREALLOCATED_BYTES=2828056
 FRONT_HEADER_BYTES=1024
 FRONT_META_ENTRY_BYTES=96
 FRONT_ENDPOINTS_ENTRY_BYTES=128

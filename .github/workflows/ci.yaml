@@ -311,6 +311,9 @@ jobs:
             --front-meta-entries "$meta_entries" \
             --front-endpoints-entries "$endpoint_entries"
 
+      - name: Assert the per-entry cost of the front maps with 1000 synthetic rows each (removed afterwards)
+        run: sudo bash scripts/assert-populated-front-memory.sh /sys/fs/bpf/beep-smoke
+
       # get.k3s.io's own installer (systemd unit + start), same source ci.yaml
       # already trusts nowhere else -- scripts/k3s-up.sh uses the identical
       # install path for the Lima gate. servicelb/traefik/metrics-server/
