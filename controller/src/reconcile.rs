@@ -674,7 +674,13 @@ mod tests {
         // loop `PinnedMaps::apply` runs against the pinned maps.
         let mut meta = HashMap::new();
         let mut endpoints = HashMap::new();
-        for plan in beep::front_swap::plan_front_writes(&meta, &endpoints, &current.fronts, true) {
+        for plan in beep::front_swap::plan_front_writes(
+            &meta,
+            &endpoints,
+            &current.fronts,
+            true,
+            &HashSet::new(),
+        ) {
             for step in plan.steps {
                 match step {
                     beep::front_swap::FrontWrite::PutEndpoint(k, v) => {
@@ -692,7 +698,7 @@ mod tests {
                 }
             }
         }
-        beep::front_swap::plan_front_writes(&meta, &endpoints, &next.fronts, true)
+        beep::front_swap::plan_front_writes(&meta, &endpoints, &next.fronts, true, &HashSet::new())
     }
 
     // A Service's first-ever reconcile against empty maps: this is what a

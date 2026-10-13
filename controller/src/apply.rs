@@ -14,18 +14,22 @@
 //! `FRONT_META` update to `{g+1, count, flags}`. `FRONT_META` is a HASH map so
 //! that single update is an atomic element replace for concurrent readers;
 //! deleting a front drops its `FRONT_META` entry first, then its endpoints.
-//! Every tick also deletes endpoint generations other than current and `g-1`,
+//! After a commit `g` stays as `g-1` for `PREVIOUS_GENERATION_GRACE` and is
+//! then deleted; every tick also deletes any other non-current generation,
 //! which is what cleans up after a crashed predecessor on startup.
 
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv4Addr,
     path::Path,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapInfo};
-use beep::front_swap::{apply_fronts, DesiredFront, FailureKind, FrontCapacity, FrontFailure};
+use beep::front_swap::{
+    apply_fronts, DesiredFront, FailureKind, FrontCapacity, FrontFailure, RecentSwaps,
+};
 use beep_common::{
     unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
     LbFrontKey, TcpFlowKey,
@@ -43,6 +47,8 @@ pub struct PinnedMaps {
     /// capacity check compares against what the kernel enforces, not what
     /// this process was started with.
     front_capacity: FrontCapacity,
+    /// Fronts whose previous generation is still inside its grace.
+    recent_swaps: RecentSwaps,
     pod_targets: AyaHashMap<MapData, [u8; 16], u8>,
     node_allow: AyaHashMap<MapData, [u8; 16], u8>,
     /// Opened for the eviction sweep only (`apply_pod_targets`) -- never
@@ -94,6 +100,7 @@ impl PinnedMaps {
                 meta: pinned_max_entries(pin_dir, "FRONT_META")?,
                 endpoints: pinned_max_entries(pin_dir, "FRONT_ENDPOINTS")?,
             },
+            recent_swaps: RecentSwaps::default(),
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
             node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
             // Both `FWD_PENDING`/`FLOW_TABLE` are `BPF_MAP_TYPE_LRU_HASH`
@@ -176,13 +183,7 @@ impl PinnedMaps {
             None => orphan_walk_error.map_or(Ok(()), Err),
         };
         let fronts_result = if desired.fronts_known {
-            apply_front_maps(
-                &mut self.front_meta,
-                &mut self.front_endpoints,
-                self.front_capacity,
-                &plan.fronts,
-                plan.prune_fronts,
-            )
+            self.apply_front_maps(&plan.fronts, plan.prune_fronts)
         } else {
             Ok(())
         };
@@ -211,18 +212,47 @@ impl PinnedMaps {
     }
 }
 
-/// Runs `beep::front_swap::apply_fronts` and turns its per-front failures
-/// into logged lines plus one loud reconcile-level error.
-fn apply_front_maps(
-    front_meta: &mut AyaHashMap<MapData, LbFrontKey, FrontMeta>,
-    front_endpoints: &mut AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
-    capacity: FrontCapacity,
-    fronts: &HashMap<LbFrontKey, DesiredFront>,
-    prune_absent: bool,
-) -> anyhow::Result<()> {
-    let failures = apply_fronts(front_meta, front_endpoints, capacity, fronts, prune_absent)
+impl PinnedMaps {
+    /// Whether a swapped front's `g-1` grace has run out, so a reconcile pass
+    /// would now delete its rows. A quiet cluster has no other trigger.
+    pub fn previous_generations_due(&self, now: Instant) -> bool {
+        self.recent_swaps.expired(now, PREVIOUS_GENERATION_GRACE)
+    }
+
+    /// Runs `beep::front_swap::apply_fronts` and turns its per-front failures
+    /// into logged lines plus one loud reconcile-level error.
+    fn apply_front_maps(
+        &mut self,
+        fronts: &HashMap<LbFrontKey, DesiredFront>,
+        prune_absent: bool,
+    ) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let held = self.recent_swaps.held(now, PREVIOUS_GENERATION_GRACE);
+        let applied = apply_fronts(
+            &mut self.front_meta,
+            &mut self.front_endpoints,
+            self.front_capacity,
+            fronts,
+            prune_absent,
+            &held,
+        )
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
-    for (front, failure) in &failures {
+        self.recent_swaps
+            .record(&applied.swapped, now, PREVIOUS_GENERATION_GRACE);
+        report_front_failures(&applied.failures)
+    }
+}
+
+/// How long a swapped front keeps its previous generation's rows. A reader
+/// needs them only for the microseconds between its `FRONT_META` and
+/// `FRONT_ENDPOINTS` lookups inside one tc invocation (no sleeping, no I/O),
+/// so even a stalled vCPU is orders of magnitude below this. Two retry polls
+/// (`RETRY_POLL`, 1 s) makes the follow-up pass land on a tick boundary
+/// within about 3 s of the commit.
+const PREVIOUS_GENERATION_GRACE: Duration = Duration::from_secs(2);
+
+fn report_front_failures(failures: &[(LbFrontKey, FrontFailure)]) -> anyhow::Result<()> {
+    for (front, failure) in failures {
         eprintln!(
             "controller: front {} {}",
             describe_lb_front_key(front),

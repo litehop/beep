@@ -282,8 +282,9 @@ pub struct LbFrontBackend {
 /// under `g+1`, (3) replace this value with `{g+1, count, flags, local_count}`. At most
 /// two generations of a front's endpoints exist at any time; a reader that
 /// loaded generation `g` just before step 3 still finds it. Deleting a front
-/// drops its `FRONT_META` entry first, then its endpoints. An unchanged front
-/// keeps `g` and `g-1`; anything older (e.g. crash leftovers) is deleted.
+/// drops its `FRONT_META` entry first, then its endpoints. After the commit
+/// `g` stays as `g-1` for a short grace and is then deleted, as is anything
+/// else that is not the live generation (e.g. crash leftovers).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontMeta {

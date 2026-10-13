@@ -628,6 +628,7 @@ fn plan_fixture_fronts(
         current_endpoints,
         &fixture_fronts(fixtures),
         true,
+        &std::collections::HashSet::new(),
     )
 }
 

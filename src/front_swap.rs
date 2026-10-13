@@ -17,13 +17,21 @@
 //! the live one is never touched before the commit. If any step-2 write fails
 //! the commit is skipped, so the old generation keeps serving. Deleting a
 //! front drops `FRONT_META` first, then its endpoints; if that first delete
-//! fails the endpoints are left alone. A front with unchanged endpoints
-//! produces no writes except deleting generations older than `g-1`, which is
-//! also what cleans up a previous process's crash leftovers on startup.
+//! fails the endpoints are left alone.
+//!
+//! After a commit, `g` stays as `g-1` for a short grace (`RecentSwaps`) and
+//! is then deleted: the only reader that can still want it is a packet that
+//! loaded `FRONT_META` at `g` just before the commit and reads
+//! `FRONT_ENDPOINTS` microseconds later. Established flows read their pin,
+//! not these maps. A front with unchanged endpoints therefore produces no
+//! writes except deleting every generation but the live one (and `g-1` while
+//! it is within its grace), which is also what cleans up a previous process's
+//! crash leftovers on startup.
 
 use std::{
     borrow::BorrowMut,
     collections::{HashMap, HashSet},
+    time::{Duration, Instant},
 };
 
 use aya::maps::{HashMap as AyaHashMap, MapData, MapError};
@@ -65,6 +73,8 @@ fn endpoint_key(front: LbFrontKey, generation: u32, slot: usize) -> FrontEndpoin
 /// (the dataplane rejects new flows to it and lets pinned ones drain); only a
 /// front absent from `desired` is deleted. With `prune_absent`, fronts (and orphan endpoints) not in `desired` are
 /// removed; without it, only fronts named in `desired` are touched.
+/// `keep_previous` names fronts still inside their post-swap grace, whose
+/// `g-1` rows an unchanged front must not delete yet.
 ///
 /// Plans come back ordered by net endpoint-row change (shrinking fronts
 /// first), then by front key: entries freed by a scale-down are available to a
@@ -75,6 +85,7 @@ pub fn plan_front_writes(
     current_endpoints: &HashMap<FrontEndpointKey, FrontEndpoint>,
     desired: &HashMap<LbFrontKey, DesiredFront>,
     prune_absent: bool,
+    keep_previous: &HashSet<LbFrontKey>,
 ) -> Vec<FrontPlan> {
     let mut endpoints_by_front: HashMap<LbFrontKey, Vec<FrontEndpointKey>> = HashMap::new();
     for key in current_endpoints.keys() {
@@ -121,7 +132,8 @@ pub fn plan_front_writes(
                             .iter()
                             .filter(|k| {
                                 k.generation != m.generation
-                                    && k.generation != m.generation.wrapping_sub(1)
+                                    && !(keep_previous.contains(&front)
+                                        && k.generation == m.generation.wrapping_sub(1))
                             })
                             .map(|k| FrontWrite::DeleteEndpoint(*k)),
                     );
@@ -324,6 +336,16 @@ pub fn capacity_shortfall(
     })
 }
 
+/// What one pass over the front maps did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FrontApply {
+    /// `(front, failure)` for every failed or refused step.
+    pub failures: Vec<(LbFrontKey, FrontFailure)>,
+    /// Fronts whose new generation was committed: their previous generation
+    /// is now `g-1` and due for deletion after the grace.
+    pub swapped: Vec<LbFrontKey>,
+}
+
 /// Runs every plan through `write`. Plans are independent, so a refused or
 /// failed one never stops the others. `used` is tracked across plans, so a
 /// plan that frees entries (run first, see `plan_front_writes`) makes room for
@@ -334,34 +356,43 @@ pub fn run_front_plans(
     mut used: FrontUsage,
     cap: FrontCapacity,
     mut write: impl FnMut(&FrontWrite) -> Result<(), MapError>,
-) -> Vec<(LbFrontKey, FrontFailure)> {
-    let mut failures = Vec::new();
+) -> FrontApply {
+    let mut applied = FrontApply::default();
     for plan in plans {
-        let had_meta = current_meta.contains_key(&plan.front);
-        if let Some(shortfall) = capacity_shortfall(plan, had_meta, used, cap) {
-            failures.push((plan.front, shortfall));
+        let live = current_meta.get(&plan.front);
+        if let Some(shortfall) = capacity_shortfall(plan, live.is_some(), used, cap) {
+            applied.failures.push((plan.front, shortfall));
             continue;
         }
+        let mut committed = false;
         let errors = run_front_plan(plan, |step| {
             write(step)?;
-            used.apply(step, had_meta);
+            used.apply(step, live.is_some());
+            if let FrontWrite::PutMeta(_, m) = step {
+                committed |= live.map(|l| l.generation) != Some(m.generation);
+            }
             Ok(())
         });
-        failures.extend(errors.into_iter().map(|e| (plan.front, e)));
+        if committed {
+            applied.swapped.push(plan.front);
+        }
+        applied
+            .failures
+            .extend(errors.into_iter().map(|e| (plan.front, e)));
     }
-    failures
+    applied
 }
 
-/// Reads both pinned maps, plans, and applies. Returns `(front, failure)`
-/// for every failed step; fronts are independent, so one front's failure
-/// (e.g. a full map) never stops the others.
+/// Reads both pinned maps, plans, and applies. Fronts are independent, so one
+/// front's failure (e.g. a full map) never stops the others.
 pub fn apply_fronts<M: BorrowMut<MapData>>(
     meta: &mut AyaHashMap<M, LbFrontKey, FrontMeta>,
     endpoints: &mut AyaHashMap<M, FrontEndpointKey, FrontEndpoint>,
     capacity: FrontCapacity,
     desired: &HashMap<LbFrontKey, DesiredFront>,
     prune_absent: bool,
-) -> anyhow::Result<Vec<(LbFrontKey, FrontFailure)>> {
+    keep_previous: &HashSet<LbFrontKey>,
+) -> anyhow::Result<FrontApply> {
     let current_meta: HashMap<LbFrontKey, FrontMeta> = meta.iter().collect::<Result<_, _>>()?;
     let current_endpoints: HashMap<FrontEndpointKey, FrontEndpoint> =
         endpoints.iter().collect::<Result<_, _>>()?;
@@ -369,7 +400,13 @@ pub fn apply_fronts<M: BorrowMut<MapData>>(
         meta: current_meta.len(),
         endpoints: current_endpoints.len(),
     };
-    let plans = plan_front_writes(&current_meta, &current_endpoints, desired, prune_absent);
+    let plans = plan_front_writes(
+        &current_meta,
+        &current_endpoints,
+        desired,
+        prune_absent,
+        keep_previous,
+    );
     Ok(run_front_plans(
         &plans,
         &current_meta,
@@ -382,6 +419,41 @@ pub fn apply_fronts<M: BorrowMut<MapData>>(
             FrontWrite::DeleteMeta(k) => meta.remove(k),
         },
     ))
+}
+
+/// Fronts that committed a new generation recently, so their `g-1` rows are
+/// still held. The grace is far longer than the dataplane's read window (a
+/// reader holding the old generation needs it for the microseconds between
+/// its two lookups in one tc invocation), so deleting after it can only race
+/// a packet stalled for that long.
+#[derive(Debug, Default)]
+pub struct RecentSwaps(HashMap<LbFrontKey, Instant>);
+
+impl RecentSwaps {
+    /// Fronts whose grace has not yet elapsed at `now`.
+    pub fn held(&self, now: Instant, grace: Duration) -> HashSet<LbFrontKey> {
+        self.0
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) < grace)
+            .map(|(front, _)| *front)
+            .collect()
+    }
+
+    /// Forgets expired holds and starts the grace for `swapped`.
+    pub fn record(&mut self, swapped: &[LbFrontKey], now: Instant, grace: Duration) {
+        self.0
+            .retain(|_, at| now.saturating_duration_since(*at) < grace);
+        self.0.extend(swapped.iter().map(|front| (*front, now)));
+    }
+
+    /// Whether some hold has expired, i.e. another pass would now delete
+    /// that front's `g-1` rows. Nothing else triggers a pass on a quiet
+    /// cluster.
+    pub fn expired(&self, now: Instant, grace: Duration) -> bool {
+        self.0
+            .values()
+            .any(|at| now.saturating_duration_since(*at) >= grace)
+    }
 }
 
 #[cfg(test)]
@@ -433,7 +505,16 @@ mod tests {
         }
 
         fn plan(&self, desired: &HashMap<LbFrontKey, DesiredFront>, prune: bool) -> Vec<FrontPlan> {
-            plan_front_writes(&self.meta, &self.endpoints, desired, prune)
+            self.plan_keeping(desired, prune, &HashSet::new())
+        }
+
+        fn plan_keeping(
+            &self,
+            desired: &HashMap<LbFrontKey, DesiredFront>,
+            prune: bool,
+            keep_previous: &HashSet<LbFrontKey>,
+        ) -> Vec<FrontPlan> {
+            plan_front_writes(&self.meta, &self.endpoints, desired, prune, keep_previous)
         }
 
         fn apply_step(&mut self, step: &FrontWrite) {
@@ -621,11 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn a_front_with_no_ready_endpoints_keeps_its_meta_at_count_zero_and_the_previous_rows() {
+    fn a_front_with_no_ready_endpoints_keeps_its_meta_at_count_zero_and_sheds_its_rows() {
         // Deleting the meta makes ingress pass the packet to the host: new
-        // clients hang instead of being refused, and pinned flows to a
-        // draining pod are cut. Count 0 plus the prior generation's rows keeps
-        // both the reject and the decap-side drain working.
+        // clients hang instead of being refused. Count 0 keeps the reject.
+        // Pinned flows to a draining pod read their conntrack pin, not these
+        // maps, so no endpoint row is needed once the grace is over.
         let f = front(1, 443);
         let old = endpoint(7, 8443);
         let mut store = Store::default();
@@ -639,14 +720,23 @@ mod tests {
         assert_eq!(
             store.endpoints.get(&endpoint_key(f, 1, 0)),
             Some(&old),
-            "the previous generation's rows must survive for decap of pinned flows"
+            "the previous generation stays for the grace"
         );
+
+        let after_grace = store.plan(&desired(&[(f, drained())]), true);
+        store.apply_all(&after_grace, |_| {});
+        assert!(
+            store.endpoints.is_empty(),
+            "a drained front must not hold endpoint rows forever: {:?}",
+            store.endpoints
+        );
+        assert_eq!(store.meta[&f].count, 0);
     }
 
     #[test]
     fn repeated_count_zero_reconciles_do_not_bump_the_generation() {
-        // A second bump while at count 0 would delete the previous
-        // generation's rows and cut the pinned flows still draining.
+        // A bump per reconcile at count 0 would churn the dataplane maps
+        // every tick for a front with nothing to publish.
         let f = front(1, 443);
         let mut store = Store::default();
         let first = store.plan(&desired(&[(f, want(endpoint(7, 8443)))]), true);
@@ -658,7 +748,150 @@ mod tests {
 
         assert_eq!(store.meta[&f].generation, 2);
         assert!(store.plan(&desired(&[(f, drained())]), true).is_empty());
-        assert!(store.endpoints.contains_key(&endpoint_key(f, 1, 0)));
+    }
+
+    #[test]
+    fn the_previous_generation_is_deleted_once_its_grace_is_over() {
+        // Keeping g-1 forever doubles steady-state rows for every front that
+        // ever swapped; it is only needed by a reader that loaded the old
+        // meta a few microseconds before the commit.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let first = store.plan(&desired(&[(f, want(endpoint(7, 8443)))]), true);
+        store.apply_all(&first, |_| {});
+        let d = desired(&[(f, want(endpoint(8, 8443)))]);
+        let swap = store.plan(&d, true);
+        store.apply_all(&swap, |_| {});
+        assert_eq!(store.endpoints.len(), 2);
+
+        let within_grace = store.plan_keeping(&d, true, &HashSet::from([f]));
+        assert!(
+            within_grace.is_empty(),
+            "g-1 must survive its grace: {within_grace:?}"
+        );
+
+        let after_grace = store.plan(&d, true);
+        store.apply_all(&after_grace, |_| {});
+        assert_eq!(
+            store.endpoints.len(),
+            1,
+            "steady state must hold only the live generation"
+        );
+        assert_eq!(store.read(f), Some(endpoint(8, 8443)));
+    }
+
+    #[test]
+    fn a_reader_that_loaded_the_old_meta_before_the_commit_still_resolves_within_grace() {
+        // The race the grace exists for: a packet reads FRONT_META at g, the
+        // controller commits g+1, and only then does the packet read
+        // FRONT_ENDPOINTS[g]. Deleting g at the commit would turn that packet
+        // into a front miss.
+        let f = front(1, 443);
+        let (old, new) = (endpoint(7, 8443), endpoint(8, 8443));
+        let mut store = Store::default();
+        let first = store.plan(&desired(&[(f, want(old))]), true);
+        store.apply_all(&first, |_| {});
+        let stale_meta = store.meta[&f];
+
+        let d = desired(&[(f, want(new))]);
+        let swap = store.plan(&d, true);
+        store.apply_all(&swap, |_| {});
+        let stale_read = |s: &Store| {
+            let key = beep_common::front_endpoint_key(f, stale_meta)?;
+            s.endpoints.get(&key).copied()
+        };
+        assert_eq!(stale_read(&store), Some(old));
+
+        let held = store.plan_keeping(&d, true, &HashSet::from([f]));
+        store.apply_all(&held, |_| {});
+        assert_eq!(
+            stale_read(&store),
+            Some(old),
+            "a reconcile inside the grace must not delete g-1"
+        );
+    }
+
+    #[test]
+    fn a_second_swap_inside_the_grace_still_deletes_the_older_generation_first() {
+        // Holding g-1 across a further swap would run three generations and
+        // break the capacity bound the pre-write check relies on.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        for pod in 1..=2u8 {
+            let plans = store.plan(&desired(&[(f, want(endpoint(pod, 8443)))]), true);
+            store.apply_all(&plans, |_| {});
+        }
+        let d = desired(&[(f, want(endpoint(3, 8443)))]);
+        let third = store.plan_keeping(&d, true, &HashSet::from([f]));
+        let mut max_gens = 0;
+        store.apply_all(&third, |s| {
+            max_gens = max_gens.max(
+                s.endpoints
+                    .keys()
+                    .map(|k| k.generation)
+                    .collect::<HashSet<_>>()
+                    .len(),
+            );
+        });
+        assert!(max_gens <= 2, "{max_gens} generations at once");
+    }
+
+    #[test]
+    fn a_committed_swap_is_reported_but_a_flags_only_change_is_not() {
+        // The grace clock starts at a generation commit; a flags republish
+        // retires nothing, and starting a hold for it would only delay GC.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let cap = FrontCapacity {
+            meta: 8,
+            endpoints: 8,
+        };
+        let swapped = |store: &mut Store, d: &HashMap<LbFrontKey, DesiredFront>| {
+            let plans = store.plan(d, true);
+            let used = FrontUsage {
+                meta: store.meta.len(),
+                endpoints: store.endpoints.len(),
+            };
+            let meta = store.meta.clone();
+            run_front_plans(&plans, &meta, used, cap, |step| {
+                store.apply_step(step);
+                Ok(())
+            })
+            .swapped
+        };
+        assert_eq!(
+            swapped(&mut store, &desired(&[(f, want(endpoint(1, 8443)))])),
+            [f]
+        );
+        assert_eq!(
+            swapped(&mut store, &desired(&[(f, want(endpoint(2, 8443)))])),
+            [f]
+        );
+        let mut flagged = want(endpoint(2, 8443));
+        flagged.flags = 1;
+        assert!(swapped(&mut store, &desired(&[(f, flagged)])).is_empty());
+    }
+
+    #[test]
+    fn recent_swaps_hold_until_the_grace_then_ask_for_a_pass() {
+        // On a quiet cluster nothing else triggers the pass that deletes g-1;
+        // `expired` is what tells the controller to run one.
+        let f = front(1, 443);
+        let grace = Duration::from_secs(2);
+        let t0 = Instant::now();
+        let mut recent = RecentSwaps::default();
+        recent.record(&[f], t0, grace);
+
+        assert!(recent.held(t0 + Duration::from_secs(1), grace).contains(&f));
+        assert!(!recent.expired(t0 + Duration::from_secs(1), grace));
+        assert!(recent.held(t0 + grace, grace).is_empty());
+        assert!(recent.expired(t0 + grace, grace));
+
+        recent.record(&[], t0 + grace, grace);
+        assert!(
+            !recent.expired(t0 + grace, grace),
+            "the pass that deleted g-1 settles the hold"
+        );
     }
 
     #[test]
@@ -678,10 +911,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_cleanup_deletes_generations_older_than_previous_and_orphans() {
-        // A crashed predecessor can leave generations behind. Keep current
-        // and g-1; delete everything else, and any endpoint of a front that
-        // has no meta at all, or map capacity leaks across restarts.
+    fn startup_cleanup_deletes_every_non_live_generation_and_orphans() {
+        // A crashed predecessor can leave generations behind. A fresh process
+        // has no grace to honour: keep only the live generation, and delete
+        // any endpoint of a front with no meta, or capacity leaks across restarts.
         let f = front(1, 443);
         let orphan_front = front(2, 443);
         let mut store = Store::default();
@@ -715,8 +948,8 @@ mod tests {
         gens.sort_unstable();
         assert_eq!(
             gens,
-            vec![4, 5],
-            "only the live generation and g-1 may survive"
+            vec![5],
+            "only the live generation may survive a restart"
         );
         assert!(
             store.endpoints.keys().all(|k| k.front != orphan_front),
@@ -821,6 +1054,7 @@ mod tests {
             store.apply_step(step);
             Ok(())
         })
+        .failures
     }
 
     #[test]

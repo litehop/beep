@@ -258,7 +258,9 @@ fn apply_reconcile(
     );
 }
 
-/// Re-runs the full reconcile whenever `retry` says a failed apply is due.
+/// Re-runs the full reconcile whenever `retry` says a failed apply is due, and
+/// once a swapped front's previous generation has outlived its grace (a quiet
+/// cluster sends no event that would delete it).
 /// Never returns; `Result` only so it joins with the watches.
 async fn run_retry_loop(
     state: Arc<Mutex<WatchState>>,
@@ -268,9 +270,17 @@ async fn run_retry_loop(
 ) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(RETRY_POLL).await;
-        retry_tick(&retry, Instant::now(), || {
+        let ran = retry_tick(&retry, Instant::now(), || {
             apply_reconcile(&state, &maps, &retry, &node)
         });
+        if !ran
+            && maps
+                .lock()
+                .unwrap()
+                .previous_generations_due(Instant::now())
+        {
+            apply_reconcile(&state, &maps, &retry, &node);
+        }
     }
 }
 
