@@ -370,26 +370,33 @@ fn own_node_ips_changed(before: &[IpAddr], after: &[IpAddr]) -> bool {
 /// other two list-watches also depend on.
 fn publish_ingress(
     client: &Arc<HyperApiClient>,
+    pending: &Arc<Mutex<PublishRetry>>,
     key: ServiceKey,
     own_ips: Vec<IpAddr>,
     desired_ips: Vec<IpAddr>,
 ) {
     let client = Arc::clone(client);
+    let pending = Arc::clone(pending);
     tokio::spawn(async move {
-        if let Err(e) =
-            ensure_node_ingress(&client, &key.namespace, &key.name, &own_ips, &desired_ips).await
-        {
+        let result =
+            ensure_node_ingress(&client, &key.namespace, &key.name, &own_ips, &desired_ips).await;
+        if let Err(e) = &result {
             eprintln!(
-                "controller: publishing status.loadBalancer.ingress for {}/{} failed: {e:#}",
+                "controller: publishing status.loadBalancer.ingress for {}/{} failed (will retry): {e:#}",
                 key.namespace, key.name
             );
         }
+        pending
+            .lock()
+            .unwrap()
+            .record(&key, result.is_ok(), Instant::now());
     });
 }
 
 /// Publishes `key`'s ingress from the current state.
 fn publish_ingress_for(
     client: &Arc<HyperApiClient>,
+    pending: &Arc<Mutex<PublishRetry>>,
     state: &Mutex<WatchState>,
     node: &NodeContext,
     key: ServiceKey,
@@ -401,7 +408,66 @@ fn publish_ingress_for(
             state.ips_to_publish(&key, node.node_ip),
         )
     };
-    publish_ingress(client, key, own_ips, desired_ips);
+    publish_ingress(client, pending, key, own_ips, desired_ips);
+}
+
+/// Services whose ingress publish failed, re-published with `RetryBackoff`
+/// delays until it succeeds: without it a node that just lost its last
+/// `externalTrafficPolicy: Local` pod stays listed until the next event.
+#[derive(Default)]
+struct PublishRetry {
+    keys: HashSet<ServiceKey>,
+    backoff: RetryBackoff,
+}
+
+impl PublishRetry {
+    fn record(&mut self, key: &ServiceKey, ok: bool, now: Instant) {
+        if ok {
+            self.keys.remove(key);
+            if self.keys.is_empty() {
+                self.backoff = RetryBackoff::default();
+            }
+        } else {
+            self.keys.insert(key.clone());
+            self.backoff.record(false, now);
+        }
+    }
+
+    /// The keys to re-publish now. Disarms the deadline so the next poll does
+    /// not re-publish while these are in flight; a failure re-arms it.
+    fn take_due(&mut self, now: Instant) -> Vec<ServiceKey> {
+        if !self.backoff.due(now) {
+            return Vec::new();
+        }
+        self.backoff.retry_at = None;
+        self.keys.iter().cloned().collect()
+    }
+}
+
+/// Re-publishes failed ingress publishes when due. A key whose Service is no
+/// longer tracked is dropped: its publish can never succeed. Never returns.
+async fn run_publish_retry_loop(
+    client: Arc<HyperApiClient>,
+    pending: Arc<Mutex<PublishRetry>>,
+    state: Arc<Mutex<WatchState>>,
+    node: NodeContext,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::time::sleep(RETRY_POLL).await;
+        let due = pending.lock().unwrap().take_due(Instant::now());
+        if due.is_empty() {
+            continue;
+        }
+        let tracked: HashSet<ServiceKey> =
+            state.lock().unwrap().service_keys().into_iter().collect();
+        for key in due {
+            if tracked.contains(&key) {
+                publish_ingress_for(&client, &pending, &state, &node, key);
+            } else {
+                pending.lock().unwrap().record(&key, true, Instant::now());
+            }
+        }
+    }
 }
 
 /// Re-publishes every tracked Service's ingress when this node's own address
@@ -413,6 +479,7 @@ fn publish_ingress_for(
 /// necessarily changing its address set.
 fn republish_if_own_ips_changed(
     client: &Arc<HyperApiClient>,
+    pending: &Arc<Mutex<PublishRetry>>,
     state: &Mutex<WatchState>,
     node: &NodeContext,
     before: &[IpAddr],
@@ -428,7 +495,7 @@ fn republish_if_own_ips_changed(
         state.lock().unwrap().local_policy_service_keys()
     };
     for key in keys {
-        publish_ingress_for(client, state, node, key);
+        publish_ingress_for(client, pending, state, node, key);
     }
 }
 
@@ -444,16 +511,18 @@ async fn run_controller_loop(
     node: NodeContext,
 ) -> anyhow::Result<()> {
     let retry = Arc::new(Mutex::new(RetryBackoff::default()));
+    let pending = Arc::new(Mutex::new(PublishRetry::default()));
     let on_service = {
         let state = Arc::clone(&state);
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
+        let pending = Arc::clone(&pending);
         move |event: Value| {
             let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
             if let Some(key) = changed {
-                publish_ingress_for(&client, &state, &node, key);
+                publish_ingress_for(&client, &pending, &state, &node, key);
             }
         }
     };
@@ -462,11 +531,12 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
+        let pending = Arc::clone(&pending);
         move |items: Vec<Value>| {
             let keys = state.lock().unwrap().replace_services(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
             for key in keys {
-                publish_ingress_for(&client, &state, &node, key);
+                publish_ingress_for(&client, &pending, &state, &node, key);
             }
             Ok(())
         }
@@ -476,11 +546,12 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
+        let pending = Arc::clone(&pending);
         move |event: Value| {
             let local_policy_key = state.lock().unwrap().apply_endpoint_slice_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
             if let Some(key) = local_policy_key {
-                publish_ingress_for(&client, &state, &node, key);
+                publish_ingress_for(&client, &pending, &state, &node, key);
             }
         }
     };
@@ -489,12 +560,13 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
+        let pending = Arc::clone(&pending);
         move |items: Vec<Value>| {
             state.lock().unwrap().replace_endpoint_slices(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
             let keys = state.lock().unwrap().local_policy_service_keys();
             for key in keys {
-                publish_ingress_for(&client, &state, &node, key);
+                publish_ingress_for(&client, &pending, &state, &node, key);
             }
             Ok(())
         }
@@ -504,11 +576,12 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
+        let pending = Arc::clone(&pending);
         move |event: Value| {
             let before = state.lock().unwrap().own_node_ips(node.node_ip);
             state.lock().unwrap().apply_node_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
-            republish_if_own_ips_changed(&client, &state, &node, &before);
+            republish_if_own_ips_changed(&client, &pending, &state, &node, &before);
         }
     };
     // Every Node LIST replaces the node set and marks it known
@@ -520,11 +593,12 @@ async fn run_controller_loop(
         let maps = Arc::clone(&maps);
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
+        let pending = Arc::clone(&pending);
         move |items: Vec<Value>| {
             let before = state.lock().unwrap().own_node_ips(node.node_ip);
             state.lock().unwrap().replace_nodes(&items, node.node_ip)?;
             apply_reconcile(&state, &maps, &retry, &node);
-            republish_if_own_ips_changed(&client, &state, &node, &before);
+            republish_if_own_ips_changed(&client, &pending, &state, &node, &before);
             Ok(())
         }
     };
@@ -532,7 +606,7 @@ async fn run_controller_loop(
     // None of the branches actually complete in practice, so which
     // error (if any) wins here never matters at runtime -- `and` just gives
     // the whole function a single `Result` to return.
-    let (services, endpoint_slices, nodes, retrier) = tokio::join!(
+    let (services, endpoint_slices, nodes, retrier, publish_retrier) = tokio::join!(
         run_list_watch(&client, "/api/v1/services", on_service, on_services_relist),
         run_list_watch(
             &client,
@@ -541,9 +615,14 @@ async fn run_controller_loop(
             on_endpoint_slices_relist,
         ),
         run_list_watch(&client, "/api/v1/nodes", on_node, on_nodes_relist),
-        run_retry_loop(state, maps, retry, node),
+        run_retry_loop(Arc::clone(&state), maps, retry, node),
+        run_publish_retry_loop(Arc::clone(&client), pending, state, node),
     );
-    services.and(endpoint_slices).and(nodes).and(retrier)
+    services
+        .and(endpoint_slices)
+        .and(nodes)
+        .and(retrier)
+        .and(publish_retrier)
 }
 
 // current_thread, not the default multi-thread runtime: this process's
@@ -982,6 +1061,50 @@ mod tests {
             "a successful retry must not run again"
         );
         assert_eq!(runs, 1);
+    }
+
+    fn svc(name: &str) -> ServiceKey {
+        ServiceKey {
+            namespace: "ns".into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn failed_ingress_publish_is_retried_until_it_succeeds_without_a_new_event() {
+        // A node that just lost its last eTP=Local pod stays listed until a
+        // publish lands; a quiet cluster sends no event to trigger another.
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.record(&svc("a"), false, t0);
+        assert!(p.take_due(t0).is_empty(), "backoff not elapsed");
+        assert_eq!(p.take_due(t0 + RETRY_INITIAL), vec![svc("a")]);
+        assert!(
+            p.take_due(t0 + RETRY_INITIAL).is_empty(),
+            "in-flight retry must not be re-issued on the next poll"
+        );
+        p.record(&svc("a"), false, t0 + RETRY_INITIAL);
+        assert!(
+            p.take_due(t0 + RETRY_INITIAL + RETRY_INITIAL).is_empty(),
+            "a failed retry backs off further"
+        );
+        let t2 = t0 + RETRY_INITIAL + RETRY_INITIAL * 2;
+        assert_eq!(p.take_due(t2), vec![svc("a")]);
+        p.record(&svc("a"), true, t2);
+        assert!(
+            p.take_due(t2 + RETRY_MAX).is_empty(),
+            "a successful publish must stop the retries"
+        );
+    }
+
+    #[test]
+    fn one_services_success_does_not_cancel_anothers_pending_retry() {
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.record(&svc("a"), false, t0);
+        p.record(&svc("b"), false, t0);
+        p.record(&svc("a"), true, t0);
+        assert_eq!(p.take_due(t0 + RETRY_INITIAL), vec![svc("b")]);
     }
 
     #[test]
