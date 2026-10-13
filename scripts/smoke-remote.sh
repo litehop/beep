@@ -28,6 +28,23 @@ have_tcpdump() { # <what is skipped>
   exit 1
 }
 
+# tcpdump only captures from the moment it prints "listening on" (its socket
+# is open and the filter attached) to stderr; a fixed sleep after launching it
+# loses the race on a slow guest and yields an empty capture. Blocks until
+# every named stderr log has that line.
+wait_tcpdump_listening() { # <stderr-log>...
+  local log i
+  for log in "$@"; do
+    for ((i = 0; i < 100; i++)); do
+      grep -q "listening on" "$log" 2>/dev/null && continue 2
+      sleep 0.1
+    done
+    echo "FAIL: tcpdump never reported 'listening on' within 10s (log ${log}) -- the wire capture cannot be trusted" >&2
+    cat "$log" >&2 || true
+    exit 1
+  done
+}
+
 # RFC 5737 documentation ranges: deliberately disjoint from any real subnet
 # a given VM's CNI/pod network happens to be using.
 FRONT_IP="203.0.113.1"
@@ -429,14 +446,15 @@ full_size_leg() {
   local wire=0
   if have_tcpdump "${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames)"; then
     wire=1
-    timeout 30 tcpdump -nn -l -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>/dev/null &
+    rm -f "$cap_opt.err" "$cap_fwd.err" "$cap_ret.err"
+    timeout 30 tcpdump -nn -l -U -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>"$cap_opt.err" &
     local opt_pid=$!
-    timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>/dev/null &
+    timeout 30 tcpdump -nn -l -U -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>"$cap_fwd.err" &
     local fwd_pid=$!
-    timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>/dev/null &
+    timeout 30 tcpdump -nn -l -U -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>"$cap_ret.err" &
     local ret_pid=$!
+    wait_tcpdump_listening "$cap_opt.err" "$cap_fwd.err" "$cap_ret.err"
   fi
-  sleep 1
   ip netns exec smoke-client curl -sS -g -m 30 -H 'Expect:' --data-binary "@${FULL_PAYLOAD}" -o "$FULL_GOT" "$url" || {
     echo "FAIL: ${label} full-size round trip did not complete" >&2
     exit 1
@@ -1235,7 +1253,7 @@ REJECT_CAPTURE_PID=""
 if have_tcpdump "reply-on-the-wire reject capture (client-side behaviour is still asserted)"; then
   ip netns exec smoke-client tcpdump -nn -l -vv -i smoke-veth1 >"$REJECT_CAPTURE" 2>&1 &
   REJECT_CAPTURE_PID=$!
-  sleep 1
+  wait_tcpdump_listening "$REJECT_CAPTURE"
 fi
 
 assert_tcp_refused() { # <label> <curl-url> [curl-extra-arg]
