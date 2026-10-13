@@ -68,8 +68,12 @@ rel_sections="$(printf '%s\n' "$sections" | grep '^\.rela\?\.BTF' || true)"
 # u32 hdr_len, then u32 off/len pairs for func_info (@8), line_info (@16) and
 # core_relo (@24). Read the first 32 bytes from the section hex dump (GNU and
 # LLVM readelf both print `0xADDR w1 w2 w3 w4 ascii`, words in file byte order).
+#
+# A valid header is 24 bytes (pre-CO-RE: no core_relo fields) or >= 32 bytes
+# (build_support/btf_ext.rs's HDR_BASE_LEN / HDR_CORE_LEN). Only the fields the
+# declared hdr_len covers are read, so a 24-byte section is not misparsed.
 hex="$("$readelf_bin" -x .BTF.ext "$object" | awk '$1 ~ /^0x/ && n++ < 2 {print $2 $3 $4 $5}' | tr -d '\n')"
-[ "${#hex}" -eq 64 ] || { echo "FAIL: $object .BTF.ext is shorter than the 32-byte header" >&2; exit 1; }
+[ "${#hex}" -ge 48 ] || { echo "FAIL: $object .BTF.ext is shorter than the 24-byte header" >&2; exit 1; }
 u32_at() {
   local w="${hex:$(($1 * 2)):8}"
   echo $((16#${w:6:2}${w:4:2}${w:2:2}${w:0:2}))
@@ -79,17 +83,23 @@ u32_at() {
   exit 1
 }
 hdr_len="$(u32_at 4)"
-[ "$hdr_len" -ge 32 ] || { echo "FAIL: $object .BTF.ext hdr_len $hdr_len has no core_relo fields" >&2; exit 1; }
+if [ "$hdr_len" -lt 24 ] || { [ "$hdr_len" -gt 24 ] && [ "$hdr_len" -lt 32 ]; }; then
+  echo "FAIL: $object .BTF.ext hdr_len $hdr_len is not 24 or >= 32" >&2
+  exit 1
+fi
 line_info_len="$(u32_at 20)"
-core_relo_len="$(u32_at 28)"
 [ "$line_info_len" -eq 0 ] || {
   echo "FAIL: $object .BTF.ext line_info_len=$line_info_len -- release line_info strip regressed" >&2
   exit 1
 }
-[ "$core_relo_len" -eq 0 ] || {
-  echo "FAIL: $object .BTF.ext core_relo_len=$core_relo_len -- the line_info rewrite must not carry CO-RE relocations" >&2
-  exit 1
-}
+if [ "$hdr_len" -ge 32 ]; then
+  [ "${#hex}" -eq 64 ] || { echo "FAIL: $object .BTF.ext is shorter than its declared $hdr_len-byte header" >&2; exit 1; }
+  core_relo_len="$(u32_at 28)"
+  [ "$core_relo_len" -eq 0 ] || {
+    echo "FAIL: $object .BTF.ext core_relo_len=$core_relo_len -- the line_info rewrite must not carry CO-RE relocations" >&2
+    exit 1
+  }
+fi
 
 size="$(wc -c < "$object" | tr -d ' ')"
 ceiling=$((128 * 1024))
