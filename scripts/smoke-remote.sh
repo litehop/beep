@@ -28,6 +28,11 @@ have_tcpdump() { # <what is skipped>
   exit 1
 }
 
+mkdir -p /tmp/slowbin
+printf '#!/bin/sh\nsleep 4\nexec %s "$@"\n' "$(command -v tcpdump)" >/tmp/slowbin/tcpdump
+chmod +x /tmp/slowbin/tcpdump
+PATH=/tmp/slowbin:$PATH
+
 # RFC 5737 documentation ranges: deliberately disjoint from any real subnet
 # a given VM's CNI/pod network happens to be using.
 FRONT_IP="203.0.113.1"
