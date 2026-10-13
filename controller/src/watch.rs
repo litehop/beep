@@ -1026,7 +1026,7 @@ impl WatchState {
                 for port in reconcile::ports_without_same_family_endpoint(&view, &endpoint_slices) {
                     warnings.insert(format!(
                         "controller: WARN service {}/{} front {front_ip}:{} has no ready {} \
-                         endpoint, only endpoints of the other family; the front rejects \
+                         endpoint, only endpoints of the other family; the front silently drops \
                          new connections",
                         key.namespace,
                         key.name,
@@ -3830,7 +3830,7 @@ mod tests {
     }
 
     // Every endpoint going not-ready (rolling update, failing probe) must keep
-    // the Service's front owned at zero endpoints: new clients are rejected and
+    // the Service's front owned at zero endpoints: new flows are silently dropped and
     // flows pinned to the draining pod keep working. Dropping the front would
     // pass new SYNs to the host (hang) and cut the pinned flows.
     #[test]

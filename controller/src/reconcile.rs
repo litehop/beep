@@ -579,7 +579,7 @@ pub fn reconcile_service(
         // same input agree.
         let candidates = eligible_endpoints(svc.policy, &matching, node.node_ip);
         // No candidate still yields the front, with zero endpoints: the front
-        // stays owned (FRONT_META count 0), so new clients are rejected and
+        // stays owned (FRONT_META count 0), so new flows are silently dropped and
         // pinned flows to draining backends keep their conntrack path.
         let endpoints = candidates
             .iter()
@@ -1254,7 +1254,7 @@ mod tests {
     }
 
     // Draining to zero must keep FRONT_META (count 0) so the dataplane
-    // rejects new clients and pinned flows keep their path; deleting it would
+    // silently drops new flows and pinned flows continue; deleting it would
     // make the front pass through to the host.
     #[test]
     fn losing_every_ready_endpoint_commits_count_zero_instead_of_deleting_the_front() {
@@ -1755,8 +1755,8 @@ mod tests {
             .expect("an owned front with no ready endpoint must stay in FRONT_META");
         assert!(
             front.endpoints.is_empty(),
-            "no ready endpoint exists, so the front must carry none -- new clients get \
-             rejected instead of routed to an unready pod"
+            "no ready endpoint exists, so the front must carry none -- new flows are dropped \
+             silently instead of being routed to an unready pod"
         );
     }
 
