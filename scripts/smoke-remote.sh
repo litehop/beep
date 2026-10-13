@@ -97,6 +97,13 @@ EVICT_FRONT_POD_IP="$POD_IP"
 # can't pollute any other section's listener.
 COLD_FRONT_PORT="19105"
 COLD_TARGET_PORT="18085"
+# Two fronts onto ONE pod:targetPort, driven from one fixed client source
+# port: the second flow collides on the backend's reverse key, so the ingress
+# remaps its source port and persists the decision as a port_memo entry.
+REMAP_FRONT_PORT_A="19106"
+REMAP_FRONT_PORT_B="19107"
+REMAP_TARGET_PORT="18086"
+REMAP_CLIENT_PORT="40000"
 EVICT_RESPONSE_FILE="/tmp/beep-smoke-response-evict.http"
 EVICT_BACKEND_LOG="/tmp/beep-smoke-backend-evict.log"
 REPLACEMENT_POD_IP="198.51.100.60"
@@ -139,6 +146,7 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${POD_IP} ${REMAP_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
   pkill -f "tcpdump -nn -l -vv -i smoke-veth1" 2>/dev/null || true
   rm -rf "$PIN_DIR"
@@ -243,6 +251,8 @@ start_loader() {
     --fixture "${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${UPLINK2_TARGET_PORT}" \
     --fixture "${FRONT_IP}:${EVICT_FRONT_PORT}:tcp:${FRONT_IP}:${EVICT_FRONT_POD_IP}:${EVICT_TARGET_PORT}" \
     --fixture "${FRONT_IP}:${COLD_FRONT_PORT}:tcp:${FRONT_IP}:${POD_IP}:${COLD_TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${REMAP_FRONT_PORT_A}:tcp:${FRONT_IP}:${POD_IP}:${REMAP_TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${REMAP_FRONT_PORT_B}:tcp:${FRONT_IP}:${POD_IP}:${REMAP_TARGET_PORT}" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -500,6 +510,39 @@ flow_table_has_pod() {
     )
   ' >/dev/null
 }
+
+echo "==> port remap: a second front onto the same pod:targetPort from the same client source port must round-trip AND persist a zero-tailed port_memo entry"
+# Fixed client port 40000 to front A then front B: both flows decap to the same
+# reverse key (client, 40000, pod, target), so front B's flow is remapped and
+# its decision memoized under key tag 02. The memo's value is 2 bytes of a 36
+# byte slot; the other 34 must be zero rather than eBPF stack residue.
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nREMAPA' > /tmp/beep-smoke-response-remap-A.http
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nREMAPB' > /tmp/beep-smoke-response-remap-B.http
+for remap_leg in A B; do
+  remap_front_port_var="REMAP_FRONT_PORT_${remap_leg}"
+  nohup nc -l -N "$POD_IP" "$REMAP_TARGET_PORT" < "/tmp/beep-smoke-response-remap-${remap_leg}.http" >/dev/null 2>&1 &
+  disown
+  sleep 0.5
+  remap_body=$(ip netns exec smoke-client curl -sS -m 5 --local-port "$REMAP_CLIENT_PORT" "http://${FRONT_IP}:${!remap_front_port_var}/") || {
+    echo "FAIL: remap round trip via front ${FRONT_IP}:${!remap_front_port_var} (client port ${REMAP_CLIENT_PORT}, leg ${remap_leg}) did not complete" >&2
+    exit 1
+  }
+  [ "$remap_body" = "REMAP${remap_leg}" ] || {
+    echo "FAIL: expected body 'REMAP${remap_leg}' via front ${!remap_front_port_var}, got: $remap_body" >&2
+    exit 1
+  }
+done
+remap_memos=$(map_json "$PIN_DIR/FLOW_TABLE" | jq -c '[.[] | select(.key[37] == "0x02")]')
+echo "port_memo entries (key tag 02): $remap_memos"
+[ "$(jq 'length' <<<"$remap_memos")" -ge 1 ] || {
+  echo "FAIL: no port_memo (key tag 02) FLOW_TABLE entry after two fronts onto ${POD_IP}:${REMAP_TARGET_PORT} from client port ${REMAP_CLIENT_PORT} -- the remap path was never exercised, so the zero-tail check proves nothing" >&2
+  exit 1
+}
+jq -e 'all(.[]; (.value | length) == 36 and all(.value[2:36][]; . == "0x00"))' <<<"$remap_memos" >/dev/null || {
+  echo "FAIL: a port_memo value has non-zero bytes in 2..36 (or is not 36 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
+  exit 1
+}
+echo "PORT-REMAP: PASS (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..36 are zero)"
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
 # The three round trips above (two fronts on the first uplink, one on the
