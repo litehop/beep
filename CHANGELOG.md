@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection prefers local endpoints when it is non-zero. Inert until the
   controller sets `local_count`.
 
+- The controller emits every ready, non-terminating, same-family endpoint of a
+  Service (previously one), with its target port and an `IS_LOCAL` flag, and
+  honours Service policy:
+  - `externalTrafficPolicy: Cluster` with no `spec.trafficDistribution`
+    spreads uniformly over all ready endpoints.
+  - `spec.trafficDistribution: PreferSameNode` prefers local endpoints and
+    falls back to all; `PreferClose` and `PreferSameZone` are treated the same
+    (beep has no zone model); an unknown value is logged and spreads uniformly.
+  - `externalTrafficPolicy: Local` uses only endpoints on the ingress node
+    (ignoring `trafficDistribution`); with no ready local pod it uses
+    serving-but-terminating local pods, and with none at all the front is
+    owned at count 0.
+  - Each node's controller writes only its own address to
+    `status.loadBalancer.ingress`; under `externalTrafficPolicy: Local` it
+    removes it while the node has no usable local pod. Switching policy does
+    not evict pinned flows; they drain naturally.
+
 ### Changed
 
 - Owned fronts with no ready endpoints (count 0: eTP=Local with no usable

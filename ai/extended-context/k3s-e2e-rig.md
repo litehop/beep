@@ -114,6 +114,15 @@ a `FLOW_TABLE` conntrack entry for the flow. Use this to check the rig
 itself (or a controller change) is healthy before spending the e2e suite's
 much longer wall-clock.
 
+After the single-pod round trip it runs the multi-endpoint legs, each on its
+own front port: (a) Cluster policy spreads fresh connections over local and
+remote pods, (b) `trafficDistribution: PreferSameNode` keeps flows on the
+ingress node's own pods, (c) `externalTrafficPolicy: Local` uses only local
+pods and advertises only the node that has them in
+`status.loadBalancer.ingress`, (d) deleting one pod loses only its flows,
+(f) a lone local pod in its preStop sleep keeps serving, (e) scaling to 0
+makes new connections fail (it asserts failure, not reset-versus-timeout).
+
 `scripts/memory-smoke-controller.sh` is a different, lighter thing worth
 not confusing with the above: it's the per-PR CI gate (`ci.yaml`'s
 `memory-smoke` job) that measures the same RSS ceilings

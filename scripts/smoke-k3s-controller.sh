@@ -61,6 +61,8 @@
 # Defaults: beep-node-a (ingress, k3s server), beep-node-b (backend Pod,
 # k3s agent), beep-client (client). All three must be on the same Lima
 # network (scripts/k3s-up.sh's beep-k3s.yaml profile for the first two).
+# --keep-going runs every multi-endpoint leg and fails at the end instead of
+# stopping at the first failed leg.
 # --proxy-mode forwards to scripts/k3s-up.sh (default iptables) -- without
 # this passthrough, this script's own k3s-up.sh invocation always defaults
 # back to iptables, silently resetting a cluster an earlier `k3s-up.sh
@@ -71,12 +73,15 @@ VM_A="beep-node-a"
 VM_B="beep-node-b"
 VM_CLIENT="beep-client"
 PROXY_MODE="iptables"
+KEEP_GOING=0
+LEG_FAILURES=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
     --vm-b) VM_B="$2"; shift 2 ;;
     --vm-client) VM_CLIENT="$2"; shift 2 ;;
     --proxy-mode) PROXY_MODE="$2"; shift 2 ;;
+    --keep-going) KEEP_GOING=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -122,7 +127,7 @@ map_entry_count() { # map_entry_count <vm> <map-name> -- entries in a pinned map
 dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 
 cleanup() {
-  kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   # The tarball above is trap-cleaned, but the locally built+tagged image
@@ -366,5 +371,242 @@ flow_a=$(map_entry_count "$VM_A" FLOW_TABLE)
 }
 echo "CONNTRACK: PASS ($VM_A FLOW_TABLE=$flow_a entries)"
 
+# ---------------------------------------------------------------------------
+# Multi-endpoint legs. Every Service gets its own front port (a front is keyed
+# on address+port, so two Services on one port would share a front). Each leg
+# asserts a property a pick-one controller or a policy-blind one cannot meet.
+# ---------------------------------------------------------------------------
+P_CLUSTER=81 P_PREF=82 P_LOCAL=83 P_TERM=84
+N_CONNS=60
+
+leg_fail() { # leg_fail <message> -- fatal, unless --keep-going, which runs every leg and fails at the end
+  echo "$1" >&2
+  LEG_FAILURES=$((LEG_FAILURES + 1))
+  [ "$KEEP_GOING" = 1 ] && return 0
+  dump_evidence
+  exit 1
+}
+
+pod_map() { # pod_map <app> -- "<pod> <node>" per pod
+  kube -n "$NAMESPACE" get pods -l "app=$1" --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}'
+}
+
+client_hits() { # client_hits <front-ip> <port> <n> -- "<count> <pod>" per distinct answering pod, "<count> FAIL" for failed connections; every request is a fresh connection
+  limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $3); do curl -sS -m 5 http://$1:$2/ 2>/dev/null | sed -n 's/^Hostname: //p' | grep . || echo FAIL; done | sort | uniq -c"
+}
+
+hits_on_node() { # hits_on_node <pod-map> <hits> <node> -- connections answered by pods on <node>
+  awk -v node="$3" 'NR==FNR{n[$1]=$2;next} n[$2]==node{s+=$1} END{print s+0}' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+hits_total() { awk '$2!="FAIL"{s+=$1} END{print s+0}' <<<"$1"; }
+hits_failed() { awk '$2=="FAIL"{s+=$1} END{print s+0}' <<<"$1"; }
+hits_pods() { awk '$2!="FAIL"{n++} END{print n+0}' <<<"$1"; }
+
+probe_rc() { # probe_rc <front-ip> <port> -- curl exit status of one fresh connection from the client
+  local rc
+  set +e
+  limactl shell "$VM_CLIENT" -- curl -sS -m 5 -o /dev/null "http://$1:$2/" >/dev/null 2>&1
+  rc=$?
+  set -e
+  echo "$rc"
+}
+
+ingress_of() { # ingress_of <svc> -- sorted, space-separated status.loadBalancer.ingress IPs
+  kube -n "$NAMESPACE" get svc "$1" -o jsonpath='{.status.loadBalancer.ingress[*].ip}' | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+wait_ingress() { # wait_ingress <svc> <expected sorted ips> -- polls, then echoes the last value
+  local got="" _
+  for _ in $(seq 1 60); do
+    got="$(ingress_of "$1")"
+    [ "$got" = "$2" ] && break
+    sleep 1
+  done
+  echo "$got"
+}
+
+apply_multi() { # apply_multi <name> <port> <replicas> <etp|-> <td|-> <extra pod spec, 6-space indented, or empty> <extra container spec, 10-space indented, or empty>
+  local name="$1" port="$2" replicas="$3" etp="$4" td="$5" podspec="$6" ctrspec="$7" policy=""
+  [ "$etp" = "-" ] || policy="$policy
+  externalTrafficPolicy: $etp"
+  [ "$td" = "-" ] || policy="$policy
+  trafficDistribution: $td"
+  cat <<EOF | kube apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $name
+  namespace: $NAMESPACE
+spec:
+  replicas: $replicas
+  selector:
+    matchLabels: {app: $name}
+  template:
+    metadata:
+      labels: {app: $name}
+    spec:
+$podspec
+      containers:
+        - name: whoami
+          image: docker.io/traefik/whoami:latest
+          ports:
+            - containerPort: 80
+$ctrspec
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $name
+  namespace: $NAMESPACE
+spec:
+  type: LoadBalancer
+  selector: {app: $name}$policy
+  ports:
+    - port: $port
+      targetPort: 80
+      protocol: TCP
+EOF
+}
+
+SPREAD_PODSPEC="      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: APP}"
+
+spread_for() { echo "${SPREAD_PODSPEC/APP/$1}"; }
+
+wait_ready() { # wait_ready <deployment> -- rollout done, then a settle for the EndpointSlice and the controller's reconcile
+  kube -n "$NAMESPACE" rollout status "deployment/$1" --timeout=120s >/dev/null || leg_fail "LEG: FAIL ($1 never became Ready)"
+  sleep 8
+}
+
+echo "==> [12] multi-endpoint legs (4 replicas spread 2+2 across $NODE_A_K8S/$NODE_B_K8S; $N_CONNS fresh connections per probe)"
+apply_multi mcluster "$P_CLUSTER" 4 - - "$(spread_for mcluster)" ""
+apply_multi mpref "$P_PREF" 4 - PreferSameNode "$(spread_for mpref)" ""
+wait_ready mcluster
+wait_ready mpref
+CMAP="$(pod_map mcluster)"
+PMAP="$(pod_map mpref)"
+[ "$(hits_on_node "$CMAP" "$(awk '{print "1 "$1}' <<<"$CMAP")" "$NODE_A_K8S")" = 2 ] || leg_fail "LEG: FAIL (mcluster replicas not spread 2+2: $CMAP)"
+
+# (a) Cluster, no trafficDistribution: spread over every pod, remote ones included although local ones exist.
+HITS="$(client_hits "$IP_A" "$P_CLUSTER" "$N_CONNS")"
+echo "$HITS"
+LOCAL_N="$(hits_on_node "$CMAP" "$HITS" "$NODE_A_K8S")"
+REMOTE_N="$(hits_on_node "$CMAP" "$HITS" "$NODE_B_K8S")"
+[ "$(hits_failed "$HITS")" = 0 ] || leg_fail "LEG-A: FAIL (connections failed: $HITS)"
+[ "$(hits_pods "$HITS")" -ge 3 ] && [ "$LOCAL_N" -ge 1 ] && [ "$REMOTE_N" -ge 1 ] || \
+  leg_fail "LEG-A: FAIL (Cluster policy must spread over local AND remote pods; local=$LOCAL_N remote=$REMOTE_N distinct=$(hits_pods "$HITS"))"
+echo "LEG-A cluster/uniform: PASS (via $IP_A: $LOCAL_N conns on node-a pods, $REMOTE_N on node-b pods, $(hits_pods "$HITS") of 4 pods used)"
+ING="$(ingress_of mcluster)"
+[ "$ING" = "$(printf '%s\n%s' "$IP_A" "$IP_B" | sort | tr '\n' ' ' | sed 's/ $//')" ] || leg_fail "LEG-A: FAIL (Cluster ingress should list both nodes, got '$ING')"
+
+# (b) PreferSameNode: every flow stays on a pod local to the node it entered.
+for pair in "$IP_A:$NODE_A_K8S:$NODE_B_K8S" "$IP_B:$NODE_B_K8S:$NODE_A_K8S"; do
+  ip="${pair%%:*}"; rest="${pair#*:}"; own="${rest%%:*}"; other="${rest#*:}"
+  HITS="$(client_hits "$ip" "$P_PREF" "$N_CONNS")"
+  echo "$HITS"
+  OWN_N="$(hits_on_node "$PMAP" "$HITS" "$own")"
+  OTHER_N="$(hits_on_node "$PMAP" "$HITS" "$other")"
+  [ "$(hits_failed "$HITS")" = 0 ] && [ "$OWN_N" -eq "$N_CONNS" ] && [ "$OTHER_N" = 0 ] || \
+    leg_fail "LEG-B: FAIL (PreferSameNode via $ip: want all $N_CONNS on $own, got own=$OWN_N other=$OTHER_N)"
+  echo "LEG-B prefer-same-node: PASS (via $ip: $OWN_N/$N_CONNS on $own pods, $OTHER_N remote)"
+done
+
+# (c) eTP=Local, pods only on node-b: node-a must not be advertised and must not serve.
+apply_multi mlocal "$P_LOCAL" 2 Local - "      nodeName: $NODE_B_K8S" ""
+wait_ready mlocal
+LMAP="$(pod_map mlocal)"
+ING="$(wait_ingress mlocal "$IP_B")"
+[ "$ING" = "$IP_B" ] || leg_fail "LEG-C: FAIL (eTP=Local ingress should be only $IP_B (the node with pods), got '$ING')"
+HITS="$(client_hits "$IP_B" "$P_LOCAL" 40)"
+echo "$HITS"
+[ "$(hits_failed "$HITS")" = 0 ] && [ "$(hits_pods "$HITS")" = 2 ] || leg_fail "LEG-C: FAIL (eTP=Local via the node with pods should spread over its 2 local pods: $HITS)"
+RC_A="$(probe_rc "$IP_A" "$P_LOCAL")"
+[ "$RC_A" != 0 ] || leg_fail "LEG-C: FAIL (a connection via $IP_A, which has no local pod, succeeded)"
+echo "LEG-C eTP=Local: PASS (ingress=$ING; $IP_B served by both local pods; $IP_A has no local pod, connection failed rc=$RC_A)"
+
+# (d) deleting one pod re-homes only its flows: every long-lived flow on a surviving pod continues,
+# and the lost flows are exactly a subset of the victim's. Each flow is one curl connection (two URLs,
+# keepalive reuse): a quick request records the serving pod, the long wait spans the delete. curl
+# silently re-sends on a fresh connection when a reused one dies, so a flow only counts as surviving
+# if both requests report the same client RemoteAddr (ip:port); a reconnect is a lost flow.
+VICTIM="$(awk -v n="$NODE_B_K8S" '$2==n{print $1; exit}' <<<"$CMAP")"
+N_LONG=24
+LONG_OUT="$(mktemp)"
+limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $N_LONG); do ( out=\$(curl -sS -m 50 'http://$IP_A:$P_CLUSTER/' 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -n 's/^Hostname: //p;s/^RemoteAddr: //p'); echo \$out ) & done; wait" >"$LONG_OUT" &
+LONG_PID=$!
+sleep 8
+kube -n "$NAMESPACE" delete pod "$VICTIM" --grace-period=0 --force >/dev/null 2>&1 || leg_fail "LEG-D: FAIL (could not delete $VICTIM)"
+wait "$LONG_PID" || true
+FLOWS="$(awk '{print ($1 ? $1 : "FAIL"), ($3 && $4 == $2 ? $3 : "FAIL")}' "$LONG_OUT")"
+rm -f "$LONG_OUT"
+echo "LEG-D flows per pod before delete:"
+awk '{print $1}' <<<"$FLOWS" | sort | uniq -c
+echo "LEG-D flows per pod after delete:"
+awk '{print $2}' <<<"$FLOWS" | sort | uniq -c
+[ "$(awk 'END{print NR}' <<<"$FLOWS")" = "$N_LONG" ] && ! awk '$1=="FAIL"{f=1} END{exit !f}' <<<"$FLOWS" || \
+  leg_fail "LEG-D: FAIL (not every flow established before the delete: $FLOWS)"
+VICTIM_FLOWS="$(awk -v v="$VICTIM" '$1==v' <<<"$FLOWS" | wc -l | tr -d ' ')"
+SURV_LOST="$(awk -v v="$VICTIM" '$1!=v && $2=="FAIL"' <<<"$FLOWS" | wc -l | tr -d ' ')"
+SURV_MOVED="$(awk -v v="$VICTIM" '$1!=v && $2!="FAIL" && $2!=$1' <<<"$FLOWS" | wc -l | tr -d ' ')"
+VICTIM_SERVED="$(awk -v v="$VICTIM" '$2==v' <<<"$FLOWS" | wc -l | tr -d ' ')"
+LONG_OK="$(awk '$2!="FAIL"' <<<"$FLOWS" | wc -l | tr -d ' ')"
+echo "LEG-D victim=$VICTIM victim_flows=$VICTIM_FLOWS survivor_flows_lost=$SURV_LOST survivor_flows_moved=$SURV_MOVED survived=$LONG_OK"
+[ "$VICTIM_FLOWS" -ge 1 ] || leg_fail "LEG-D: FAIL (no long-lived flow landed on $VICTIM; the leg proves nothing: $FLOWS)"
+[ "$VICTIM_SERVED" = 0 ] || leg_fail "LEG-D: FAIL (a connection was answered by the deleted pod $VICTIM)"
+[ "$SURV_LOST" = 0 ] && [ "$SURV_MOVED" = 0 ] || \
+  leg_fail "LEG-D: FAIL (flows on surviving pods were disturbed by deleting $VICTIM: lost=$SURV_LOST moved=$SURV_MOVED; flows (before after): $FLOWS)"
+echo "LEG-D pod-delete: PASS (deleted $VICTIM: lost flows are exactly its $VICTIM_FLOWS; all $LONG_OK survivor flows continued unmoved)"
+wait_ready mcluster
+HITS="$(client_hits "$IP_A" "$P_CLUSTER" 40)"
+[ "$(hits_failed "$HITS")" = 0 ] || leg_fail "LEG-D: FAIL (new connections failed after the delete: $HITS)"
+
+# (f) eTP=Local, single local pod being deleted with a preStop sleep: the draining pod still serves.
+TERM_PODSPEC="      nodeName: $NODE_B_K8S
+      terminationGracePeriodSeconds: 45"
+TERM_CTR="          lifecycle:
+            preStop:
+              sleep: {seconds: 30}
+          readinessProbe:
+            httpGet: {path: /, port: 80}
+            initialDelaySeconds: 25
+            periodSeconds: 2"
+apply_multi mterm "$P_TERM" 1 Local - "$TERM_PODSPEC" "$TERM_CTR"
+kube -n "$NAMESPACE" rollout status deployment/mterm --timeout=120s >/dev/null || leg_fail "LEG-F: FAIL (mterm never became Ready)"
+sleep 8
+OLD="$(pod_map mterm | awk '{print $1}')"
+[ -n "$OLD" ] || leg_fail "LEG-F: FAIL (no mterm pod)"
+kube -n "$NAMESPACE" delete pod "$OLD" --wait=false >/dev/null
+sleep 5
+HITS="$(client_hits "$IP_B" "$P_TERM" 10)"
+echo "$HITS"
+[ "$(hits_failed "$HITS")" = 0 ] && [ "$(hits_total "$HITS")" = 10 ] && [ "$(awk '$2==o{s+=$1} END{print s+0}' o="$OLD" <<<"$HITS")" = 10 ] || \
+  leg_fail "LEG-F: FAIL (the terminating-but-serving local pod $OLD must keep serving while its replacement is not ready: $HITS)"
+ING="$(ingress_of mterm)"
+[ "$ING" = "$IP_B" ] || leg_fail "LEG-F: FAIL (node with the draining pod must stay listed, got '$ING')"
+echo "LEG-F eTP=Local terminating fallback: PASS (10/10 connections answered by draining $OLD while no replacement was ready)"
+
+# (e) no ready endpoints: new connections do not succeed (drop vs reject is not asserted here).
+kube -n "$NAMESPACE" scale deployment/mcluster --replicas=0 >/dev/null
+for _ in $(seq 1 60); do
+  [ -z "$(pod_map mcluster)" ] && break
+  sleep 1
+done
+sleep 8
+for ip in "$IP_A" "$IP_B"; do
+  RC="$(probe_rc "$ip" "$P_CLUSTER")"
+  [ "$RC" != 0 ] || leg_fail "LEG-E: FAIL (a connection via $ip succeeded with 0 endpoints)"
+done
+echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
+
 echo ""
+if [ "$LEG_FAILURES" -gt 0 ]; then
+  echo "GATE CONTROLLER-DRIVEN ROUND-TRIP: FAIL ($LEG_FAILURES multi-endpoint assertion(s) failed)" >&2
+  exit 1
+fi
 echo "GATE CONTROLLER-DRIVEN ROUND-TRIP: PASS"

@@ -35,13 +35,33 @@ use std::{
 };
 
 use aya::maps::{HashMap as AyaHashMap, MapData, MapError};
-use beep_common::{FrontEndpoint, FrontEndpointKey, FrontMeta, LbFrontKey};
+use beep_common::{FrontEndpoint, FrontEndpointKey, FrontMeta, LbFrontKey, ENDPOINT_FLAG_IS_LOCAL};
 
 /// The endpoint set a front should have. Slot `i` is `endpoints[i]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesiredFront {
     pub flags: u16,
+    /// Whether new flows prefer the local endpoints. `false` publishes
+    /// `local_count = 0` so the dataplane hashes over every endpoint, however
+    /// the rows are flagged.
+    pub prefer_local: bool,
     pub endpoints: Vec<FrontEndpoint>,
+}
+
+impl DesiredFront {
+    /// The `FRONT_META.local_count`: the length of the leading run of
+    /// `ENDPOINT_FLAG_IS_LOCAL` slots when `prefer_local`, else 0. The
+    /// dataplane hashes over exactly that prefix, so callers preferring local
+    /// must order local endpoints first.
+    pub fn local_count(&self) -> u16 {
+        if !self.prefer_local {
+            return 0;
+        }
+        self.endpoints
+            .iter()
+            .take_while(|e| e.flags & ENDPOINT_FLAG_IS_LOCAL != 0)
+            .count() as u16
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,8 +139,10 @@ pub fn plan_front_writes(
             }
             Some(want) => {
                 let count = want.endpoints.len() as u16;
+                let local_count = want.local_count();
                 let unchanged = meta.filter(|m| {
                     m.count == count
+                        && m.local_count == local_count
                         && want.endpoints.iter().enumerate().all(|(slot, ep)| {
                             current_endpoints.get(&endpoint_key(front, m.generation, slot))
                                 == Some(ep)
@@ -167,7 +189,7 @@ pub fn plan_front_writes(
                             generation: next,
                             count,
                             flags: want.flags,
-                            local_count: 0,
+                            local_count,
                             _pad: 0,
                         },
                     ));
@@ -484,6 +506,7 @@ mod tests {
 
     fn want(ep: FrontEndpoint) -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![ep],
         }
@@ -657,6 +680,107 @@ mod tests {
         assert_eq!(store.read(f), Some(endpoint(7, 9443)));
     }
 
+    fn local(mut ep: FrontEndpoint) -> FrontEndpoint {
+        ep.flags = ENDPOINT_FLAG_IS_LOCAL;
+        ep
+    }
+
+    fn many(eps: Vec<FrontEndpoint>) -> DesiredFront {
+        DesiredFront {
+            prefer_local: true,
+            flags: 0,
+            endpoints: eps,
+        }
+    }
+
+    #[test]
+    fn an_endpoint_becoming_local_mints_a_generation_and_publishes_local_count() {
+        // The row flag and FRONT_META.local_count together define the hash
+        // domain; a pod gaining locality with no other change must still
+        // republish, or the node keeps spreading over remotes.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let first = store.plan(
+            &desired(&[(f, many(vec![endpoint(7, 8443), endpoint(8, 8443)]))]),
+            true,
+        );
+        store.apply_all(&first, |_| {});
+        assert_eq!(store.meta[&f].local_count, 0);
+
+        let after = many(vec![local(endpoint(7, 8443)), endpoint(8, 8443)]);
+        let plans = store.plan(&desired(&[(f, after)]), true);
+        store.apply_all(&plans, |_| {});
+
+        assert_eq!(
+            store.meta[&f].generation, 2,
+            "flag change must mint a generation"
+        );
+        assert_eq!(store.meta[&f].local_count, 1);
+        assert_eq!(store.meta[&f].count, 2);
+    }
+
+    #[test]
+    fn a_front_not_preferring_local_publishes_zero_local_count_despite_local_rows() {
+        // Cluster policy must hash over every endpoint even when a local row
+        // exists; flipping the preference alone must republish the meta.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let mut uniform = many(vec![local(endpoint(7, 8443)), endpoint(8, 8443)]);
+        uniform.prefer_local = false;
+        let first = store.plan(&desired(&[(f, uniform.clone())]), true);
+        store.apply_all(&first, |_| {});
+        assert_eq!(store.meta[&f].local_count, 0);
+
+        let mut preferring = uniform;
+        preferring.prefer_local = true;
+        let plans = store.plan(&desired(&[(f, preferring)]), true);
+        store.apply_all(&plans, |_| {});
+
+        assert_eq!(store.meta[&f].local_count, 1);
+    }
+
+    #[test]
+    fn a_local_count_mismatch_alone_republishes() {
+        // Rows already carry the right flags (e.g. a previous writer left
+        // local_count 0): the meta must still be corrected.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let d = many(vec![local(endpoint(7, 8443)), endpoint(8, 8443)]);
+        let first = store.plan(&desired(&[(f, d.clone())]), true);
+        store.apply_all(&first, |_| {});
+        store.meta.get_mut(&f).unwrap().local_count = 0;
+
+        let plans = store.plan(&desired(&[(f, d)]), true);
+
+        assert!(!plans.is_empty(), "stale local_count must be repaired");
+    }
+
+    #[test]
+    fn a_reader_never_sees_a_count_past_the_rows_that_exist_while_scaling() {
+        // Hash selection can land on any slot below `count`: at every step
+        // boundary of a 1 -> 3 -> 1 scale, each such slot must resolve.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let eps = |n: u8| (1..=n).map(|o| endpoint(o, 8443)).collect::<Vec<_>>();
+        let mut seen = 0;
+        for n in [1u8, 3, 1] {
+            let plans = store.plan(&desired(&[(f, many(eps(n)))]), true);
+            store.apply_all(&plans, |s| {
+                let Some(m) = s.meta.get(&f) else { return };
+                for slot in 0..m.count as usize {
+                    seen += 1;
+                    assert!(
+                        s.endpoints
+                            .contains_key(&endpoint_key(f, m.generation, slot)),
+                        "slot {slot} of count {} is missing mid-scale to {n}",
+                        m.count
+                    );
+                }
+            });
+        }
+        assert!(seen > 0);
+    }
+
     #[test]
     fn a_flags_only_change_republishes_meta_without_a_new_generation() {
         let f = front(1, 443);
@@ -696,6 +820,7 @@ mod tests {
 
     fn drained() -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![],
         }
@@ -1034,6 +1159,7 @@ mod tests {
 
     fn two(a: u8, b: u8) -> DesiredFront {
         DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![endpoint(a, 8443), endpoint(b, 8443)],
         }
@@ -1072,6 +1198,7 @@ mod tests {
 
         // 2 -> 3 endpoints needs 3 new rows next to the 2 live ones.
         let three = DesiredFront {
+            prefer_local: true,
             flags: 0,
             endpoints: vec![endpoint(1, 8443), endpoint(2, 8443), endpoint(4, 8443)],
         };
