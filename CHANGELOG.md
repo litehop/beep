@@ -14,8 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_entries` differ from the new definition (one log line per map). This
   release changes `FLOW_TABLE` values from 36 to 40 bytes and `FRONT_META`
   from 8 to 12 bytes. Established flows are reset once.
+- **`FRONT_META` and `FRONT_ENDPOINTS` are recreated on upgrade.** The loader
+  now also compares a pinned map's `BPF_F_NO_PREALLOC` flag, and both front
+  maps change from preallocated to no-prealloc (and `FRONT_META` from 4096 to
+  1024 default entries). The loader or controller repopulates them on start;
+  until the controller's first reconcile, ingress misses the front and passes
+  the packet to the host.
+- **Breaking flag change.** `--front-meta-max-entries` and
+  `--front-endpoints-max-entries` are removed from `beep` and
+  `beep-controller`. Use `--max-fronts` (default 1024, env `BEEP_MAX_FRONTS`)
+  and `--endpoints-per-front` (default 4, env `BEEP_ENDPOINTS_PER_FRONT`):
+  `FRONT_META` holds `max-fronts` rows and `FRONT_ENDPOINTS`
+  `max-fronts x endpoints-per-front x 2` (the 2 is swap headroom).
 
 ### Added
+
+- Front-map write failures are reported by cause: `E2BIG` (capacity), `ENOMEM`
+  (kernel out of memory allocating a map element, transient) and other, each
+  with its errno text. A front update that would not fit under the pinned
+  map's `max_entries` is refused whole before any row is written, with a
+  capacity error naming the map; fronts are applied shrinking first, then in
+  key order, so the front that starves under pressure is deterministic. The
+  front is left on its previous endpoints in every case.
 
 - Node-local endpoint preference: `FRONT_META` carries a `local_count`, and
   selection prefers local endpoints when it is non-zero. Inert until the
@@ -25,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The forward Geneve option is now 24 bytes and carries the target port.
   Decap reads the port from the option and no longer consults the front maps.
+- `FRONT_META` and `FRONT_ENDPOINTS` are `BPF_F_NO_PREALLOC`: memory is a
+  bucket array (~16 B per slot of `max_entries`) plus ~96 B per front and
+  ~128 B per endpoint row in use, instead of the full cap. At the 11-front
+  smoke scale the two maps drop from 1.54 MB to ~0.15 MB.
+- The previous endpoint generation is deleted about 2 s after a swap commits
+  (it was kept until the next swap). Only a packet that loaded the old
+  `FRONT_META` microseconds before the commit can still want it; established
+  flows read their conntrack pin. Steady state holds one generation per front.
+- The memory-smoke tripwire is 1.15x of the expected usage (bucket floors +
+  entries x per-entry + the preallocated maps) instead of a flat 6 MiB, which
+  stays as the gross ceiling.
 
 ## [0.4.0] - 2026-10-09
 
