@@ -428,9 +428,15 @@ pub union FlowValue {
 /// the chosen arm is smaller than the union.
 impl FlowValue {
     const fn zeroed() -> Self {
-        // SAFETY: every arm is plain integer/array data, for which all-zero
-        // is valid.
-        unsafe { core::mem::zeroed() }
+        Self {
+            forward: ForwardFlowValue {
+                backend: LbFrontBackend {
+                    backend_node_ip: [0; 16],
+                    pod_ip: [0; 16],
+                },
+                ingress_ifindex: 0,
+            },
+        }
     }
 
     pub const fn from_forward(forward: ForwardFlowValue) -> Self {
@@ -451,6 +457,11 @@ impl FlowValue {
         v
     }
 }
+
+// `zeroed` initialises only the `forward` arm; every byte of the union is
+// zeroed only if that arm spans it, so uninitialised stack never reaches
+// FLOW_TABLE through a smaller arm.
+const _: () = assert!(size_of::<ForwardFlowValue>() == size_of::<FlowValue>());
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
