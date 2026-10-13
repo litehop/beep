@@ -111,6 +111,7 @@ const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
 const GENEVE_OPT_TYPE_FRONT_ECHO: u8 = 0x02;
 
 const ETH_HLEN: usize = 14;
+const NO_L3_ETHERTYPE: u16 = 0;
 const ETH_P_IPV4: u16 = 0x0800u16.to_be();
 const ETH_P_IPV6: u16 = 0x86ddu16.to_be();
 const IPPROTO_TCP: u8 = 6;
@@ -864,7 +865,7 @@ fn tunnel_remote(tkey: &bpf_tunnel_key, used_ipv6: bool) -> [u8; 16] {
 }
 
 /// Stamps Geneve metadata (remote, VNI, option bytes) on the skb and redirects
-/// it to `geneve0`; the verdict to return. `l3_ethertype` is `Some` for an
+/// it to `geneve0`; the verdict to return. `l3_ethertype` is non-zero for an
 /// L3-only (WireGuard) uplink, which never gave this skb a MAC header, but
 /// geneve0 is always Ethernet-type: dev_queue_xmit's redirect path drops
 /// any skb with mac_len==0 targeting an Ethernet device (confirmed via a
@@ -883,6 +884,12 @@ fn tunnel_remote(tkey: &bpf_tunnel_key, used_ipv6: bool) -> [u8; 16] {
 /// compile-time constant for the verifier. Helper-call order matters:
 /// `change_head` invalidates packet pointers, so nothing reads the packet
 /// after it except the const-offset `ctx.store`.
+///
+/// `l3_ethertype` is a `NO_L3_ETHERTYPE` sentinel, not an `Option`: the
+/// `Option<u16>` parameter cost ~1.2 KB across the inlined sites. The
+/// `Option<i32>` return (always `Some`) is kept because the verifier rejects
+/// the plain `i32` shape ("R8 pointer arithmetic with <<= operator
+/// prohibited").
 #[inline(always)]
 fn redirect_to_geneve<const N: usize>(
     ctx: &TcContext,
@@ -890,7 +897,7 @@ fn redirect_to_geneve<const N: usize>(
     remote: &[u8; 16],
     vni: u32,
     mut opt: [u8; N],
-    l3_ethertype: Option<u16>,
+    l3_ethertype: u16,
 ) -> Option<i32> {
     // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
     // which all-zero is a valid value.
@@ -920,7 +927,8 @@ fn redirect_to_geneve<const N: usize>(
         return Some(TC_ACT_SHOT);
     }
 
-    if let Some(ethertype) = l3_ethertype {
+    if l3_ethertype != NO_L3_ETHERTYPE {
+        let ethertype = l3_ethertype;
         // SAFETY: `ctx.skb.skb` is the live skb; no argument is a pointer.
         if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
@@ -1058,7 +1066,11 @@ fn uplink_ingress_encap(
         &backend.backend_node_ip,
         VNI_FWD,
         opt,
-        l3_only.then_some(flow.ethertype),
+        if l3_only {
+            flow.ethertype
+        } else {
+            NO_L3_ETHERTYPE
+        },
     )
 }
 
@@ -2039,7 +2051,11 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
         &rev.ingress_node_ip,
         VNI_RET,
         opt,
-        (L2_HLEN == 0).then_some(ETH_P_IPV4),
+        if L2_HLEN == 0 {
+            ETH_P_IPV4
+        } else {
+            NO_L3_ETHERTYPE
+        },
     )
 }
 
@@ -2115,7 +2131,11 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
         &rev.ingress_node_ip,
         VNI_RET,
         opt,
-        (L2_HLEN == 0).then_some(ETH_P_IPV6),
+        if L2_HLEN == 0 {
+            ETH_P_IPV6
+        } else {
+            NO_L3_ETHERTYPE
+        },
     )
 }
 
