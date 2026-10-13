@@ -65,6 +65,11 @@ fn endpoint_key(front: LbFrontKey, generation: u32, slot: usize) -> FrontEndpoin
 /// (the dataplane rejects new flows to it and lets pinned ones drain); only a
 /// front absent from `desired` is deleted. With `prune_absent`, fronts (and orphan endpoints) not in `desired` are
 /// removed; without it, only fronts named in `desired` are touched.
+///
+/// Plans come back ordered by net endpoint-row change (shrinking fronts
+/// first), then by front key: entries freed by a scale-down are available to a
+/// scale-up in the same pass, and which front starves under pressure is
+/// deterministic rather than hash-random.
 pub fn plan_front_writes(
     current_meta: &HashMap<LbFrontKey, FrontMeta>,
     current_endpoints: &HashMap<FrontEndpointKey, FrontEndpoint>,
@@ -162,6 +167,10 @@ pub fn plan_front_writes(
             plans.push(FrontPlan { front, steps });
         }
     }
+    plans.sort_by_key(|p| {
+        let (net, ..) = plan_effect(p, current_meta.contains_key(&p.front));
+        (net, p.front.front_ip, p.front.front_port, p.front.proto)
+    });
     plans
 }
 
@@ -244,29 +253,135 @@ pub fn run_front_plan(
     failures
 }
 
-/// Reads both pinned maps, plans, and applies. Returns `(front, message)`
+/// The `max_entries` of the two pinned front maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontCapacity {
+    pub meta: u32,
+    pub endpoints: u32,
+}
+
+/// How many entries the two front maps currently hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrontUsage {
+    pub meta: usize,
+    pub endpoints: usize,
+}
+
+impl FrontUsage {
+    fn apply(&mut self, step: &FrontWrite, front_had_meta: bool) {
+        match step {
+            FrontWrite::PutEndpoint(..) => self.endpoints += 1,
+            FrontWrite::DeleteEndpoint(_) => self.endpoints = self.endpoints.saturating_sub(1),
+            FrontWrite::PutMeta(..) if !front_had_meta => self.meta += 1,
+            FrontWrite::PutMeta(..) => {}
+            FrontWrite::DeleteMeta(_) => self.meta = self.meta.saturating_sub(1),
+        }
+    }
+}
+
+/// Net and peak change in entries a plan causes, run in step order:
+/// `(endpoint net, endpoint peak, meta peak)`. The peak is what must fit under
+/// the cap, since a plan's deletes run before its writes.
+fn plan_effect(plan: &FrontPlan, front_had_meta: bool) -> (isize, usize, usize) {
+    let (mut ep, mut ep_peak, mut meta, mut meta_peak) = (0isize, 0isize, 0isize, 0isize);
+    for step in &plan.steps {
+        match step {
+            FrontWrite::PutEndpoint(..) => ep += 1,
+            FrontWrite::DeleteEndpoint(_) => ep -= 1,
+            FrontWrite::PutMeta(..) if !front_had_meta => meta += 1,
+            FrontWrite::PutMeta(..) => {}
+            FrontWrite::DeleteMeta(_) => meta -= 1,
+        }
+        ep_peak = ep_peak.max(ep);
+        meta_peak = meta_peak.max(meta);
+    }
+    (ep, ep_peak as usize, meta_peak as usize)
+}
+
+/// Checks that `plan` fits under the caps before any of it is written. A plan
+/// that would run the map out of room is refused whole, instead of writing a
+/// partial new generation that then fails on `E2BIG` and lingers as dead rows.
+pub fn capacity_shortfall(
+    plan: &FrontPlan,
+    front_had_meta: bool,
+    used: FrontUsage,
+    cap: FrontCapacity,
+) -> Option<FrontFailure> {
+    let (_, ep_peak, meta_peak) = plan_effect(plan, front_had_meta);
+    let (map, need, used, max) = if used.endpoints + ep_peak > cap.endpoints as usize {
+        ("FRONT_ENDPOINTS", ep_peak, used.endpoints, cap.endpoints)
+    } else if used.meta + meta_peak > cap.meta as usize {
+        ("FRONT_META", meta_peak, used.meta, cap.meta)
+    } else {
+        return None;
+    };
+    Some(FrontFailure {
+        kind: FailureKind::Capacity,
+        message: format!(
+            "{map} has {used} of {max} entries used, but this front's update needs {need} more; \
+             nothing written"
+        ),
+    })
+}
+
+/// Runs every plan through `write`. Plans are independent, so a refused or
+/// failed one never stops the others. `used` is tracked across plans, so a
+/// plan that frees entries (run first, see `plan_front_writes`) makes room for
+/// the ones after it.
+pub fn run_front_plans(
+    plans: &[FrontPlan],
+    current_meta: &HashMap<LbFrontKey, FrontMeta>,
+    mut used: FrontUsage,
+    cap: FrontCapacity,
+    mut write: impl FnMut(&FrontWrite) -> Result<(), MapError>,
+) -> Vec<(LbFrontKey, FrontFailure)> {
+    let mut failures = Vec::new();
+    for plan in plans {
+        let had_meta = current_meta.contains_key(&plan.front);
+        if let Some(shortfall) = capacity_shortfall(plan, had_meta, used, cap) {
+            failures.push((plan.front, shortfall));
+            continue;
+        }
+        let errors = run_front_plan(plan, |step| {
+            write(step)?;
+            used.apply(step, had_meta);
+            Ok(())
+        });
+        failures.extend(errors.into_iter().map(|e| (plan.front, e)));
+    }
+    failures
+}
+
+/// Reads both pinned maps, plans, and applies. Returns `(front, failure)`
 /// for every failed step; fronts are independent, so one front's failure
 /// (e.g. a full map) never stops the others.
 pub fn apply_fronts<M: BorrowMut<MapData>>(
     meta: &mut AyaHashMap<M, LbFrontKey, FrontMeta>,
     endpoints: &mut AyaHashMap<M, FrontEndpointKey, FrontEndpoint>,
+    capacity: FrontCapacity,
     desired: &HashMap<LbFrontKey, DesiredFront>,
     prune_absent: bool,
 ) -> anyhow::Result<Vec<(LbFrontKey, FrontFailure)>> {
     let current_meta: HashMap<LbFrontKey, FrontMeta> = meta.iter().collect::<Result<_, _>>()?;
     let current_endpoints: HashMap<FrontEndpointKey, FrontEndpoint> =
         endpoints.iter().collect::<Result<_, _>>()?;
-    let mut failures = Vec::new();
-    for plan in plan_front_writes(&current_meta, &current_endpoints, desired, prune_absent) {
-        let errors = run_front_plan(&plan, |step| match step {
+    let used = FrontUsage {
+        meta: current_meta.len(),
+        endpoints: current_endpoints.len(),
+    };
+    let plans = plan_front_writes(&current_meta, &current_endpoints, desired, prune_absent);
+    Ok(run_front_plans(
+        &plans,
+        &current_meta,
+        used,
+        capacity,
+        |step| match step {
             FrontWrite::DeleteEndpoint(k) => endpoints.remove(k),
             FrontWrite::PutEndpoint(k, v) => endpoints.insert(k, v, 0),
             FrontWrite::PutMeta(k, v) => meta.insert(k, v, 0),
             FrontWrite::DeleteMeta(k) => meta.remove(k),
-        });
-        failures.extend(errors.into_iter().map(|e| (plan.front, e)));
-    }
-    Ok(failures)
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -682,6 +797,143 @@ mod tests {
             );
             assert_eq!(scratch.read(f), Some(old), "errno {errno} must fail stale");
         }
+    }
+
+    fn two(a: u8, b: u8) -> DesiredFront {
+        DesiredFront {
+            flags: 0,
+            endpoints: vec![endpoint(a, 8443), endpoint(b, 8443)],
+        }
+    }
+
+    fn run_all(
+        store: &mut Store,
+        desired: &HashMap<LbFrontKey, DesiredFront>,
+        cap: FrontCapacity,
+    ) -> Vec<(LbFrontKey, FrontFailure)> {
+        let plans = store.plan(desired, true);
+        let used = FrontUsage {
+            meta: store.meta.len(),
+            endpoints: store.endpoints.len(),
+        };
+        let meta = store.meta.clone();
+        run_front_plans(&plans, &meta, used, cap, |step| {
+            store.apply_step(step);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_swap_that_does_not_fit_is_refused_before_any_row_is_written() {
+        // Writing the new generation until E2BIG leaves partial rows behind
+        // and a stale front with no explanation; the operator must instead
+        // get one loud capacity failure and an untouched map.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let cap = FrontCapacity {
+            meta: 8,
+            endpoints: 4,
+        };
+        assert!(run_all(&mut store, &desired(&[(f, two(1, 2))]), cap).is_empty());
+
+        // 2 -> 3 endpoints needs 3 new rows next to the 2 live ones.
+        let three = DesiredFront {
+            flags: 0,
+            endpoints: vec![endpoint(1, 8443), endpoint(2, 8443), endpoint(4, 8443)],
+        };
+        let failures = run_all(&mut store, &desired(&[(f, three)]), cap);
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, f);
+        assert_eq!(failures[0].1.kind, FailureKind::Capacity);
+        assert!(
+            failures[0].1.message.contains("FRONT_ENDPOINTS"),
+            "{:?}",
+            failures[0].1.message
+        );
+        assert_eq!(
+            store.endpoints.len(),
+            2,
+            "a refused swap must not leave partial rows of the new generation"
+        );
+        assert_eq!(store.meta[&f].generation, 1);
+    }
+
+    #[test]
+    fn a_new_front_is_refused_when_front_meta_is_full() {
+        let mut store = Store::default();
+        let cap = FrontCapacity {
+            meta: 1,
+            endpoints: 8,
+        };
+        let both = desired(&[
+            (front(1, 443), want(endpoint(1, 8443))),
+            (front(2, 443), want(endpoint(2, 8443))),
+        ]);
+        let failures = run_all(&mut store, &both, cap);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].1.message.contains("FRONT_META"));
+        assert_eq!(store.meta.len(), 1, "FRONT_META must stay within its cap");
+        assert_eq!(
+            store.endpoints.len(),
+            1,
+            "the refused front must not strand endpoint rows"
+        );
+    }
+
+    #[test]
+    fn removed_fronts_are_applied_first_so_their_freed_rows_fund_growing_fronts() {
+        // With hash-random order a grower can hit a full map that a deletion
+        // would have freed a moment later, so which Services update would
+        // depend on luck. Deletions (net shrink) must run first.
+        let mut store = Store::default();
+        let roomy = FrontCapacity {
+            meta: 32,
+            endpoints: 32,
+        };
+        let growers: Vec<LbFrontKey> = (1..=4).map(|n| front(n, 443)).collect();
+        let removed: Vec<LbFrontKey> = (11..=18).map(|n| front(n, 443)).collect();
+        let start: Vec<_> = growers
+            .iter()
+            .chain(&removed)
+            .map(|f| (*f, want(endpoint(1, 8443))))
+            .collect();
+        assert!(run_all(&mut store, &desired(&start), roomy).is_empty());
+        assert_eq!(store.endpoints.len(), 12);
+
+        // Cap equals the current usage: growers (2 new rows each) fit only
+        // once the 8 removed fronts' rows are gone.
+        let full = FrontCapacity {
+            meta: 32,
+            endpoints: 12,
+        };
+        let next: Vec<_> = growers.iter().map(|f| (*f, two(1, 2))).collect();
+        let failures = run_all(&mut store, &desired(&next), full);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(growers.iter().all(|g| store.meta[g].count == 2));
+        assert!(store.endpoints.len() <= 12);
+    }
+
+    #[test]
+    fn plan_order_is_deterministic_for_equal_effects() {
+        // Which front starves under pressure must not depend on HashSet
+        // iteration order, or the same shortfall hits random Services.
+        let fronts: Vec<LbFrontKey> = (1..=6).map(|n| front(n, 443)).collect();
+        let want_all: HashMap<_, _> = fronts
+            .iter()
+            .map(|f| (*f, want(endpoint(9, 8443))))
+            .collect();
+        let store = Store::default();
+        let order: Vec<_> = store
+            .plan(&want_all, true)
+            .iter()
+            .map(|p| p.front)
+            .collect();
+        let mut sorted = fronts.clone();
+        sorted.sort_by_key(|f| (f.front_ip, f.front_port, f.proto));
+        assert_eq!(order, sorted);
     }
 
     #[test]

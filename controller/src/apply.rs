@@ -24,8 +24,8 @@ use std::{
 };
 
 use anyhow::Context;
-use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep::front_swap::{apply_fronts, DesiredFront, FailureKind, FrontFailure};
+use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapInfo};
+use beep::front_swap::{apply_fronts, DesiredFront, FailureKind, FrontCapacity, FrontFailure};
 use beep_common::{
     unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
     LbFrontKey, TcpFlowKey,
@@ -39,6 +39,10 @@ use crate::reconcile::DesiredEntries;
 pub struct PinnedMaps {
     front_meta: AyaHashMap<MapData, LbFrontKey, FrontMeta>,
     front_endpoints: AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
+    /// The pinned front maps' `max_entries`, read once at open: the pre-write
+    /// capacity check compares against what the kernel enforces, not what
+    /// this process was started with.
+    front_capacity: FrontCapacity,
     pod_targets: AyaHashMap<MapData, [u8; 16], u8>,
     node_allow: AyaHashMap<MapData, [u8; 16], u8>,
     /// Opened for the eviction sweep only (`apply_pod_targets`) -- never
@@ -74,11 +78,22 @@ fn open_hash_map<K: aya::Pod, V: aya::Pod>(
         .with_context(|| format!("map `{name}` is not a BPF_MAP_TYPE_HASH"))
 }
 
+fn pinned_max_entries(pin_dir: &Path, name: &str) -> anyhow::Result<u32> {
+    let path = pin_dir.join(name);
+    Ok(MapInfo::from_pin(&path)
+        .with_context(|| format!("reading pinned map `{name}` info from {}", path.display()))?
+        .max_entries())
+}
+
 impl PinnedMaps {
     pub fn open(pin_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             front_meta: open_hash_map(pin_dir, "FRONT_META")?,
             front_endpoints: open_hash_map(pin_dir, "FRONT_ENDPOINTS")?,
+            front_capacity: FrontCapacity {
+                meta: pinned_max_entries(pin_dir, "FRONT_META")?,
+                endpoints: pinned_max_entries(pin_dir, "FRONT_ENDPOINTS")?,
+            },
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
             node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
             // Both `FWD_PENDING`/`FLOW_TABLE` are `BPF_MAP_TYPE_LRU_HASH`
@@ -164,6 +179,7 @@ impl PinnedMaps {
             apply_front_maps(
                 &mut self.front_meta,
                 &mut self.front_endpoints,
+                self.front_capacity,
                 &plan.fronts,
                 plan.prune_fronts,
             )
@@ -200,10 +216,11 @@ impl PinnedMaps {
 fn apply_front_maps(
     front_meta: &mut AyaHashMap<MapData, LbFrontKey, FrontMeta>,
     front_endpoints: &mut AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
+    capacity: FrontCapacity,
     fronts: &HashMap<LbFrontKey, DesiredFront>,
     prune_absent: bool,
 ) -> anyhow::Result<()> {
-    let failures = apply_fronts(front_meta, front_endpoints, fronts, prune_absent)
+    let failures = apply_fronts(front_meta, front_endpoints, capacity, fronts, prune_absent)
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
     for (front, failure) in &failures {
         eprintln!(
