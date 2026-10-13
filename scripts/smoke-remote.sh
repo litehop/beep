@@ -435,7 +435,7 @@ full_size_leg() {
     exit 1
   }
   if [ "$wire" -eq 0 ]; then
-    echo "FULL-SIZE ${label}: PASS, payload integrity only (256 KiB each way); wire assertions skipped"
+    echo "FULL-SIZE ${label}: PARTIAL (tcpdump absent: wire-option/frame-size assertions SKIPPED; payload integrity PASS, 256 KiB each way)"
     return 0
   fi
   # Geneve header (8 bytes at frame offset 42: opt-len 6 words, Transparent
