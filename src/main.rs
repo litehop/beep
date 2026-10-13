@@ -35,7 +35,7 @@ use aya::{
     Ebpf,
 };
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
+    attach_and_pin, capacity_hint, evict_pod_flows,
     front_swap::{plan_front_writes, run_front_plan, DesiredFront, FrontPlan, FrontWrite},
     load_ebpf, local_pod_ips, parse_fixture, parse_iface_name, populate_config,
     populate_uplink_config, random_seed, stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture,
