@@ -38,9 +38,10 @@ use beep::{
     attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
     front_swap::{plan_front_writes, run_front_plan, DesiredFront, FrontPlan, FrontWrite},
     load_ebpf, local_pod_ips, parse_fixture, parse_iface_name, populate_config,
-    populate_uplink_config, random_seed, stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture,
-    DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES, DEFAULT_FRONT_META_MAX_ENTRIES,
-    DEFAULT_NODE_ALLOW_MAX_ENTRIES, DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
+    populate_uplink_config, random_seed, require_supported_kernel, stale_pod_targets,
+    tunnel_remote_v6, wire_ip_v6, Fixture, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
+    DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
+    DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
 };
 use beep_common::{
     wire_port, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
@@ -447,6 +448,7 @@ fn main() -> anyhow::Result<()> {
         node_allow_max_entries,
         pod_targets_max_entries,
     } = Args::parse();
+    require_supported_kernel()?;
     let pin_dir = require_explicit_pin_dir(pin_dir).map_err(|e| anyhow!(e))?;
 
     for fixture in &fixtures {
