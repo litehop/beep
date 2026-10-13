@@ -55,8 +55,8 @@ use aya_ebpf::{
     },
     helpers::{
         bpf_csum_diff, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head,
-        bpf_skb_change_tail, bpf_skb_change_type, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt,
-        bpf_skb_load_bytes, bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt, bpf_skb_store_bytes,
+        bpf_skb_change_tail, bpf_skb_get_tunnel_key, bpf_skb_get_tunnel_opt, bpf_skb_load_bytes,
+        bpf_skb_set_tunnel_key, bpf_skb_set_tunnel_opt, bpf_skb_store_bytes,
     },
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
@@ -814,6 +814,84 @@ fn tunnel_remote(tkey: &bpf_tunnel_key, used_ipv6: bool) -> [u8; 16] {
     )
 }
 
+/// Stamps Geneve metadata (remote, VNI, option bytes) on the skb and redirects
+/// it to `geneve0`; the verdict to return. `l3_ethertype` is `Some` for an
+/// L3-only (WireGuard) uplink, which never gave this skb a MAC header, but
+/// geneve0 is always Ethernet-type: dev_queue_xmit's redirect path drops
+/// any skb with mac_len==0 targeting an Ethernet device (confirmed via a
+/// live kfree_skb trace, __bpf_redirect, reason NOT_SPECIFIED).
+/// bpf_skb_change_head resets both mac_header and mac_len, satisfying
+/// that contract; the zeroed 14 bytes it inserts become the Geneve
+/// inner frame's L2 header, which decap's hard-coded ETH_HLEN skip
+/// already expects (see try_geneve_decap_forward/_return). The inserted
+/// bytes are otherwise zero, so the EtherType field must be stamped
+/// explicitly -- decap's own EtherType check (unconditional, since
+/// geneve0's inner frame is always "real" Ethernet from its point of
+/// view) would otherwise silently no-op on a live-captured all-zero
+/// EtherType (confirmed via a raw packet capture on the peer's wg0).
+///
+/// `opt`'s length is const so the option helper's size argument stays a
+/// compile-time constant for the verifier. Helper-call order matters:
+/// `change_head` invalidates packet pointers, so nothing reads the packet
+/// after it except the const-offset `ctx.store`.
+#[inline(always)]
+fn redirect_to_geneve<const N: usize>(
+    ctx: &TcContext,
+    geneve_ifindex: u32,
+    remote: &[u8; 16],
+    vni: u32,
+    mut opt: [u8; N],
+    l3_ethertype: Option<u16>,
+) -> Option<i32> {
+    // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
+    // which all-zero is a valid value.
+    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
+    let tkey_flags = set_tunnel_remote(&mut tkey, remote);
+    tkey.tunnel_id = vni;
+    tkey.tunnel_ttl = 64;
+    // SAFETY: `ctx.skb.skb` is the live skb of this program invocation;
+    // `tkey` is a stack local of exactly the `size_of` passed.
+    if unsafe {
+        bpf_skb_set_tunnel_key(
+            ctx.skb.skb,
+            &mut tkey,
+            core::mem::size_of::<bpf_tunnel_key>() as u32,
+            tkey_flags,
+        )
+    } != 0
+    {
+        return Some(TC_ACT_SHOT);
+    }
+
+    // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
+    // exactly `opt.len()` bytes.
+    if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
+        != 0
+    {
+        return Some(TC_ACT_SHOT);
+    }
+
+    if let Some(ethertype) = l3_ethertype {
+        // SAFETY: `ctx.skb.skb` is the live skb; no argument is a pointer.
+        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
+            return Some(TC_ACT_SHOT);
+        }
+        // `ethertype` is a stack local, not a const reference: referencing
+        // the const promotes it into a shared `.rodata` allocation, which
+        // bpftool's map-discovery walk (and the CI memory-smoke gate) counts
+        // as a 9th "map".
+        if ctx.store(12, &ethertype, 0).is_err() {
+            return Some(TC_ACT_SHOT);
+        }
+    }
+
+    // SAFETY: no pointer arguments.
+    if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
+        return Some(TC_ACT_SHOT);
+    }
+    Some(TC_ACT_REDIRECT)
+}
+
 /// Hook 1: ingress classifier on the physical uplink, every node (forward
 /// leg). Classifies LB-front-IP:PORT traffic, stamps Geneve metadata, redirects to
 /// `geneve0`. Everything else passes through untouched -- this hook sees
@@ -918,64 +996,20 @@ fn uplink_ingress_encap(
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    let tkey_flags = set_tunnel_remote(&mut tkey, &backend.backend_node_ip);
-    tkey.tunnel_id = VNI_FWD;
-    tkey.tunnel_ttl = 64;
-    if unsafe {
-        bpf_skb_set_tunnel_key(
-            ctx.skb.skb,
-            &mut tkey,
-            core::mem::size_of::<bpf_tunnel_key>() as u32,
-            tkey_flags,
-        )
-    } != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
-
     let mut opt = [0u8; 20];
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
     opt[2] = GENEVE_OPT_TYPE_POD_ID;
     opt[3] = 4; // opt_data length in 4-byte words (16 bytes, dual-stack pod_ip).
     opt[4..20].copy_from_slice(&backend.pod_ip);
-    if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
 
-    // An L3-only (WireGuard) uplink never gave this skb a MAC header, but
-    // geneve0 is always Ethernet-type: dev_queue_xmit's redirect path drops
-    // any skb with mac_len==0 targeting an Ethernet device (confirmed via a
-    // live kfree_skb trace, __bpf_redirect, reason NOT_SPECIFIED).
-    // bpf_skb_change_head resets both mac_header and mac_len, satisfying
-    // that contract; the zeroed 14 bytes it inserts become the Geneve
-    // inner frame's L2 header, which decap's hard-coded ETH_HLEN skip
-    // already expects (see try_geneve_decap_forward/_return). The inserted
-    // bytes are otherwise zero, so the EtherType field must be stamped
-    // explicitly -- decap's own EtherType check (unconditional, since
-    // geneve0's inner frame is always "real" Ethernet from its point of
-    // view) would otherwise silently no-op on a live-captured all-zero
-    // EtherType (confirmed via a raw packet capture on the peer's wg0).
-    if l3_only {
-        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
-            return Some(TC_ACT_SHOT);
-        }
-        // A stack local, not a const reference: referencing the const
-        // promotes it into a shared `.rodata` allocation, which bpftool's
-        // map-discovery walk (and the CI memory-smoke gate) counts as a 9th
-        // "map".
-        let ethertype = flow.ethertype;
-        if ctx.store(12, &ethertype, 0).is_err() {
-            return Some(TC_ACT_SHOT);
-        }
-    }
-
-    if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
-        return Some(TC_ACT_SHOT);
-    }
-    Some(TC_ACT_REDIRECT)
+    redirect_to_geneve(
+        ctx,
+        geneve_ifindex,
+        &backend.backend_node_ip,
+        VNI_FWD,
+        opt,
+        l3_only.then_some(flow.ethertype),
+    )
 }
 
 /// Dispatches on the inner packet's own address family before parsing any
@@ -1389,7 +1423,7 @@ fn try_geneve_decap_forward_v4(
     // is the kernel's own escape hatch for exactly this class of
     // encap/decap mismatch, forcing local-delivery eligibility so routing
     // keys off the (correct, just-rewritten) IP destination instead.
-    if unsafe { bpf_skb_change_type(ctx.skb.skb, PACKET_HOST) } != 0 {
+    if ctx.change_type(PACKET_HOST).is_err() {
         return Some(TC_ACT_SHOT);
     }
 
@@ -1537,7 +1571,7 @@ fn try_geneve_decap_forward_v6(
         UDP_CSUM_V6,
     )?;
 
-    if unsafe { bpf_skb_change_type(ctx.skb.skb, PACKET_HOST) } != 0 {
+    if ctx.change_type(PACKET_HOST).is_err() {
         return Some(TC_ACT_SHOT);
     }
 
@@ -1932,54 +1966,21 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    let tkey_flags = set_tunnel_remote(&mut tkey, &rev.ingress_node_ip);
-    tkey.tunnel_id = VNI_RET;
-    tkey.tunnel_ttl = 64;
-    if unsafe {
-        bpf_skb_set_tunnel_key(
-            ctx.skb.skb,
-            &mut tkey,
-            core::mem::size_of::<bpf_tunnel_key>() as u32,
-            tkey_flags,
-        )
-    } != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
-
     let mut opt = [0u8; 24];
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
     opt[2] = GENEVE_OPT_TYPE_FRONT_ECHO;
     opt[3] = 5; // opt_data length in 4-byte words (16 + 2 + 2 padding bytes).
     opt[4..20].copy_from_slice(&rev.front_ip);
     opt[20..22].copy_from_slice(&rev.front_port.to_ne_bytes());
-    if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
 
-    // See try_uplink_ingress's matching comment: this node's uplink can be
-    // the same L3-only WireGuard device, so its geneve0 redirect needs the
-    // same synthesized MAC header (including the EtherType stamp decap
-    // relies on).
-    if L2_HLEN == 0 {
-        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
-            return Some(TC_ACT_SHOT);
-        }
-        // See try_uplink_ingress's matching comment on why this is a local,
-        // not `&ETH_P_IPV4` directly.
-        let ethertype = ETH_P_IPV4;
-        if ctx.store(12, &ethertype, 0).is_err() {
-            return Some(TC_ACT_SHOT);
-        }
-    }
-
-    if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
-        return Some(TC_ACT_SHOT);
-    }
-    Some(TC_ACT_REDIRECT)
+    redirect_to_geneve(
+        ctx,
+        geneve_ifindex,
+        &rev.ingress_node_ip,
+        VNI_RET,
+        opt,
+        (L2_HLEN == 0).then_some(ETH_P_IPV4),
+    )
 }
 
 /// IPv6 sibling of `try_uplink_egress_return_headers_v4`.
@@ -2041,49 +2042,21 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
-    let tkey_flags = set_tunnel_remote(&mut tkey, &rev.ingress_node_ip);
-    tkey.tunnel_id = VNI_RET;
-    tkey.tunnel_ttl = 64;
-    if unsafe {
-        bpf_skb_set_tunnel_key(
-            ctx.skb.skb,
-            &mut tkey,
-            core::mem::size_of::<bpf_tunnel_key>() as u32,
-            tkey_flags,
-        )
-    } != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
-
     let mut opt = [0u8; 24];
     opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
     opt[2] = GENEVE_OPT_TYPE_FRONT_ECHO;
     opt[3] = 5; // opt_data length in 4-byte words (16 + 2 + 2 padding bytes).
     opt[4..20].copy_from_slice(&rev.front_ip);
     opt[20..22].copy_from_slice(&rev.front_port.to_ne_bytes());
-    if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        != 0
-    {
-        return Some(TC_ACT_SHOT);
-    }
 
-    // See try_uplink_ingress_headers_v6's matching comment.
-    if L2_HLEN == 0 {
-        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
-            return Some(TC_ACT_SHOT);
-        }
-        let ethertype = ETH_P_IPV6;
-        if ctx.store(12, &ethertype, 0).is_err() {
-            return Some(TC_ACT_SHOT);
-        }
-    }
-
-    if unsafe { bpf_redirect(geneve_ifindex, 0) } as i32 != TC_ACT_REDIRECT {
-        return Some(TC_ACT_SHOT);
-    }
-    Some(TC_ACT_REDIRECT)
+    redirect_to_geneve(
+        ctx,
+        geneve_ifindex,
+        &rev.ingress_node_ip,
+        VNI_RET,
+        opt,
+        (L2_HLEN == 0).then_some(ETH_P_IPV6),
+    )
 }
 
 /// Rewrites one address:port pair in place (dst for forward DNAT, src for
