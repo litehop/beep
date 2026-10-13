@@ -495,28 +495,93 @@ pub struct PortMemoValue {
     pub backend_src_port: u16,
 }
 
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for LbFrontKey {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for LbFrontBackend {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for FrontMeta {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for FrontEndpointKey {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for FrontEndpoint {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for ForwardFlowValue {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for Config {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for UplinkConfig {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for FlowValue {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for RevFlowValue {}
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PortMemoValue {}
+/// Emits `aya::Pod` for a `#[repr(C)]` map type plus a compile-time proof that
+/// it has no padding: `Pod` promises every byte is initialized and
+/// deterministic, so a compiler-inserted padding byte would reach the kernel's
+/// raw-byte key hashing/compare uninitialized. A struct lists its fields and
+/// the assert requires `size_of` to equal their summed sizes; a union lists its
+/// arms and the assert requires `size_of` to equal the largest arm (each arm
+/// is itself padding-free via its own `impl_pod!`). The assert is emitted on
+/// every build of the crate; only the `Pod` impl needs the `user` feature.
+macro_rules! impl_pod {
+    ($t:ident { $($f:ident : $ft:ty),+ $(,)? }) => {
+        // SAFETY: `#[repr(C)]`, every field is plain integer/array data (or a
+        // nested Pod), and the assert below proves there is no padding, so
+        // all bytes are initialized and any bit pattern is valid.
+        #[cfg(feature = "user")]
+        unsafe impl aya::Pod for $t {}
+        const _: () = assert!(
+            core::mem::size_of::<$t>() == 0 $(+ core::mem::size_of::<$ft>())+,
+            concat!(stringify!($t), " has padding; add explicit `_pad` fields")
+        );
+    };
+    (union $t:ident { $($f:ident : $ft:ty),+ $(,)? }) => {
+        // SAFETY: `#[repr(C)]` union whose arms are all padding-free Pod; the
+        // assert proves its size is the largest arm, so it adds no bytes of
+        // its own.
+        #[cfg(feature = "user")]
+        unsafe impl aya::Pod for $t {}
+        const _: () = assert!(
+            core::mem::size_of::<$t>() == {
+                let mut max = 0;
+                $(
+                    if core::mem::size_of::<$ft>() > max {
+                        max = core::mem::size_of::<$ft>();
+                    }
+                )+
+                max
+            },
+            concat!(stringify!($t), " is larger than its largest arm")
+        );
+    };
+}
+
+impl_pod!(LbFrontKey {
+    front_ip: [u8; 16],
+    front_port: u16,
+    proto: u8,
+    _pad: u8
+});
+impl_pod!(LbFrontBackend {
+    backend_node_ip: [u8; 16],
+    pod_ip: [u8; 16]
+});
+impl_pod!(FrontMeta {
+    generation: u32,
+    count: u16,
+    flags: u16
+});
+impl_pod!(FrontEndpointKey {
+    front: LbFrontKey,
+    generation: u32,
+    slot: u16,
+    _pad: u16
+});
+impl_pod!(FrontEndpoint {
+    backend: LbFrontBackend,
+    target_port: u16,
+    _pad: [u8; 6]
+});
+impl_pod!(ForwardFlowValue {
+    backend: LbFrontBackend,
+    ingress_ifindex: u32
+});
+impl_pod!(Config {
+    geneve_ifindex: u32,
+    _pad: u32,
+    flow_hash_seed: u64
+});
+impl_pod!(UplinkConfig { l2_hlen: u32 });
+impl_pod!(RevFlowValue {
+    ingress_node_ip: [u8; 16],
+    front_ip: [u8; 16],
+    front_port: u16,
+    original_client_port: u16
+});
+impl_pod!(PortMemoValue {
+    backend_src_port: u16
+});
+impl_pod!(union FlowValue { forward: ForwardFlowValue, reverse: RevFlowValue, port_memo: PortMemoValue });
 
 /// Safe union-arm readers for the userspace/controller side (the eBPF side
 /// already inlines these same reads directly at each of its few call sites,
