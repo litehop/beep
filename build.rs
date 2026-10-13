@@ -34,11 +34,14 @@ fn ebpf_object_path() -> aya_build::Result<PathBuf> {
 /// map + relocation info -- but the DWARF `.debug_*` sections that come
 /// along with it serve no runtime purpose and dominate the embedded
 /// object's size. Strip them here, after linking, so the loader binary
-/// only ships what aya actually reads back.
+/// only ships what aya actually reads back. `.rel.BTF`/`.rel.BTF.ext` are
+/// linker-only relocation sections that aya never reads, so they go too.
 fn strip_dwarf_keep_btf(object: &Path) -> aya_build::Result<()> {
     let objcopy = locate_llvm_objcopy()?;
     let status = Command::new(&objcopy)
         .arg("--strip-debug")
+        .arg("--remove-section=.rel.BTF")
+        .arg("--remove-section=.rel.BTF.ext")
         .arg(object)
         .status()
         .with_context(|| {
