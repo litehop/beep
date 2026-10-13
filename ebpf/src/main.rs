@@ -50,7 +50,7 @@ use core::mem::MaybeUninit;
 
 use aya_ebpf::{
     bindings::{
-        bpf_tunnel_key, bpf_tunnel_key__bindgen_ty_1, bpf_tunnel_key__bindgen_ty_2,
+        __sk_buff, bpf_tunnel_key, bpf_tunnel_key__bindgen_ty_1, bpf_tunnel_key__bindgen_ty_2,
         bpf_tunnel_key__bindgen_ty_3, BPF_F_PSEUDO_HDR, BPF_F_TUNINFO_IPV6, TC_ACT_OK,
         TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
@@ -519,13 +519,22 @@ enum IngressMiss {
     Reject,
 }
 
+/// The program's `__sk_buff` context for plain field reads. Callers read the
+/// field immediately; no reference is held across a helper that rewrites the
+/// skb.
+#[inline(always)]
+fn skb_ctx(ctx: &TcContext) -> &__sk_buff {
+    // SAFETY: `ctx.skb.skb` is the program's live, non-null `__sk_buff`
+    // context for the whole invocation.
+    unsafe { &*ctx.skb.skb }
+}
+
 /// Entry gate shared by the two reject paths: the L3 offset and whether the
 /// client packet is IPv4, or `None` when the packet must not be answered at
 /// all (link-layer broadcast/multicast or not addressed to this host).
 #[inline(always)]
 fn reject_l3(ctx: &TcContext, ingress_ifindex: u32) -> Option<(usize, bool)> {
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    if unsafe { (*ctx.skb.skb).pkt_type } != PACKET_HOST {
+    if skb_ctx(ctx).pkt_type != PACKET_HOST {
         return None;
     }
     let l3 = uplink_config_get(ingress_ifindex)?.l2_hlen as usize;
@@ -986,8 +995,7 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // hook the packet's ingress ifindex IS the physical uplink it just
     // arrived on (this classifier is attached directly to that device's
     // ingress, before any redirect).
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    let ingress_ifindex = unsafe { (*ctx.skb.skb).ingress_ifindex };
+    let ingress_ifindex = skb_ctx(ctx).ingress_ifindex;
     // A per-uplink map hit is simultaneously admission (this ifindex is a
     // configured `--uplink-iface`) and the L2 header length to parse with --
     // a miss means an unconfigured interface, passed through untouched like
@@ -1938,8 +1946,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // this datapath reads skb->mark today, but leaving a stale internal
     // marker on a packet leaving the node is a needless landmine for any
     // future mark-based tc/iptables rule on this uplink.
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    let mark = unsafe { (*ctx.skb.skb).mark };
+    let mark = skb_ctx(ctx).mark;
     if is_redirected_return_mark(mark) {
         ctx.set_mark(0);
         return Some(TC_ACT_OK);
@@ -1953,8 +1960,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // which configured uplink this invocation is running for. See
     // `try_uplink_ingress`'s matching comment for why the L2 header length
     // is resolved once by the loader, not assumed to be Ethernet's 14 bytes.
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let ifindex = skb_ctx(ctx).ifindex;
     let l2_hlen = uplink_config_get(ifindex)?.l2_hlen as usize;
     // See `try_uplink_ingress`'s matching comment: dispatches on a const
     // generic so every `load_direct` offset below is a compile-time literal.
