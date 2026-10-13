@@ -153,8 +153,8 @@ impl PinnedMaps {
         );
         self.orphans_swept = orphans_swept_after(
             self.orphans_swept,
-            orphans.is_some(),
-            plan.sweep_error.is_some(),
+            orphans.as_ref(),
+            plan.sweep_error.as_ref(),
         );
         let sweep_result = match plan.sweep_error.take() {
             Some(e) => Err(e.context("sweeping flows of departed or reused backend pods")),
@@ -320,9 +320,14 @@ fn split_orphan_walk(walk: OrphanWalk) -> (Option<HashSet<[u8; 16]>>, Option<any
 }
 
 /// The `orphans_swept` latch after a tick: set only once a walk's orphans were
-/// swept without error, so a failed walk or sweep is retried next tick.
-fn orphans_swept_after(already: bool, walked: bool, sweep_failed: bool) -> bool {
-    already || (walked && !sweep_failed)
+/// swept without error, so a failed walk or sweep is retried next tick. The
+/// arguments have distinct types so a call site cannot transpose them.
+fn orphans_swept_after(
+    already: bool,
+    swept: Option<&HashSet<[u8; 16]>>,
+    sweep_error: Option<&anyhow::Error>,
+) -> bool {
+    already || (swept.is_some() && sweep_error.is_none())
 }
 
 /// What one reconcile tick may write after its conntrack sweep.
@@ -718,24 +723,25 @@ mod tests {
 
     #[test]
     fn orphan_latch_sets_only_after_a_clean_walk_and_sweep() {
+        let sweep_err = anyhow::anyhow!("sweep failed");
         assert!(
-            orphans_swept_after(false, true, false),
+            orphans_swept_after(false, Some(&set(&[7])), None),
             "a clean sweep must latch or every tick re-walks the tables and resets flows pinned since"
         );
         assert!(
-            !orphans_swept_after(false, true, true),
+            !orphans_swept_after(false, Some(&set(&[7])), Some(&sweep_err)),
             "a failed sweep must stay unlatched so the next tick retries it"
         );
         assert!(
-            !orphans_swept_after(false, false, false),
+            !orphans_swept_after(false, None, None),
             "no walk happened (failed or not due): nothing was swept"
         );
         assert!(
-            orphans_swept_after(true, false, false),
+            orphans_swept_after(true, None, None),
             "the latch never resets"
         );
         assert!(
-            orphans_swept_after(true, true, true),
+            orphans_swept_after(true, Some(&set(&[7])), Some(&sweep_err)),
             "the latch never resets"
         );
     }
@@ -746,7 +752,7 @@ mod tests {
         assert!(orphans.is_none(), "a failed walk has no orphans to sweep");
         assert!(err.is_some(), "the walk error must reach the tick's result");
         assert!(
-            !orphans_swept_after(false, orphans.is_some(), false),
+            !orphans_swept_after(false, orphans.as_ref(), None),
             "a failed walk must be retried next tick, or orphaned pins blackhole until LRU eviction"
         );
 
