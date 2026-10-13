@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes / operator action required
+
+- **Pinned maps are recreated on upgrade, flushing conntrack.** The loader
+  deletes and recreates any pinned map whose type, key size, value size or
+  `max_entries` differ from the new definition (one log line per map). This
+  release changes `FLOW_TABLE` values from 36 to 40 bytes and `FRONT_META`
+  from 8 to 12 bytes. Established flows are reset once.
+
+### Added
+
+- Node-local endpoint preference: `FRONT_META` carries a `local_count`, and
+  selection prefers local endpoints when it is non-zero. Inert until the
+  controller sets `local_count`.
+
+### Changed
+
+- The forward Geneve option is now 24 bytes and carries the target port.
+  Decap reads the port from the option and no longer consults the front maps.
+
 ## [0.4.0] - 2026-10-09
 
 ### Upgrade notes / operator action required

@@ -390,6 +390,87 @@ body2=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_POR
 }
 echo "MULTI-PORT ROUND-TRIP: PASS (client ${CLIENT_IP} -> front ${FRONT_IP}:${FRONT_PORT2} -> backend ${POD_IP}:${TARGET_PORT2} -> response 'OK2', distinct from the first Service port's target)"
 
+# Drives one POST with a 256 KiB body and a 256 KiB reply through a front and
+# checks, on the wire at the Geneve underlay (`lo`, since the backend node is
+# this node): the forward option is the 24-byte pod-id TLV carrying the target
+# port; a full-size (1500-byte inner) packet crossed in BOTH directions, so the
+# 24-byte options fit; and neither payload was corrupted.
+#   $1 label  $2 nc family flag  $3 pod ip  $4 backend port  $5 front url
+#   $6 pod ip as 32 hex chars (v4 pods v4-mapped)  $7 target port as 4 hex chars (wire order)
+FULL_PAYLOAD="/tmp/beep-smoke-full-payload.bin"
+FULL_REPLY="/tmp/beep-smoke-full-reply.bin"
+FULL_REQUEST_SEEN="/tmp/beep-smoke-full-request.bin"
+FULL_GOT="/tmp/beep-smoke-full-got.bin"
+FULL_FRAME_BYTES=1588 # 14 outer eth + 20 IP + 8 UDP + 8 Geneve + 24 option + 14 inner eth + 1500 inner IP
+full_size_leg() {
+  local label="$1" ncflag="$2" pod="$3" port="$4" url="$5" pod_hex="$6" port_hex="$7"
+  local cap_opt=/tmp/beep-smoke-cap-opt.txt cap_fwd=/tmp/beep-smoke-cap-fwd.txt cap_ret=/tmp/beep-smoke-cap-ret.txt
+  rm -f "$cap_opt" "$cap_fwd" "$cap_ret" "$FULL_REQUEST_SEEN" "$FULL_GOT"
+  nohup bash -c "{ sleep 2; printf 'HTTP/1.1 200 OK\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n'; cat ${FULL_REPLY}; } | nc ${ncflag} -l -N ${pod} ${port} >${FULL_REQUEST_SEEN} 2>/dev/null" >/dev/null 2>&1 &
+  disown
+  local wire=0
+  if command -v tcpdump >/dev/null; then
+    wire=1
+    timeout 30 tcpdump -nn -l -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>/dev/null &
+    local opt_pid=$!
+    timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>/dev/null &
+    local fwd_pid=$!
+    timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>/dev/null &
+    local ret_pid=$!
+  else
+    echo "WARN: tcpdump not installed -- ${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames) SKIPPED; only payload integrity is checked" >&2
+  fi
+  sleep 1
+  ip netns exec smoke-client curl -sS -g -m 30 -H 'Expect:' --data-binary "@${FULL_PAYLOAD}" -o "$FULL_GOT" "$url" || {
+    echo "FAIL: ${label} full-size round trip did not complete" >&2
+    exit 1
+  }
+  [ "$wire" -eq 0 ] || wait "$opt_pid" "$fwd_pid" "$ret_pid" || true
+  cmp -s "$FULL_GOT" "$FULL_REPLY" || {
+    echo "FAIL: ${label} reply body differs from the 256 KiB sent by the backend" >&2
+    exit 1
+  }
+  tail -c 262144 "$FULL_REQUEST_SEEN" | cmp -s - "$FULL_PAYLOAD" || {
+    echo "FAIL: ${label} request body the backend received differs from the 256 KiB the client sent" >&2
+    exit 1
+  }
+  if [ "$wire" -eq 0 ]; then
+    echo "FULL-SIZE ${label}: PARTIAL (tcpdump absent: wire-option/frame-size assertions SKIPPED; payload integrity PASS, 256 KiB each way)"
+    return 0
+  fi
+  # Geneve header (8 bytes at frame offset 42: opt-len 6 words, Transparent
+  # Ethernet Bridging, VNI 100) then the option: class ffff, type 01, 5 data
+  # words, pod ip, target port, 2 pad bytes.
+  local hex want
+  hex=$(sed -n 's/^[[:space:]]*0x[0-9a-f]*:[[:space:]]*//p' "$cap_opt" | tr -d ' \n')
+  want="0600655800006400ffff0105${pod_hex}${port_hex}0000"
+  [ "${hex:84:64}" = "$want" ] || {
+    echo "FAIL: ${label} forward Geneve header+option on the wire is '${hex:84:64}', expected '${want}' -- the forward option must be 24 bytes and carry the target port so decap needs no front lookup" >&2
+    exit 1
+  }
+  [ -s "$cap_fwd" ] || {
+    echo "FAIL: ${label} no forward-leg Geneve frame of exactly ${FULL_FRAME_BYTES} bytes seen on lo -- a full-size (1500-byte inner) packet with the 24-byte option never crossed" >&2
+    exit 1
+  }
+  [ -s "$cap_ret" ] || {
+    echo "FAIL: ${label} no return-leg Geneve frame of exactly ${FULL_FRAME_BYTES} bytes seen on lo" >&2
+    exit 1
+  }
+  echo "FULL-SIZE ${label}: PASS (forward option on the wire = 24 B carrying port ${port_hex}; ${FULL_FRAME_BYTES}-byte Geneve frames crossed both directions; 256 KiB each way intact)"
+}
+
+echo "==> full-size packets: single-segment skbs so TCP emits 1500-byte packets instead of GSO aggregates"
+head -c 262144 /dev/urandom > "$FULL_PAYLOAD"
+head -c 262144 /dev/urandom > "$FULL_REPLY"
+ip link set smoke-veth0 gso_max_size 1500
+ip netns exec smoke-client ip link set smoke-veth1 gso_max_size 1500
+full_size_leg "v4" "-4" "$POD_IP" "$TARGET_PORT" "http://${FRONT_IP}:${FRONT_PORT}/" \
+  "00000000000000000000ffffc6336435" "$(printf '%04x' "$TARGET_PORT")"
+full_size_leg "v6" "-6" "$POD6_A" "$PIN6_TARGET_PORT" "http://[${FRONT_IP6}]:${PIN6_FRONT_PORT}/" \
+  "20010db8000600000000000000000053" "$(printf '%04x' "$PIN6_TARGET_PORT")"
+ip link set smoke-veth0 gso_max_size 65536
+ip netns exec smoke-client ip link set smoke-veth1 gso_max_size 65536
+
 echo "==> starting a backend responder for the second uplink's front on ${POD_IP}:${UPLINK2_TARGET_PORT}"
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK3' > "$UPLINK2_RESPONSE_FILE"
 nohup nc -l -N "$POD_IP" "$UPLINK2_TARGET_PORT" < "$UPLINK2_RESPONSE_FILE" >"$UPLINK2_BACKEND_LOG" 2>&1 &
@@ -546,8 +627,8 @@ flow_table_has_pod() {
 echo "==> port remap: a second front onto the same pod:targetPort from the same client source port must round-trip AND persist a zero-tailed port_memo entry"
 # Fixed client port 40000 to front A then front B: both flows decap to the same
 # reverse key (client, 40000, pod, target), so front B's flow is remapped and
-# its decision memoized under key tag 02. The memo's value is 2 bytes of a 36
-# byte slot; the other 34 must be zero rather than eBPF stack residue.
+# its decision memoized under key tag 02. The memo's value is 2 bytes of a 40
+# byte slot; the other 38 must be zero rather than eBPF stack residue.
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nREMAPA' > /tmp/beep-smoke-response-remap-A.http
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nREMAPB' > /tmp/beep-smoke-response-remap-B.http
 for remap_leg in A B; do
@@ -582,11 +663,11 @@ echo "port_memo entries (key tag 02): $remap_memos"
   echo "FAIL: no port_memo (key tag 02) FLOW_TABLE entry after two fronts onto ${POD_IP}:${REMAP_TARGET_PORT} from client port ${REMAP_CLIENT_PORT} -- the remap path was never exercised, so the zero-tail check proves nothing" >&2
   exit 1
 }
-jq -e 'all(.[]; (.value | length) == 36 and all(.value[2:36][]; . == "0x00"))' <<<"$remap_memos" >/dev/null || {
-  echo "FAIL: a port_memo value has non-zero bytes in 2..36 (or is not 36 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
+jq -e 'all(.[]; (.value | length) == 40 and all(.value[2:40][]; . == "0x00"))' <<<"$remap_memos" >/dev/null || {
+  echo "FAIL: a port_memo value has non-zero bytes in 2..40 (or is not 40 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
   exit 1
 }
-echo "PORT-REMAP: PASS (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..36 are zero)"
+echo "PORT-REMAP: PASS (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero)"
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
 # The three round trips above (two fronts on the first uplink, one on the
@@ -793,13 +874,15 @@ PIN_DRAIN_FIFO="/tmp/beep-smoke-pin-drain-fifo"
 PIN_STEER_BACKEND_IN="/tmp/beep-smoke-pin-steer-backend.in"
 PIN_STEER_MSG="PINMSG"
 PIN_DRAIN_MSG="PINDRAIN"
-rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN"
-mkfifo "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO"
+PIN_DRAIN2_FIFO="/tmp/beep-smoke-pin-drain2-fifo"
+PIN_DRAIN2_MSG="PINSWAP2"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_DRAIN2_FIFO" "$PIN_STEER_BACKEND_IN"
+mkfifo "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_DRAIN2_FIFO"
 pin_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 nohup bash -c "sleep 60 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
 disown
 sleep 0.5
-nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_DRAIN_FIFO}; printf '%s' ${PIN_DRAIN_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
+nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_DRAIN_FIFO}; printf '%s' ${PIN_DRAIN_MSG}; read -r _ < ${PIN_DRAIN2_FIFO}; printf '%s' ${PIN_DRAIN2_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
 disown
 for _ in $(seq 1 30); do
   pin_flows_now=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
@@ -937,13 +1020,17 @@ echo "PIN-STEERING (pending): PASS (a still-FWD_PENDING flow kept its original b
 # generation's rows left in FRONT_ENDPOINTS. The controller does not yet write
 # count 0 (it deletes FRONT_META for an empty set).
 DRAIN_FRONT_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ') $((EVICT_FRONT_PORT >> 8)) $((EVICT_FRONT_PORT & 255)) 6 0"
-drain_gen_bytes=($(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0:4][]'))
-drain_gen=$((drain_gen_bytes[0] | drain_gen_bytes[1] << 8 | drain_gen_bytes[2] << 16 | drain_gen_bytes[3] << 24))
-drain_gen=$(((drain_gen + 1) & 0xffffffff))
-bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((drain_gen & 255)) $(((drain_gen >> 8) & 255)) $(((drain_gen >> 16) & 255)) $(((drain_gen >> 24) & 255)) 0 0 0 0 || {
-  echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
-  exit 1
+drain_front_to_next_generation() {
+  local gen_bytes gen
+  gen_bytes=($(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0:4][]'))
+  gen=$((gen_bytes[0] | gen_bytes[1] << 8 | gen_bytes[2] << 16 | gen_bytes[3] << 24))
+  gen=$(((gen + 1) & 0xffffffff))
+  bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((gen & 255)) $(((gen >> 8) & 255)) $(((gen >> 16) & 255)) $(((gen >> 24) & 255)) 0 0 0 0 0 0 0 0 || {
+    echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
+    exit 1
+  }
 }
+drain_front_to_next_generation
 printf '\n' 1<>"$PIN_DRAIN_FIFO"
 for _ in $(seq 1 25); do
   grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
@@ -963,6 +1050,20 @@ drain_ms=$((($(date +%s%N) - drain_start) / 1000000))
   exit 1
 }
 echo "PIN-DRAIN (new flow): PASS (new connection refused after ${drain_ms}ms)"
+# A second swap at count 0: the controller deletes every non-live generation,
+# so no endpoint row of the pinned flow's front survives. The backend must
+# still deliver, because the target port travels in the Geneve option.
+drain_front_to_next_generation
+printf '\n' 1<>"$PIN_DRAIN2_FIFO"
+for _ in $(seq 1 25); do
+  grep -q "$PIN_DRAIN2_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null && break
+  sleep 0.2
+done
+grep -q "$PIN_DRAIN2_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null || {
+  echo "FAIL: after a second swap at count 0 left no endpoint rows for the front, a packet of the pinned flow did not reach ${POD_IP} (backend received: '$(cat "$PIN_STEER_BACKEND_IN" 2>/dev/null)'). Decap must take the target port from the forward Geneve option, not look the front up." >&2
+  exit 1
+}
+echo "PIN-DRAIN (second swap): PASS (pinned flow kept forwarding with no endpoint rows left for its front)"
 EVICT_FRONT_POD_IP="$POD_IP"
 PIN6_FRONT_POD_IP="$POD6_A"
 PEND_BACKEND_NODE_IP="$FLOOD_BACKEND_NODE_IP"
@@ -970,7 +1071,7 @@ stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"
 wait_for_attach "$EVICT_LOADER_LOG_REUSE"
 pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
-rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_STEER_BACKEND_IN" "$PIN6_FIFO" "$PIN6_BACKEND_IN" "$PEND_BACKEND_OUT"
+rm -f "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_DRAIN2_FIFO" "$PIN_STEER_BACKEND_IN" "$PIN6_FIFO" "$PIN6_BACKEND_IN" "$PEND_BACKEND_OUT"
 
 echo "==> non-LB node egress: with this node's own address in POD_TARGETS (a hostNetwork backend), a fresh outbound connection from it must still leave the uplink"
 # A hostNetwork backend's pod IP IS the node's address, so POD_TARGETS holds
@@ -1014,7 +1115,7 @@ CONTROL_TCP6_PORT=19305
 REJECT_CAPTURE="/tmp/beep-smoke-reject-capture.txt"
 
 set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
-  bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 || {
+  bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 0 0 0 0 || {
     echo "FAIL: could not insert a count-0 FRONT_META row (key ip bytes '$1', port $2)" >&2
     exit 1
   }

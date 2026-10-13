@@ -69,16 +69,17 @@ use beep_common::reject::{
     ICMP_UNREACH_V4_LEN, TCP_RST_V4_IN_LEN, TCP_RST_V4_LEN, TCP_RST_V6_IN_LEN, TCP_RST_V6_LEN,
 };
 use beep_common::{
-    address_rewrite_checksums, backend_port_resolution, decap_endpoint_key,
-    decap_forward_pod_admission, egress_return_admission, egress_return_outcome, encode_flow_key,
-    encode_tcp_flow_key, flow_hash, forward_admission, fwd_pending_affinity_pin, ingress_steer,
-    ipv4_mapped_v6, is_redirected_return_mark, occupant_conflicts, peer_node_admission,
-    resolve_backend_src_port, return_authorization, tunnel_remote_addr, unmap_ipv4,
-    AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
-    DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey,
-    FlowValue, ForwardAdmission, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
-    FwdPendingPin, IngressSteer, LbFrontBackend, LbFrontKey, PeerNodeAdmission, PortMemoValue,
-    ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig, REDIRECTED_RETURN_MARK,
+    address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
+    decode_pod_id_option, egress_return_admission, egress_return_outcome, encode_flow_key,
+    encode_pod_id_option, encode_tcp_flow_key, flow_hash, forward_admission,
+    fwd_pending_affinity_pin, ingress_steer, ipv4_mapped_v6, is_redirected_return_mark,
+    occupant_conflicts, peer_node_admission, resolve_backend_src_port, return_authorization,
+    tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums, BackendPortDecision,
+    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
+    EgressReturnOutcome, FlowDirection, FlowKey, FlowValue, ForwardAdmission, ForwardFlowValue,
+    FrontEndpoint, FrontEndpointKey, FrontMeta, FwdPendingPin, IngressSteer, LbFrontBackend,
+    LbFrontKey, PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey,
+    UplinkConfig, GENEVE_OPT_CLASS, POD_ID_OPT_LEN, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -91,24 +92,13 @@ const VNI_FWD: u32 = 100;
 /// two programs racing to terminally-`TC_ACT_OK` the same chain.
 const VNI_RET: u32 = 200;
 
-/// Geneve option class for both TLVs this dataplane defines. `0xffff` is
-/// IANA's "Experimental" class (RFC 8926 SS3.1) -- no allocation needed for a
-/// private, single-implementation encoding. Wire order (see module doc).
-const GENEVE_OPT_CLASS: u16 = 0xffffu16.to_be();
-/// Forward-leg option: the pod-identifier the backend needs to pick a
-/// target port (`docs/decisions/servicelb-ebpf-geneve-dataplane.md`
-/// wire-format settlement: "raw pod IP for the pod identifier"), widened to
-/// always carry the full dual-stack `[u8; 16]` shape (16 bytes: opt[4..20])
-/// -- a v4 pod IP goes in `ipv4_mapped_v6`-embedded, a genuine v6 one as-is,
-/// so this option's own encoding never needs a family branch, only the
-/// surrounding inner-header parsing does.
-const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
 /// Return-leg option: `LB_FRONT_IP:LB_FRONT_PORT` echo, captured by the
 /// backend before it DNATs and echoed back so the ingress can un-DNAT
 /// without its own state lookup racing the encap. Widened the same way as
-/// `GENEVE_OPT_TYPE_POD_ID`: front_ip is the full 16 bytes (opt[4..20]), plus
-/// front_port (2 bytes, opt[20..22]) and 2 bytes of padding to round the
-/// option's data length up to a 4-byte-word multiple (RFC 8926 SS3.4).
+/// the forward option (`beep_common::GENEVE_OPT_TYPE_POD_ID`): front_ip is
+/// the full 16 bytes (opt[4..20]), plus front_port (2 bytes, opt[20..22]) and
+/// 2 bytes of padding to round the option's data length up to a 4-byte-word
+/// multiple (RFC 8926 SS3.4).
 const GENEVE_OPT_TYPE_FRONT_ECHO: u8 = 0x02;
 
 const ETH_HLEN: usize = 14;
@@ -156,8 +146,9 @@ const UDP_CSUM_V6: usize = L4_OFF_V6 + 6;
 /// Per-front live-generation pointer: front tuple -> `{generation, count,
 /// flags}` (`beep_common::FrontMeta`). A `BPF_MAP_TYPE_HASH` (not an array)
 /// so the controller's single-element replace is the atomic commit of a new
-/// endpoint generation; ingress and decap read this once per packet, then
-/// read `FRONT_ENDPOINTS` at `(front, generation, slot 0)`.
+/// endpoint generation; ingress reads this once per packet, then reads
+/// `FRONT_ENDPOINTS` at the slot `beep_common::select_endpoint_slot` picks
+/// (the node-local prefix `0..local_count` when non-empty, else all slots).
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
 /// userspace loader overrides it via `EbpfLoader::map_max_entries`
@@ -169,11 +160,10 @@ const UDP_CSUM_V6: usize = L4_OFF_V6 + 6;
 static FRONT_META: HashMap<LbFrontKey, FrontMeta> = HashMap::with_max_entries(4096, 0);
 
 /// Endpoint table: `(front, generation, slot)` -> `{backend_node_ip, pod_ip,
-/// target_port}` (`beep_common::FrontEndpoint`). Ingress takes the Geneve
-/// remote and pod option from it; the backend node's decap takes the DNAT
-/// target port from it, keyed on the front tuple the packet still carries
-/// (the forward Geneve option only carries the raw pod IP, so the front
-/// tuple is what disambiguates 80->8080 from 443->8443 on the same pod).
+/// target_port}` (`beep_common::FrontEndpoint`). Ingress-only: it takes the
+/// Geneve remote and the forward option (pod IP and DNAT target port) from
+/// it; the backend node's decap reads both from the option and never
+/// touches this map.
 /// A front has exactly one endpoint (slot 0) today; at most two generations
 /// per front are present (`FrontMeta`'s write protocol).
 ///
@@ -425,21 +415,6 @@ fn uplink_config_get(ifindex: u32) -> Option<UplinkConfig> {
     UPLINK_CONFIG.get_ptr(ifindex).map(|p| unsafe { *p })
 }
 
-/// Resolves a front to its slot-0 endpoint: one `FRONT_META` read, then one
-/// `FRONT_ENDPOINTS` read at the generation it names. A front absent from
-/// `FRONT_META` is simply not a front (`None`, uncounted). A front present
-/// but without a readable endpoint is a protocol violation: counted in
-/// `FRONT_MISSES` and yields `None` (ingress passes to host, decap drops).
-#[inline(always)]
-fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
-    let meta = front_meta_get(front)?;
-    let endpoint = front_endpoints_get(decap_endpoint_key(front, meta));
-    if endpoint.is_none() {
-        count_front_miss();
-    }
-    endpoint
-}
-
 #[inline(always)]
 fn count_front_miss() {
     if let Some(misses) = FRONT_MISSES.get_ptr_mut(0) {
@@ -462,14 +437,14 @@ fn ingress_backend(
     flow_key: TcpFlowKey,
     fwd_key: FlowKey,
     ingress_ifindex: u32,
-) -> Result<LbFrontBackend, IngressMiss> {
+) -> Result<(LbFrontBackend, u16), IngressMiss> {
     let Some(meta) = front_meta_get(front) else {
         return Err(IngressMiss::Verdict(TC_ACT_OK));
     };
     let Some(seed) = CONFIG.get(0).map(|c| c.flow_hash_seed) else {
         return Err(IngressMiss::Verdict(TC_ACT_OK));
     };
-    let established = flow_table_get_forward(fwd_key).map(|v| v.backend);
+    let established = flow_table_get_forward(fwd_key);
     let pending = if established.is_some() {
         None
     } else {
@@ -478,17 +453,22 @@ fn ingress_backend(
     let steer = ingress_steer(
         meta,
         established,
-        pending.map(|p| p.backend),
+        pending,
         flow_hash(seed, client_ip, client_port, &front),
         front,
         front_endpoints_get,
     );
     match steer {
-        IngressSteer::Forward(backend) => {
+        IngressSteer::Forward {
+            backend,
+            target_port,
+        } => {
             if let ForwardAdmission::MintPending = forward_admission(established.is_some()) {
                 let admitted = ForwardFlowValue {
                     backend,
                     ingress_ifindex,
+                    target_port,
+                    _pad: 0,
                 };
                 if let FwdPendingPin::Insert(candidate) =
                     fwd_pending_affinity_pin(pending, admitted)
@@ -498,7 +478,7 @@ fn ingress_backend(
                     }
                 }
             }
-            Ok(backend)
+            Ok((backend, target_port))
         }
         IngressSteer::Reject => {
             count_front_miss();
@@ -1065,7 +1045,7 @@ fn uplink_ingress_encap(
         key.proto,
         FlowDirection::Forward,
     );
-    let backend = match ingress_backend(
+    let (backend, target_port) = match ingress_backend(
         key,
         flow.client_ip,
         flow.client_port,
@@ -1073,7 +1053,7 @@ fn uplink_ingress_encap(
         fwd_key,
         ingress_ifindex,
     ) {
-        Ok(backend) => backend,
+        Ok(chosen) => chosen,
         Err(IngressMiss::Verdict(verdict)) => return Some(verdict),
         Err(IngressMiss::Reject) if flow.front.proto == IPPROTO_TCP => {
             return Some(reject_tcp(ctx, ingress_ifindex))
@@ -1083,18 +1063,12 @@ fn uplink_ingress_encap(
 
     let geneve_ifindex = CONFIG.get(0)?.geneve_ifindex;
 
-    let mut opt = [0u8; 20];
-    opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
-    opt[2] = GENEVE_OPT_TYPE_POD_ID;
-    opt[3] = 4; // opt_data length in 4-byte words (16 bytes, dual-stack pod_ip).
-    opt[4..20].copy_from_slice(&backend.pod_ip);
-
     redirect_to_geneve(
         ctx,
         geneve_ifindex,
         &backend.backend_node_ip,
         VNI_FWD,
-        opt,
+        encode_pod_id_option(&backend.pod_ip, target_port),
         if l3_only {
             flow.ethertype
         } else {
@@ -1282,34 +1256,34 @@ fn try_geneve_decap_forward(
     // always the full dual-stack `[u8; 16]` shape) -- read and check them
     // once here, before the inner packet's own family is even known, so
     // `_v4`/`_v6` below don't each need their own copy of this block.
-    let mut opt = [0u8; 20];
+    let mut opt = [0u8; POD_ID_OPT_LEN];
     // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
     // exactly `opt.len()` bytes.
-    if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) } < 0
-    {
+    let opt_len =
+        unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) };
+    // The helper returns the option's actual length: anything but the exact
+    // forward-option length (e.g. a pre-widening 20-byte option, zero-padded
+    // into `opt`) would yield a bogus target port.
+    if opt_len != POD_ID_OPT_LEN as i64 {
         return Some(TC_ACT_SHOT);
     }
-    if opt[0..2] != GENEVE_OPT_CLASS.to_ne_bytes() || opt[2] != GENEVE_OPT_TYPE_POD_ID {
+    let Some((pod_ip_v6, target_port)) = decode_pod_id_option(&opt) else {
         return Some(TC_ACT_SHOT);
-    }
-    let pod_ip_v6: [u8; 16] = opt[4..20].try_into().ok()?;
+    };
 
-    // Membership gate: the front's endpoint lookup below only confirms this node hosts
-    // SOME backend for the front, never that this specific pod_ip -- as
-    // stamped by the ingress node, possibly stale under cross-node
-    // convergence drift -- is still one of this node's own pods. Same
+    // Membership gate: this node, not a possibly-lagging ingress, is the
+    // authority on whether the stamped pod_ip -- possibly stale under
+    // cross-node convergence drift -- is still one of its own pods. Same
     // pod-IP-only POD_TARGETS membership `try_uplink_egress_return` gates
-    // its own direction on (`egress_return_admission`'s doc comment),
-    // checked here before the front-tuple endpoint lookup so a
-    // not-our-pod packet is rejected off the cheaper key first.
+    // its own direction on (`egress_return_admission`'s doc comment).
     let is_local_pod = POD_TARGETS.get_ptr(pod_ip_v6).is_some();
     if let DecapForwardPodAdmission::Drop = decap_forward_pod_admission(is_local_pod) {
         return Some(TC_ACT_SHOT);
     }
 
     match ctx.load::<u16>(12).ok()? {
-        ETH_P_IPV4 => try_geneve_decap_forward_v4(ctx, tkey, used_ipv6, pod_ip_v6),
-        ETH_P_IPV6 => try_geneve_decap_forward_v6(ctx, tkey, used_ipv6, pod_ip_v6),
+        ETH_P_IPV4 => try_geneve_decap_forward_v4(ctx, tkey, used_ipv6, pod_ip_v6, target_port),
+        ETH_P_IPV6 => try_geneve_decap_forward_v6(ctx, tkey, used_ipv6, pod_ip_v6, target_port),
         _ => Some(TC_ACT_OK),
     }
 }
@@ -1320,6 +1294,7 @@ fn try_geneve_decap_forward_v4(
     tkey: &bpf_tunnel_key,
     used_ipv6: bool,
     pod_ip_v6: [u8; 16],
+    target_port: u16,
 ) -> Option<i32> {
     if ctx.load::<u8>(IP_VER_IHL).ok()? & 0x0f != 5 {
         return Some(TC_ACT_OK);
@@ -1333,17 +1308,6 @@ fn try_geneve_decap_forward_v4(
     let client_port: u16 = ctx.load(L4_SPORT).ok()?;
     let front_ip: u32 = ctx.load(IP_DST).ok()?; // captured before rewrite
     let front_port: u16 = ctx.load(L4_DPORT).ok()?; // captured before rewrite
-
-    // Re-keyed off the front the packet still carries at decap time, not the
-    // Geneve option's pod IP: the pod IP alone can't tell 80->8080 apart from
-    // 443->8443 on the same pod (`FRONT_ENDPOINTS`' doc comment).
-    let target_port = front_endpoint(LbFrontKey {
-        front_ip: ipv4_mapped_v6(front_ip),
-        front_port,
-        proto,
-        _pad: 0,
-    })?
-    .target_port;
 
     let client_ip_v6 = ipv4_mapped_v6(client_ip);
     let front_ip_v6 = ipv4_mapped_v6(front_ip);
@@ -1535,6 +1499,7 @@ fn try_geneve_decap_forward_v6(
     tkey: &bpf_tunnel_key,
     used_ipv6: bool,
     pod_ip_v6: [u8; 16],
+    target_port: u16,
 ) -> Option<i32> {
     let proto: u8 = ctx.load(IP6_NEXT_HDR).ok()?;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
@@ -1545,14 +1510,6 @@ fn try_geneve_decap_forward_v6(
     let client_port: u16 = ctx.load(L4_SPORT_V6).ok()?;
     let front_ip_v6: [u8; 16] = ctx.load(IP6_DST).ok()?; // captured before rewrite
     let front_port: u16 = ctx.load(L4_DPORT_V6).ok()?; // captured before rewrite
-
-    let target_port = front_endpoint(LbFrontKey {
-        front_ip: front_ip_v6,
-        front_port,
-        proto,
-        _pad: 0,
-    })?
-    .target_port;
 
     let natural_rev_key = encode_flow_key(
         client_ip_v6,

@@ -173,10 +173,14 @@ flows pass to the host unbalanced (an absent front is not a front).
 
 ## Settled wire-format decisions (2026-09-03)
 
-- **Geneve option encoding**: raw pod IP for the pod identifier; raw
-  `FRONT_IP:FRONT_PORT` for the front-IP echo. Compact alternatives cost
-  a map-ordering/id-collision surface for little savings — the echo is
-  load-bearing (see Conntrack), not cosmetic.
+- **Geneve option encoding**: raw pod IP plus the wire-order target port
+  for the pod identifier (24 bytes, the same length as the return option, so
+  the forward leg needs no more underlay headroom: inner L3 ≤ underlay MTU −
+  74 on a v4 underlay, − 94 on v6); raw `FRONT_IP:FRONT_PORT` for the
+  front-IP echo. Compact alternatives cost a map-ordering/id-collision
+  surface for little savings — the echo is load-bearing (see Conntrack), not
+  cosmetic. The backend's decap reads the target port from the option and
+  never looks the front up.
 - **Front-IP↔PodIP NAT placement**: DNAT on the backend (step 4),
   un-DNAT on the ingress (step 7), reusing the step-2 write. Gates
   Phase 2 (mayor-g7jh2).

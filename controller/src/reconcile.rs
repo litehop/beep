@@ -490,7 +490,8 @@ pub fn reconcile_service(
                     pod_ip: wire_ip_v6(backend.pod_ip),
                 },
                 target_port: wire_port(port.target_port),
-                _pad: [0; 6],
+                flags: 0,
+                _pad: [0; 4],
             })
             .into_iter()
             .collect();

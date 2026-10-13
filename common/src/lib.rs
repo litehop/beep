@@ -279,7 +279,7 @@ pub struct LbFrontBackend {
 /// Write protocol (controller, per front): a new generation is minted only
 /// when the front's endpoint set changes. With `g` the live generation:
 /// (1) delete every endpoint generation other than `g`, (2) write every slot
-/// under `g+1`, (3) replace this value with `{g+1, count, flags}`. At most
+/// under `g+1`, (3) replace this value with `{g+1, count, flags, local_count}`. At most
 /// two generations of a front's endpoints exist at any time; a reader that
 /// loaded generation `g` just before step 3 still finds it. Deleting a front
 /// drops its `FRONT_META` entry first, then its endpoints. An unchanged front
@@ -292,6 +292,10 @@ pub struct FrontMeta {
     pub count: u16,
     /// `FRONT_FLAG_*` bits.
     pub flags: u16,
+    /// Slots `0..local_count` are this node's own pods (`ENDPOINT_FLAG_IS_LOCAL`).
+    /// Must not exceed `count`; `select_endpoint_slot` fails closed if it does.
+    pub local_count: u16,
+    pub _pad: u16,
 }
 
 /// `FRONT_ENDPOINTS` key: one endpoint slot of one generation of a front.
@@ -315,7 +319,65 @@ pub struct FrontEndpointKey {
 pub struct FrontEndpoint {
     pub backend: LbFrontBackend,
     pub target_port: u16,
-    pub _pad: [u8; 6],
+    /// `ENDPOINT_FLAG_*` bits. Distinct from `FrontMeta::flags`, whose bits
+    /// describe the front, not one endpoint.
+    pub flags: u16,
+    pub _pad: [u8; 4],
+}
+
+/// `FrontEndpoint::flags`: the pod runs on the node holding this map. Local
+/// endpoints occupy the first `FrontMeta::local_count` slots.
+pub const ENDPOINT_FLAG_IS_LOCAL: u16 = 1;
+
+/// Geneve option class for every TLV this dataplane defines. `0xffff` is
+/// IANA's "Experimental" class (RFC 8926 SS3.1). Wire order.
+pub const GENEVE_OPT_CLASS: u16 = 0xffffu16.to_be();
+/// Forward-leg option type: the pod the backend delivers to plus the port it
+/// DNATs to.
+pub const GENEVE_OPT_TYPE_POD_ID: u8 = 0x01;
+/// Forward-leg option total length: 4-byte TLV header, 16-byte dual-stack
+/// `pod_ip`, 2-byte wire-order `target_port`, 2 bytes of padding (RFC 8926
+/// SS3.4 word multiple). The same length as the return leg's front echo, so
+/// the forward leg never needs more underlay headroom than the return leg.
+pub const POD_ID_OPT_LEN: usize = 24;
+
+/// Builds the forward-leg option. `target_port` is wire-order (`wire_port`),
+/// as stored in `FrontEndpoint`.
+#[inline(always)]
+pub fn encode_pod_id_option(pod_ip: &[u8; 16], target_port: u16) -> [u8; POD_ID_OPT_LEN] {
+    let mut opt = [0u8; POD_ID_OPT_LEN];
+    opt[0..2].copy_from_slice(&GENEVE_OPT_CLASS.to_ne_bytes());
+    opt[2] = GENEVE_OPT_TYPE_POD_ID;
+    opt[3] = (POD_ID_OPT_LEN as u8 - 4) / 4;
+    opt[4..20].copy_from_slice(pod_ip);
+    opt[20..22].copy_from_slice(&target_port.to_ne_bytes());
+    opt
+}
+
+/// Reads `(pod_ip, target_port)` back out of a forward-leg option; `None`
+/// unless class, type and length word all match.
+#[inline(always)]
+pub fn decode_pod_id_option(opt: &[u8; POD_ID_OPT_LEN]) -> Option<([u8; 16], u16)> {
+    if opt[0..2] != GENEVE_OPT_CLASS.to_ne_bytes()
+        || opt[2] != GENEVE_OPT_TYPE_POD_ID
+        || opt[3] != (POD_ID_OPT_LEN as u8 - 4) / 4
+    {
+        return None;
+    }
+    let pod_ip: [u8; 16] = opt[4..20].try_into().ok()?;
+    let target_port = u16::from_ne_bytes([opt[20], opt[21]]);
+    Some((pod_ip, target_port))
+}
+
+/// Bytes a Geneve-encapsulated inner L3 packet grows by on the underlay: the
+/// inner Ethernet header (geneve0 frames are always Ethernet), outer IP, UDP,
+/// the 8-byte Geneve header, and the options. The kernel's tunnel PMTU check
+/// admits inner L3 packets up to `underlay_mtu - geneve_overhead(..)`; the
+/// loader sets no `geneve0` MTU (an external device defaults to ~64 KiB), so
+/// this is the only size budget.
+pub const fn geneve_overhead(outer_ipv6: bool, opt_len: usize) -> usize {
+    let outer_ip = if outer_ipv6 { 40 } else { 20 };
+    14 + outer_ip + 8 + 8 + opt_len
 }
 
 /// The only slot a front has until multi-endpoint selection exists.
@@ -332,26 +394,6 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
     Some(FrontEndpointKey {
         front,
         generation: meta.generation,
-        slot: FRONT_SLOT_FIRST,
-        _pad: 0,
-    })
-}
-
-/// The `FRONT_ENDPOINTS` key decap reads for the target port of a front. At
-/// `count == 0` that is slot 0 of the previous generation, which the write
-/// protocol leaves in place: flows pinned before the front drained must keep
-/// resolving their target port, or they would be dropped on the backend node
-/// even though ingress still forwards them.
-///
-/// INTERIM: remove once the target port travels in the forward Geneve option.
-/// It only covers a front drained by exactly one swap (the next swap deletes
-/// every non-live generation, so a second generation bump at count 0 loses the
-/// rows), and slot 0 may name a different target port than the pinned pod
-/// under named ports.
-pub fn decap_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> FrontEndpointKey {
-    front_endpoint_key(front, meta).unwrap_or(FrontEndpointKey {
-        front,
-        generation: meta.generation.wrapping_sub(1),
         slot: FRONT_SLOT_FIRST,
         _pad: 0,
     })
@@ -404,6 +446,10 @@ pub struct UplinkConfig {
 pub struct ForwardFlowValue {
     pub backend: LbFrontBackend,
     pub ingress_ifindex: u32,
+    /// Wire-order port the backend node DNATs to, pinned with the pod so a
+    /// flow keeps its target port when its front is re-pointed or drained.
+    pub target_port: u16,
+    pub _pad: u16,
 }
 
 /// Union of the three roles `FLOW_TABLE` stores, discriminated by the
@@ -435,6 +481,8 @@ impl FlowValue {
                     pod_ip: [0; 16],
                 },
                 ingress_ifindex: 0,
+                target_port: 0,
+                _pad: 0,
             },
         }
     }
@@ -562,7 +610,9 @@ impl_pod!(LbFrontBackend {
 impl_pod!(FrontMeta {
     generation: u32,
     count: u16,
-    flags: u16
+    flags: u16,
+    local_count: u16,
+    _pad: u16
 });
 impl_pod!(FrontEndpointKey {
     front: LbFrontKey,
@@ -573,11 +623,14 @@ impl_pod!(FrontEndpointKey {
 impl_pod!(FrontEndpoint {
     backend: LbFrontBackend,
     target_port: u16,
-    _pad: [u8; 6]
+    flags: u16,
+    _pad: [u8; 4]
 });
 impl_pod!(ForwardFlowValue {
     backend: LbFrontBackend,
-    ingress_ifindex: u32
+    ingress_ifindex: u32,
+    target_port: u16,
+    _pad: u16
 });
 impl_pod!(Config {
     geneve_ifindex: u32,
@@ -1078,6 +1131,25 @@ pub fn select_backend_slot(
     slot_in_range(flow_hash(seed, client_ip, client_port, front), n)
 }
 
+/// Slot a new flow lands on: node-local pods win whenever any exist, so a
+/// request that arrives on a node with a ready pod never pays a cross-node
+/// hop. With `local_count > 0` the hash reduces over the local prefix
+/// `[0, local_count)`; otherwise over all `ready_count` slots. `None` when
+/// there are no slots, and when `local_count > ready_count`: that meta cannot
+/// come from a correct writer, and clamping it would silently send traffic
+/// to slots that may hold no endpoint.
+pub fn select_endpoint_slot(hash: u32, ready_count: u16, local_count: u16) -> Option<u16> {
+    if local_count > ready_count {
+        return None;
+    }
+    let range = if local_count > 0 {
+        local_count
+    } else {
+        ready_count
+    };
+    slot_in_range(hash, range as u32).map(|slot| slot as u16)
+}
+
 /// What ingress does with a packet addressed to a front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressSteer {
@@ -1088,8 +1160,12 @@ pub enum IngressSteer {
     /// The front has endpoints but the chosen row is unreadable: fail closed
     /// rather than leak a front-addressed packet to the host stack.
     Drop,
-    /// Send to this backend; the caller pins it only if the flow has no pin.
-    Forward(LbFrontBackend),
+    /// Send to this backend, stamping `target_port` (wire order) into the
+    /// forward option; the caller pins both only if the flow has no pin.
+    Forward {
+        backend: LbFrontBackend,
+        target_port: u16,
+    },
 }
 
 /// Ingress backend choice for one packet of a front. An existing pin
@@ -1097,35 +1173,46 @@ pub enum IngressSteer {
 /// wins over the hash, and over a zero count: a changed endpoint count or slot
 /// order must never move a live connection to a pod holding no state for it,
 /// and a front draining to zero ready endpoints must not reset live
-/// connections. Only a flow with no pin is rejected at count 0, else it
-/// reduces `hash` (a `flow_hash` of the flow) over `meta.count` and reads the
-/// chosen row through `endpoint_at`.
+/// connections. A pin carries its own target port, so the backend keeps
+/// delivering to the port the pod was chosen with. Only a flow with no pin is
+/// rejected at count 0, else `select_endpoint_slot` reduces `hash` (a
+/// `flow_hash` of the flow) and the chosen row is read through `endpoint_at`.
+/// A row picked from the local prefix that is not flagged local breaks the
+/// writer's ordering contract and is dropped, not forwarded.
 pub fn ingress_steer(
     meta: FrontMeta,
-    established: Option<LbFrontBackend>,
-    pending: Option<LbFrontBackend>,
+    established: Option<ForwardFlowValue>,
+    pending: Option<ForwardFlowValue>,
     hash: u32,
     front: LbFrontKey,
     endpoint_at: impl FnOnce(FrontEndpointKey) -> Option<FrontEndpoint>,
 ) -> IngressSteer {
-    if let Some(backend) = established.or(pending) {
-        return IngressSteer::Forward(backend);
+    if let Some(pin) = established.or(pending) {
+        return IngressSteer::Forward {
+            backend: pin.backend,
+            target_port: pin.target_port,
+        };
     }
     if meta.count == 0 {
         return IngressSteer::Reject;
     }
-    let Some(slot) = slot_in_range(hash, meta.count as u32) else {
+    let Some(slot) = select_endpoint_slot(hash, meta.count, meta.local_count) else {
         return IngressSteer::Drop;
     };
     let key = FrontEndpointKey {
         front,
         generation: meta.generation,
-        slot: slot as u16,
+        slot,
         _pad: 0,
     };
     match endpoint_at(key) {
-        Some(endpoint) => IngressSteer::Forward(endpoint.backend),
-        None => IngressSteer::Drop,
+        Some(endpoint) if meta.local_count == 0 || endpoint.flags & ENDPOINT_FLAG_IS_LOCAL != 0 => {
+            IngressSteer::Forward {
+                backend: endpoint.backend,
+                target_port: endpoint.target_port,
+            }
+        }
+        _ => IngressSteer::Drop,
     }
 }
 
@@ -1340,13 +1427,14 @@ mod tests {
     #[test]
     fn forward_flow_value_has_no_padding() {
         // LbFrontBackend (32 bytes: 2x [u8; 16], widened for dual-stack) +
-        // ingress_ifindex (4 bytes) -- LbFrontBackend's
-        // byte-array fields have no alignment requirement above 1, so
-        // ingress_ifindex's own u32 alignment is the only constraint, and it
-        // already falls on a multiple-of-4 offset (32). A regression that
-        // reorders fields around a smaller type would silently reintroduce a
-        // padding gap here.
-        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 36);
+        // ingress_ifindex (4) + target_port (2) + explicit _pad (2) -- the
+        // pad keeps the struct a multiple of its u32 alignment with no
+        // compiler-inserted bytes. A regression that reorders fields around a
+        // smaller type would silently reintroduce a padding gap here.
+        assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 40);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, ingress_ifindex), 32);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, target_port), 36);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, _pad), 38);
     }
 
     #[test]
@@ -1371,7 +1459,7 @@ mod tests {
     #[test]
     fn flow_value_size_matches_its_largest_arm_with_no_extra_padding() {
         // FlowValue must be exactly as large as its largest arm
-        // (RevFlowValue, 36 bytes) -- any larger would mean the union picked
+        // (ForwardFlowValue, 40 bytes) -- any larger would mean the union picked
         // up padding bytes FLOW_TABLE's kernel-side write leaves
         // uninitialized, and a userspace `aya::Pod` read of a DIFFERENT arm
         // (e.g. the `port_memo` arm of a slot written as `forward`) would then
@@ -1379,13 +1467,13 @@ mod tests {
         // field data instead of cleanly aliasing the smaller arm's prefix.
         assert_eq!(
             core::mem::size_of::<FlowValue>(),
-            core::mem::size_of::<RevFlowValue>()
+            core::mem::size_of::<ForwardFlowValue>()
         );
-        assert_eq!(core::mem::size_of::<FlowValue>(), 36);
+        assert_eq!(core::mem::size_of::<FlowValue>(), 40);
     }
 
-    fn flow_value_bytes(v: &FlowValue) -> [u8; 36] {
-        // SAFETY: `FlowValue` is exactly 36 bytes (asserted by
+    fn flow_value_bytes(v: &FlowValue) -> [u8; 40] {
+        // SAFETY: `FlowValue` is exactly 40 bytes (asserted by
         // `flow_value_size_matches_its_largest_arm_with_no_extra_padding`) and
         // its constructors zero-initialize it, so every byte is initialized.
         unsafe { core::mem::transmute_copy(v) }
@@ -1393,7 +1481,7 @@ mod tests {
 
     #[test]
     fn port_memo_flow_value_tail_is_zero_so_no_kernel_stack_leaks_into_the_map() {
-        // The port_memo arm is 2 of 36 bytes; the other 34 land in
+        // The port_memo arm is 2 of 40 bytes; the other 38 land in
         // userspace-visible FLOW_TABLE entries (eviction scans, bpftool
         // dumps). They must be deterministic zeros, not eBPF stack residue.
         let v = FlowValue::from_port_memo(PortMemoValue {
@@ -1416,6 +1504,8 @@ mod tests {
                 pod_ip: [7; 16],
             },
             ingress_ifindex: 9,
+            target_port: wire_port(8080),
+            _pad: 0,
         };
         let rev = RevFlowValue {
             ingress_node_ip: [1; 16],
@@ -1452,12 +1542,17 @@ mod tests {
     // silent front outage.
 
     #[test]
-    fn front_meta_layout_is_eight_bytes_with_no_padding() {
-        assert_eq!(core::mem::size_of::<FrontMeta>(), 8);
+    fn front_meta_layout_is_twelve_bytes_with_explicit_trailing_pad() {
+        // Existing fields keep their offsets; `local_count` plus an explicit
+        // `_pad` fill the rest of the 4-byte alignment, so no byte is
+        // compiler-inserted.
+        assert_eq!(core::mem::size_of::<FrontMeta>(), 12);
         assert_eq!(core::mem::align_of::<FrontMeta>(), 4);
         assert_eq!(core::mem::offset_of!(FrontMeta, generation), 0);
         assert_eq!(core::mem::offset_of!(FrontMeta, count), 4);
         assert_eq!(core::mem::offset_of!(FrontMeta, flags), 6);
+        assert_eq!(core::mem::offset_of!(FrontMeta, local_count), 8);
+        assert_eq!(core::mem::offset_of!(FrontMeta, _pad), 10);
     }
 
     #[test]
@@ -1474,11 +1569,15 @@ mod tests {
     }
 
     #[test]
-    fn front_endpoint_layout_has_explicit_trailing_padding_only() {
+    fn front_endpoint_layout_is_unchanged_by_repurposing_pad_as_flags() {
+        // `flags` takes the first two bytes of the old 6-byte pad: the value
+        // stays 40 bytes and `target_port` keeps offset 32, so a stored row
+        // from before the flag still decodes with flags == 0.
         assert_eq!(core::mem::size_of::<FrontEndpoint>(), 40);
         assert_eq!(core::mem::offset_of!(FrontEndpoint, backend), 0);
         assert_eq!(core::mem::offset_of!(FrontEndpoint, target_port), 32);
-        assert_eq!(core::mem::offset_of!(FrontEndpoint, _pad), 34);
+        assert_eq!(core::mem::offset_of!(FrontEndpoint, flags), 34);
+        assert_eq!(core::mem::offset_of!(FrontEndpoint, _pad), 36);
     }
 
     fn sample_front() -> LbFrontKey {
@@ -1498,6 +1597,8 @@ mod tests {
             generation: 7,
             count: 1,
             flags: 0,
+            local_count: 0,
+            _pad: 0,
         };
         let key = front_endpoint_key(sample_front(), meta).expect("count 1 has slot 0");
         assert_eq!(key.generation, 7);
@@ -1515,6 +1616,8 @@ mod tests {
             generation: 3,
             count: 0,
             flags: 0,
+            local_count: 0,
+            _pad: 0,
         };
         assert!(
             front_endpoint_key(sample_front(), meta).is_none(),
@@ -1524,25 +1627,66 @@ mod tests {
     }
 
     #[test]
-    fn decap_reads_the_prior_generation_when_the_front_drained_so_pinned_flows_survive() {
-        let drained = FrontMeta {
-            generation: 4,
-            count: 0,
-            flags: 0,
-        };
-        let key = decap_endpoint_key(sample_front(), drained);
+    fn pod_id_option_round_trips_pod_ip_and_target_port() {
+        // Decap DNATs to exactly this pod and port with no map lookup, so a
+        // lossy encode/decode misdelivers every flow on the backend node.
+        let v4_pod = ipv4_mapped_v6(wire_ip(u32::from_be_bytes([198, 51, 100, 53])));
+        let v6_pod = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+        ];
+        for pod in [v4_pod, v6_pod] {
+            let opt = encode_pod_id_option(&pod, wire_port(8443));
+            assert_eq!(decode_pod_id_option(&opt), Some((pod, wire_port(8443))));
+        }
+    }
+
+    #[test]
+    fn pod_id_option_wire_layout_is_24_bytes_with_port_after_the_pod_ip() {
+        // The Geneve length word counts 4-byte words after the 4-byte TLV
+        // header; a wrong value makes the kernel mis-frame the option.
+        let opt = encode_pod_id_option(&[7; 16], 0x1234);
+        assert_eq!(POD_ID_OPT_LEN, 24);
+        assert_eq!(opt.len(), 24);
+        assert_eq!(opt[0..2], [0xff, 0xff]);
+        assert_eq!(opt[2], 0x01);
+        assert_eq!(opt[3], 5);
+        assert_eq!(opt[4..20], [7; 16]);
+        assert_eq!(opt[20..22], 0x1234u16.to_ne_bytes());
+        assert_eq!(opt[22..24], [0, 0], "padding must stay zero on the wire");
+    }
+
+    #[test]
+    fn pod_id_option_decode_rejects_a_wrong_class_type_or_length_word() {
+        // A pre-widening 20-byte option (length word 4) or the return-leg
+        // echo must not be read as a forward option: its port bytes would be
+        // padding or a front port.
+        let good = encode_pod_id_option(&[1; 16], 80);
+        for (idx, bad) in [(0, 0xfe), (2, 0x02), (3, 4)] {
+            let mut opt = good;
+            opt[idx] = bad;
+            assert_eq!(decode_pod_id_option(&opt), None, "byte {idx} = {bad:#x}");
+        }
+    }
+
+    #[test]
+    fn forward_option_needs_no_more_underlay_headroom_than_the_return_echo() {
+        // The return leg already carries a 24-byte option, so a path that
+        // carries replies carries requests: growing the forward option to the
+        // same length lowers no path's usable MTU. Worst case is a v6
+        // underlay: 14 + 40 + 8 + 8 + 24 = 94.
+        const RETURN_ECHO_OPT_LEN: usize = 24;
+        assert_eq!(POD_ID_OPT_LEN, RETURN_ECHO_OPT_LEN);
+        assert_eq!(geneve_overhead(true, POD_ID_OPT_LEN), 94);
+        assert_eq!(geneve_overhead(false, POD_ID_OPT_LEN), 74);
+        // Largest inner L3 packet on a 1500-byte underlay, v4 / v6: 1426 /
+        // 1406, i.e. 4 bytes below the old forward leg and equal to the
+        // return leg's existing limit.
+        assert_eq!(1500 - geneve_overhead(false, POD_ID_OPT_LEN), 1426);
+        assert_eq!(1500 - geneve_overhead(true, POD_ID_OPT_LEN), 1406);
         assert_eq!(
-            (key.generation, key.slot, key._pad),
-            (3, FRONT_SLOT_FIRST, 0),
-            "a drained front's rows live under the previous generation; reading the empty live \
-             one drops every pinned flow on the backend node"
+            geneve_overhead(true, POD_ID_OPT_LEN) - geneve_overhead(true, 20),
+            4
         );
-        let live = FrontMeta {
-            generation: 4,
-            count: 2,
-            flags: 0,
-        };
-        assert_eq!(decap_endpoint_key(sample_front(), live).generation, 4);
     }
 
     // LbFrontKey/LbFrontBackend/RevFlowValue's address fields widened from
@@ -2228,6 +2372,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(100),
             },
             ingress_ifindex: 7,
+            target_port: wire_port(8080),
+            _pad: 0,
         };
         assert_eq!(
             fwd_pending_affinity_pin(None, candidate),
@@ -2248,6 +2394,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(100),
             },
             ingress_ifindex: 7,
+            target_port: wire_port(8080),
+            _pad: 0,
         };
         let candidate = ForwardFlowValue {
             backend: LbFrontBackend {
@@ -2255,6 +2403,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(200),
             },
             ingress_ifindex: 9,
+            target_port: wire_port(9090),
+            _pad: 0,
         };
         assert_eq!(
             fwd_pending_affinity_pin(Some(pinned), candidate),
@@ -2760,20 +2910,60 @@ mod tests {
     }
 
     fn meta(generation: u32, count: u16) -> FrontMeta {
+        meta_local(generation, count, 0)
+    }
+
+    fn meta_local(generation: u32, count: u16, local_count: u16) -> FrontMeta {
         FrontMeta {
             generation,
             count,
             flags: 0,
+            local_count,
+            _pad: 0,
+        }
+    }
+
+    // Each backend has its own target port, as with named ports.
+    fn port_n(n: u8) -> u16 {
+        wire_port(8000 + n as u16)
+    }
+
+    fn pin_n(n: u8) -> ForwardFlowValue {
+        ForwardFlowValue {
+            backend: backend_n(n),
+            ingress_ifindex: 2,
+            target_port: port_n(n),
+            _pad: 0,
+        }
+    }
+
+    fn forward_n(n: u8) -> IngressSteer {
+        IngressSteer::Forward {
+            backend: backend_n(n),
+            target_port: port_n(n),
         }
     }
 
     // Endpoint table for one front: slot i -> backend_n(order[i]).
     fn table(order: &[u8]) -> impl Fn(FrontEndpointKey) -> Option<FrontEndpoint> + '_ {
+        table_local(order, 0)
+    }
+
+    // As `table`, with the first `local` slots flagged `ENDPOINT_FLAG_IS_LOCAL`.
+    fn table_local(
+        order: &[u8],
+        local: usize,
+    ) -> impl Fn(FrontEndpointKey) -> Option<FrontEndpoint> + '_ {
         move |k| {
             order.get(k.slot as usize).map(|&n| FrontEndpoint {
                 backend: backend_n(n),
-                target_port: 0,
-                _pad: [0; 6],
+                target_port: port_n(n),
+                flags: if (k.slot as usize) < local {
+                    ENDPOINT_FLAG_IS_LOCAL
+                } else {
+                    0
+                },
+                _pad: [0; 4],
             })
         }
     }
@@ -2797,9 +2987,19 @@ mod tests {
             for i in 0..200u32 {
                 let port = 32768 + i as u16;
                 let hash = flow_hash(SEED, client(i), port, &front);
-                let IngressSteer::Forward(pinned) = steer_new_flow(client(i), port, &[1, 2, 3, 4])
+                let first = steer_new_flow(client(i), port, &[1, 2, 3, 4]);
+                let IngressSteer::Forward {
+                    backend,
+                    target_port,
+                } = first
                 else {
                     panic!("new flow must forward");
+                };
+                let pinned = ForwardFlowValue {
+                    backend,
+                    ingress_ifindex: 2,
+                    target_port,
+                    _pad: 0,
                 };
                 for after in [&[1u8, 2, 3, 4, 5][..], &[4, 3, 2, 1], &[9], &[7, 8]] {
                     let steered = ingress_steer(
@@ -2810,7 +3010,7 @@ mod tests {
                         front,
                         table(after),
                     );
-                    assert_eq!(steered, IngressSteer::Forward(pinned));
+                    assert_eq!(steered, first);
                 }
             }
         }
@@ -2819,16 +3019,15 @@ mod tests {
     #[test]
     fn pending_flow_keeps_its_pod_when_endpoints_change_or_first_reply_lands_elsewhere() {
         let front = test_front();
-        let pending = backend_n(3);
         let steered = ingress_steer(
             meta(2, 2),
             None,
-            Some(pending),
+            Some(pin_n(3)),
             flow_hash(SEED, v4_client(1), 4000, &front),
             front,
             table(&[8, 9]),
         );
-        assert_eq!(steered, IngressSteer::Forward(pending));
+        assert_eq!(steered, forward_n(3));
     }
 
     #[test]
@@ -2836,13 +3035,13 @@ mod tests {
         let front = test_front();
         let steered = ingress_steer(
             meta(1, 2),
-            Some(backend_n(1)),
-            Some(backend_n(2)),
+            Some(pin_n(1)),
+            Some(pin_n(2)),
             0,
             front,
             table(&[5, 6]),
         );
-        assert_eq!(steered, IngressSteer::Forward(backend_n(1)));
+        assert_eq!(steered, forward_n(1));
     }
 
     #[test]
@@ -2851,7 +3050,9 @@ mod tests {
             let mut seen = [0u32; 4];
             for i in 0..2000u32 {
                 match steer_new_flow(client(i / 40), 32768 + (i % 40) as u16, &[0, 1, 2, 3]) {
-                    IngressSteer::Forward(b) => seen[b.backend_node_ip[0] as usize] += 1,
+                    IngressSteer::Forward { backend, .. } => {
+                        seen[backend.backend_node_ip[0] as usize] += 1
+                    }
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -2899,16 +3100,28 @@ mod tests {
     #[test]
     fn pinned_flow_keeps_forwarding_when_front_drains_to_zero_endpoints() {
         let front = test_front();
-        for (established, pending) in [(Some(backend_n(1)), None), (None, Some(backend_n(2)))] {
+        for (n, established, pending) in [(1, Some(pin_n(1)), None), (2, None, Some(pin_n(2)))] {
             let steered = ingress_steer(meta(1, 0), established, pending, 0, front, |_| {
                 panic!("no row may be read for a pinned flow")
             });
             assert_eq!(
                 steered,
-                IngressSteer::Forward(established.or(pending).unwrap()),
+                forward_n(n),
                 "a rolling update can drop the ready count to 0; live connections must drain, not reset"
             );
         }
+    }
+
+    #[test]
+    fn new_flow_forwards_the_target_port_of_its_chosen_endpoint() {
+        // Decap reads this port from the option instead of looking the front
+        // up, so a wrong port here DNATs to a port the pod does not serve.
+        let front = test_front();
+        let hash = flow_hash(SEED, v4_client(4), 6000, &front);
+        let slot = slot_in_range(hash, 3).unwrap() as usize;
+        let order = [4u8, 5, 6];
+        let steered = ingress_steer(meta(1, 3), None, None, hash, front, table(&order));
+        assert_eq!(steered, forward_n(order[slot]));
     }
 
     #[test]
@@ -2918,5 +3131,153 @@ mod tests {
             panic!("no row may be read when count is 0")
         });
         assert_eq!(steered, IngressSteer::Reject);
+    }
+
+    fn spread_hashes() -> impl Iterator<Item = u32> {
+        let front = test_front();
+        (0..2000u32)
+            .map(move |i| flow_hash(SEED, v4_client(i / 40), 32768 + (i % 40) as u16, &front))
+    }
+
+    #[test]
+    fn local_only_front_spreads_over_every_local_slot() {
+        // All ready pods are local: locality must not narrow the choice below
+        // the full set, or one pod takes all the load.
+        let mut seen = [0u32; 3];
+        for hash in spread_hashes() {
+            seen[select_endpoint_slot(hash, 3, 3).unwrap() as usize] += 1;
+        }
+        assert!(seen.iter().all(|&c| c > 400), "skewed spread: {seen:?}");
+    }
+
+    #[test]
+    fn front_without_local_pods_spreads_over_all_ready_slots() {
+        // local_count == 0 must mean "no preference", not "no slots": a node
+        // with no local pod still has to serve the front from remote ones.
+        let mut seen = [0u32; 5];
+        for hash in spread_hashes() {
+            seen[select_endpoint_slot(hash, 5, 0).unwrap() as usize] += 1;
+        }
+        assert!(seen.iter().all(|&c| c > 250), "skewed spread: {seen:?}");
+    }
+
+    #[test]
+    fn mixed_front_never_leaves_the_local_prefix_so_no_flow_pays_a_cross_node_hop() {
+        let mut seen = [0u32; 2];
+        for hash in spread_hashes() {
+            let slot = select_endpoint_slot(hash, 6, 2).unwrap();
+            assert!(slot < 2, "slot {slot} is remote although local pods exist");
+            seen[slot as usize] += 1;
+        }
+        assert!(
+            seen.iter().all(|&c| c > 700),
+            "local pods unevenly loaded: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn local_count_above_ready_count_selects_nothing_instead_of_clamping() {
+        // A clamped local_count would index slots the generation never wrote.
+        for hash in [0, 1, u32::MAX / 2, u32::MAX] {
+            assert_eq!(select_endpoint_slot(hash, 2, 3), None);
+            assert_eq!(select_endpoint_slot(hash, 0, 1), None);
+            assert_eq!(select_endpoint_slot(hash, 0, 0), None);
+        }
+    }
+
+    #[test]
+    fn locality_never_changes_the_slot_when_every_pod_is_local_or_none_is() {
+        for hash in spread_hashes() {
+            assert_eq!(
+                select_endpoint_slot(hash, 4, 4),
+                select_endpoint_slot(hash, 4, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn new_flow_on_a_mixed_front_is_steered_to_a_local_pod() {
+        // Backends 1,2 are local (slots 0,1); 7,8,9 are remote.
+        let front = test_front();
+        let order = [1u8, 2, 7, 8, 9];
+        for hash in spread_hashes() {
+            let steered = ingress_steer(
+                meta_local(3, 5, 2),
+                None,
+                None,
+                hash,
+                front,
+                table_local(&order, 2),
+            );
+            assert!(
+                steered == forward_n(1) || steered == forward_n(2),
+                "steered to a remote pod: {steered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_flow_falls_back_to_remote_pods_when_none_is_local() {
+        let front = test_front();
+        let order = [7u8, 8, 9];
+        let mut seen = [false; 3];
+        for hash in spread_hashes() {
+            match ingress_steer(meta(3, 3), None, None, hash, front, table(&order)) {
+                IngressSteer::Forward { backend, .. } => {
+                    seen[(backend.backend_node_ip[0] - 7) as usize] = true
+                }
+                other => panic!("a front with only remote pods must still forward: {other:?}"),
+            }
+        }
+        assert_eq!(seen, [true; 3]);
+    }
+
+    #[test]
+    fn corrupt_local_count_drops_new_flows_without_reading_a_row() {
+        let front = test_front();
+        let steered = ingress_steer(meta_local(1, 2, 3), None, None, 0, front, |_| {
+            panic!("no row may be read when local_count exceeds count")
+        });
+        assert_eq!(steered, IngressSteer::Drop);
+    }
+
+    #[test]
+    fn local_prefix_row_not_flagged_local_is_dropped_not_forwarded() {
+        // Selection trusts the writer's ordering; a row in the prefix that
+        // does not claim to be local means the prefix is wrong, and forwarding
+        // it could defeat locality or hit a stale slot.
+        let front = test_front();
+        let steered = ingress_steer(
+            meta_local(1, 3, 2),
+            None,
+            None,
+            0,
+            front,
+            table_local(&[1, 2, 3], 0),
+        );
+        assert_eq!(steered, IngressSteer::Drop);
+    }
+
+    #[test]
+    fn pinned_flow_keeps_its_remote_pod_after_a_local_pod_appears() {
+        // A local pod coming up must not move live connections off the pod
+        // that holds their state.
+        let front = test_front();
+        let steered = ingress_steer(meta_local(2, 3, 1), Some(pin_n(9)), None, 0, front, |_| {
+            panic!("no row may be read for a pinned flow")
+        });
+        assert_eq!(steered, forward_n(9));
+    }
+
+    #[test]
+    fn front_level_flags_do_not_turn_on_locality() {
+        // FrontMeta::flags says the node owns the front; the endpoint flag
+        // says a pod is local. Only local_count and the row flag drive
+        // selection.
+        let front = test_front();
+        let mut m = meta(1, 2);
+        m.flags = ENDPOINT_FLAG_IS_LOCAL;
+        let steered = ingress_steer(m, None, None, 0, front, table_local(&[1, 2], 0));
+        assert_eq!(steered, forward_n(1));
     }
 }
