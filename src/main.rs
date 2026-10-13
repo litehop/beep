@@ -153,8 +153,10 @@ struct Args {
     /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). The front address is
     /// this node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
     /// Format: `front_ip:front_port:proto:backend_node_ip:pod_ip:target_port`
-    /// (`proto` is `tcp` or `udp`).
-    #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
+    /// (`proto` is `tcp` or `udp`). With no `--fixture` the loader only
+    /// loads, migrates and attaches, leaving every map as found -- the
+    /// controller-managed restart shape, where the maps are filled after attach.
+    #[arg(long = "fixture", value_parser = parse_fixture)]
     fixtures: Vec<Fixture>,
 
     /// Cluster pod CIDR (e.g. `10.244.0.0/16` or a v6 range). Every
@@ -490,8 +492,10 @@ fn main() -> anyhow::Result<()> {
     };
     populate_config(&mut ebpf, &geneve_iface, flow_hash_seed).context("populating CONFIG map")?;
     populate_uplink_config(&mut ebpf, &uplink_ifaces).context("populating UPLINK_CONFIG map")?;
-    populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
-        .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
+    if !fixtures.is_empty() {
+        populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
+            .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
+    }
 
     let uplink_iface_refs: Vec<&str> = uplink_ifaces.iter().map(String::as_str).collect();
     let geneve_iface_refs = [geneve_iface.as_str()];

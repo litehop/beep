@@ -815,6 +815,77 @@ restart_body="$(cat "$RESTART_CLIENT_OUT" 2>/dev/null || true)"
 }
 echo "RESTART FLOW CONTINUITY: PASS (client received both chunks across the loader restart: '$restart_body')"
 
+echo "==> cap-change restart: an established front flow must survive a loader restart that recreates the front maps (changed --max-fronts), with nothing repopulating them before attach"
+# Ingress passes a FRONT_META miss to the host, so a recreated-empty front map
+# resets every established front flow until a controller reconciles. A
+# fixture-less loader never repopulates the maps, so only the loader's own
+# snapshot/restore can keep the flow alive. Data is sent AFTER the restart:
+# the forward leg is the one that looks the front up.
+CAPCHG_PING_BEFORE="capchg-ping-before"
+CAPCHG_PING_AFTER="capchg-ping-after"
+CAPCHG_CLIENT_FIFO="/tmp/beep-smoke-capchg-client-fifo"
+CAPCHG_BACKEND_LOG="/tmp/beep-smoke-capchg-backend.log"
+CAPCHG_LOADER_LOG="/tmp/beep-smoke-loader-capchg.log"
+rm -f "$CAPCHG_CLIENT_FIFO" "$CAPCHG_BACKEND_LOG"
+mkfifo "$CAPCHG_CLIENT_FIFO"
+nohup nc -l -N "$POD_IP" "$TARGET_PORT" < <(sleep 40) >"$CAPCHG_BACKEND_LOG" 2>&1 &
+disown
+for _ in $(seq 1 30); do
+  ss -ltnH "sport = :${TARGET_PORT}" | grep -q . && break
+  sleep 0.1
+done
+( printf '%s' "$CAPCHG_PING_BEFORE"; read -r _ < "$RESTART_SIGNAL_FIFO"; printf '%s' "$CAPCHG_PING_AFTER"; sleep 10 ) > "$CAPCHG_CLIENT_FIFO" &
+disown
+ip netns exec smoke-client bash -c "timeout 35 nc ${FRONT_IP} ${FRONT_PORT} < ${CAPCHG_CLIENT_FIFO} > /dev/null" &
+capchg_client_pid=$!
+disown
+
+capchg_backend_has() { grep -q "$1" "$CAPCHG_BACKEND_LOG" 2>/dev/null; }
+for _ in $(seq 1 30); do
+  capchg_backend_has "$CAPCHG_PING_BEFORE" && break
+  sleep 0.2
+done
+capchg_backend_has "$CAPCHG_PING_BEFORE" || {
+  echo "FAIL: the cap-change flow never reached the backend before the restart (backend log: $(cat "$CAPCHG_BACKEND_LOG" 2>/dev/null))" >&2
+  exit 1
+}
+capchg_fronts_before=$(map_entry_count "$PIN_DIR/FRONT_META")
+
+stop_loader
+nohup "$BIN" \
+  --uplink-iface smoke-veth0 --uplink-iface "$UPLINK2_IFACE" --geneve-iface geneve0 \
+  --pin-dir "$PIN_DIR" \
+  --pod-cidr "$POD_CIDR" --node-ip "$FRONT_IP" \
+  --max-fronts 512 \
+  >"$CAPCHG_LOADER_LOG" 2>&1 &
+loader_pid=$!
+disown
+wait_for_attach "$CAPCHG_LOADER_LOG"
+
+capchg_fronts_after=$(map_entry_count "$PIN_DIR/FRONT_META")
+[ "$capchg_fronts_after" = "$capchg_fronts_before" ] && [ "$capchg_fronts_after" -gt 0 ] || {
+  echo "FAIL: FRONT_META held $capchg_fronts_before fronts before a recreating restart and $capchg_fronts_after after, with no fixture to refill it -- established front flows would pass to the host until a controller reconciles. Loader log:" >&2
+  cat "$CAPCHG_LOADER_LOG" >&2
+  exit 1
+}
+release_restart_signal
+for _ in $(seq 1 30); do
+  capchg_backend_has "$CAPCHG_PING_AFTER" && break
+  sleep 0.2
+done
+capchg_backend_has "$CAPCHG_PING_AFTER" || {
+  echo "FAIL: the established flow broke across a cap-change loader restart -- data sent after it never reached the backend (backend log: $(cat "$CAPCHG_BACKEND_LOG" 2>/dev/null)). Loader log:" >&2
+  cat "$CAPCHG_LOADER_LOG" >&2
+  exit 1
+}
+echo "CAP-CHANGE RESTART FLOW CONTINUITY: PASS (FRONT_META kept $capchg_fronts_after fronts across a recreating restart; the held flow still delivered '$CAPCHG_PING_AFTER')"
+kill "$capchg_client_pid" 2>/dev/null || true
+
+echo "==> restarting the loader with the standard fixtures and default caps (migrates back, refills fixtures)"
+stop_loader
+start_loader "$LOADER_LOG.capchg-restore"
+wait_for_attach "$LOADER_LOG.capchg-restore"
+
 echo "==> selective conntrack eviction: establishing a flow on a DEDICATED front to evict"
 # A front of its own (EVICT_FRONT_PORT/EVICT_TARGET_PORT), not reused from the
 # round trips above, so this section's before/after assertions aren't

@@ -17,9 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`FRONT_META` and `FRONT_ENDPOINTS` are recreated on upgrade.** The loader
   now also compares a pinned map's `BPF_F_NO_PREALLOC` flag, and both front
   maps change from preallocated to no-prealloc (and `FRONT_META` from 4096 to
-  1024 default entries). The loader or controller repopulates them on start;
-  until the controller's first reconcile, ingress misses the front and passes
-  the packet to the host.
+  1024 default entries). A pin whose type, key size and value size are
+  unchanged (flag or `max_entries` change only, e.g. this upgrade or a changed
+  `--max-fronts`/`--endpoints-per-front`) has its entries copied into the new
+  map before any program is attached, so established flows see no gap; if a
+  cap shrink does not fit, whole fronts are kept in key order, the loss is
+  logged with counts, and the controller reconciles the rest. A layout change
+  (key/value size) recreates the map empty, and established flows through
+  fronts reset until the controller's first reconcile. Entries the previous
+  loader's programs write after the snapshot (new flows) are not carried over.
 - **Breaking flag change.** `--front-meta-max-entries` and
   `--front-endpoints-max-entries` are removed from `beep` and
   `beep-controller`. Use `--max-fronts` (default 1024, env `BEEP_MAX_FRONTS`)
