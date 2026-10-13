@@ -372,19 +372,52 @@ static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries
 /// same reason `try_geneve_decap_forward`/`_return` are (module doc):
 /// several call sites, no downside to forcing inlining, and it sidesteps
 /// this toolchain's non-inlined-BPF-to-BPF-call miscompile risk outright.
+///
+/// The per-map accessors below all copy the value out of the `get_ptr`
+/// pointer at once. The union reads copy one `Copy` arm of plain integer
+/// data, so any bit pattern is valid.
 #[inline(always)]
 fn flow_table_get_forward(key: FlowKey) -> Option<ForwardFlowValue> {
-    unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.forward })
+    // SAFETY: `get_ptr` yields a non-null pointer into the map element,
+    // copied before any other helper call; a concurrent update or eviction
+    // can only make the copy stale.
+    FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).forward })
 }
 
 #[inline(always)]
 fn flow_table_get_reverse(key: FlowKey) -> Option<RevFlowValue> {
-    unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.reverse })
+    // SAFETY: as `flow_table_get_forward`.
+    FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).reverse })
 }
 
 #[inline(always)]
 fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
-    unsafe { FLOW_TABLE.get(key) }.map(|v| unsafe { v.port_memo })
+    // SAFETY: as `flow_table_get_forward`.
+    FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).port_memo })
+}
+
+#[inline(always)]
+fn front_meta_get(front: LbFrontKey) -> Option<FrontMeta> {
+    // SAFETY: as `flow_table_get_forward`.
+    FRONT_META.get_ptr(front).map(|p| unsafe { *p })
+}
+
+#[inline(always)]
+fn front_endpoints_get(key: FrontEndpointKey) -> Option<FrontEndpoint> {
+    // SAFETY: as `flow_table_get_forward`.
+    FRONT_ENDPOINTS.get_ptr(key).map(|p| unsafe { *p })
+}
+
+#[inline(always)]
+fn fwd_pending_get(key: TcpFlowKey) -> Option<ForwardFlowValue> {
+    // SAFETY: as `flow_table_get_forward`.
+    FWD_PENDING.get_ptr(key).map(|p| unsafe { *p })
+}
+
+#[inline(always)]
+fn uplink_config_get(ifindex: u32) -> Option<UplinkConfig> {
+    // SAFETY: as `flow_table_get_forward`.
+    UPLINK_CONFIG.get_ptr(ifindex).map(|p| unsafe { *p })
 }
 
 /// Resolves a front to its slot-0 endpoint: one `FRONT_META` read, then one
@@ -394,8 +427,8 @@ fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
 /// `FRONT_MISSES` and yields `None` (ingress passes to host, decap drops).
 #[inline(always)]
 fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
-    let meta = *unsafe { FRONT_META.get(front) }?;
-    let endpoint = unsafe { FRONT_ENDPOINTS.get(decap_endpoint_key(front, meta)) }.copied();
+    let meta = front_meta_get(front)?;
+    let endpoint = front_endpoints_get(decap_endpoint_key(front, meta));
     if endpoint.is_none() {
         count_front_miss();
     }
@@ -405,6 +438,8 @@ fn front_endpoint(front: LbFrontKey) -> Option<FrontEndpoint> {
 #[inline(always)]
 fn count_front_miss() {
     if let Some(misses) = FRONT_MISSES.get_ptr_mut(0) {
+        // SAFETY: `FRONT_MISSES` is a `PerCpuArray`, so the slot is private
+        // to this CPU and the non-atomic increment cannot race.
         unsafe { *misses += 1 };
     }
 }
@@ -423,17 +458,17 @@ fn ingress_backend(
     fwd_key: FlowKey,
     ingress_ifindex: u32,
 ) -> Result<LbFrontBackend, IngressMiss> {
-    let Some(meta) = unsafe { FRONT_META.get(front) }.copied() else {
+    let Some(meta) = front_meta_get(front) else {
         return Err(IngressMiss::Verdict(TC_ACT_OK));
     };
     let Some(seed) = CONFIG.get(0).map(|c| c.flow_hash_seed) else {
         return Err(IngressMiss::Verdict(TC_ACT_OK));
     };
-    let established = unsafe { FLOW_TABLE.get(fwd_key) }.map(|v| unsafe { v.forward.backend });
+    let established = flow_table_get_forward(fwd_key).map(|v| v.backend);
     let pending = if established.is_some() {
         None
     } else {
-        unsafe { FWD_PENDING.get(flow_key) }.copied()
+        fwd_pending_get(flow_key)
     };
     let steer = ingress_steer(
         meta,
@@ -441,7 +476,7 @@ fn ingress_backend(
         pending.map(|p| p.backend),
         flow_hash(seed, client_ip, client_port, &front),
         front,
-        |key| unsafe { FRONT_ENDPOINTS.get(key) }.copied(),
+        front_endpoints_get,
     );
     match steer {
         IngressSteer::Forward(backend) => {
@@ -487,7 +522,7 @@ fn reject_l3(ctx: &TcContext, ingress_ifindex: u32) -> Option<(usize, bool)> {
     if unsafe { (*ctx.skb.skb).pkt_type } != PACKET_HOST {
         return None;
     }
-    let l3 = unsafe { UPLINK_CONFIG.get(ingress_ifindex) }?.l2_hlen as usize;
+    let l3 = uplink_config_get(ingress_ifindex)?.l2_hlen as usize;
     let ver = ctx.load::<u8>(l3).ok()?;
     Some((l3, ver >> 4 == 4))
 }
@@ -805,7 +840,7 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // like WireGuard (no L2 header at all) -- resolved once by the loader
     // (`UplinkConfig`'s doc comment) since this no_std program has no
     // syscall of its own to tell the two apart.
-    let l2_hlen = unsafe { UPLINK_CONFIG.get(ingress_ifindex) }?.l2_hlen as usize;
+    let l2_hlen = uplink_config_get(ingress_ifindex)?.l2_hlen as usize;
     // Dispatch on a const generic rather than threading `l2_hlen` through as
     // a runtime header-relative offset: this kernel's verifier never
     // re-establishes a packet pointer's safe range after a bounds check once
@@ -1112,7 +1147,7 @@ fn try_geneve_decap_forward(
     // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
     // than the pre-existing POD_TARGETS check below alone required; accepted
     // as the cost of not reintroducing a restart-wipe risk on this map.
-    let is_known_peer = unsafe { NODE_ALLOW.get(tunnel_remote(tkey, used_ipv6)) }.is_some();
+    let is_known_peer = NODE_ALLOW.get_ptr(tunnel_remote(tkey, used_ipv6)).is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1140,7 +1175,7 @@ fn try_geneve_decap_forward(
     // its own direction on (`egress_return_admission`'s doc comment),
     // checked here before the front-tuple endpoint lookup so a
     // not-our-pod packet is rejected off the cheaper key first.
-    let is_local_pod = unsafe { POD_TARGETS.get(pod_ip_v6) }.is_some();
+    let is_local_pod = POD_TARGETS.get_ptr(pod_ip_v6).is_some();
     if let DecapForwardPodAdmission::Drop = decap_forward_pod_admission(is_local_pod) {
         return Some(TC_ACT_SHOT);
     }
@@ -1519,7 +1554,7 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
     // Same peer-node attestation as `try_geneve_decap_forward` above -- this
     // branch used to take `tkey` unused, relying entirely on the FLOW_TABLE
     // reverse-key match with no outer-source check of its own.
-    let is_known_peer = unsafe { NODE_ALLOW.get(tunnel_remote(tkey, used_ipv6)) }.is_some();
+    let is_known_peer = NODE_ALLOW.get_ptr(tunnel_remote(tkey, used_ipv6)).is_some();
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1562,7 +1597,7 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
 /// no new map lookups or hand-built header bytes on this side.
 #[inline(always)]
 fn redirect_client_bound(ingress_ifindex: u32) -> Option<i32> {
-    let l2_hlen = unsafe { UPLINK_CONFIG.get(ingress_ifindex) }?.l2_hlen as usize;
+    let l2_hlen = uplink_config_get(ingress_ifindex)?.l2_hlen as usize;
     let redirect = if l2_hlen == ETH_HLEN {
         unsafe { bpf_redirect_neigh(ingress_ifindex, core::ptr::null_mut(), 0, 0) }
     } else {
@@ -1624,7 +1659,7 @@ fn try_geneve_decap_return_v4(
     let forward_value = if let Some(value) = existing_forward {
         Some(value)
     } else {
-        let pending_value = unsafe { FWD_PENDING.get(key) }.copied();
+        let pending_value = fwd_pending_get(key);
         match return_authorization(false, pending_value.is_some()) {
             ReturnAuthorization::Promote => {
                 let value = pending_value?;
@@ -1720,7 +1755,7 @@ fn try_geneve_decap_return_v6(
     let forward_value = if let Some(value) = existing_forward {
         Some(value)
     } else {
-        let pending_value = unsafe { FWD_PENDING.get(key) }.copied();
+        let pending_value = fwd_pending_get(key);
         match return_authorization(false, pending_value.is_some()) {
             ReturnAuthorization::Promote => {
                 let value = pending_value?;
@@ -1793,7 +1828,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // `try_uplink_ingress`'s matching comment for why the L2 header length
     // is resolved once by the loader, not assumed to be Ethernet's 14 bytes.
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    let l2_hlen = unsafe { UPLINK_CONFIG.get(ifindex) }?.l2_hlen as usize;
+    let l2_hlen = uplink_config_get(ifindex)?.l2_hlen as usize;
     // See `try_uplink_ingress`'s matching comment: dispatches on a const
     // generic so every `load_direct` offset below is a compile-time literal.
     match l2_hlen {
@@ -1857,7 +1892,7 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
     // table, far cheaper to probe than this hook's own conntrack table, and
     // most packets crossing this hook (ALL uplink egress, not just
     // beep's) take this branch.
-    let is_backend_pod = unsafe { POD_TARGETS.get(ipv4_mapped_v6(pod_ip)) }.is_some();
+    let is_backend_pod = POD_TARGETS.get_ptr(ipv4_mapped_v6(pod_ip)).is_some();
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);
     }
@@ -1972,7 +2007,7 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let pod_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
 
-    let is_backend_pod = unsafe { POD_TARGETS.get(pod_ip_v6) }.is_some();
+    let is_backend_pod = POD_TARGETS.get_ptr(pod_ip_v6).is_some();
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);
     }
