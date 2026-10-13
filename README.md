@@ -30,6 +30,8 @@ $ cargo build --release   # from this directory; builds beep-ebpf too
 
 `build.rs` cross-builds `beep-ebpf` for `bpfel-unknown-none` or `bpfeb-unknown-none`, matching your host's endianness. It uses `aya-build`, with `.cargo/config.toml` setting `linker = "bpf-linker"` for that target, and it embeds the resulting object into the loader binary.
 
+Release builds strip `.BTF.ext` line info from the embedded object to stay under the 128 KiB size ceiling, so verifier rejection logs and `bpftool prog dump` carry no source lines. To debug a rejection, rebuild without `--release` (`cargo build`): dev builds keep line info.
+
 ## Running
 
 Requires Linux >= 6.6 (TCX attach; the loader no longer raises `RLIMIT_MEMLOCK`).

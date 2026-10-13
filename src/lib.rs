@@ -8,6 +8,12 @@
 
 pub mod front_swap;
 
+// build.rs's `.BTF.ext` rewrite; build scripts can't host tests themselves.
+#[cfg(test)]
+#[path = "../build_support/btf_ext.rs"]
+#[allow(dead_code)]
+mod btf_ext;
+
 use std::{collections::HashSet, net::IpAddr, path::Path};
 
 use anyhow::{anyhow, Context};
