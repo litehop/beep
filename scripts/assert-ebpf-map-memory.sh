@@ -19,18 +19,55 @@
 # just a byte-count ceiling: a partial-discovery regression (e.g. only 9 of 10
 # maps found) still sums to a smaller, still-passing total -- this is the
 # gate this script exists to close. Also asserts their summed bytes_memlock
-# is > 0 and under a gross-regression ceiling (not a tight bound, just a
-# tripwire for an accidental max_entries blow-up). The ceiling is 6 MiB, an
-# INTERIM value: the measured footprint is 4,185,352 bytes (CI run
-# 37885413497), so 6 MiB is ~1.5x, pending the FRONT_ENDPOINTS sizing
-# decision; the long-term value is re-derived at ~2x the measured footprint.
-# LRU_HASH conntrack maps (FWD_PENDING/FLOW_TABLE) preallocate for their
-# full max_entries capacity regardless of active-flow count; FLOW_TABLE
-# (16384 entries, ~2.25 MiB) is the largest share.
+# is > 0 and under a gross-regression ceiling of 6 MiB.
+#
+# Tripwires at 1.15x of an expected USAGE, not of a cap:
+#   * FRONT_META / FRONT_ENDPOINTS are BPF_F_NO_PREALLOC, so their footprint is
+#     a bucket array that is allocated up front (16 B x next_pow2(max_entries))
+#     plus a ~1 KiB header, plus a per-entry cost for the entries actually
+#     present (~96 B META, ~128 B ENDPOINTS: element header + key + value, each
+#     rounded to 8). The entry counts are passed in (count them from the pins
+#     with `bpftool map dump pinned <pin> -j | jq length`), so a regression in
+#     max_entries or per-entry cost trips the per-map check even though both are
+#     far under any cap.
+#   * Everything else preallocates for its full max_entries regardless of use;
+#     FLOW_TABLE (16384 entries, ~2.25 MiB) is the largest share. Their summed
+#     footprint is EXPECTED_PREALLOCATED_BYTES below; the total check is 1.15x
+#     of that plus the two front maps' expected usage.
 set -euo pipefail
 
-csv="${1:?usage: $0 <ebpf-map-memory.csv>}"
+usage="usage: $0 <ebpf-map-memory.csv> --front-meta-entries N --front-endpoints-entries N"
+csv="${1:?$usage}"
+shift
+front_meta_entries=""
+front_endpoints_entries=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --front-meta-entries) front_meta_entries="${2:?$usage}"; shift 2 ;;
+    --front-endpoints-entries) front_endpoints_entries="${2:?$usage}"; shift 2 ;;
+    *) echo "FAIL: unknown argument $1 ($usage)" >&2; exit 1 ;;
+  esac
+done
 [ -f "$csv" ] || { echo "FAIL: $csv not found" >&2; exit 1; }
+case "$front_meta_entries$front_endpoints_entries" in
+  ''|*[!0-9]*) echo "FAIL: --front-meta-entries and --front-endpoints-entries must be integers ($usage)" >&2; exit 1 ;;
+esac
+[ -n "$front_meta_entries" ] && [ -n "$front_endpoints_entries" ] || { echo "FAIL: $usage" >&2; exit 1; }
+
+# bytes_memlock of the non-front maps, measured in CI run 38385070814
+# (main, 2026-10-13T10:41Z): 4,185,688 total minus the two then-preallocated
+# front maps (393,216 + 1,114,112).
+EXPECTED_PREALLOCATED_BYTES=2678360
+FRONT_HEADER_BYTES=1024
+FRONT_META_ENTRY_BYTES=96
+FRONT_ENDPOINTS_ENTRY_BYTES=128
+TRIPWIRE_PERCENT=115
+
+next_pow2() {
+  local n=$1 p=1
+  while [ "$p" -lt "$n" ]; do p=$((p * 2)); done
+  echo "$p"
+}
 
 names=()
 while IFS= read -r name; do
@@ -58,4 +95,24 @@ expected_sorted="$(printf '%s\n' "${expected[@]}" | sort -u)"
 limit=$((6 * 1024 * 1024))
 [ "$total" -lt "$limit" ] || { echo "FAIL: total bytes_memlock ($total) >= 6 MiB gross-regression ceiling" >&2; exit 1; }
 
-echo "PASS: exactly ${#expected[@]} known beep maps discovered, total bytes_memlock=$total is within the gross-regression ceiling"
+# Per-map usage check for the two no-prealloc front maps.
+expected_total=$EXPECTED_PREALLOCATED_BYTES
+for spec in "FRONT_META:$front_meta_entries:$FRONT_META_ENTRY_BYTES" "FRONT_ENDPOINTS:$front_endpoints_entries:$FRONT_ENDPOINTS_ENTRY_BYTES"; do
+  IFS=: read -r map entries per_entry <<<"$spec"
+  max_entries=$(awk -F, -v m="$map" 'NR>1 && $3==m {print $5}' "$csv")
+  actual=$(awk -F, -v m="$map" 'NR>1 && $3==m {print $6}' "$csv")
+  expected_bytes=$(( 16 * $(next_pow2 "$max_entries") + FRONT_HEADER_BYTES + entries * per_entry ))
+  map_limit=$(( expected_bytes * TRIPWIRE_PERCENT / 100 ))
+  echo "$map: max_entries=$max_entries entries=$entries expected~$expected_bytes tripwire=$map_limit actual=$actual"
+  [ "$actual" -le "$map_limit" ] || {
+    echo "FAIL: $map bytes_memlock ($actual) exceeds ${TRIPWIRE_PERCENT}% of the expected usage ($expected_bytes = 16 x next_pow2($max_entries) bucket floor + header + $entries x $per_entry B)" >&2
+    exit 1
+  }
+  expected_total=$((expected_total + expected_bytes))
+done
+
+total_limit=$(( expected_total * TRIPWIRE_PERCENT / 100 ))
+echo "expected total ~$expected_total, tripwire $total_limit"
+[ "$total" -le "$total_limit" ] || { echo "FAIL: total bytes_memlock ($total) exceeds ${TRIPWIRE_PERCENT}% of the expected footprint ($expected_total)" >&2; exit 1; }
+
+echo "PASS: exactly ${#expected[@]} known beep maps discovered, total bytes_memlock=$total is within ${TRIPWIRE_PERCENT}% of the expected usage and under the gross-regression ceiling"
