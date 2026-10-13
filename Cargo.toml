@@ -15,6 +15,12 @@ license = "Apache-2.0"
 members = ["ebpf", "common", "controller", "kubeconfig"]
 resolver = "2"
 
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[lints]
+workspace = true
+
 [profile.release.package.beep-ebpf]
 debug = 2
 codegen-units = 1

@@ -519,6 +519,7 @@ enum IngressMiss {
 /// all (link-layer broadcast/multicast or not addressed to this host).
 #[inline(always)]
 fn reject_l3(ctx: &TcContext, ingress_ifindex: u32) -> Option<(usize, bool)> {
+    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
     if unsafe { (*ctx.skb.skb).pkt_type } != PACKET_HOST {
         return None;
     }
@@ -549,6 +550,8 @@ fn reject_tcp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
         return TC_ACT_OK;
     };
     let mut raw = MaybeUninit::<[u8; TCP_RST_V6_LEN]>::uninit();
+    // SAFETY: `u8` has no invalid bit patterns; as this fn's doc comment
+    // explains, every byte is written before it is read or stored.
     let buf = unsafe { &mut *raw.as_mut_ptr() };
     if is_v4 {
         let Some(reply) = buf.first_chunk_mut::<TCP_RST_V4_LEN>() else {
@@ -586,6 +589,8 @@ fn reject_udp(ctx: &TcContext, ingress_ifindex: u32) -> i32 {
         return TC_ACT_OK;
     };
     let mut raw = MaybeUninit::<[u8; ICMP6_UNREACH_LEN]>::uninit();
+    // SAFETY: `u8` has no invalid bit patterns; as `reject_tcp`'s doc
+    // comment explains, every byte is written before it is read or stored.
     let buf = unsafe { &mut *raw.as_mut_ptr() };
     if is_v4 {
         let Some(reply) = buf.first_chunk_mut::<ICMP_UNREACH_V4_LEN>() else {
@@ -626,7 +631,12 @@ fn send_reply(ctx: &TcContext, ingress_ifindex: u32, l3: usize, reply: &[u8]) ->
     let Some(bucket) = REJECT_BUCKET.get_ptr_mut(0) else {
         return TC_ACT_SHOT;
     };
-    if !reject_admit(unsafe { &mut *bucket }, unsafe { bpf_ktime_get_ns() }) {
+    // SAFETY: `bucket` is this CPU's `PerCpuArray` slot, non-null from
+    // `get_ptr_mut`, and nothing else on this CPU aliases it during the call.
+    let bucket = unsafe { &mut *bucket };
+    // SAFETY: `bpf_ktime_get_ns` takes no arguments.
+    let now = unsafe { bpf_ktime_get_ns() };
+    if !reject_admit(bucket, now) {
         return TC_ACT_SHOT;
     }
     if !resize_packet(ctx, l3 + reply.len()) {
@@ -642,6 +652,9 @@ fn send_reply(ctx: &TcContext, ingress_ifindex: u32, l3: usize, reply: &[u8]) ->
 /// `bpf_csum_diff` over `data`, a multiple of 4 bytes.
 #[inline(always)]
 fn csum_native(data: &[u8], seed: u32) -> u32 {
+    // SAFETY: `data` is a valid slice of `data.len()` bytes the helper only
+    // reads (the `cast_mut` is for the helper's signature); the null `to`
+    // is paired with size 0.
     unsafe {
         bpf_csum_diff(
             core::ptr::null_mut(),
@@ -657,6 +670,8 @@ fn csum_native(data: &[u8], seed: u32) -> u32 {
 /// site); `TcContext::load_bytes` would silently clamp to a short packet.
 #[inline(always)]
 fn load_into(ctx: &TcContext, offset: usize, dst: &mut [u8]) -> bool {
+    // SAFETY: `ctx.skb.skb` is the live skb; `dst` is a valid slice of
+    // exactly `dst.len()` writable bytes.
     unsafe {
         bpf_skb_load_bytes(
             ctx.skb.skb.cast(),
@@ -671,11 +686,14 @@ fn load_into(ctx: &TcContext, offset: usize, dst: &mut [u8]) -> bool {
 /// untouched, so the caller can still pass it to the host.
 #[inline(always)]
 fn resize_packet(ctx: &TcContext, len: usize) -> bool {
+    // SAFETY: `ctx.skb.skb` is the live skb; no pointer arguments.
     unsafe { bpf_skb_change_tail(ctx.skb.skb, len as u32, 0) == 0 }
 }
 
 #[inline(always)]
 fn put(ctx: &TcContext, offset: usize, part: &[u8]) -> bool {
+    // SAFETY: `ctx.skb.skb` is the live skb; `part` is a valid slice of
+    // exactly `part.len()` bytes the helper only reads.
     unsafe {
         bpf_skb_store_bytes(
             ctx.skb.skb.cast(),
@@ -733,14 +751,36 @@ static UPLINK_CONFIG: HashMap<u32, UplinkConfig> = HashMap::with_max_entries(8, 
 /// constant delta from `ctx.data()`" -- callers needing offset 0 must use
 /// `TcContext::load` instead.
 #[inline(always)]
-fn load_direct<T: Copy>(ctx: &TcContext, offset: usize) -> Option<T> {
+fn load_direct<T: AnyBitPattern>(ctx: &TcContext, offset: usize) -> Option<T> {
     let start = ctx.data();
     let end = ctx.data_end();
     if start + offset + core::mem::size_of::<T>() > end {
         return None;
     }
+    // SAFETY: the bounds check above keeps `size_of::<T>()` bytes from
+    // `start + offset` inside the linear head, `read_unaligned` needs no
+    // alignment, and `T: AnyBitPattern` makes any wire bytes a valid `T`.
     Some(unsafe { core::ptr::read_unaligned((start + offset) as *const T) })
 }
+
+/// Types `load_direct` may read straight off the wire.
+///
+/// # Safety
+/// Every bit pattern of `Self` must be a valid value.
+unsafe trait AnyBitPattern: Copy {}
+
+macro_rules! any_bit_pattern {
+    ($($t:ty),+) => {
+        $(
+            // SAFETY: plain integer, every bit pattern is valid.
+            unsafe impl AnyBitPattern for $t {}
+        )+
+    };
+}
+any_bit_pattern!(u8, u16, u32);
+
+// SAFETY: an array of `u8` has no invalid bit patterns.
+unsafe impl<const N: usize> AnyBitPattern for [u8; N] {}
 
 /// Sets `tkey`'s Geneve tunnel remote from a `beep_common`-shaped dual-
 /// stack node address (`LbFrontBackend::backend_node_ip`/
@@ -787,11 +827,16 @@ fn set_tunnel_remote(tkey: &mut bpf_tunnel_key, node_ip: &[u8; 16]) -> u64 {
 /// union field (`tunnel_remote` below).
 #[inline(always)]
 fn get_tunnel_key(ctx: &TcContext) -> Option<(bpf_tunnel_key, bool)> {
+    // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
+    // which all-zero is a valid value.
     let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
     let size = core::mem::size_of::<bpf_tunnel_key>() as u32;
+    // SAFETY: `ctx.skb.skb` is the live skb; `tkey` is a stack local of
+    // exactly `size` bytes.
     if unsafe { bpf_skb_get_tunnel_key(ctx.skb.skb, &mut tkey, size, 0) } == 0 {
         return Some((tkey, false));
     }
+    // SAFETY: as above.
     if unsafe { bpf_skb_get_tunnel_key(ctx.skb.skb, &mut tkey, size, BPF_F_TUNINFO_IPV6 as u64) }
         == 0
     {
@@ -807,11 +852,15 @@ fn get_tunnel_key(ctx: &TcContext) -> Option<(bpf_tunnel_key, bool)> {
 /// there without a live kernel.
 #[inline(always)]
 fn tunnel_remote(tkey: &bpf_tunnel_key, used_ipv6: bool) -> [u8; 16] {
-    tunnel_remote_addr(
-        used_ipv6,
-        unsafe { tkey.__bindgen_anon_1.remote_ipv4 },
-        unsafe { tkey.__bindgen_anon_1.remote_ipv6 },
-    )
+    // SAFETY: both arms are plain integer data, so reading either is valid;
+    // `tunnel_remote_addr` picks the arm the kernel actually filled.
+    let (v4, v6) = unsafe {
+        (
+            tkey.__bindgen_anon_1.remote_ipv4,
+            tkey.__bindgen_anon_1.remote_ipv6,
+        )
+    };
+    tunnel_remote_addr(used_ipv6, v4, v6)
 }
 
 /// Stamps Geneve metadata (remote, VNI, option bytes) on the skb and redirects
@@ -908,6 +957,7 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // hook the packet's ingress ifindex IS the physical uplink it just
     // arrived on (this classifier is attached directly to that device's
     // ingress, before any redirect).
+    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
     let ingress_ifindex = unsafe { (*ctx.skb.skb).ingress_ifindex };
     // A per-uplink map hit is simultaneously admission (this ifindex is a
     // configured `--uplink-iface`) and the L2 header length to parse with --
@@ -1192,6 +1242,8 @@ fn try_geneve_decap_forward(
     // once here, before the inner packet's own family is even known, so
     // `_v4`/`_v6` below don't each need their own copy of this block.
     let mut opt = [0u8; 20];
+    // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
+    // exactly `opt.len()` bytes.
     if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) } < 0
     {
         return Some(TC_ACT_SHOT);
@@ -1597,6 +1649,8 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
     // widening), same as forward-decap's pod-id option -- read it once here
     // before the inner packet's own family is known.
     let mut opt = [0u8; 24];
+    // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
+    // exactly `opt.len()` bytes.
     if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) } < 0
     {
         return Some(TC_ACT_SHOT);
@@ -1633,8 +1687,11 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
 fn redirect_client_bound(ingress_ifindex: u32) -> Option<i32> {
     let l2_hlen = uplink_config_get(ingress_ifindex)?.l2_hlen as usize;
     let redirect = if l2_hlen == ETH_HLEN {
+        // SAFETY: a null `params` with `plen` 0 is the helper's documented
+        // "resolve the neighbour from the route" form.
         unsafe { bpf_redirect_neigh(ingress_ifindex, core::ptr::null_mut(), 0, 0) }
     } else {
+        // SAFETY: no pointer arguments.
         unsafe { bpf_redirect(ingress_ifindex, 0) }
     };
     if redirect as i32 != TC_ACT_REDIRECT {
@@ -1848,7 +1905,9 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // this datapath reads skb->mark today, but leaving a stale internal
     // marker on a packet leaving the node is a needless landmine for any
     // future mark-based tc/iptables rule on this uplink.
-    if is_redirected_return_mark(unsafe { (*ctx.skb.skb).mark }) {
+    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
+    let mark = unsafe { (*ctx.skb.skb).mark };
+    if is_redirected_return_mark(mark) {
         ctx.set_mark(0);
         return Some(TC_ACT_OK);
     }
@@ -1861,6 +1920,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // which configured uplink this invocation is running for. See
     // `try_uplink_ingress`'s matching comment for why the L2 header length
     // is resolved once by the loader, not assumed to be Ethernet's 14 bytes.
+    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
     let l2_hlen = uplink_config_get(ifindex)?.l2_hlen as usize;
     // See `try_uplink_ingress`'s matching comment: dispatches on a const

@@ -428,6 +428,8 @@ pub union FlowValue {
 /// the chosen arm is smaller than the union.
 impl FlowValue {
     const fn zeroed() -> Self {
+        // SAFETY: every arm is plain integer/array data, for which all-zero
+        // is valid.
         unsafe { core::mem::zeroed() }
     }
 
@@ -505,10 +507,10 @@ pub struct PortMemoValue {
 /// every build of the crate; only the `Pod` impl needs the `user` feature.
 macro_rules! impl_pod {
     ($t:ident { $($f:ident : $ft:ty),+ $(,)? }) => {
+        #[cfg(feature = "user")]
         // SAFETY: `#[repr(C)]`, every field is plain integer/array data (or a
         // nested Pod), and the assert below proves there is no padding, so
         // all bytes are initialized and any bit pattern is valid.
-        #[cfg(feature = "user")]
         unsafe impl aya::Pod for $t {}
         const _: () = assert!(
             core::mem::size_of::<$t>() == 0 $(+ core::mem::size_of::<$ft>())+,
@@ -516,10 +518,10 @@ macro_rules! impl_pod {
         );
     };
     (union $t:ident { $($f:ident : $ft:ty),+ $(,)? }) => {
+        #[cfg(feature = "user")]
         // SAFETY: `#[repr(C)]` union whose arms are all padding-free Pod; the
         // assert proves its size is the largest arm, so it adds no bytes of
         // its own.
-        #[cfg(feature = "user")]
         unsafe impl aya::Pod for $t {}
         const _: () = assert!(
             core::mem::size_of::<$t>() == {
@@ -596,16 +598,21 @@ impl FlowValue {
     /// `FlowDirection::Forward` -- reading the wrong arm returns whatever
     /// bytes the last write into that union slot happened to leave there.
     pub fn as_forward(&self) -> ForwardFlowValue {
+        // SAFETY: every arm is padding-free `Copy` integer/array data (see
+        // `impl_pod!`), so any bytes are a valid value of any arm; a wrong
+        // arm yields wrong data, not UB.
         unsafe { self.forward }
     }
 
     /// Reads the `reverse` arm -- see `as_forward`'s caveat.
     pub fn as_reverse(&self) -> RevFlowValue {
+        // SAFETY: as `as_forward`.
         unsafe { self.reverse }
     }
 
     /// Reads the `port_memo` arm -- see `as_forward`'s caveat.
     pub fn as_port_memo(&self) -> PortMemoValue {
+        // SAFETY: as `as_forward`.
         unsafe { self.port_memo }
     }
 }
@@ -1379,6 +1386,9 @@ mod tests {
     }
 
     fn flow_value_bytes(v: &FlowValue) -> [u8; 36] {
+        // SAFETY: `FlowValue` is exactly 36 bytes (asserted by
+        // `flow_value_size_matches_its_largest_arm_with_no_extra_padding`) and
+        // its constructors zero-initialize it, so every byte is initialized.
         unsafe { core::mem::transmute_copy(v) }
     }
 
@@ -1414,7 +1424,9 @@ mod tests {
             front_port: 80,
             original_client_port: 1234,
         };
+        // SAFETY: each value is read back through the arm its constructor wrote.
         assert_eq!(unsafe { FlowValue::from_forward(fwd).forward }, fwd);
+        // SAFETY: as above.
         assert!(unsafe { FlowValue::from_reverse(rev).reverse } == rev);
     }
 

@@ -4,6 +4,9 @@ version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[lints]
+workspace = true
+
 # no_std except under `cargo test`, which needs std's test harness -- this
 # lets `cargo test` run natively on any host while `beep-ebpf` still
 # pulls it in as a no_std, core-only dependency for bpfel-unknown-none.
