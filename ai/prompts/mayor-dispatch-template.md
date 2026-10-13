@@ -423,14 +423,15 @@ re-ingestion, not resume itself.
 beep verifies its dataplane on real Lima Linux VMs, since the loader links
 Linux-only syscalls and the eBPF verifier only exists on Linux — there is no
 macOS-native way to prove a load succeeds. Unlike a large pool of
-interchangeable ported/isolated slots, beep has exactly **three fixed-role
+interchangeable ported/isolated slots, beep has exactly **four fixed-role
 VMs**:
 
-| VM name | Role | Driven by |
-|---|---|---|
-| `beep-smoke` | single-node smoke gate — a local veth-pair fixture stands in for a client | `scripts/smoke.sh --vm beep-smoke` |
-| `beep-node-a` | cross-node WireGuard rig, ingress side (owns the front) | `scripts/smoke-wg-2node.sh --vm-a beep-node-a --vm-b beep-node-b` |
-| `beep-node-b` | cross-node WireGuard rig, backend side (backend Pod + "client") | same as above |
+| VM name | OS / kernel | Role | Driven by |
+|---|---|---|---|
+| `beep-smoke` | Debian 13 / 6.12 LTS (`6.12.111+deb13-cloud-arm64`) | single-node smoke gate — a local veth-pair fixture stands in for a client | `scripts/smoke.sh --vm beep-smoke` |
+| `beep-node-a` | Ubuntu 24.04 / 6.8.0-14x | cross-node WireGuard rig, ingress side (owns the front) | `scripts/smoke-wg-2node.sh --vm-a beep-node-a --vm-b beep-node-b` |
+| `beep-node-b` | Ubuntu 24.04 / 6.8.0-14x | cross-node WireGuard rig, backend side (backend Pod + "client") | same as above |
+| `beep-client` | Ubuntu 24.04 / 6.8.0-14x | 3rd-VM client for the cross-node rigs | same as above (`--vm-client`) |
 
 No port table and no per-worker port flags exist for these scripts
 — each takes only a `--vm` (or `--vm-a`/`--vm-b`) name, defaulting to the

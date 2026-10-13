@@ -1,7 +1,8 @@
-# Lima VM for beep-ebpf smoke testing (scripts/smoke.sh,
-# scripts/smoke-wg-2node.sh) -- a Linux kernel to load the compiled eBPF
-# object into and drive real packets through, since beep-ebpf only builds
-# for bpfel-unknown-none and beep's loader is Linux-only.
+# Lima VM for beep-ebpf smoke testing (scripts/smoke.sh) -- a Linux kernel to
+# load the compiled eBPF object into and drive real packets through, since
+# beep-ebpf only builds for bpfel-unknown-none and beep's loader is
+# Linux-only. Debian 13 (trixie), Linux 6.12 LTS. beep-node-a/beep-node-b/
+# beep-client stay on Ubuntu 24.04 (lima/beep-k3s.yaml, lima/beep-client.yaml).
 #
 # Usage:
 #   scripts/lima-up.sh [vm-name]
@@ -12,17 +13,19 @@ cpus: 1
 memory: "2GiB"
 disk: "10GiB"
 
-# Plain unprivileged switch so multiple VMs (e.g. beep-node-a/beep-node-b for
-# smoke-wg-2node.sh) can reach each other directly. Needs no socket_vmnet/
-# sudoers host setup, unlike shared/bridged/host.
+# Plain unprivileged switch so multiple VMs can reach each other directly.
+# Needs no socket_vmnet/sudoers host setup, unlike shared/bridged/host.
 networks:
   - lima: user-v2
 
+# Pinned to a dated release + digest; never a floating `latest`/`trixie` path.
 images:
-  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+  - location: https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2
     arch: x86_64
-  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+    digest: sha512:f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d
+  - location: https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-arm64-20261001-2618.qcow2
     arch: aarch64
+    digest: sha512:d8470b8c6c38fead046c794b5800a5a7b96672d5bcf543cc230ceb0c4b8ace05ed341a0c8928045422243fde26b2f1f2f58e99244c65709ffda2e3d4b674dd5a
 
 provision:
   - mode: system
@@ -30,15 +33,8 @@ provision:
       #!/bin/bash
       set -euo pipefail
 
+      export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq
 
-      # bpftool: not always packaged for the running kernel. Try the generic
-      # package first, then the kernel-specific one; if neither is available,
-      # leave a clear message instead of failing provisioning outright --
-      # smoke-remote.sh's own bpftool checks will fail loud if it's truly
-      # missing.
-      apt-get install -y linux-tools-generic \
-        || apt-get install -y "linux-tools-$(uname -r)" \
-        || echo "WARNING: bpftool package unavailable for this kernel -- install manually" >&2
-
-      apt-get install -y wireguard-tools netcat-openbsd curl jq
+      # bpftool is its own Debian package (not linux-tools-$(uname -r)).
+      apt-get install -y bpftool iproute2 procps netcat-openbsd curl jq tcpdump wireguard-tools

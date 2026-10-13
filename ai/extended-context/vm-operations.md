@@ -21,10 +21,13 @@ VM you didn't provision breaks whoever is mid-task on it.
 
 Four named VMs, fixed roles:
 
-- **`beep-smoke`** — single-node smoke gate. `scripts/smoke.sh` targets this
+- **`beep-smoke`** — single-node smoke gate, **Debian 13 / Linux 6.12 LTS**
+  (image pinned in `lima/beep.yaml`; boots `6.12.111+deb13-cloud-arm64`).
+  `scripts/smoke.sh` targets this
   by default: loads the tc-bpf classifiers into a real kernel verifier and
   drives packets through the Geneve encap/decap dataplane on one node.
-- **`beep-node-a`** + **`beep-node-b`** — cross-node WireGuard pair, used by
+- **`beep-node-a`** + **`beep-node-b`** (Ubuntu 24.04 / 6.8.0-14x, as is
+  `beep-client`) — cross-node WireGuard pair, used by
   `scripts/smoke-wg-2node.sh`. This is the known-blocker path (bead
   beep-n24; the original mayor-f3ru5 redirect-drop blocker is fixed by
   PR #9): cross-node conntrack/WireGuard behavior that single-node smoke
@@ -65,8 +68,8 @@ cross-builds on the host instead of building inside the VM:
 
 Nightly and `bpf-linker` stay host-side only — never installed or invoked
 inside the VM. The VM only needs `bpftool` for independent load
-confirmation (already present on `beep-smoke`; otherwise
-`apt-get install linux-tools-$(uname -r)`).
+confirmation (installed by `lima/beep.yaml` provisioning; on Debian it is the
+`bpftool` package, on the Ubuntu VMs `linux-tools-$(uname -r)`).
 
 ## In-VM inspection via MCP
 
