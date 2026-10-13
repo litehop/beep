@@ -34,6 +34,10 @@
 # the backend's raw un-DNAT'd reply leaks out node-b's real NIC
 # unencapsulated and the client never completes its handshake).
 #
+# Negative control (stage 7): with NODE_ALLOW seeding skipped the same request
+# must time out (rc=28); only then are the peers seeded and the round trip
+# required to pass, so a green result is attributable to peer admission.
+#
 # Usage: scripts/smoke-eth-ingress-2node.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>]
 # Defaults match this rig's assigned VMs: beep-node-a (ingress, owns the
 # front), beep-node-b (backend Pod), beep-client (client). All three VMs
@@ -95,6 +99,17 @@ eth0_ip() { # eth0_ip <vm> -- this VM's real underlay address
   limactl shell "$1" -- bash -c "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1"
 }
 
+geneve_rx() { # rx packet count on <vm>'s geneve0
+  limactl shell "$1" -- cat /sys/class/net/geneve0/statistics/rx_packets
+}
+
+curl_front() { # curl_front <max-seconds>; sets CLIENT_RC/CLIENT_BODY
+  set +e
+  CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m "$1" "http://${IP_A}:${FRONT_PORT}/" 2>&1)"
+  CLIENT_RC=$?
+  set -e
+}
+
 # Same retry rationale as smoke-wg-2node.sh's cleanup trap: a burst of
 # back-to-back `limactl shell` sessions can leave SSH's own connection
 # layer transiently unhappy right after the run finishes.
@@ -115,7 +130,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> [1/7] bringing up $VM_A, $VM_B, and $VM_CLIENT"
+echo "==> [1/8] bringing up $VM_A, $VM_B, and $VM_CLIENT"
 for vm in "$VM_A" "$VM_B"; do
   if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${vm}[[:space:]]+Running"; then
     limactl start "$vm"
@@ -126,7 +141,7 @@ if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${V
   limactl start "$VM_CLIENT"
 fi
 
-echo "==> [2/7] confirming node-a's user-v2 NIC name (must not be assumed)"
+echo "==> [2/8] confirming node-a's user-v2 NIC name (must not be assumed)"
 IFACE_A_ACTUAL="$(limactl shell "$VM_A" -- bash -c "ip -4 -o addr show | awk '\$4 !~ /^127\\./ {print \$2; exit}'")"
 [ "$IFACE_A_ACTUAL" = "$UPLINK_IFACE_A" ] || {
   echo "FAIL: expected $VM_A's user-v2 NIC to be '$UPLINK_IFACE_A', found '$IFACE_A_ACTUAL' -- update UPLINK_IFACE_A" >&2
@@ -134,7 +149,7 @@ IFACE_A_ACTUAL="$(limactl shell "$VM_A" -- bash -c "ip -4 -o addr show | awk '\$
 }
 echo "UPLINK-IFACE-NAME: PASS ($VM_A's user-v2 NIC is $UPLINK_IFACE_A)"
 
-echo "==> [3/7] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
+echo "==> [3/8] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
 ( cd "$BEEP_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
 BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
 [ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
@@ -146,7 +161,7 @@ for vm in "$VM_A" "$VM_B"; do
   remote "$vm" cleanup >/dev/null 2>&1 || true
 done
 
-echo "==> [4/7] establishing the real WireGuard tunnel between $VM_A and $VM_B (the Geneve TRANSPORT, not the client-facing ingress)"
+echo "==> [4/8] establishing the real WireGuard tunnel between $VM_A and $VM_B (the Geneve TRANSPORT, not the client-facing ingress)"
 IP_A="$(eth0_ip "$VM_A")"
 IP_B="$(eth0_ip "$VM_B")"
 [ -n "$IP_A" ] && [ -n "$IP_B" ] || {
@@ -166,12 +181,12 @@ limactl shell "$VM_A" -- ping -c 2 -W 2 "$WG_SUBNET_B" >/dev/null || {
 }
 echo "WIREGUARD TUNNEL: PASS ($VM_A $WG_SUBNET_A <-> $VM_B $WG_SUBNET_B, over real underlay $IP_A/$IP_B)"
 
-echo "==> [5/7] creating geneve0 on both nodes + verifying $VM_A's real uplink is up"
+echo "==> [5/8] creating geneve0 on both nodes + verifying $VM_A's real uplink is up"
 remote "$VM_A" setup-geneve
 remote "$VM_B" setup-geneve
 remote "$VM_A" check-uplink "$UPLINK_IFACE_A"
 
-echo "==> [6/7] loading beep-ebpf: $VM_A and $VM_B both uplink=$UPLINK_IFACE_A (their shared real underlay NIC; wg0 is pure Geneve transport substrate on top of it, not either node's client/return-facing device)"
+echo "==> [6/8] loading beep-ebpf: $VM_A and $VM_B both uplink=$UPLINK_IFACE_A (their shared real underlay NIC; wg0 is pure Geneve transport substrate on top of it, not either node's client/return-facing device)"
 FIXTURE="${IP_A}:${FRONT_PORT}:tcp:${WG_SUBNET_B}:${POD_IP}:${TARGET_PORT}"
 remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_A"
 # --uplink-iface must match $VM_A's (not the wg0 default): the backend
@@ -185,6 +200,41 @@ remote "$VM_A" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE
 # <client>.PORT` on $VM_B's real eth0, never entering geneve0 at all).
 remote "$VM_B" start-loader --uplink-iface "$UPLINK_IFACE_A" --fixture "$FIXTURE" --pod-cidr "$POD_CIDR" --node-ip "$WG_SUBNET_B"
 
+remote "$VM_B" setup-backend --pod-ip "$POD_IP"
+remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
+
+echo "==> [7/8] NEGATIVE CONTROL: NODE_ALLOW not seeded -- the round trip must FAIL"
+# Attribution to NODE_ALLOW, not just "some failure": curl must time out
+# (rc=28; a crashed loader/backend gives rc=7/52), both loaders must still be
+# alive, and the forward Geneve packet must have reached $VM_B's geneve0 (rx
+# moved: wg0 transport and decap path work) without being delivered -- the
+# admission drop happens in beep's hook after geneve0 has counted the packet.
+NC_RX_B_BEFORE="$(geneve_rx "$VM_B")"
+curl_front 8
+NC_RX_B_AFTER="$(geneve_rx "$VM_B")"
+echo "NEGATIVE-CONTROL: curl rc=$CLIENT_RC; geneve0 rx $VM_B $NC_RX_B_BEFORE -> $NC_RX_B_AFTER"
+if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
+  echo "NEGATIVE-CONTROL: FAIL (round trip succeeded without NODE_ALLOW seeding -- the rig does not prove peer admission)" >&2
+  exit 1
+fi
+if [ "$CLIENT_RC" -ne 28 ]; then
+  echo "NEGATIVE-CONTROL: FAIL (curl rc=$CLIENT_RC, expected 28 timeout -- a refused/reset connection is not a NODE_ALLOW drop: '$CLIENT_BODY')" >&2
+  exit 1
+fi
+for vm in "$VM_A" "$VM_B"; do
+  # -x truncates to 15 chars and never matches $BIN_NAME; [b] keeps pgrep -f from matching its own command line.
+  limactl shell "$vm" -- pgrep -f "/tmp/[${BIN_NAME:0:1}]${BIN_NAME:1} --uplink-iface" >/dev/null || {
+    echo "NEGATIVE-CONTROL: FAIL (loader not running on $vm after the unseeded attempt -- crash, not admission drop)" >&2
+    exit 1
+  }
+done
+if [ "$NC_RX_B_AFTER" -le "$NC_RX_B_BEFORE" ]; then
+  echo "NEGATIVE-CONTROL: FAIL ($VM_B geneve0 rx did not move: the packet never arrived, so the timeout is not attributable to NODE_ALLOW)" >&2
+  exit 1
+fi
+echo "NEGATIVE-CONTROL: PASS (unseeded: curl timed out, loaders alive, packet reached $VM_B geneve0 but was not delivered)"
+
+echo "==> [8/8] seeding NODE_ALLOW bidirectionally, then driving one client ($VM_CLIENT) -> node-a's real Ethernet front -> cross-node backend round trip"
 # A bare loader attests only its own --node-ip (NODE_ALLOW), so each node
 # must be told about the other or its Geneve decap drops the peer's packets
 # (forward leg at $VM_B's geneve_ingress, return leg at $VM_A's). Both
@@ -195,11 +245,6 @@ NODE_A_KEY="$(remote "$VM_A" dump-node-allow-key)"
 NODE_B_KEY="$(remote "$VM_B" dump-node-allow-key)"
 remote "$VM_B" seed-node-allow --key-hex "$NODE_A_KEY"
 remote "$VM_A" seed-node-allow --key-hex "$NODE_B_KEY"
-
-remote "$VM_B" setup-backend --pod-ip "$POD_IP"
-remote "$VM_B" start-backend-responder --pod-ip "$POD_IP" --port "$TARGET_PORT"
-
-echo "==> [7/7] driving one client ($VM_CLIENT) -> node-a's real Ethernet front -> cross-node backend round trip"
 # Client = the genuinely separate beep-client VM dialing vm-a's REAL eth0
 # address -- driven directly via limactl, not the remote.sh subcommand
 # protocol (beep-client has no /tmp/${BIN_NAME}-remote.sh copy and no MCP
@@ -208,10 +253,7 @@ echo "==> [7/7] driving one client ($VM_CLIENT) -> node-a's real Ethernet front 
 # the WG tunnel's own handshake, so the first SYN(-ACK) round trip alone
 # can take several seconds -- confirmed empirically, a 5s cap flakes on a
 # cold rig even though the dataplane mechanism itself is correct.
-set +e
-CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m 20 "http://${IP_A}:${FRONT_PORT}/" 2>&1)"
-CLIENT_RC=$?
-set -e
+curl_front 20
 if [ "$CLIENT_RC" -eq 0 ] && [ "$CLIENT_BODY" = "OK" ]; then
   echo "ROUND-TRIP: PASS (client $VM_CLIENT -> front ${IP_A}:${FRONT_PORT} -> cross-node backend -> response 'OK')"
   echo "GATE 1 TIER-1 MECHANISM: PASS (eth0-ingress, wg0-transport, symmetric return proven from a genuinely foreign client)"
