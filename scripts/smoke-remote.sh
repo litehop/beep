@@ -172,6 +172,7 @@ cleanup() {
   pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
   pkill -f "tcpdump -nn -l -vv -i smoke-veth1" 2>/dev/null || true
   rm -rf "$PIN_DIR"
+  rm -f /tmp/beep-smoke-response-remap-*.http /tmp/beep-smoke-response-pin6.http
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
   # netns: deleting the netns first can orphan smoke-veth1's namespace --
   # the veth peer keeps it alive with its bind-mount name already gone,
@@ -475,7 +476,7 @@ case "$cold_entry" in
   *) echo "FAIL: reply was delivered but the host's neighbour for ${CLIENT_IP} is '${cold_entry:-absent}', not resolved (no lladdr)" >&2; exit 1 ;;
 esac
 kill "$cold_nc_pid" 2>/dev/null || true
-ip netns exec smoke-client ip neigh del "$FRONT_IP" dev smoke-veth1
+ip netns exec smoke-client ip neigh del "$FRONT_IP" dev smoke-veth1 2>/dev/null || true
 echo "COLD-NEIGHBOR ROUND-TRIP: PASS (neighbour for ${CLIENT_IP} absent before the flow, '${cold_entry}' after; response 'COLD' delivered)"
 
 # bpftool exits nonzero AND still prints a JSON error object to stdout for a
@@ -554,8 +555,20 @@ for remap_leg in A B; do
   nohup nc -l -N "$POD_IP" "$REMAP_TARGET_PORT" < "/tmp/beep-smoke-response-remap-${remap_leg}.http" >/dev/null 2>&1 &
   disown
   sleep 0.5
-  remap_body=$(ip netns exec smoke-client curl -sS -m 5 --local-port "$REMAP_CLIENT_PORT" "http://${FRONT_IP}:${!remap_front_port_var}/") || {
-    echo "FAIL: remap round trip via front ${FRONT_IP}:${!remap_front_port_var} (client port ${REMAP_CLIENT_PORT}, leg ${remap_leg}) did not complete" >&2
+  # The previous leg's client socket sits in TIME_WAIT on the fixed source
+  # port and curl's explicit bind() cannot reuse it (rc 45, EADDRINUSE).
+  # Destroy it if the kernel allows, else wait it out.
+  ip netns exec smoke-client ss -K -tan sport = ":${REMAP_CLIENT_PORT}" >/dev/null 2>&1 || true
+  for _ in $(seq 1 70); do
+    [ -z "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ] && break
+    sleep 1
+  done
+  remap_rc=0
+  remap_body=$(ip netns exec smoke-client curl -sS -m 5 --local-port "$REMAP_CLIENT_PORT" "http://${FRONT_IP}:${!remap_front_port_var}/") || remap_rc=$?
+  [ "$remap_rc" -eq 0 ] || {
+    echo "FAIL: remap round trip via front ${FRONT_IP}:${!remap_front_port_var} (client port ${REMAP_CLIENT_PORT}, leg ${remap_leg}) did not complete (curl rc ${remap_rc}; 45 = client bind, 28 = timeout)" >&2
+    ip netns exec smoke-client ss -tan sport = ":${REMAP_CLIENT_PORT}" >&2 || true
+    map_json "$PIN_DIR/FLOW_TABLE" | jq -c '.[]' >&2 || true
     exit 1
   }
   [ "$remap_body" = "REMAP${remap_leg}" ] || {
@@ -887,6 +900,9 @@ grep -q "$PIN6_MSG" "$PIN6_BACKEND_IN" 2>/dev/null || {
   exit 1
 }
 echo "PIN-STEERING (v6 established): PASS (v6 flow kept pod ${POD6_A} after its front was re-pointed at ${POD6_B})"
+pkill -P "$(pgrep -f "sleep 60 \| nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT}" | head -n1)" 2>/dev/null || true
+pkill -f "sleep 60 \| nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT}" 2>/dev/null || true
+pkill -f "timeout 60 nc -6 ${FRONT_IP6} ${PIN6_FRONT_PORT}" 2>/dev/null || true
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nREPLACEMENT6' > /tmp/beep-smoke-response-pin6.http
 nohup nc -6 -l -N "$POD6_B" "$PIN6_TARGET_PORT" < /tmp/beep-smoke-response-pin6.http >/dev/null 2>&1 &
 disown
