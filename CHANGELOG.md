@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Owned fronts with no ready endpoints (count 0: eTP=Local with no usable
+  local pod, 0-backend Services) now silently drop new flows instead of
+  answering with a TCP RST / ICMP(v6) port unreachable, matching kube-proxy's
+  hardened edge posture. Established and pending pinned flows still forward.
+  A front with no `FRONT_META` row still passes to the host. The reject path
+  (`beep_common::reject`) and its `REJECT_BUCKET` rate limiter are removed;
+  the loader deletes a leftover `REJECT_BUCKET` pin on start.
 - The forward Geneve option is now 24 bytes and carries the target port.
   Decap reads the port from the option and no longer consults the front maps.
 - `FRONT_META` and `FRONT_ENDPOINTS` are `BPF_F_NO_PREALLOC`: memory is a
