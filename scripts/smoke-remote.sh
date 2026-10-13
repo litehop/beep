@@ -395,11 +395,11 @@ flush_host_neigh_and_assert_absent() {
 
 echo "==> control: client answers no ARP (arp off), so a cold return leg CANNOT resolve -- the round trip must fail"
 ip netns exec smoke-client ip link set smoke-veth1 arp off
-flush_host_neigh_and_assert_absent
 nohup nc -l -N "$POD_IP" "$COLD_TARGET_PORT" < "$COLD_RESPONSE_FILE" >"$COLD_BACKEND_LOG" 2>&1 &
 cold_nc_pid=$!
 disown
 sleep 0.5
+flush_host_neigh_and_assert_absent
 if control_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${FRONT_IP}:${COLD_FRONT_PORT}/" 2>&1); then
   echo "FAIL: cold-neighbor control succeeded ('$control_body') although the client could never answer ARP -- the return leg is NOT depending on neighbour resolution, so the variant below proves nothing" >&2
   exit 1
@@ -407,17 +407,19 @@ fi
 control_entry=$(host_neigh)
 case "$control_entry" in
   *lladdr*) echo "FAIL: control resolved ${CLIENT_IP} ('$control_entry') despite arp off on the client" >&2; exit 1 ;;
+  *INCOMPLETE*|*FAILED*) ;;
+  *) echo "FAIL: control left host neighbour for ${CLIENT_IP} '${control_entry:-absent}', expected INCOMPLETE|FAILED -- the return leg never attempted resolution, so the control's failure is not about ARP" >&2; exit 1 ;;
 esac
 echo "COLD-NEIGHBOR CONTROL: PASS (unresolvable client => round trip failed and host neighbour is '${control_entry:-absent}' -- success below can only come from real resolution)"
 kill "$cold_nc_pid" 2>/dev/null || true
 ip netns exec smoke-client ip link set smoke-veth1 arp on
 
 echo "==> cold-cache round trip: flush the host's entry for ${CLIENT_IP}, then drive the flow"
-flush_host_neigh_and_assert_absent
 nohup nc -l -N "$POD_IP" "$COLD_TARGET_PORT" < "$COLD_RESPONSE_FILE" >"$COLD_BACKEND_LOG" 2>&1 &
 cold_nc_pid=$!
 disown
 sleep 0.5
+flush_host_neigh_and_assert_absent
 cold_body=$(ip netns exec smoke-client curl -sS -m 8 "http://${FRONT_IP}:${COLD_FRONT_PORT}/") || {
   echo "FAIL: round trip with a cold host neighbour cache did not complete -- bpf_redirect_neigh failed to resolve ${CLIENT_IP} on the return leg" >&2
   exit 1
@@ -428,9 +430,11 @@ cold_body=$(ip netns exec smoke-client curl -sS -m 8 "http://${FRONT_IP}:${COLD_
 }
 cold_entry=$(host_neigh)
 case "$cold_entry" in
-  *FAILED*|*INCOMPLETE*|"") echo "FAIL: reply was delivered but the host's neighbour for ${CLIENT_IP} is '${cold_entry:-absent}', not resolved" >&2; exit 1 ;;
+  *lladdr*) ;;
+  *) echo "FAIL: reply was delivered but the host's neighbour for ${CLIENT_IP} is '${cold_entry:-absent}', not resolved (no lladdr)" >&2; exit 1 ;;
 esac
 kill "$cold_nc_pid" 2>/dev/null || true
+ip netns exec smoke-client ip neigh del "$FRONT_IP" dev smoke-veth1
 echo "COLD-NEIGHBOR ROUND-TRIP: PASS (neighbour for ${CLIENT_IP} absent before the flow, '${cold_entry}' after; response 'COLD' delivered)"
 
 # bpftool exits nonzero AND still prints a JSON error object to stdout for a
