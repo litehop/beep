@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use beep::front_swap::DesiredFront;
 use beep::{tunnel_remote_v6, wire_ip_v6};
-use beep_common::{wire_port, FrontEndpoint, LbFrontBackend, LbFrontKey};
+use beep_common::{wire_port, FrontEndpoint, LbFrontBackend, LbFrontKey, ENDPOINT_FLAG_IS_LOCAL};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -214,6 +214,9 @@ pub struct Endpoint {
     /// picked from these, so node identity must be decided against this set.
     pub node_addrs: Vec<IpAddr>,
     pub ready: bool,
+    /// `conditions.terminating`: a shutting-down pod never takes new flows,
+    /// even if its `ready` condition has not yet flipped.
+    pub terminating: bool,
     pub ports: Vec<u16>,
     /// `endpoints[].targetRef.uid`: the owning pod's identity, absent when the
     /// slice carries no `targetRef`. Lets the controller notice a pod IP
@@ -312,18 +315,11 @@ pub struct DesiredEntries {
 
 #[cfg(test)]
 impl DesiredEntries {
-    /// Slot-0 backend per front (every front has exactly one endpoint today).
+    /// Slot-0 backend per front. Panics on a drained front.
     pub(crate) fn backends(&self) -> HashMap<LbFrontKey, LbFrontBackend> {
         self.fronts
             .iter()
-            .map(|(k, f)| {
-                assert_eq!(
-                    f.endpoints.len(),
-                    1,
-                    "count is 1 until multi-endpoint lands"
-                );
-                (*k, f.endpoints[0].backend)
-            })
+            .map(|(k, f)| (*k, f.endpoints[0].backend))
             .collect()
     }
 
@@ -362,6 +358,12 @@ fn front_key(front_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
 /// negated, observational complement below.
 fn is_admitted(ep: &Endpoint, node: &NodeContext) -> bool {
     node.pod_cidr.contains(ep.pod_ip) || ep.node_addrs.contains(&ep.pod_ip)
+}
+
+/// Whether `ep` runs on this node: its hosting node's address set contains
+/// this node's own address, the same identity test `pod_targets_for_node` uses.
+fn is_local(ep: &Endpoint, node: &NodeContext) -> bool {
+    ep.node_addrs.contains(&node.node_ip)
 }
 
 /// POD_TARGETS is this node's own local serving-set, port-agnostic by
@@ -464,21 +466,20 @@ pub fn reconcile_service(
             .copied()
             .filter(|e| {
                 e.ready
+                    && !e.terminating
                     && e.ports.contains(&port.target_port)
                     && e.pod_ip.is_ipv4() == svc.front_ip.is_ipv4()
             })
             .collect();
-        // One endpoint per front (slot 0) for now: pick deterministically --
-        // lowest pod IP -- rather than arbitrarily (e.g. HashMap iteration
-        // order), so two reconciles over the same input always agree and a
-        // fixture-driven test can assert a specific outcome. It does not
-        // spread load across endpoints.
-        candidates.sort_by_key(|e| e.pod_ip);
+        // Local endpoints first (the dataplane hashes over that prefix), then
+        // by pod IP, so slots depend only on the endpoint set and two
+        // reconciles over the same input agree.
+        candidates.sort_by_key(|e| (!is_local(e, node), e.pod_ip));
         // No candidate still yields the front, with zero endpoints: the front
         // stays owned (FRONT_META count 0), so new clients are rejected and
         // pinned flows to draining backends keep their conntrack path.
         let endpoints = candidates
-            .first()
+            .iter()
             .map(|backend| FrontEndpoint {
                 backend: LbFrontBackend {
                     // Host-native, not wire_ip: the kernel's own
@@ -490,10 +491,13 @@ pub fn reconcile_service(
                     pod_ip: wire_ip_v6(backend.pod_ip),
                 },
                 target_port: wire_port(port.target_port),
-                flags: 0,
+                flags: if is_local(backend, node) {
+                    ENDPOINT_FLAG_IS_LOCAL
+                } else {
+                    0
+                },
                 _pad: [0; 4],
             })
-            .into_iter()
             .collect();
 
         desired.fronts.insert(
@@ -520,6 +524,7 @@ pub fn ports_without_same_family_endpoint(
     let serving = |port: &ServicePort, same_family: bool| {
         slices.iter().flat_map(|s| s.endpoints.iter()).any(|e| {
             e.ready
+                && !e.terminating
                 && e.ports.contains(&port.target_port)
                 && (e.pod_ip.is_ipv4() == svc.front_ip.is_ipv4()) == same_family
         })
@@ -582,6 +587,7 @@ mod tests {
             node_ip: IpAddr::V4(node_ip),
             node_addrs: vec![IpAddr::V4(node_ip)],
             ready: true,
+            terminating: false,
             ports,
             pod_uid: None,
         }
@@ -593,6 +599,7 @@ mod tests {
             node_ip: IpAddr::V6(node_ip),
             node_addrs: vec![IpAddr::V6(node_ip)],
             ready: true,
+            terminating: false,
             ports,
             pod_uid: None,
         }
@@ -870,14 +877,24 @@ mod tests {
         }
     }
 
+    fn pod_wire(octet: u8) -> [u8; 16] {
+        wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 0, octet)))
+    }
+
+    fn only_front(desired: &DesiredEntries) -> &DesiredFront {
+        assert_eq!(desired.fronts.len(), 1);
+        desired.fronts.values().next().unwrap()
+    }
+
+    fn slot_pods(front: &DesiredFront) -> Vec<[u8; 16]> {
+        front.endpoints.iter().map(|e| e.backend.pod_ip).collect()
+    }
+
     // Real EndpointSlices shard endpoints across multiple objects once a
-    // Service exceeds ~100 endpoints (or across zones). Treating only the
-    // first slice as authoritative would silently ignore backends in later
-    // slices, and could pick the WRONG (higher-IP) backend if the actual
-    // lowest-IP endpoint happens to land in a later slice -- breaking
-    // decision #5's determinism guarantee.
+    // Service exceeds ~100 endpoints (or across zones). Dropping later slices
+    // would leave their pods permanently unreachable through the front.
     #[test]
-    fn endpoints_split_across_multiple_slices_are_pooled_before_picking_a_backend() {
+    fn endpoints_split_across_multiple_slices_are_pooled_into_one_front() {
         let node_ip = Ipv4Addr::new(10, 0, 0, 5);
         let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         let slices = vec![
@@ -899,12 +916,359 @@ mod tests {
 
         let desired = reconcile_service(&svc, &slices, &node(node_ip));
 
-        let (_, backend) = desired.backends().into_iter().next().unwrap();
         assert_eq!(
-            unmap_ipv4(&backend.pod_ip).unwrap().to_le_bytes(),
-            [10, 244, 0, 2],
-            "the lowest-IP endpoint across BOTH slices must win -- a reconcile that only looked \
-             at the first slice would wrongly pick .20 here"
+            slot_pods(only_front(&desired)),
+            vec![pod_wire(2), pod_wire(20)],
+            "pods from BOTH slices must be slotted; a reconcile that only looked at one slice \
+             would leave the other slice's pods unreachable"
+        );
+    }
+
+    // The dataplane picks slot = hash % count, so every ready pod must own a
+    // slot: with pick-one, every new flow lands on the lowest pod and the
+    // others sit idle.
+    #[test]
+    fn every_ready_endpoint_gets_its_own_slot_with_the_wire_target_port() {
+        let node_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: [30u8, 10, 20]
+                .iter()
+                .map(|o| ready_endpoint(Ipv4Addr::new(10, 244, 0, *o), node_ip, vec![8080]))
+                .collect(),
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(node_ip));
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(10), pod_wire(20), pod_wire(30)],
+            "N ready endpoints must produce N slots, ordered by pod IP"
+        );
+        assert!(
+            front
+                .endpoints
+                .iter()
+                .all(|e| e.target_port == wire_port(8080)),
+            "every row carries the target port; decap reads it from the row's option"
+        );
+    }
+
+    // A slot move re-hashes flows that were not touched by the change. Slots
+    // depend only on the endpoint SET, never on the order the apiserver
+    // happened to list it.
+    #[test]
+    fn slots_are_stable_across_endpoint_and_slice_order() {
+        let node_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let ep = |o: u8| ready_endpoint(Ipv4Addr::new(10, 244, 0, o), node_ip, vec![8080]);
+        let one_slice = vec![EndpointSliceView {
+            endpoints: vec![ep(10), ep(20), ep(30)],
+        }];
+        let reordered = vec![
+            EndpointSliceView {
+                endpoints: vec![ep(30)],
+            },
+            EndpointSliceView {
+                endpoints: vec![ep(20), ep(10)],
+            },
+        ];
+
+        let a = reconcile_service(&svc, &one_slice, &node(node_ip));
+        let b = reconcile_service(&svc, &reordered, &node(node_ip));
+
+        assert_eq!(
+            only_front(&a),
+            only_front(&b),
+            "same endpoint set must give identical slots, or every listing-order flip re-homes \
+             live flows"
+        );
+        assert!(
+            plan_for(&a, &b).is_empty(),
+            "an unchanged set must not mint a new generation"
+        );
+    }
+
+    // New flows must only reach pods that serve the client's address family:
+    // the Geneve inner packet keeps the client's family, so a cross-family
+    // pod can never answer.
+    #[test]
+    fn only_endpoints_of_the_fronts_address_family_are_slotted() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip: Ipv6Addr = "fd00::5".parse().unwrap();
+        let v6_pod: Ipv6Addr = "fd00:244::9".parse().unwrap();
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 9), node_v4, vec![8080]),
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 8), node_v4, vec![8080]),
+                ready_endpoint_v6(v6_pod, node_v6_ip, vec![8080]),
+            ],
+        }];
+        let v4 = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let v6 = single_port_service_v6("fd00:beef::1".parse().unwrap(), 80, 8080);
+
+        let d4 = reconcile_service(&v4, &slices, &node(node_v4));
+        let d6 = reconcile_service(&v6, &slices, &node(node_v4));
+
+        assert_eq!(
+            slot_pods(only_front(&d4)),
+            vec![pod_wire(8), pod_wire(9)],
+            "the v4 front must carry both v4 pods and no v6 pod"
+        );
+        assert_eq!(
+            slot_pods(only_front(&d6)),
+            vec![wire_ip_v6(IpAddr::V6(v6_pod))],
+            "the v6 front must carry only the v6 pod"
+        );
+    }
+
+    // A terminating pod is shutting down; sending it new flows resets them
+    // mid-handshake. `ready` can lag `terminating`, so both are checked.
+    #[test]
+    fn terminating_and_unready_endpoints_never_take_new_flows() {
+        let node_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let ep = |o: u8| ready_endpoint(Ipv4Addr::new(10, 244, 0, o), node_ip, vec![8080]);
+        let mut terminating = ep(10);
+        terminating.terminating = true;
+        let mut unready = ep(11);
+        unready.ready = false;
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![terminating, unready, ep(12)],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(node_ip));
+
+        assert_eq!(
+            slot_pods(only_front(&desired)),
+            vec![pod_wire(12)],
+            "only the ready, non-terminating pod may be slotted"
+        );
+        assert!(
+            desired.pod_targets.contains(&pod_wire(10)),
+            "a terminating pod keeps its POD_TARGETS entry so its pinned flows still drain"
+        );
+    }
+
+    // Slots `0..local_count` are the node's own pods and the dataplane hashes
+    // over exactly that prefix, so local pods must come first AND carry the
+    // flag, even when a remote pod has the lower IP.
+    #[test]
+    fn local_endpoints_sort_first_and_are_flagged() {
+        let this_node = Ipv4Addr::new(10, 0, 0, 5);
+        let other_node = Ipv4Addr::new(10, 0, 0, 6);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 1), other_node, vec![8080]),
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 30), this_node, vec![8080]),
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 20), this_node, vec![8080]),
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 2), other_node, vec![8080]),
+            ],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(this_node));
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(20), pod_wire(30), pod_wire(1), pod_wire(2)],
+            "local pods first (by IP), then remote pods (by IP)"
+        );
+        let flags: Vec<u16> = front.endpoints.iter().map(|e| e.flags).collect();
+        assert_eq!(
+            flags,
+            vec![ENDPOINT_FLAG_IS_LOCAL, ENDPOINT_FLAG_IS_LOCAL, 0, 0],
+            "IS_LOCAL marks exactly the local prefix"
+        );
+        assert_eq!(front.local_count(), 2);
+        let plans = plan_for(&DesiredEntries::default(), &desired);
+        assert!(
+            matches!(plans[0].steps.last(), Some(beep::front_swap::FrontWrite::PutMeta(_, m))
+                if m.count == 4 && m.local_count == 2),
+            "FRONT_META must publish count 4 / local_count 2; got {:?}",
+            plans[0].steps
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_local_endpoint_has_local_count_zero_so_it_spreads_over_all() {
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let remote = Ipv4Addr::new(10, 0, 0, 6);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 1), remote, vec![8080]),
+                ready_endpoint(Ipv4Addr::new(10, 244, 0, 2), remote, vec![8080]),
+            ],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        let front = only_front(&desired);
+        assert_eq!(front.endpoints.len(), 2);
+        assert_eq!(
+            front.local_count(),
+            0,
+            "local_count > 0 would pin every flow to one local prefix; with none local the \
+             dataplane must hash over all ready slots"
+        );
+    }
+
+    // A pod that is local on a dual-stack node answers to either of its
+    // node's addresses, so locality must be decided on the whole address set,
+    // not the one address picked as the Geneve remote.
+    #[test]
+    fn locality_matches_any_of_the_hosting_nodes_addresses() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip: Ipv6Addr = "fd00::5".parse().unwrap();
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                ready_endpoint(
+                    Ipv4Addr::new(10, 244, 0, 1),
+                    Ipv4Addr::new(10, 0, 0, 6),
+                    vec![8080],
+                ),
+                dual_stack_endpoint(
+                    IpAddr::V4(Ipv4Addr::new(10, 244, 0, 9)),
+                    vec![IpAddr::V6(node_v6_ip), IpAddr::V4(node_v4)],
+                ),
+            ],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(node_v4));
+
+        let front = only_front(&desired);
+        assert_eq!(slot_pods(front), vec![pod_wire(9), pod_wire(1)]);
+        assert_eq!(front.local_count(), 1);
+    }
+
+    // Draining to zero must keep FRONT_META (count 0) so the dataplane
+    // rejects new clients and pinned flows keep their path; deleting it would
+    // make the front pass through to the host.
+    #[test]
+    fn losing_every_ready_endpoint_commits_count_zero_instead_of_deleting_the_front() {
+        let node_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let ep = |o: u8| ready_endpoint(Ipv4Addr::new(10, 244, 0, o), node_ip, vec![8080]);
+        let ready = reconcile_service(
+            &svc,
+            &[EndpointSliceView {
+                endpoints: vec![ep(1), ep(2)],
+            }],
+            &node(node_ip),
+        );
+        let mut gone = ep(1);
+        gone.ready = false;
+        let mut gone2 = ep(2);
+        gone2.terminating = true;
+        let drained = reconcile_service(
+            &svc,
+            &[EndpointSliceView {
+                endpoints: vec![gone, gone2],
+            }],
+            &node(node_ip),
+        );
+
+        let plans = plan_for(&ready, &drained);
+
+        assert_eq!(plans.len(), 1);
+        let steps = &plans[0].steps;
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, beep::front_swap::FrontWrite::DeleteMeta(_))),
+            "an owned front with no ready endpoint must keep its FRONT_META row; got {steps:?}"
+        );
+        assert!(
+            matches!(steps.last(), Some(beep::front_swap::FrontWrite::PutMeta(_, m))
+                if m.count == 0 && m.local_count == 0),
+            "the drained front must commit count 0; got {steps:?}"
+        );
+    }
+
+    // Scaling 1 -> 3 and 3 -> 1: new rows are written under the next
+    // generation BEFORE the meta flip raises the count, and the live
+    // generation's rows are never touched by the plan that lowers the count,
+    // so a reader never sees a count past the rows that exist.
+    #[test]
+    fn scaling_writes_rows_before_the_count_and_never_touches_the_live_generation() {
+        use beep::front_swap::FrontWrite;
+        let node_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let ep = |o: u8| ready_endpoint(Ipv4Addr::new(10, 244, 0, o), node_ip, vec![8080]);
+        let at = |eps: Vec<Endpoint>| {
+            reconcile_service(
+                &svc,
+                &[EndpointSliceView { endpoints: eps }],
+                &node(node_ip),
+            )
+        };
+        let one = at(vec![ep(1)]);
+        let three = at(vec![ep(1), ep(2), ep(3)]);
+
+        let up = plan_for(&one, &three);
+        let steps = &up[0].steps;
+        let puts = steps
+            .iter()
+            .filter(|s| matches!(s, FrontWrite::PutEndpoint(k, _) if k.generation == 2))
+            .count();
+        assert_eq!(
+            puts, 3,
+            "all three rows are written under the next generation"
+        );
+        assert!(
+            matches!(steps.last(), Some(FrontWrite::PutMeta(_, m)) if m.count == 3 && m.generation == 2),
+            "the count is raised last, after every row exists; got {steps:?}"
+        );
+
+        let down = plan_for(&three, &one);
+        let steps = &down[0].steps;
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, FrontWrite::DeleteEndpoint(k) if k.generation == 1)),
+            "lowering the count must not delete the live generation's rows in the same plan; \
+             got {steps:?}"
+        );
+        assert!(
+            matches!(steps.last(), Some(FrontWrite::PutMeta(_, m)) if m.count == 1 && m.generation == 2),
+            "the lowered count commits after the 1-row generation is written; got {steps:?}"
+        );
+    }
+
+    // A pod moving off this node keeps its IP, target port and node IP view;
+    // only IS_LOCAL and local_count change, yet the dataplane's hash domain
+    // changes with them, so the planner must republish.
+    #[test]
+    fn a_locality_change_alone_republishes_the_front() {
+        let this_node = Ipv4Addr::new(10, 0, 0, 5);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let remote = Ipv4Addr::new(10, 0, 0, 6);
+        let slices = |first_is_local: bool| {
+            let mut first = ready_endpoint(Ipv4Addr::new(10, 244, 0, 1), remote, vec![8080]);
+            if first_is_local {
+                first.node_addrs = vec![IpAddr::V4(this_node)];
+            }
+            vec![EndpointSliceView {
+                endpoints: vec![
+                    first,
+                    ready_endpoint(Ipv4Addr::new(10, 244, 0, 2), remote, vec![8080]),
+                ],
+            }]
+        };
+        let before = reconcile_service(&svc, &slices(true), &node(this_node));
+        let after = reconcile_service(&svc, &slices(false), &node(this_node));
+
+        let plans = plan_for(&before, &after);
+
+        assert_eq!(plans.len(), 1, "lost locality must be republished");
+        assert!(
+            matches!(plans[0].steps.last(), Some(beep::front_swap::FrontWrite::PutMeta(_, m))
+                if m.local_count == 0 && m.count == 2),
+            "the new generation must carry local_count 0; got {:?}",
+            plans[0].steps
         );
     }
 
@@ -1062,6 +1426,7 @@ mod tests {
             node_ip: node_addrs[0],
             node_addrs,
             ready: true,
+            terminating: false,
             ports: vec![8080],
             pod_uid: None,
         }
@@ -1396,7 +1761,7 @@ mod tests {
             assert_eq!(
                 f.endpoints.len(),
                 1,
-                "count must be 1 until selection exists"
+                "each front carries only the pod of its own family"
             );
             assert_eq!(f.endpoints[0].target_port, wire_port(8080));
             assert_eq!(f.endpoints[0].backend.pod_ip, wire_ip_v6(expected_pod));

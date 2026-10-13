@@ -92,6 +92,7 @@ struct RawEndpoint {
     pod_ip: IpAddr,
     node_name: Option<String>,
     ready: bool,
+    terminating: bool,
     pod_uid: Option<String>,
 }
 
@@ -296,6 +297,7 @@ fn parse_endpoint_slice(obj: &Value) -> RawEndpointSlice {
                 pod_ip,
                 node_name: e["nodeName"].as_str().map(str::to_owned),
                 ready: e["conditions"]["ready"].as_bool().unwrap_or(true),
+                terminating: e["conditions"]["terminating"].as_bool().unwrap_or(false),
                 pod_uid: e["targetRef"]["uid"].as_str().map(str::to_owned),
             })
         })
@@ -895,6 +897,7 @@ impl WatchState {
                                 node_ip,
                                 node_addrs,
                                 ready: e.ready,
+                                terminating: e.terminating,
                                 ports: slice.ports.iter().map(|p| p.port).collect(),
                                 pod_uid: e.pod_uid.clone(),
                             })
@@ -1525,6 +1528,71 @@ mod tests {
             state.desired(&ingress).cluster_backends.is_empty(),
             "a departed backend must leave the set so the sweep sees it go"
         );
+    }
+
+    // End to end from raw API objects: nodeName must survive parsing to
+    // decide locality, and `conditions.terminating` must exclude a pod whose
+    // `ready` has not flipped yet.
+    #[test]
+    fn raw_slices_become_a_local_first_slot_list_without_terminating_pods() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"namespace": "default", "name": "svc-a"},
+                "spec": {
+                    "type": "LoadBalancer",
+                    "ports": [{"port": 80, "protocol": "TCP"}],
+                    "ipFamilies": ["IPv4"],
+                },
+            },
+        }));
+        for (name, ip) in [("node-a", "10.0.0.5"), ("node-b", "10.0.0.6")] {
+            state.apply_node_event(&serde_json::json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": name},
+                    "status": {"addresses": [{"type": "InternalIP", "address": ip}]},
+                },
+            }));
+        }
+        state.mark_fully_listed();
+        let ep = |ip: &str, node: &str, terminating: bool| {
+            serde_json::json!({
+                "addresses": [ip], "nodeName": node,
+                "conditions": {"ready": true, "terminating": terminating},
+            })
+        };
+        state.apply_endpoint_slice_event(&serde_json::json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "s1",
+                    "labels": {"kubernetes.io/service-name": "svc-a"},
+                },
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "endpoints": [
+                    ep("10.244.0.1", "node-b", false),
+                    ep("10.244.1.30", "node-a", false),
+                    ep("10.244.0.2", "node-b", true),
+                    ep("10.244.1.20", "node-a", false),
+                ],
+            },
+        }));
+
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+
+        let front = desired.fronts.values().next().expect("one front");
+        let wire =
+            |third: u8, last: u8| wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, third, last)));
+        let slots: Vec<_> = front.endpoints.iter().map(|e| e.backend.pod_ip).collect();
+        assert_eq!(
+            slots,
+            vec![wire(1, 20), wire(1, 30), wire(0, 1)],
+            "local pods first, then remote, with the terminating pod dropped"
+        );
+        assert_eq!(front.local_count(), 2);
     }
 
     // A terminating pod (ready=false, serving=true) and a pod flapping its
