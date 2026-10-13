@@ -35,7 +35,7 @@ use aya::{
     Ebpf,
 };
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, capacity_hint, evict_pod_flows,
+    attach_and_pin, capacity_hint, evict_pod_flows,
     front_swap::{plan_front_writes, run_front_plan, DesiredFront, FrontPlan, FrontWrite},
     load_ebpf, local_pod_ips, parse_fixture, parse_iface_name, populate_config,
     populate_uplink_config, random_seed, stale_pod_targets, tunnel_remote_v6, wire_ip_v6, Fixture,
@@ -455,8 +455,6 @@ fn main() -> anyhow::Result<()> {
             front_outside_service_cidr(fixture.front_ip, service_cidr).map_err(|e| anyhow!(e))?;
         }
     }
-
-    bump_memlock_rlimit();
 
     // Pin dir must exist before `loader.load()`: `map_pin_path`'s
     // `create_pinned_by_name` calls `bpf_obj_pin` on a miss, which fails if

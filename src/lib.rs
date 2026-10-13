@@ -233,8 +233,8 @@ pub fn stale_pod_targets<T: Copy + Eq + std::hash::Hash>(existing: &[T], live: &
 /// `beep_common::encode_flow_key`'s doc comment), or `None` for a tag value
 /// `beep-ebpf` never writes. Callers MUST branch on this before reading
 /// either the key (Reverse/PortMemo) or the value's union arm (Forward) --
-/// `FlowValue::as_forward`/`as_reverse`/`as_port_memo` are unchecked reads
-/// (`beep_common`'s own doc comment on `FlowValue`) that silently return
+/// `FlowValue::as_forward` is an unchecked read
+/// (`beep_common`'s own doc comment on `FlowValue`) that silently returns
 /// garbage for the wrong arm instead of erroring.
 pub fn flow_key_direction(key: &FlowKey) -> Option<FlowDirection> {
     match key[TCP_FLOW_KEY_LEN] {
@@ -382,23 +382,6 @@ pub fn evict_pod_flows(
         anyhow::bail!("{failed} conntrack eviction delete(s) failed -- see per-entry errors above");
     }
     Ok(())
-}
-
-/// Bumps the memlock rlimit for kernels that still account eBPF map memory
-/// against it instead of the memcg-based accounting used since Linux 5.11.
-pub fn bump_memlock_rlimit() {
-    let rlim = libc::rlimit {
-        rlim_cur: libc::RLIM_INFINITY,
-        rlim_max: libc::RLIM_INFINITY,
-    };
-    // SAFETY: `&rlim` points to a live, fully initialised local `rlimit`
-    // that setrlimit only reads for the duration of the call.
-    let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
-    if ret != 0 {
-        eprintln!(
-            "warning: setrlimit(RLIMIT_MEMLOCK) failed (harmless on memcg-accounted kernels)"
-        );
-    }
 }
 
 /// `FRONT_META` holds one entry per front address x Service port, which
@@ -1512,8 +1495,7 @@ mod tests {
     #[test]
     fn flow_key_direction_reads_the_tag_byte_each_role_was_encoded_with() {
         // The eviction sweep's tag-check-before-union-read guardrail
-        // (`FlowValue::as_forward`/`as_reverse`/`as_port_memo` are unchecked
-        // reads) depends entirely on this decode being correct -- a
+        // (`FlowValue::as_forward` is an unchecked read) depends entirely on this decode being correct -- a
         // mismatched tag byte here would make the sweep call the wrong
         // union arm's reader on a Forward-tagged row.
         let ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));

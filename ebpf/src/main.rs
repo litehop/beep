@@ -50,8 +50,9 @@ use core::mem::MaybeUninit;
 
 use aya_ebpf::{
     bindings::{
-        bpf_tunnel_key, BPF_F_PSEUDO_HDR, BPF_F_TUNINFO_IPV6, TC_ACT_OK, TC_ACT_REDIRECT,
-        TC_ACT_SHOT,
+        __sk_buff, bpf_tunnel_key, bpf_tunnel_key__bindgen_ty_1, bpf_tunnel_key__bindgen_ty_2,
+        bpf_tunnel_key__bindgen_ty_3, BPF_F_PSEUDO_HDR, BPF_F_TUNINFO_IPV6, TC_ACT_OK,
+        TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
     helpers::{
         bpf_csum_diff, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head,
@@ -380,8 +381,11 @@ static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries
 #[inline(always)]
 fn flow_table_get_forward(key: FlowKey) -> Option<ForwardFlowValue> {
     // SAFETY: `get_ptr` yields a non-null pointer into the map element,
-    // copied before any other helper call; a concurrent update or eviction
-    // can only make the copy stale.
+    // copied before any other helper call. FLOW_TABLE is written only via
+    // map `insert` (replaces the whole element) and loader `remove`, so a
+    // reader sees a whole old or new value, never a torn one. Invariant:
+    // FLOW_TABLE must never get an in-place writer (`get_ptr_mut`,
+    // BPF_F_LOCK); that would make this copy racy.
     FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).forward })
 }
 
@@ -515,13 +519,22 @@ enum IngressMiss {
     Reject,
 }
 
+/// The program's `__sk_buff` context for plain field reads. Callers read the
+/// field immediately; no reference is held across a helper that rewrites the
+/// skb.
+#[inline(always)]
+fn skb_ctx(ctx: &TcContext) -> &__sk_buff {
+    // SAFETY: `ctx.skb.skb` is the program's live, non-null `__sk_buff`
+    // context for the whole invocation.
+    unsafe { &*ctx.skb.skb }
+}
+
 /// Entry gate shared by the two reject paths: the L3 offset and whether the
 /// client packet is IPv4, or `None` when the packet must not be answered at
 /// all (link-layer broadcast/multicast or not addressed to this host).
 #[inline(always)]
 fn reject_l3(ctx: &TcContext, ingress_ifindex: u32) -> Option<(usize, bool)> {
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    if unsafe { (*ctx.skb.skb).pkt_type } != PACKET_HOST {
+    if skb_ctx(ctx).pkt_type != PACKET_HOST {
         return None;
     }
     let l3 = uplink_config_get(ingress_ifindex)?.l2_hlen as usize;
@@ -816,6 +829,27 @@ fn set_tunnel_remote(tkey: &mut bpf_tunnel_key, node_ip: &[u8; 16]) -> u64 {
     }
 }
 
+// The kernel reads and writes `bpf_tunnel_key` as raw bytes, so every byte of
+// the zeroed key must be initialised; that holds only while the struct has no
+// padding (4 + 16 + 1 + 1 + 2 + 4 + 16) and each union literal below uses its
+// largest arm.
+const _: () = assert!(core::mem::size_of::<bpf_tunnel_key>() == 44);
+
+#[inline(always)]
+fn zeroed_tunnel_key() -> bpf_tunnel_key {
+    bpf_tunnel_key {
+        tunnel_id: 0,
+        __bindgen_anon_1: bpf_tunnel_key__bindgen_ty_1 {
+            remote_ipv6: [0; 4],
+        },
+        tunnel_tos: 0,
+        tunnel_ttl: 0,
+        __bindgen_anon_2: bpf_tunnel_key__bindgen_ty_2 { tunnel_ext: 0 },
+        tunnel_label: 0,
+        __bindgen_anon_3: bpf_tunnel_key__bindgen_ty_3 { local_ipv6: [0; 4] },
+    }
+}
+
 /// GET-side counterpart of `set_tunnel_remote`: `bpf_skb_get_tunnel_key`
 /// errors outright (`-EPROTO`, `net/core/filter.c`) when its `flags`
 /// argument doesn't match the tunnel's actual family, so a single flags=0
@@ -828,9 +862,7 @@ fn set_tunnel_remote(tkey: &mut bpf_tunnel_key, node_ip: &[u8; 16]) -> u64 {
 /// union field (`tunnel_remote` below).
 #[inline(always)]
 fn get_tunnel_key(ctx: &TcContext) -> Option<(bpf_tunnel_key, bool)> {
-    // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
-    // which all-zero is a valid value.
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
+    let mut tkey = zeroed_tunnel_key();
     let size = core::mem::size_of::<bpf_tunnel_key>() as u32;
     // SAFETY: `ctx.skb.skb` is the live skb; `tkey` is a stack local of
     // exactly `size` bytes.
@@ -899,9 +931,7 @@ fn redirect_to_geneve<const N: usize>(
     mut opt: [u8; N],
     l3_ethertype: u16,
 ) -> Option<i32> {
-    // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
-    // which all-zero is a valid value.
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
+    let mut tkey = zeroed_tunnel_key();
     let tkey_flags = set_tunnel_remote(&mut tkey, remote);
     tkey.tunnel_id = vni;
     tkey.tunnel_ttl = 64;
@@ -965,8 +995,7 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // hook the packet's ingress ifindex IS the physical uplink it just
     // arrived on (this classifier is attached directly to that device's
     // ingress, before any redirect).
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    let ingress_ifindex = unsafe { (*ctx.skb.skb).ingress_ifindex };
+    let ingress_ifindex = skb_ctx(ctx).ingress_ifindex;
     // A per-uplink map hit is simultaneously admission (this ifindex is a
     // configured `--uplink-iface`) and the L2 header length to parse with --
     // a miss means an unconfigured interface, passed through untouched like
@@ -1917,8 +1946,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // this datapath reads skb->mark today, but leaving a stale internal
     // marker on a packet leaving the node is a needless landmine for any
     // future mark-based tc/iptables rule on this uplink.
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    let mark = unsafe { (*ctx.skb.skb).mark };
+    let mark = skb_ctx(ctx).mark;
     if is_redirected_return_mark(mark) {
         ctx.set_mark(0);
         return Some(TC_ACT_OK);
@@ -1932,8 +1960,7 @@ fn try_uplink_egress_return(ctx: &TcContext) -> Option<i32> {
     // which configured uplink this invocation is running for. See
     // `try_uplink_ingress`'s matching comment for why the L2 header length
     // is resolved once by the loader, not assumed to be Ethernet's 14 bytes.
-    // SAFETY: `ctx.skb.skb` is the program's live `__sk_buff` context.
-    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    let ifindex = skb_ctx(ctx).ifindex;
     let l2_hlen = uplink_config_get(ifindex)?.l2_hlen as usize;
     // See `try_uplink_ingress`'s matching comment: dispatches on a const
     // generic so every `load_direct` offset below is a compile-time literal.

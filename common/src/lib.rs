@@ -428,9 +428,15 @@ pub union FlowValue {
 /// the chosen arm is smaller than the union.
 impl FlowValue {
     const fn zeroed() -> Self {
-        // SAFETY: every arm is plain integer/array data, for which all-zero
-        // is valid.
-        unsafe { core::mem::zeroed() }
+        Self {
+            forward: ForwardFlowValue {
+                backend: LbFrontBackend {
+                    backend_node_ip: [0; 16],
+                    pod_ip: [0; 16],
+                },
+                ingress_ifindex: 0,
+            },
+        }
     }
 
     pub const fn from_forward(forward: ForwardFlowValue) -> Self {
@@ -451,6 +457,11 @@ impl FlowValue {
         v
     }
 }
+
+// `zeroed` initialises only the `forward` arm; every byte of the union is
+// zeroed only if that arm spans it, so uninitialised stack never reaches
+// FLOW_TABLE through a smaller arm.
+const _: () = assert!(size_of::<ForwardFlowValue>() == size_of::<FlowValue>());
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
@@ -602,18 +613,6 @@ impl FlowValue {
         // `impl_pod!`), so any bytes are a valid value of any arm; a wrong
         // arm yields wrong data, not UB.
         unsafe { self.forward }
-    }
-
-    /// Reads the `reverse` arm -- see `as_forward`'s caveat.
-    pub fn as_reverse(&self) -> RevFlowValue {
-        // SAFETY: as `as_forward`.
-        unsafe { self.reverse }
-    }
-
-    /// Reads the `port_memo` arm -- see `as_forward`'s caveat.
-    pub fn as_port_memo(&self) -> PortMemoValue {
-        // SAFETY: as `as_forward`.
-        unsafe { self.port_memo }
     }
 }
 
@@ -1375,7 +1374,7 @@ mod tests {
         // (RevFlowValue, 36 bytes) -- any larger would mean the union picked
         // up padding bytes FLOW_TABLE's kernel-side write leaves
         // uninitialized, and a userspace `aya::Pod` read of a DIFFERENT arm
-        // (e.g. `as_port_memo` on a slot written as `forward`) would then
+        // (e.g. the `port_memo` arm of a slot written as `forward`) would then
         // read stale/uninitialized trailing bytes as if they were real
         // field data instead of cleanly aliasing the smaller arm's prefix.
         assert_eq!(

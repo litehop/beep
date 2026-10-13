@@ -18,8 +18,8 @@ use std::{
 use anyhow::Context;
 use aya::programs::TcAttachType;
 use beep::{
-    attach_and_pin, bump_memlock_rlimit, disable_rp_filter, ensure_geneve_iface, load_ebpf,
-    parse_iface_name, populate_config, populate_uplink_config, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
+    attach_and_pin, disable_rp_filter, ensure_geneve_iface, load_ebpf, parse_iface_name,
+    populate_config, populate_uplink_config, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
     DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
     DEFAULT_POD_TARGETS_MAX_ENTRIES,
 };
@@ -526,7 +526,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    bump_memlock_rlimit();
     // Pin dir must exist before `load_ebpf`: a fresh pin path's
     // `create_pinned_by_name` calls `bpf_obj_pin` on a miss, which fails if
     // its parent directory isn't there yet.
