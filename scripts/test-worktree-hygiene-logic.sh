@@ -510,6 +510,31 @@ printf 'Just prose, no bead reference.\n' > "$FINDING_NO_HEADER"
 assert "bead_id_from_finding returns empty for a file with no Bead: header (must not be treated as a match for any bead)" \
   "$([ -z "$(call bead_id_from_finding "$FINDING_NO_HEADER")" ] && echo 1 || echo 0)"
 
+# Regression: `Bead: beep-zy. Written ...` was parsed as "beep-zy." (the
+# trailing '.' swallowed into the ID), so bd showed no live record and a live
+# finding was flagged for deletion. Dotted child suffixes (`beep-zx.4`) must
+# still survive.
+check_extract() {  # <label> <header line> <expected id; empty = unparseable>
+  local label="$1" line="$2" want="$3" f="$SANDBOX_ROOT/extract.md"
+  printf '%s\n\nBody.\n' "$line" > "$f"
+  assert "bead_id_from_finding: $label" \
+    "$([ "$(call bead_id_from_finding "$f")" = "$want" ] && echo 1 || echo 0)"
+}
+check_extract "trailing sentence period is not part of the id (live finding must not be flagged stale)" \
+  'Bead: beep-zy. Written 2026-10-13' "beep-zy"
+check_extract "dotted child suffix is kept" 'Bead: beep-zx.4' "beep-zx.4"
+check_extract "trailing period after a dotted child id is stripped" 'Bead: beep-zx.4.' "beep-zx.4"
+check_extract "HTML-comment header form is accepted" '<!-- Bead: mayor-zw.22 -->' "mayor-zw.22"
+check_extract "trailing comma is stripped" 'Bead: beep-zv,' "beep-zv"
+check_extract "garbage header yields no id" 'Bead: !!! not a bead' ""
+
+FINDING_GARBAGE="$SANDBOX_ROOT/finding-garbage.md"
+printf 'Bead: !!! not a bead\n' > "$FINDING_GARBAGE"
+RC=0
+call finding_has_bead_header "$FINDING_GARBAGE" || RC=$?
+assert "an unparseable Bead: header is still recognised as a header so step E can say 'unparseable' instead of 'no live record'" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
 # Regression: a header with trailing descriptive text (e.g. a parenthetical
 # naming related beads) used to be slurped whole, whitespace stripped, into
 # one mangled compound token that matches no live bd record -- so a real,
