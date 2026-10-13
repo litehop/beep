@@ -59,6 +59,10 @@ fetch_verified() {
 guest() {
   local bin="$1"
   echo "==> guest kernel: $(uname -r)"
+  # The runner ships /usr/sbin/bpftool, a linux-tools wrapper that only works
+  # for the host's own kernel release; the workflow's standalone build is in
+  # /usr/local/bin.
+  export PATH="/usr/local/bin:$PATH"
   mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
   install -m 0755 "$bin" /tmp/beep-smoke
   bash scripts/smoke-remote.sh run
