@@ -32,6 +32,8 @@ $ cargo build --release   # from this directory; builds beep-ebpf too
 
 ## Running
 
+Requires Linux >= 5.11 (memcg-based BPF memory accounting; the loader no longer raises `RLIMIT_MEMLOCK`).
+
 Run the loader as root, pointing it at your interfaces and at least one fixture:
 
 ```console

@@ -384,23 +384,6 @@ pub fn evict_pod_flows(
     Ok(())
 }
 
-/// Bumps the memlock rlimit for kernels that still account eBPF map memory
-/// against it instead of the memcg-based accounting used since Linux 5.11.
-pub fn bump_memlock_rlimit() {
-    let rlim = libc::rlimit {
-        rlim_cur: libc::RLIM_INFINITY,
-        rlim_max: libc::RLIM_INFINITY,
-    };
-    // SAFETY: `&rlim` points to a live, fully initialised local `rlimit`
-    // that setrlimit only reads for the duration of the call.
-    let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
-    if ret != 0 {
-        eprintln!(
-            "warning: setrlimit(RLIMIT_MEMLOCK) failed (harmless on memcg-accounted kernels)"
-        );
-    }
-}
-
 /// `FRONT_META` holds one entry per front address x Service port, which
 /// scales with nodes x Service ports under the every-node-is-a-front model;
 /// 4096 covers e.g. 100 nodes x 40 Service ports.

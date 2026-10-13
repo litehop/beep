@@ -456,8 +456,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    bump_memlock_rlimit();
-
     // Pin dir must exist before `loader.load()`: `map_pin_path`'s
     // `create_pinned_by_name` calls `bpf_obj_pin` on a miss, which fails if
     // its parent directory isn't there yet.

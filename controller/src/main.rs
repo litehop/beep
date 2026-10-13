@@ -526,7 +526,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    bump_memlock_rlimit();
     // Pin dir must exist before `load_ebpf`: a fresh pin path's
     // `create_pinned_by_name` calls `bpf_obj_pin` on a miss, which fails if
     // its parent directory isn't there yet.
