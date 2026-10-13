@@ -70,10 +70,10 @@ mkelf() {
 
 # .BTF.ext: 32-byte header, func_info 8 bytes, then line_info/core_relo payloads.
 btf_ext() {
-  local line_len=$1 core_len=$2
+  local line_len=$1 core_len=$2 hdr_len=${3:-32}
   {
     printf '\x9f\xeb\x01\x00'
-    le 4 32; le 4 0; le 4 8; le 4 8; le 4 "$line_len"; le 4 $((8 + line_len)); le 4 "$core_len"
+    le 4 "$hdr_len"; le 4 0; le 4 8; le 4 8; le 4 "$line_len"; le 4 $((8 + line_len)); le 4 "$core_len"
     head -c $((8 + line_len + core_len)) /dev/zero
   }
 }
@@ -121,6 +121,65 @@ expect_fail ".rel.BTF present is rejected" "$tmp/relb.o" "BTF relocation section
 
 build dbg 0 0 .debug_info="$tmp/junk"
 expect_fail ".debug_* present is rejected" "$tmp/dbg.o" "debug_"
+
+build_raw() {
+  mkelf "$tmp/$1.o" .BTF="$tmp/btf" .BTF.ext="$tmp/ext"
+}
+
+# 24-byte (pre-CO-RE) header: magic..line_info_len, then func_info payload.
+hdr24() {
+  {
+    printf '\x9f\xeb\x01\x00'
+    le 4 24; le 4 0; le 4 8; le 4 8; le 4 "$1"
+    head -c 8 /dev/zero
+  } > "$tmp/ext"
+}
+
+hdr24 0
+build_raw h24
+if out="$(bash "$SCRIPT" "$tmp/h24.o" 2>&1)"; then
+  assert "24-byte header with line_info 0 passes (valid pre-CO-RE objects must not be rejected)" ok
+else
+  assert "24-byte header with line_info 0 passes: $out" bad
+fi
+
+head -c 24 "$tmp/ext" > "$tmp/ext24"
+mv "$tmp/ext24" "$tmp/ext"
+build_raw h24short
+if out="$(bash "$SCRIPT" "$tmp/h24short.o" 2>&1)"; then
+  assert "bare 24-byte section (< 32 bytes) passes" ok
+else
+  assert "bare 24-byte section (< 32 bytes) passes: $out" bad
+fi
+
+hdr24 24
+build_raw h24line
+expect_fail "24-byte header with line_info present is rejected (line_info is read even without core_relo)" "$tmp/h24line.o" "line_info_len=24"
+
+btf_ext 0 0 16 > "$tmp/ext"
+build_raw bhdr16
+expect_fail "hdr_len < 24 is rejected" "$tmp/bhdr16.o" "hdr_len 16"
+
+btf_ext 0 0 28 > "$tmp/ext"
+build_raw bhdr28
+expect_fail "hdr_len 28 is rejected (no valid header has 25..31 bytes)" "$tmp/bhdr28.o" "hdr_len 28"
+
+btf_ext 0 0 > "$tmp/ext"
+printf '\x00\x00' | dd of="$tmp/ext" bs=1 conv=notrunc 2>/dev/null
+build_raw badmagic
+expect_fail "bad magic is rejected (not a BTF.ext header)" "$tmp/badmagic.o" "magic"
+
+btf_ext 0 0 > "$tmp/ext"
+head -c 20 "$tmp/ext" > "$tmp/ext20"
+mv "$tmp/ext20" "$tmp/ext"
+build_raw trunc
+expect_fail "section shorter than 24 bytes is rejected (fail closed, never vacuous)" "$tmp/trunc.o" "shorter than"
+
+btf_ext 0 0 > "$tmp/ext"
+head -c 28 "$tmp/ext" > "$tmp/ext28"
+mv "$tmp/ext28" "$tmp/ext"
+build_raw h32trunc
+expect_fail "hdr_len 32 with a 28-byte section is rejected (core_relo unreadable)" "$tmp/h32trunc.o" "declared 32-byte"
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
