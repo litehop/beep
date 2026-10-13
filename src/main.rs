@@ -671,12 +671,16 @@ fn populate_fixtures(
             .context("reading FRONT_ENDPOINTS")?;
         let mut detail: Vec<String> = Vec::new();
         for plan in plan_fixture_fronts(&current_meta, &current_endpoints, fixtures) {
-            detail.extend(run_front_plan(&plan, |step| match step {
-                FrontWrite::DeleteEndpoint(k) => front_endpoints.remove(k),
-                FrontWrite::PutEndpoint(k, v) => front_endpoints.insert(k, v, 0),
-                FrontWrite::PutMeta(k, v) => front_meta.insert(k, v, 0),
-                FrontWrite::DeleteMeta(k) => front_meta.remove(k),
-            }));
+            detail.extend(
+                run_front_plan(&plan, |step| match step {
+                    FrontWrite::DeleteEndpoint(k) => front_endpoints.remove(k),
+                    FrontWrite::PutEndpoint(k, v) => front_endpoints.insert(k, v, 0),
+                    FrontWrite::PutMeta(k, v) => front_meta.insert(k, v, 0),
+                    FrontWrite::DeleteMeta(k) => front_meta.remove(k),
+                })
+                .into_iter()
+                .map(|f| f.message),
+            );
         }
         if !detail.is_empty() {
             anyhow::bail!(

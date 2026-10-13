@@ -25,7 +25,7 @@ use std::{
 
 use anyhow::Context;
 use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep::front_swap::{apply_fronts, DesiredFront};
+use beep::front_swap::{apply_fronts, DesiredFront, FailureKind, FrontFailure};
 use beep_common::{
     unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
     LbFrontKey, TcpFlowKey,
@@ -205,22 +205,53 @@ fn apply_front_maps(
 ) -> anyhow::Result<()> {
     let failures = apply_fronts(front_meta, front_endpoints, fronts, prune_absent)
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
-    for (front, message) in &failures {
+    for (front, failure) in &failures {
         eprintln!(
-            "controller: front {} {message} (front left on its previous endpoints -- map may be \
-             at capacity)",
-            describe_lb_front_key(front)
+            "controller: front {} {}",
+            describe_lb_front_key(front),
+            front_failure_line(failure)
         );
     }
     if !failures.is_empty() {
+        let kinds: Vec<FailureKind> = failures.iter().map(|(_, f)| f.kind).collect();
         anyhow::bail!(
-            "{} front write(s) failed -- see per-front errors above; {} / {}",
+            "{} front write(s) failed -- see per-front errors above{}",
             failures.len(),
-            beep::capacity_hint("FRONT_META"),
-            beep::capacity_hint("FRONT_ENDPOINTS")
+            front_failure_advice(&kinds)
         );
     }
     Ok(())
+}
+
+/// The log line for one failed front write. Only a `Capacity` failure may talk
+/// about a cap: blaming it for ENOMEM sends the operator after the wrong knob.
+fn front_failure_line(failure: &FrontFailure) -> String {
+    let cause = match failure.kind {
+        FailureKind::Capacity => "map at capacity",
+        FailureKind::OutOfMemory => {
+            "kernel out of memory allocating a map element (ENOMEM), not a map-size limit; \
+             retried on the next reconcile"
+        }
+        FailureKind::Other => "unexpected map error",
+    };
+    format!(
+        "{} ({cause}; front left on its previous endpoints)",
+        failure.message
+    )
+}
+
+/// What to tell the operator after a failed apply: the cap flags only when a
+/// cap was actually hit.
+fn front_failure_advice(kinds: &[FailureKind]) -> String {
+    if kinds.contains(&FailureKind::Capacity) {
+        format!(
+            "; {} / {}",
+            beep::capacity_hint("FRONT_META"),
+            beep::capacity_hint("FRONT_ENDPOINTS")
+        )
+    } else {
+        String::new()
+    }
 }
 
 fn describe_lb_front_key(key: &LbFrontKey) -> String {
@@ -545,6 +576,39 @@ mod tests {
     use beep_common::{ipv4_mapped_v6, LbFrontBackend};
 
     type Known = HashMap<[u8; 16], Option<String>>;
+
+    fn failure(kind: FailureKind) -> FrontFailure {
+        FrontFailure {
+            kind,
+            message: "FRONT_ENDPOINTS write failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn enomem_is_never_blamed_on_a_cap() {
+        // Telling an operator to raise a cap on a transient kernel ENOMEM
+        // sends them after the wrong knob during an incident.
+        let line = front_failure_line(&failure(FailureKind::OutOfMemory));
+        assert!(
+            line.contains("ENOMEM") && !line.contains("capacity"),
+            "{line}"
+        );
+        assert!(
+            front_failure_advice(&[FailureKind::OutOfMemory, FailureKind::Other]).is_empty(),
+            "no cap flag advice without a capacity failure"
+        );
+    }
+
+    #[test]
+    fn a_capacity_failure_names_the_cap_flags() {
+        let line = front_failure_line(&failure(FailureKind::Capacity));
+        assert!(line.contains("capacity"), "{line}");
+        let advice = front_failure_advice(&[FailureKind::OutOfMemory, FailureKind::Capacity]);
+        assert!(
+            advice.contains("FRONT_META") && advice.contains("FRONT_ENDPOINTS"),
+            "{advice}"
+        );
+    }
 
     fn ip(n: u32) -> [u8; 16] {
         ipv4_mapped_v6(n)

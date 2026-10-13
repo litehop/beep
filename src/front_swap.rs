@@ -26,7 +26,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use aya::maps::{HashMap as AyaHashMap, MapData};
+use aya::maps::{HashMap as AyaHashMap, MapData, MapError};
 use beep_common::{FrontEndpoint, FrontEndpointKey, FrontMeta, LbFrontKey};
 
 /// The endpoint set a front should have. Slot `i` is `endpoints[i]`.
@@ -165,14 +165,58 @@ pub fn plan_front_writes(
     plans
 }
 
-/// Runs one front's plan through `write`, in order. Returns one message per
+/// Why a front write failed. The remedies differ: `Capacity` needs a bigger
+/// cap, `OutOfMemory` is the kernel failing to allocate a map element (a
+/// non-preallocated map allocates per insert, even when replacing a key) and
+/// clears on its own, `Other` is anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    Capacity,
+    OutOfMemory,
+    Other,
+}
+
+impl FailureKind {
+    pub fn from_errno(errno: Option<i32>) -> Self {
+        match errno {
+            Some(libc::E2BIG) => Self::Capacity,
+            Some(libc::ENOMEM) => Self::OutOfMemory,
+            _ => Self::Other,
+        }
+    }
+
+    fn of(error: &MapError) -> Self {
+        match error {
+            MapError::SyscallError(e) => Self::from_errno(e.io_error.raw_os_error()),
+            _ => Self::Other,
+        }
+    }
+}
+
+/// aya's syscall errors display only the syscall name; the errno is what
+/// tells E2BIG from ENOMEM.
+fn describe(error: &MapError) -> String {
+    match error {
+        MapError::SyscallError(e) => format!("`{}` failed: {}", e.call, e.io_error),
+        other => format!("{other:#}"),
+    }
+}
+
+/// One failed front write: what failed and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontFailure {
+    pub kind: FailureKind,
+    pub message: String,
+}
+
+/// Runs one front's plan through `write`, in order. Returns one failure per
 /// failed step. A failed endpoint write suppresses the `FRONT_META` commit
 /// (the old generation keeps serving); a failed `FRONT_META` delete
 /// suppresses the endpoint deletes behind it (they would strand a live front).
-pub fn run_front_plan<E: std::fmt::Display>(
+pub fn run_front_plan(
     plan: &FrontPlan,
-    mut write: impl FnMut(&FrontWrite) -> Result<(), E>,
-) -> Vec<String> {
+    mut write: impl FnMut(&FrontWrite) -> Result<(), MapError>,
+) -> Vec<FrontFailure> {
     let mut failures = Vec::new();
     let mut commit_blocked = false;
     for step in &plan.steps {
@@ -186,7 +230,10 @@ pub fn run_front_plan<E: std::fmt::Display>(
                 FrontWrite::PutMeta(..) => "FRONT_META write",
                 FrontWrite::DeleteMeta(_) => "FRONT_META delete",
             };
-            failures.push(format!("{what} failed: {e:#}"));
+            failures.push(FrontFailure {
+                kind: FailureKind::of(&e),
+                message: format!("{what} failed: {}", describe(&e)),
+            });
             match step {
                 FrontWrite::PutEndpoint(..) => commit_blocked = true,
                 FrontWrite::DeleteMeta(_) => break,
@@ -205,7 +252,7 @@ pub fn apply_fronts<M: BorrowMut<MapData>>(
     endpoints: &mut AyaHashMap<M, FrontEndpointKey, FrontEndpoint>,
     desired: &HashMap<LbFrontKey, DesiredFront>,
     prune_absent: bool,
-) -> anyhow::Result<Vec<(LbFrontKey, String)>> {
+) -> anyhow::Result<Vec<(LbFrontKey, FrontFailure)>> {
     let current_meta: HashMap<LbFrontKey, FrontMeta> = meta.iter().collect::<Result<_, _>>()?;
     let current_endpoints: HashMap<FrontEndpointKey, FrontEndpoint> =
         endpoints.iter().collect::<Result<_, _>>()?;
@@ -578,7 +625,7 @@ mod tests {
         let plans = store.plan(&desired(&[(f, want(new))]), true);
 
         let failures = run_front_plan(&plans[0], |step| match step {
-            FrontWrite::PutEndpoint(..) => Err("E2BIG"),
+            FrontWrite::PutEndpoint(..) => Err(sys_error(libc::E2BIG)),
             other => {
                 store.apply_step(other);
                 Ok(())
@@ -587,6 +634,54 @@ mod tests {
 
         assert_eq!(failures.len(), 1);
         assert_eq!(store.read(f), Some(old), "old generation must keep serving");
+    }
+
+    fn sys_error(errno: i32) -> MapError {
+        MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_update_elem",
+            io_error: std::io::Error::from_raw_os_error(errno),
+        })
+    }
+
+    #[test]
+    fn enomem_is_reported_as_out_of_memory_not_as_a_full_map() {
+        // A non-preallocated map can fail an insert with ENOMEM while far
+        // from its cap; telling the operator to raise a cap that is not the
+        // problem wastes the incident. Both still fail-stale.
+        let f = front(1, 443);
+        let mut store = Store::default();
+        let (old, new) = (endpoint(7, 8443), endpoint(8, 8443));
+        let first = store.plan(&desired(&[(f, want(old))]), true);
+        store.apply_all(&first, |_| {});
+        let plans = store.plan(&desired(&[(f, want(new))]), true);
+
+        for (errno, kind) in [
+            (libc::ENOMEM, FailureKind::OutOfMemory),
+            (libc::E2BIG, FailureKind::Capacity),
+            (libc::EPERM, FailureKind::Other),
+        ] {
+            let mut scratch = Store {
+                meta: store.meta.clone(),
+                endpoints: store.endpoints.clone(),
+            };
+            let failures = run_front_plan(&plans[0], |step| match step {
+                FrontWrite::PutEndpoint(..) => Err(sys_error(errno)),
+                other => {
+                    scratch.apply_step(other);
+                    Ok(())
+                }
+            });
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].kind, kind, "errno {errno}");
+            assert!(
+                failures[0]
+                    .message
+                    .contains(&std::io::Error::from_raw_os_error(errno).to_string()),
+                "the log must carry the errno text, got {:?}",
+                failures[0].message
+            );
+            assert_eq!(scratch.read(f), Some(old), "errno {errno} must fail stale");
+        }
     }
 
     #[test]
