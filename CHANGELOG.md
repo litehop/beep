@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loader derives requested map shapes from the embedded ELF and no longer
   does a probe load (#171).
 - eBPF object trimmed to fit the shared stack and size budgets; the
-  embedded-object gross-size ceiling is 160 KB (#195, #202).
+  embedded-object gross-size ceiling is 128 KiB (#195, #202).
 - Dependency and CI-action bumps (Renovate).
 
 ### Fixed

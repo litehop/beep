@@ -8,6 +8,12 @@
 
 pub mod front_swap;
 
+// build.rs's `.BTF.ext` rewrite; build scripts can't host tests themselves.
+#[cfg(test)]
+#[path = "../build_support/btf_ext.rs"]
+#[allow(dead_code)]
+mod btf_ext;
+
 use std::{collections::HashSet, net::IpAddr, path::Path};
 
 use anyhow::{anyhow, Context};
@@ -944,11 +950,95 @@ pub fn attach_and_pin(
     Ok(())
 }
 
+/// Attach goes through TCX only (no netlink fallback), which needs Linux 6.6.
+pub const MIN_KERNEL: (u32, u32) = (6, 6);
+
+/// Fails closed on unparseable input: every Linux release string starts
+/// `major.minor`, and a kernel that hides it is not one we can vouch for.
+pub fn check_kernel_release(release: &str) -> Result<(), String> {
+    let mut nums = release.trim().splitn(3, '.').map(|p| {
+        p.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+    });
+    let parse = |s: Option<String>| s.and_then(|s| s.parse::<u32>().ok());
+    let (Some(major), Some(minor)) = (parse(nums.next()), parse(nums.next())) else {
+        return Err(format!(
+            "cannot parse kernel release {release:?}; beep requires Linux >= {}.{} (TCX attach)",
+            MIN_KERNEL.0, MIN_KERNEL.1
+        ));
+    };
+    if (major, minor) < MIN_KERNEL {
+        return Err(format!(
+            "kernel {release:?} is too old: beep requires Linux >= {}.{} (TCX attach)",
+            MIN_KERNEL.0, MIN_KERNEL.1
+        ));
+    }
+    Ok(())
+}
+
+pub fn require_supported_kernel() -> anyhow::Result<()> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("reading /proc/sys/kernel/osrelease")?;
+    check_kernel_release(&release).map_err(|e| anyhow!(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn kernel_floor_accepts_cloud_suffix_release() {
+        assert!(
+            check_kernel_release("6.17.0-1022-azure\n").is_ok(),
+            "CI/cloud kernels carry vendor suffixes and a trailing newline from procfs"
+        );
+    }
+
+    #[test]
+    fn kernel_floor_boundary_is_inclusive() {
+        assert!(
+            check_kernel_release("6.6.0").is_ok(),
+            "6.6 is the first kernel with TCX; rejecting it would lock out supported hosts"
+        );
+    }
+
+    #[test]
+    fn kernel_floor_rejects_just_below_with_version_in_message() {
+        let err = check_kernel_release("6.5.13").unwrap_err();
+        assert!(
+            err.contains("6.5.13") && err.contains("6.6") && err.contains("TCX"),
+            "operator must see detected version and the requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn kernel_floor_compares_major_before_minor() {
+        assert!(
+            check_kernel_release("7.0.0-rc1").is_ok(),
+            "major 7 with minor 0 must not be rejected by a minor-only comparison"
+        );
+    }
+
+    #[test]
+    fn kernel_floor_rejects_old_lts() {
+        assert!(
+            check_kernel_release("5.15.0-91-generic").is_err(),
+            "5.15 has no TCX; loader would otherwise fail with an opaque attach error"
+        );
+    }
+
+    #[test]
+    fn kernel_floor_fails_closed_on_unparseable() {
+        for bad in ["", "garbage", "6", "6.x.1", ".6.1"] {
+            assert!(
+                check_kernel_release(bad).is_err(),
+                "unverifiable kernel {bad:?} must not be assumed new enough"
+            );
+        }
+    }
 
     #[test]
     fn only_pins_to_backends_no_slice_names_are_orphans() {
