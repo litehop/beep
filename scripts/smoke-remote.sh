@@ -408,18 +408,24 @@ full_size_leg() {
   rm -f "$cap_opt" "$cap_fwd" "$cap_ret" "$FULL_REQUEST_SEEN" "$FULL_GOT"
   nohup bash -c "{ sleep 2; printf 'HTTP/1.1 200 OK\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n'; cat ${FULL_REPLY}; } | nc ${ncflag} -l -N ${pod} ${port} >${FULL_REQUEST_SEEN} 2>/dev/null" >/dev/null 2>&1 &
   disown
-  timeout 30 tcpdump -nn -l -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>/dev/null &
-  local opt_pid=$!
-  timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>/dev/null &
-  local fwd_pid=$!
-  timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>/dev/null &
-  local ret_pid=$!
+  local wire=0
+  if command -v tcpdump >/dev/null; then
+    wire=1
+    timeout 30 tcpdump -nn -l -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>/dev/null &
+    local opt_pid=$!
+    timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>/dev/null &
+    local fwd_pid=$!
+    timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>/dev/null &
+    local ret_pid=$!
+  else
+    echo "WARN: tcpdump not installed -- ${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames) SKIPPED; only payload integrity is checked" >&2
+  fi
   sleep 1
   ip netns exec smoke-client curl -sS -g -m 30 -H 'Expect:' --data-binary "@${FULL_PAYLOAD}" -o "$FULL_GOT" "$url" || {
     echo "FAIL: ${label} full-size round trip did not complete" >&2
     exit 1
   }
-  wait "$opt_pid" "$fwd_pid" "$ret_pid" || true
+  [ "$wire" -eq 0 ] || wait "$opt_pid" "$fwd_pid" "$ret_pid" || true
   cmp -s "$FULL_GOT" "$FULL_REPLY" || {
     echo "FAIL: ${label} reply body differs from the 256 KiB sent by the backend" >&2
     exit 1
@@ -428,6 +434,10 @@ full_size_leg() {
     echo "FAIL: ${label} request body the backend received differs from the 256 KiB the client sent" >&2
     exit 1
   }
+  if [ "$wire" -eq 0 ]; then
+    echo "FULL-SIZE ${label}: PASS, payload integrity only (256 KiB each way); wire assertions skipped"
+    return 0
+  fi
   # Geneve header (8 bytes at frame offset 42: opt-len 6 words, Transparent
   # Ethernet Bridging, VNI 100) then the option: class ffff, type 01, 5 data
   # words, pod ip, target port, 2 pad bytes.
