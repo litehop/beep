@@ -377,9 +377,18 @@ step_d_gone_upstream_branches() {
 # errexit and kills the whole run with no anomaly printed -- "no bead id
 # found" is an expected, non-error outcome here, not a script failure.
 bead_id_from_finding() {
-  local f="$1" bead_line
-  bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
-  printf '%s' "$bead_line" | grep -oE '(mayor|beep)-[a-z0-9.]+' | head -1 || true
+  local f="$1" bead_line rest
+  bead_line=$(head -n 5 "$f" | grep -m1 -E '^(<!-- *)?Bead: ' || true)
+  rest="${bead_line#*Bead: }"
+  printf '%s' "$rest" | grep -oE '^[a-z]+-[a-z0-9]+(\.[0-9]+)*' | head -1 || true
+}
+
+# True (exit 0) iff the file's first 5 lines carry a `Bead:` header, whether
+# or not an ID parses out of it. The ID shape allows dotted child suffixes
+# (`beep-zx.4`) but a '.' not followed by digits is sentence punctuation
+# (`Bead: beep-zy. Written ...`), not part of the ID.
+finding_has_bead_header() {
+  head -n 5 "$1" | grep -qE '^(<!-- *)?Bead: '
 }
 
 # True (exit 0) iff a bead in the given live-bd status is stale enough to
@@ -403,7 +412,13 @@ step_e_stale_findings() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     bead_id=$(bead_id_from_finding "$REPO_ROOT/$f")
-    [ -n "$bead_id" ] || continue
+    if [ -z "$bead_id" ]; then
+      if finding_has_bead_header "$REPO_ROOT/$f"; then
+        stale_count=$(( stale_count + 1 ))
+        echo "[hygiene] stale-finding: $f has a Bead: header but no bead ID could be parsed from it -- fix the header; not checking bd"
+      fi
+      continue
+    fi
     status=$(bd -C "$REPO_ROOT" show "$bead_id" --json 2>/dev/null | jq -r '.[0]?.status // empty') || true
     if is_stale_bead_status "$status"; then
       stale_count=$(( stale_count + 1 ))
