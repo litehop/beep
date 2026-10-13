@@ -233,8 +233,8 @@ pub fn stale_pod_targets<T: Copy + Eq + std::hash::Hash>(existing: &[T], live: &
 /// `beep_common::encode_flow_key`'s doc comment), or `None` for a tag value
 /// `beep-ebpf` never writes. Callers MUST branch on this before reading
 /// either the key (Reverse/PortMemo) or the value's union arm (Forward) --
-/// `FlowValue::as_forward`/`as_reverse`/`as_port_memo` are unchecked reads
-/// (`beep_common`'s own doc comment on `FlowValue`) that silently return
+/// `FlowValue::as_forward` is an unchecked read
+/// (`beep_common`'s own doc comment on `FlowValue`) that silently returns
 /// garbage for the wrong arm instead of erroring.
 pub fn flow_key_direction(key: &FlowKey) -> Option<FlowDirection> {
     match key[TCP_FLOW_KEY_LEN] {
@@ -1512,8 +1512,7 @@ mod tests {
     #[test]
     fn flow_key_direction_reads_the_tag_byte_each_role_was_encoded_with() {
         // The eviction sweep's tag-check-before-union-read guardrail
-        // (`FlowValue::as_forward`/`as_reverse`/`as_port_memo` are unchecked
-        // reads) depends entirely on this decode being correct -- a
+        // (`FlowValue::as_forward` is an unchecked read) depends entirely on this decode being correct -- a
         // mismatched tag byte here would make the sweep call the wrong
         // union arm's reader on a Forward-tagged row.
         let ip = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));

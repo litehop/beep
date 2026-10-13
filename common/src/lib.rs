@@ -603,18 +603,6 @@ impl FlowValue {
         // arm yields wrong data, not UB.
         unsafe { self.forward }
     }
-
-    /// Reads the `reverse` arm -- see `as_forward`'s caveat.
-    pub fn as_reverse(&self) -> RevFlowValue {
-        // SAFETY: as `as_forward`.
-        unsafe { self.reverse }
-    }
-
-    /// Reads the `port_memo` arm -- see `as_forward`'s caveat.
-    pub fn as_port_memo(&self) -> PortMemoValue {
-        // SAFETY: as `as_forward`.
-        unsafe { self.port_memo }
-    }
 }
 
 /// Flow-table admission: forward-path decision (`beep-ebpf`'s
@@ -1375,7 +1363,7 @@ mod tests {
         // (RevFlowValue, 36 bytes) -- any larger would mean the union picked
         // up padding bytes FLOW_TABLE's kernel-side write leaves
         // uninitialized, and a userspace `aya::Pod` read of a DIFFERENT arm
-        // (e.g. `as_port_memo` on a slot written as `forward`) would then
+        // (e.g. the `port_memo` arm of a slot written as `forward`) would then
         // read stale/uninitialized trailing bytes as if they were real
         // field data instead of cleanly aliasing the smaller arm's prefix.
         assert_eq!(
