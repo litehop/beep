@@ -166,7 +166,7 @@ const UDP_CSUM_V6: usize = L4_OFF_V6 + 6;
 /// "Packet flow" step 1) makes this map's entry count nodes x Service ports,
 /// not just Service ports.
 #[map]
-static FRONT_META: HashMap<LbFrontKey, FrontMeta> = HashMap::with_max_entries(4096, 0);
+static FRONT_META: HashMap<LbFrontKey, FrontMeta> = HashMap::with_max_entries(4096, 1);
 
 /// Endpoint table: `(front, generation, slot)` -> `{backend_node_ip, pod_ip,
 /// target_port}` (`beep_common::FrontEndpoint`). Ingress takes the Geneve
@@ -182,7 +182,7 @@ static FRONT_META: HashMap<LbFrontKey, FrontMeta> = HashMap::with_max_entries(40
 /// transiently, so the default is twice `FRONT_META`'s.
 #[map]
 static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
-    HashMap::with_max_entries(8192, 0);
+    HashMap::with_max_entries(8192, 1);
 
 /// Single-slot per-CPU counter: lookups where `FRONT_META` named a front
 /// but its endpoint was missing (or the count was zero). Traffic for that
