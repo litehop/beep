@@ -16,7 +16,7 @@ beep-kubeconfig = { path = "../kubeconfig" }
 aya = { version = "0.14", default-features = false }
 anyhow = "1"
 base64 = "0.23"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dhat = { version = "0.3", optional = true }
 hyper = "1"
 libc = "0.2"

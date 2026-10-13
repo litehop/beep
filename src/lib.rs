@@ -16,7 +16,7 @@ mod btf_ext;
 
 use std::{collections::HashSet, net::IpAddr, path::Path};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use aya::{
     include_bytes_aligned,
     maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, MapInfo},
@@ -30,7 +30,7 @@ use aya::{
 };
 use beep_common::{
     decode_tcp_flow_key, ipv4_mapped_v6, wire_ip, Config, FlowDirection, FlowKey, FlowValue,
-    ForwardFlowValue, TcpFlowKey, UplinkConfig, TCP_FLOW_KEY_LEN,
+    ForwardFlowValue, TcpFlowKey, UplinkConfig, BPF_F_NO_PREALLOC, TCP_FLOW_KEY_LEN,
 };
 use clap::ValueEnum;
 
@@ -390,14 +390,40 @@ pub fn evict_pod_flows(
     Ok(())
 }
 
-/// `FRONT_META` holds one entry per front address x Service port, which
-/// scales with nodes x Service ports under the every-node-is-a-front model;
-/// 4096 covers e.g. 100 nodes x 40 Service ports.
-pub const DEFAULT_FRONT_META_MAX_ENTRIES: u32 = 4096;
-/// `FRONT_ENDPOINTS` holds one row per front x endpoint, and up to two
-/// generations of a front coexist during a swap, so the default is twice
-/// `FRONT_META`'s at one endpoint per front.
-pub const DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES: u32 = 2 * DEFAULT_FRONT_META_MAX_ENTRIES;
+/// Default `--max-fronts`: one `FRONT_META` entry per front address x Service
+/// port x protocol, so nodes x Service ports under the every-node-is-a-front
+/// model.
+pub const DEFAULT_MAX_FRONTS: u32 = 1024;
+/// Default `--endpoints-per-front`: the endpoints each front is sized for.
+pub const DEFAULT_ENDPOINTS_PER_FRONT: u32 = 4;
+
+/// `(FRONT_META, FRONT_ENDPOINTS)` `max_entries` for the derived front-map
+/// sizing flags: `FRONT_META` holds `max_fronts` rows and `FRONT_ENDPOINTS`
+/// `max_fronts x endpoints_per_front x 2` -- the factor 2 is swap headroom,
+/// since a front's new generation is written next to the live one before the
+/// commit. Both maps are `BPF_F_NO_PREALLOC`, so these are ceilings: only the
+/// ~16 B/slot bucket array is paid up front, entries cost memory as they are
+/// used. Prefer values at or just below a power of two; one just above doubles
+/// the bucket array.
+pub fn front_map_max_entries(
+    max_fronts: u32,
+    endpoints_per_front: u32,
+) -> anyhow::Result<(u32, u32)> {
+    if max_fronts == 0 || endpoints_per_front == 0 {
+        bail!("--max-fronts and --endpoints-per-front must be at least 1");
+    }
+    let rows = max_fronts
+        .checked_mul(endpoints_per_front)
+        .and_then(|rows| rows.checked_mul(2))
+        .ok_or_else(|| {
+            anyhow!(
+                "--max-fronts {max_fronts} x --endpoints-per-front {endpoints_per_front} x 2 \
+                 overflows the FRONT_ENDPOINTS row count"
+            )
+        })?;
+    Ok((max_fronts, rows))
+}
+
 /// `NODE_ALLOW` holds one entry per node underlay address, so a dual-stack
 /// node costs two; 32 covers 16 dual-stack nodes.
 pub const DEFAULT_NODE_ALLOW_MAX_ENTRIES: u32 = 32;
@@ -408,20 +434,20 @@ pub const DEFAULT_POD_TARGETS_MAX_ENTRIES: u32 = 128;
 /// Operator-facing advice appended to a failed `NODE_ALLOW`/`POD_TARGETS`/
 /// `FRONT_META`/`FRONT_ENDPOINTS`
 /// write: these maps are capped by `--node-allow-max-entries`/
-/// `--pod-targets-max-entries`/`--front-meta-max-entries`/
-/// `--front-endpoints-max-entries`, and an insert past the cap would otherwise
+/// `--pod-targets-max-entries` and, for the front maps, by `--max-fronts`/
+/// `--endpoints-per-front`, and an insert past the cap would otherwise
 /// surface only the kernel's bare `E2BIG`, leaving a node or pod silently
 /// unreachable with no hint which knob to turn. Empty for any other map.
 pub fn capacity_hint(map_name: &str) -> String {
-    let flag = match map_name {
-        "NODE_ALLOW" => "--node-allow-max-entries",
-        "POD_TARGETS" => "--pod-targets-max-entries",
-        "FRONT_META" => "--front-meta-max-entries",
-        "FRONT_ENDPOINTS" => "--front-endpoints-max-entries",
+    let flags = match map_name {
+        "NODE_ALLOW" => "`--node-allow-max-entries`",
+        "POD_TARGETS" => "`--pod-targets-max-entries`",
+        "FRONT_META" => "`--max-fronts`",
+        "FRONT_ENDPOINTS" => "`--max-fronts` or `--endpoints-per-front`",
         _ => return String::new(),
     };
     format!(
-        "if `{map_name}` is full (E2BIG), raise `{flag}`; a changed cap recreates the pinned \
+        "if `{map_name}` is full (E2BIG), raise {flags}; a changed cap recreates the pinned \
          `{map_name}` on the next loader start"
     )
 }
@@ -499,7 +525,6 @@ pub struct MapShape {
 /// Only these are compared: the kernel may report extra bits on a live map
 /// (e.g. `BPF_F_MMAPABLE`), which must not force a recreate on every restart.
 const COMPARED_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
-const BPF_F_NO_PREALLOC: u32 = 1;
 
 impl MapShape {
     fn from_info(info: &MapInfo) -> anyhow::Result<Self> {
@@ -1161,17 +1186,65 @@ mod tests {
             pod.contains("POD_TARGETS") && pod.contains("--pod-targets-max-entries"),
             "a full POD_TARGETS must tell the operator which flag to raise, got {pod:?}"
         );
-        for (map, flag) in [
-            ("FRONT_META", "--front-meta-max-entries"),
-            ("FRONT_ENDPOINTS", "--front-endpoints-max-entries"),
+        for (map, flags) in [
+            ("FRONT_META", &["--max-fronts"][..]),
+            (
+                "FRONT_ENDPOINTS",
+                &["--max-fronts", "--endpoints-per-front"][..],
+            ),
         ] {
             let hint = capacity_hint(map);
             assert!(
-                hint.contains(map) && hint.contains(flag),
-                "a full {map} leaves fronts unrouted; the error must name {flag}, got {hint:?}"
+                hint.contains(map) && flags.iter().all(|f| hint.contains(f)),
+                "a full {map} leaves fronts unrouted; the error must name {flags:?}, got {hint:?}"
+            );
+            assert!(
+                !hint.contains("max-entries"),
+                "the raw --*-max-entries flags no longer exist for the front maps: {hint:?}"
             );
         }
         assert!(capacity_hint("FLOW_TABLE").is_empty());
+    }
+
+    #[test]
+    fn front_map_rows_are_fronts_times_endpoints_times_two_generations() {
+        // The x2 is the swap headroom: a front's next generation is written
+        // beside the live one, so sizing without it E2BIGs mid-swap.
+        assert_eq!(
+            front_map_max_entries(DEFAULT_MAX_FRONTS, DEFAULT_ENDPOINTS_PER_FRONT).unwrap(),
+            (1024, 8192)
+        );
+        assert_eq!(front_map_max_entries(100, 3).unwrap(), (100, 600));
+    }
+
+    #[test]
+    fn front_map_sizing_rejects_zero_and_overflow_instead_of_wrapping() {
+        // A wrapped product would silently load a tiny map and leave fronts
+        // unrouted; zero would create an unusable one.
+        assert!(front_map_max_entries(0, 4).is_err());
+        assert!(front_map_max_entries(4, 0).is_err());
+        assert!(front_map_max_entries(u32::MAX, 2).is_err());
+        assert!(front_map_max_entries(1 << 20, 1 << 12).is_err());
+    }
+
+    #[test]
+    fn front_maps_are_declared_no_prealloc_in_the_object() {
+        // The loader only compares a pin's flags against the object's, so
+        // this is what makes a fresh node skip preallocation and an upgraded
+        // one recreate its old pin.
+        let shapes = requested_shapes(ebpf_object(), &[]).unwrap();
+        for (name, shape) in &shapes {
+            let expected = if matches!(*name, "FRONT_META" | "FRONT_ENDPOINTS") {
+                BPF_F_NO_PREALLOC
+            } else {
+                0
+            };
+            assert_eq!(
+                shape.map_flags & COMPARED_MAP_FLAGS,
+                expected,
+                "{name} map_flags"
+            );
+        }
     }
 
     #[test]

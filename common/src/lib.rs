@@ -11,6 +11,12 @@
 
 pub mod reject;
 
+/// `BPF_F_NO_PREALLOC`: allocate hash elements on insert instead of reserving
+/// `max_entries` up front. `beep-ebpf` sets it on the controller-written front
+/// maps and the loader compares it on pinned maps, so one definition keeps
+/// both sides agreeing.
+pub const BPF_F_NO_PREALLOC: u32 = 1;
+
 /// TCP/UDP flow-affinity key: IPv6-primary, 37 bytes (16+16+2+2+1), no
 /// padding. A flat byte array rather than a `#[repr(C)]` struct: the kernel
 /// hashes/compares a `BPF_MAP_TYPE_*_HASH` key's raw bytes, and a padded

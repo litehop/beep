@@ -128,8 +128,8 @@ forward-write and return-read).
 |---|---|---|
 | Userspace control-plane process | ~6.9 MiB RSS | Rust async binary; idle after reconcile. Measured, not estimated — gated by CI's `memory-smoke` job (`scripts/memory-smoke-controller.sh`). |
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
-| `FRONT_META` (front tuple -> live generation, count, flags) | ~385 KiB (measured) | 4096 entries by default (`--front-meta-max-entries`): nodes × Service ports. |
-| `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~1.06 MiB (measured) | 8192 entries by default (`--front-endpoints-max-entries`): up to two generations of every front coexist during a swap. Full map on every node. |
+| `FRONT_META` (front tuple -> live generation, count, flags) | ~17 KiB bucket floor + ~96 B/front used | `BPF_F_NO_PREALLOC`, so only used entries cost memory. `max_entries` = `--max-fronts` (1024 by default): nodes × Service ports. |
+| `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~129 KiB bucket floor + ~128 B/row used | `BPF_F_NO_PREALLOC`. `max_entries` = `--max-fronts` × `--endpoints-per-front` (4) × 2 = 8192 by default; the 2 is swap headroom (a front's next generation is written next to the live one; the previous one is deleted ~2 s after the commit). Full map on every node. |
 | `FRONT_MISSES` | <1 KiB | Per-CPU counter of lookups where `FRONT_META` hit but the endpoint was missing (ingress passes to host, decap drops). |
 | `REJECT_BUCKET` | <1 KiB | Per-CPU token bucket (100 replies/s, burst 25) gating TCP RST / ICMP unreachable replies from fronts with no ready backends; over budget the packet is dropped. |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
