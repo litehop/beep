@@ -22,7 +22,7 @@ VM you didn't provision breaks whoever is mid-task on it.
 Four named VMs, fixed roles:
 
 - **`beep-smoke`** — single-node smoke gate, **Debian 13 / Linux 6.12 LTS**
-  (image pinned in `lima/beep.yaml`; boots `6.12.111+deb13-cloud-arm64`).
+  (image pinned in `lima/beep.yaml`; boots `6.12.x` (Debian 13)).
   `scripts/smoke.sh` targets this
   by default: loads the tc-bpf classifiers into a real kernel verifier and
   drives packets through the Geneve encap/decap dataplane on one node.
