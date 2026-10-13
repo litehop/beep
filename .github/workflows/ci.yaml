@@ -263,10 +263,10 @@ jobs:
           sudo chmod +x /usr/local/bin/bpftool
           bpftool version
 
-      - name: Install netcat (round-trip backend responder)
+      - name: Install netcat and tcpdump (round-trip responder, wire assertions)
         run: |
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
-          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y netcat-openbsd
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y netcat-openbsd tcpdump
 
       - name: Build beep-ebpf + beep + beep-controller
         run: cargo build --release -p beep -p beep-controller
@@ -373,7 +373,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
-          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y qemu-system-x86 virtme-ng netcat-openbsd
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y qemu-system-x86 virtme-ng netcat-openbsd tcpdump
           vng --version
           cd /tmp
           curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz

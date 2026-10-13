@@ -8,7 +8,25 @@
 # Owns geneve0 and the smoke-veth0/smoke-client fixture
 # exclusively for its duration -- do not run this alongside a real
 # beep deployment on the same VM.
+#
+# tcpdump is required: the full-size wire assertions (forward Geneve option
+# bytes, 1588-byte frames) and the reject-reply capture are only checkable on
+# the wire, and a silently skipped assertion is not a pass. Without tcpdump the
+# run FAILS. Set BEEP_SMOKE_ALLOW_NO_TCPDUMP=1 on a local dev host to skip
+# those assertions (loudly) and check only payload integrity / client behaviour.
 set -euo pipefail
+
+# Succeeds when tcpdump is usable; with the opt-out set, returns 1 after a
+# WARN so the caller skips its wire assertion. Otherwise exits non-zero.
+have_tcpdump() { # <what is skipped>
+  command -v tcpdump >/dev/null && return 0
+  if [ "${BEEP_SMOKE_ALLOW_NO_TCPDUMP:-0}" = "1" ]; then
+    echo "WARN: tcpdump not installed and BEEP_SMOKE_ALLOW_NO_TCPDUMP=1 -- $1 SKIPPED" >&2
+    return 1
+  fi
+  echo "FAIL: tcpdump not installed -- $1 cannot run; install tcpdump (or set BEEP_SMOKE_ALLOW_NO_TCPDUMP=1 on a dev host to skip)" >&2
+  exit 1
+}
 
 # RFC 5737 documentation ranges: deliberately disjoint from any real subnet
 # a given VM's CNI/pod network happens to be using.
@@ -409,7 +427,7 @@ full_size_leg() {
   nohup bash -c "{ sleep 2; printf 'HTTP/1.1 200 OK\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n'; cat ${FULL_REPLY}; } | nc ${ncflag} -l -N ${pod} ${port} >${FULL_REQUEST_SEEN} 2>/dev/null" >/dev/null 2>&1 &
   disown
   local wire=0
-  if command -v tcpdump >/dev/null; then
+  if have_tcpdump "${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames)"; then
     wire=1
     timeout 30 tcpdump -nn -l -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>/dev/null &
     local opt_pid=$!
@@ -417,8 +435,6 @@ full_size_leg() {
     local fwd_pid=$!
     timeout 30 tcpdump -nn -l -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>/dev/null &
     local ret_pid=$!
-  else
-    echo "WARN: tcpdump not installed -- ${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames) SKIPPED; only payload integrity is checked" >&2
   fi
   sleep 1
   ip netns exec smoke-client curl -sS -g -m 30 -H 'Expect:' --data-binary "@${FULL_PAYLOAD}" -o "$FULL_GOT" "$url" || {
@@ -435,7 +451,7 @@ full_size_leg() {
     exit 1
   }
   if [ "$wire" -eq 0 ]; then
-    echo "FULL-SIZE ${label}: PARTIAL (tcpdump absent: wire-option/frame-size assertions SKIPPED; payload integrity PASS, 256 KiB each way)"
+    echo "FULL-SIZE ${label}: PARTIAL (BEEP_SMOKE_ALLOW_NO_TCPDUMP=1: wire-option/frame-size assertions SKIPPED; payload integrity PASS, 256 KiB each way)"
     return 0
   fi
   # Geneve header (8 bytes at frame offset 42: opt-len 6 words, Transparent
@@ -1141,12 +1157,10 @@ host_listener tcp 6 "$FRONT_IP6" "$CONTROL_TCP6_PORT"
 sleep 1
 
 REJECT_CAPTURE_PID=""
-if command -v tcpdump >/dev/null; then
+if have_tcpdump "reply-on-the-wire reject capture (client-side behaviour is still asserted)"; then
   ip netns exec smoke-client tcpdump -nn -l -vv -i smoke-veth1 >"$REJECT_CAPTURE" 2>&1 &
   REJECT_CAPTURE_PID=$!
   sleep 1
-else
-  echo "WARN: tcpdump not installed -- reply-on-the-wire capture skipped; client-side behaviour is still asserted" >&2
 fi
 
 assert_tcp_refused() { # <label> <curl-url> [curl-extra-arg]
