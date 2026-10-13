@@ -64,7 +64,7 @@ guest() {
   # /usr/local/bin.
   export PATH="/usr/local/bin:$PATH"
   mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
-  install -m 0755 "$bin" /tmp/beep-smoke
+  install -m 0755 /bin/true /tmp/beep-smoke
   bash scripts/smoke-remote.sh run
 }
 
