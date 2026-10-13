@@ -575,7 +575,8 @@ mod tests {
                     pod_ip: ip(pod),
                 },
                 target_port: 80,
-                _pad: [0; 6],
+                flags: 0,
+                _pad: [0; 4],
             }],
         }
     }

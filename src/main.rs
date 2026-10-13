@@ -601,7 +601,8 @@ fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
                     pod_ip: wire_ip_v6(fixture.pod_ip),
                 },
                 target_port: wire_port(fixture.target_port),
-                _pad: [0; 6],
+                flags: 0,
+                _pad: [0; 4],
             };
             (
                 fixture_key(fixture),
@@ -1135,6 +1136,8 @@ mod tests {
                         generation: 1,
                         count: 1,
                         flags: 0,
+                        local_count: 0,
+                        _pad: 0,
                     },
                 )
             })

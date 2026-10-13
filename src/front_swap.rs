@@ -150,6 +150,8 @@ pub fn plan_front_writes(
                             generation: next,
                             count,
                             flags: want.flags,
+                            local_count: 0,
+                            _pad: 0,
                         },
                     ));
                 }
@@ -241,7 +243,8 @@ mod tests {
                 pod_ip: ipv4_mapped_v6(wire_ip(u32::from_be_bytes([10, 244, 0, pod_octet]))),
             },
             target_port: wire_port(target_port),
-            _pad: [0; 6],
+            flags: 0,
+            _pad: [0; 4],
         }
     }
 
@@ -526,6 +529,8 @@ mod tests {
                 generation: 5,
                 count: 1,
                 flags: 0,
+                local_count: 0,
+                _pad: 0,
             },
         );
         let ep = endpoint(7, 8443);

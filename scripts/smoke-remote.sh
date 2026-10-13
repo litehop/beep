@@ -1015,7 +1015,7 @@ drain_front_to_next_generation() {
   gen_bytes=($(bpftool -j map lookup pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY | jq -r '.value[0:4][]'))
   gen=$((gen_bytes[0] | gen_bytes[1] << 8 | gen_bytes[2] << 16 | gen_bytes[3] << 24))
   gen=$(((gen + 1) & 0xffffffff))
-  bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((gen & 255)) $(((gen >> 8) & 255)) $(((gen >> 16) & 255)) $(((gen >> 24) & 255)) 0 0 0 0 || {
+  bpftool map update pinned "$PIN_DIR/FRONT_META" key $DRAIN_FRONT_KEY value $((gen & 255)) $(((gen >> 8) & 255)) $(((gen >> 16) & 255)) $(((gen >> 24) & 255)) 0 0 0 0 0 0 0 0 || {
     echo "FAIL: could not zero the ready count of front ${FRONT_IP}:${EVICT_FRONT_PORT}" >&2
     exit 1
   }
@@ -1105,7 +1105,7 @@ CONTROL_TCP6_PORT=19305
 REJECT_CAPTURE="/tmp/beep-smoke-reject-capture.txt"
 
 set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
-  bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 || {
+  bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 0 0 0 0 || {
     echo "FAIL: could not insert a count-0 FRONT_META row (key ip bytes '$1', port $2)" >&2
     exit 1
   }

@@ -146,8 +146,9 @@ const UDP_CSUM_V6: usize = L4_OFF_V6 + 6;
 /// Per-front live-generation pointer: front tuple -> `{generation, count,
 /// flags}` (`beep_common::FrontMeta`). A `BPF_MAP_TYPE_HASH` (not an array)
 /// so the controller's single-element replace is the atomic commit of a new
-/// endpoint generation; ingress and decap read this once per packet, then
-/// read `FRONT_ENDPOINTS` at `(front, generation, slot 0)`.
+/// endpoint generation; ingress reads this once per packet, then reads
+/// `FRONT_ENDPOINTS` at the slot `beep_common::select_endpoint_slot` picks
+/// (the node-local prefix `0..local_count` when non-empty, else all slots).
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
 /// userspace loader overrides it via `EbpfLoader::map_max_entries`
