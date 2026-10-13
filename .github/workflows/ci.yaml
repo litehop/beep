@@ -266,7 +266,7 @@ jobs:
       - name: Install netcat and tcpdump (round-trip responder, wire assertions)
         run: |
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
-          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y netcat-openbsd && sudo apt-get remove -y tcpdump && ! command -v tcpdump
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 install -y netcat-openbsd
 
       - name: Build beep-ebpf + beep + beep-controller
         run: cargo build --release -p beep -p beep-controller
