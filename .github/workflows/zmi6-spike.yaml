@@ -21,8 +21,9 @@ jobs:
       - name: install
         run: |
           sudo apt-get -o Acquire::Retries=3 update -qq
-          sudo apt-get -o Acquire::Retries=3 install -y qemu-system-x86 virtme-ng
-          vng --version
+          sudo apt-get -o Acquire::Retries=3 install -y qemu-system-x86 virtme-ng netcat-openbsd
+          curl -sSLO https://github.com/libbpf/bpftool/releases/download/v7.7.0/bpftool-v7.7.0-amd64.tar.gz
+          sudo tar -xzf bpftool-v7.7.0-amd64.tar.gz -C /usr/local/bin bpftool
       - name: fetch kernel
         run: |
           set -euxo pipefail
@@ -34,12 +35,9 @@ jobs:
           mkdir x
           dpkg -x ${{ matrix.img }} x
           sudo dpkg -x ${{ matrix.mod }} /
-          ls x/boot /lib/modules
-      - name: config
-        run: |
-          cfg=$(ls /boot/config-${{ matrix.v }}-*)
-          for o in BPF_SYSCALL BPF_JIT NET_CLS_BPF NET_ACT_BPF NET_XGRESS GENEVE VETH NET_NS 9P_FS NET_9P_VIRTIO VIRTIO_PCI VIRTIO_BLK OVERLAY_FS DEBUG_INFO_BTF NET_SCH_INGRESS NET_SCH_CLSACT; do grep -E "^CONFIG_$o[= ]|^# CONFIG_$o " $cfg || echo "CONFIG_$o absent"; done
       - name: boot
         run: |
-          set -x
-          time sudo vng --run /tmp/k/x/boot/vmlinuz-* --user root --verbose --exec 'uname -r; ip -V; which nc bpftool; mount | grep -E " / |bpf"; ls /sys/kernel/btf/vmlinux' 2>&1 | tail -80
+          printf '%s\n' 'uname -r' 'id' 'ip -V' 'which nc bpftool' 'mount | grep -E " / |bpf"' 'ls /sys/kernel/btf/vmlinux' 'ls /tmp | head' 'echo exit-test; exit 7' > guest.sh
+          set +e
+          time sudo vng --run /tmp/k/x/boot/vmlinuz-* --user root --verbose --exec "bash $PWD/guest.sh"
+          echo "vng rc=$?"
