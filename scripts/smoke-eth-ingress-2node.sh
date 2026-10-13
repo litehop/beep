@@ -103,6 +103,11 @@ geneve_rx() { # rx packet count on <vm>'s geneve0
   limactl shell "$1" -- cat /sys/class/net/geneve0/statistics/rx_packets
 }
 
+loader_pids() { # sorted loader PIDs on <vm>; empty if none
+  # -x truncates to 15 chars and never matches $BIN_NAME; [b] keeps pgrep -f from matching its own command line.
+  limactl shell "$1" -- pgrep -f "/tmp/[${BIN_NAME:0:1}]${BIN_NAME:1} --uplink-iface" | sort | tr '\n' ' ' || true
+}
+
 curl_front() { # curl_front <max-seconds>; sets CLIENT_RC/CLIENT_BODY
   set +e
   CLIENT_BODY="$(limactl shell "$VM_CLIENT" -- curl -sS -m "$1" "http://${IP_A}:${FRONT_PORT}/" 2>&1)"
@@ -209,6 +214,16 @@ echo "==> [7/8] NEGATIVE CONTROL: NODE_ALLOW not seeded -- the round trip must F
 # alive, and the forward Geneve packet must have reached $VM_B's geneve0 (rx
 # moved: wg0 transport and decap path work) without being delivered -- the
 # admission drop happens in beep's hook after geneve0 has counted the packet.
+# Loader PIDs are recorded before and must be identical after, so a crash plus
+# restart cannot pass. The dataplane has no per-reason drop counter (NODE_ALLOW
+# misses return TC_ACT_SHOT uncounted; only FRONT_MISSES/REJECT_BUCKET exist),
+# so rx movement cannot separate an admission drop from another in-hook drop.
+NC_PIDS_A="$(loader_pids "$VM_A")"
+NC_PIDS_B="$(loader_pids "$VM_B")"
+if [ -z "$NC_PIDS_A" ] || [ -z "$NC_PIDS_B" ]; then
+  echo "NEGATIVE-CONTROL: FAIL (no loader running before the unseeded attempt: a='$NC_PIDS_A' b='$NC_PIDS_B')" >&2
+  exit 1
+fi
 NC_RX_B_BEFORE="$(geneve_rx "$VM_B")"
 curl_front 8
 NC_RX_B_AFTER="$(geneve_rx "$VM_B")"
@@ -222,11 +237,13 @@ if [ "$CLIENT_RC" -ne 28 ]; then
   exit 1
 fi
 for vm in "$VM_A" "$VM_B"; do
-  # -x truncates to 15 chars and never matches $BIN_NAME; [b] keeps pgrep -f from matching its own command line.
-  limactl shell "$vm" -- pgrep -f "/tmp/[${BIN_NAME:0:1}]${BIN_NAME:1} --uplink-iface" >/dev/null || {
-    echo "NEGATIVE-CONTROL: FAIL (loader not running on $vm after the unseeded attempt -- crash, not admission drop)" >&2
+  pids_before="$NC_PIDS_B"
+  [ "$vm" = "$VM_A" ] && pids_before="$NC_PIDS_A"
+  pids_after="$(loader_pids "$vm")"
+  if [ -z "$pids_after" ] || [ "$pids_after" != "$pids_before" ]; then
+    echo "NEGATIVE-CONTROL: FAIL (loader PIDs on $vm changed across the unseeded attempt: '$pids_before' -> '$pids_after' -- crash/restart, not admission drop)" >&2
     exit 1
-  }
+  fi
 done
 if [ "$NC_RX_B_AFTER" -le "$NC_RX_B_BEFORE" ]; then
   echo "NEGATIVE-CONTROL: FAIL ($VM_B geneve0 rx did not move: the packet never arrived, so the timeout is not attributable to NODE_ALLOW)" >&2
