@@ -35,13 +35,12 @@ use aya::{
     Ebpf,
 };
 use beep::{
-    attach_and_pin, capacity_hint, evict_pod_flows,
+    attach_and_pin, capacity_hint, evict_pod_flows, front_map_max_entries,
     front_swap::{plan_front_writes, run_front_plan, DesiredFront, FrontPlan, FrontWrite},
     load_ebpf, local_pod_ips, parse_fixture, parse_iface_name, populate_config,
     populate_uplink_config, random_seed, require_supported_kernel, stale_pod_targets,
-    tunnel_remote_v6, wire_ip_v6, Fixture, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
-    DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
-    DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
+    tunnel_remote_v6, wire_ip_v6, Fixture, DEFAULT_ENDPOINTS_PER_FRONT, DEFAULT_MAX_FRONTS,
+    DEFAULT_NODE_ALLOW_MAX_ENTRIES, DEFAULT_POD_TARGETS_MAX_ENTRIES, MAP_NAMES,
 };
 use beep_common::{
     wire_port, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
@@ -154,8 +153,10 @@ struct Args {
     /// becomes its own front (`FRONT_META` + slot-0 `FRONT_ENDPOINTS`). The front address is
     /// this node's own IP in the node-owned-address model (`ebpf-lb-dataplane.md`).
     /// Format: `front_ip:front_port:proto:backend_node_ip:pod_ip:target_port`
-    /// (`proto` is `tcp` or `udp`).
-    #[arg(long = "fixture", required = true, value_parser = parse_fixture)]
+    /// (`proto` is `tcp` or `udp`). With no `--fixture` the loader only
+    /// loads, migrates and attaches, leaving every map as found -- the
+    /// controller-managed restart shape, where the maps are filled after attach.
+    #[arg(long = "fixture", value_parser = parse_fixture)]
     fixtures: Vec<Fixture>,
 
     /// Cluster pod CIDR (e.g. `10.244.0.0/16` or a v6 range). Every
@@ -220,14 +221,22 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
 
-    /// `FRONT_META` max_entries -- see `beep-ebpf`'s doc comment. A load-time
-    /// DaemonSet config knob, not a value baked into the eBPF object.
-    #[arg(long, default_value_t = DEFAULT_FRONT_META_MAX_ENTRIES)]
-    front_meta_max_entries: u32,
+    /// Most fronts (front address x Service port x protocol) the node can
+    /// hold. Sizes `FRONT_META` (max_fronts rows) and, with
+    /// `--endpoints-per-front`, `FRONT_ENDPOINTS` (max_fronts x
+    /// endpoints_per_front x 2 rows; the 2 is swap headroom). Both maps are
+    /// allocated on use, so unused capacity costs only ~16 B per slot.
+    #[arg(long, env = "BEEP_MAX_FRONTS", default_value_t = DEFAULT_MAX_FRONTS)]
+    max_fronts: u32,
 
-    /// `FRONT_ENDPOINTS` max_entries -- see `beep-ebpf`'s doc comment.
-    #[arg(long, default_value_t = DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES)]
-    front_endpoints_max_entries: u32,
+    /// Endpoints each front is sized for; see `--max-fronts` for the
+    /// `FRONT_ENDPOINTS` row formula.
+    #[arg(
+        long,
+        env = "BEEP_ENDPOINTS_PER_FRONT",
+        default_value_t = DEFAULT_ENDPOINTS_PER_FRONT
+    )]
+    endpoints_per_front: u32,
 
     /// `NODE_ALLOW` max_entries -- one entry per node underlay address, so a
     /// dual-stack node costs two. See `beep-ebpf`'s doc comment.
@@ -443,11 +452,13 @@ fn main() -> anyhow::Result<()> {
         flow_hash_seed,
         fwd_pending_max_entries,
         flow_table_max_entries,
-        front_meta_max_entries,
-        front_endpoints_max_entries,
+        max_fronts,
+        endpoints_per_front,
         node_allow_max_entries,
         pod_targets_max_entries,
     } = Args::parse();
+    let (front_meta_max_entries, front_endpoints_max_entries) =
+        front_map_max_entries(max_fronts, endpoints_per_front)?;
     require_supported_kernel()?;
     let pin_dir = require_explicit_pin_dir(pin_dir).map_err(|e| anyhow!(e))?;
 
@@ -481,8 +492,10 @@ fn main() -> anyhow::Result<()> {
     };
     populate_config(&mut ebpf, &geneve_iface, flow_hash_seed).context("populating CONFIG map")?;
     populate_uplink_config(&mut ebpf, &uplink_ifaces).context("populating UPLINK_CONFIG map")?;
-    populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
-        .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
+    if !fixtures.is_empty() {
+        populate_fixtures(&mut ebpf, &fixtures, node_ip, &pin_dir)
+            .context("populating FRONT_META/FRONT_ENDPOINTS/POD_TARGETS/NODE_ALLOW fixture")?;
+    }
 
     let uplink_iface_refs: Vec<&str> = uplink_ifaces.iter().map(String::as_str).collect();
     let geneve_iface_refs = [geneve_iface.as_str()];
@@ -628,6 +641,7 @@ fn plan_fixture_fronts(
         current_endpoints,
         &fixture_fronts(fixtures),
         true,
+        &std::collections::HashSet::new(),
     )
 }
 
@@ -671,12 +685,16 @@ fn populate_fixtures(
             .context("reading FRONT_ENDPOINTS")?;
         let mut detail: Vec<String> = Vec::new();
         for plan in plan_fixture_fronts(&current_meta, &current_endpoints, fixtures) {
-            detail.extend(run_front_plan(&plan, |step| match step {
-                FrontWrite::DeleteEndpoint(k) => front_endpoints.remove(k),
-                FrontWrite::PutEndpoint(k, v) => front_endpoints.insert(k, v, 0),
-                FrontWrite::PutMeta(k, v) => front_meta.insert(k, v, 0),
-                FrontWrite::DeleteMeta(k) => front_meta.remove(k),
-            }));
+            detail.extend(
+                run_front_plan(&plan, |step| match step {
+                    FrontWrite::DeleteEndpoint(k) => front_endpoints.remove(k),
+                    FrontWrite::PutEndpoint(k, v) => front_endpoints.insert(k, v, 0),
+                    FrontWrite::PutMeta(k, v) => front_meta.insert(k, v, 0),
+                    FrontWrite::DeleteMeta(k) => front_meta.remove(k),
+                })
+                .into_iter()
+                .map(|f| f.message),
+            );
         }
         if !detail.is_empty() {
             anyhow::bail!(
@@ -954,6 +972,42 @@ mod tests {
         .unwrap();
         assert_eq!(args.node_allow_max_entries, 64);
         assert_eq!(args.pod_targets_max_entries, 512);
+    }
+
+    #[test]
+    fn front_sizing_flags_default_to_the_decided_caps_and_derive_the_map_rows() {
+        // 1024 fronts x 4 endpoints is the operator-decided small-cluster
+        // cap; FRONT_ENDPOINTS rows are x2 for the swap headroom. A silently
+        // different default changes every node's footprint.
+        let args = Args::try_parse_from(REQUIRED_ARGS).unwrap();
+        assert_eq!((args.max_fronts, args.endpoints_per_front), (1024, 4));
+        assert_eq!(
+            front_map_max_entries(args.max_fronts, args.endpoints_per_front).unwrap(),
+            (1024, 8192)
+        );
+    }
+
+    #[test]
+    fn front_sizing_flags_have_env_aliases_for_a_configmap() {
+        use clap::CommandFactory;
+        let cmd = Args::command();
+        for (flag, env) in [
+            ("max_fronts", "BEEP_MAX_FRONTS"),
+            ("endpoints_per_front", "BEEP_ENDPOINTS_PER_FRONT"),
+        ] {
+            let arg = cmd.get_arguments().find(|a| a.get_id() == flag).unwrap();
+            assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env));
+        }
+    }
+
+    #[test]
+    fn the_raw_front_max_entries_flags_are_gone() {
+        for flag in ["--front-meta-max-entries", "--front-endpoints-max-entries"] {
+            assert!(
+                Args::try_parse_from(REQUIRED_ARGS.into_iter().chain([flag, "16"])).is_err(),
+                "{flag} was replaced by --max-fronts/--endpoints-per-front"
+            );
+        }
     }
 
     #[test]

@@ -209,43 +209,107 @@ assert_eq "loader-rss.csv also writes its header exactly once across two once ca
 #    sampler produces and (b) even the OLD ambiguous multi-tick shape, fed
 #    to it anyway, is rejected rather than silently passed.
 # ===========================================================================
+# Entries present in the front maps when the GOOD_CSV numbers were taken.
+ENTRY_ARGS="--front-meta-entries 14 --front-endpoints-entries 13"
 GOOD_CSV="$TMPDIR_TEST/good.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,1024,18752"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
-  echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:00Z,192,FRONT_ENDPOINTS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
-  echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,2360224"
+  echo "2026-09-05T00:00:00Z,192,FRONT_ENDPOINTS,hash,8192,133664"
+  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,2048,295840"
+  echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,128,5000"
+  echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,32,3000"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
   echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$GOOD_CSV"
 set +e
-bash "$ASSERT_SCRIPT" "$GOOD_CSV" >/dev/null 2>&1
+bash "$ASSERT_SCRIPT" "$GOOD_CSV" $ENTRY_ARGS >/dev/null 2>&1
 GOOD_EXIT=$?
 set -e
 assert_true "a correct single-tick CSV with all 10 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
+
+# The usage-based tripwire: FRONT_ENDPOINTS back to a preallocated footprint
+# (8192 x 136 B) is ~8x its expected usage but far under the 6 MiB gross
+# ceiling, so only the per-map usage check can catch a lost BPF_F_NO_PREALLOC.
+PREALLOC_CSV="$TMPDIR_TEST/prealloc.csv"
+sed 's|FRONT_ENDPOINTS,hash,8192,133664|FRONT_ENDPOINTS,hash,8192,1115168|' "$GOOD_CSV" > "$PREALLOC_CSV"
+set +e
+PREALLOC_OUT="$(bash "$ASSERT_SCRIPT" "$PREALLOC_CSV" $ENTRY_ARGS 2>&1)"
+PREALLOC_EXIT=$?
+set -e
+if [ "$PREALLOC_EXIT" -ne 0 ] && printf '%s' "$PREALLOC_OUT" | grep -q "FRONT_ENDPOINTS bytes_memlock"; then
+  echo "PASS: a preallocated FRONT_ENDPOINTS under the gross ceiling is rejected by the usage-based check"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: a preallocated FRONT_ENDPOINTS must trip the usage-based tripwire — exit $PREALLOC_EXIT: $PREALLOC_OUT"
+  FAIL=$(( FAIL + 1 ))
+fi
+
+# The bucket floor is derived from the map's own max_entries, so an intended
+# bigger cap is not flagged (the cap flags are the knob).
+BIGCAP_CSV="$TMPDIR_TEST/bigcap.csv"
+sed 's|FRONT_META,hash,1024,18752|FRONT_META,hash,65536,1066560|' "$GOOD_CSV" > "$BIGCAP_CSV"
+set +e
+bash "$ASSERT_SCRIPT" "$BIGCAP_CSV" --front-meta-entries 14 --front-endpoints-entries 13 >/dev/null 2>&1
+BIGCAP_EXIT=$?
+set -e
+if [ "$BIGCAP_EXIT" -eq 0 ]; then
+  echo "PASS: a bucket floor matching its own max_entries is accepted (the floor is derived from max_entries, not fixed)"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: bucket floor must scale with the map's own max_entries"
+  FAIL=$(( FAIL + 1 ))
+fi
+
+# Per-entry bloat: the same map reporting 1000 entries' worth of memory while
+# 14 entries are present.
+BLOAT_CSV="$TMPDIR_TEST/bloat.csv"
+sed 's|FRONT_META,hash,1024,18752|FRONT_META,hash,1024,112000|' "$GOOD_CSV" > "$BLOAT_CSV"
+set +e
+bash "$ASSERT_SCRIPT" "$BLOAT_CSV" $ENTRY_ARGS >/dev/null 2>&1
+BLOAT_EXIT=$?
+set -e
+if [ "$BLOAT_EXIT" -ne 0 ]; then
+  echo "PASS: memory far above bucket floor + entries x per-entry is rejected"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: per-entry bloat must trip the tripwire"
+  FAIL=$(( FAIL + 1 ))
+fi
+
+# The entry counts are mandatory: without them the expectation is a guess.
+set +e
+bash "$ASSERT_SCRIPT" "$GOOD_CSV" >/dev/null 2>&1
+NOARGS_EXIT=$?
+set -e
+if [ "$NOARGS_EXIT" -ne 0 ]; then
+  echo "PASS: missing entry counts fail loudly instead of defaulting"
+  PASS=$(( PASS + 1 ))
+else
+  echo "FAIL: the assertion must require the front-map entry counts"
+  FAIL=$(( FAIL + 1 ))
+fi
 
 # A single tick that dropped FRONT_ENDPOINTS — the actual shape an "9 of 10 maps
 # found" discovery regression produces against the fixed CI invocation.
 DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,1024,18752"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
-  echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
-  echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,2360224"
+  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,2048,295840"
+  echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,128,5000"
+  echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,32,3000"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
   echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$DROPPED_CSV"
 set +e
-DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" 2>&1)"
+DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" $ENTRY_ARGS 2>&1)"
 DROPPED_EXIT=$?
 set -e
 if [ "$DROPPED_EXIT" -ne 0 ]; then
@@ -266,22 +330,22 @@ fi
 LEGACY_8_THEN_7_CSV="$TMPDIR_TEST/legacy-8-then-7.csv"
 {
   echo "ts,map_id,map_name,map_type,max_entries,bytes_memlock"
-  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,189,FRONT_META,hash,1024,18752"
   echo "2026-09-05T00:00:00Z,190,CONFIG,array,1,512"
-  echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:00Z,192,FRONT_ENDPOINTS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,64,4096"
-  echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,32,4096"
-  echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,16,4096"
-  echo "2026-09-05T00:00:01Z,189,FRONT_META,hash,16,4096"
+  echo "2026-09-05T00:00:00Z,191,FLOW_TABLE,hash,16384,2360224"
+  echo "2026-09-05T00:00:00Z,192,FRONT_ENDPOINTS,hash,8192,133664"
+  echo "2026-09-05T00:00:00Z,193,FWD_PENDING,hash,2048,295840"
+  echo "2026-09-05T00:00:00Z,195,POD_TARGETS,hash,128,5000"
+  echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,32,3000"
+  echo "2026-09-05T00:00:01Z,189,FRONT_META,hash,1024,18752"
   echo "2026-09-05T00:00:01Z,190,CONFIG,array,1,512"
-  echo "2026-09-05T00:00:01Z,191,FLOW_TABLE,hash,16384,1966976"
-  echo "2026-09-05T00:00:01Z,192,FRONT_ENDPOINTS,hash,32,4096"
-  echo "2026-09-05T00:00:01Z,193,FWD_PENDING,hash,64,4096"
-  echo "2026-09-05T00:00:01Z,195,POD_TARGETS,hash,32,4096"
+  echo "2026-09-05T00:00:01Z,191,FLOW_TABLE,hash,16384,2360224"
+  echo "2026-09-05T00:00:01Z,192,FRONT_ENDPOINTS,hash,8192,133664"
+  echo "2026-09-05T00:00:01Z,193,FWD_PENDING,hash,2048,295840"
+  echo "2026-09-05T00:00:01Z,195,POD_TARGETS,hash,128,5000"
 } > "$LEGACY_8_THEN_7_CSV"
 set +e
-LEGACY_OUT="$(bash "$ASSERT_SCRIPT" "$LEGACY_8_THEN_7_CSV" 2>&1)"
+LEGACY_OUT="$(bash "$ASSERT_SCRIPT" "$LEGACY_8_THEN_7_CSV" $ENTRY_ARGS 2>&1)"
 LEGACY_EXIT=$?
 set -e
 if [ "$LEGACY_EXIT" -ne 0 ]; then

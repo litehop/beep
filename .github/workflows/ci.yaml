@@ -223,7 +223,7 @@ jobs:
 
   # Loads the real programs and drives one client->front->backend round trip
   # natively on ubuntu-latest (no Lima/cross-build), then asserts the discovered
-  # map set is EXACTLY the 7 known maps (catches partial-discovery regressions a
+  # map set is EXACTLY the 10 known maps (catches partial-discovery regressions a
   # byte-sum-only check would miss) under a gross-regression bytes_memlock ceiling.
   # Also runs the real beep-controller binary against a real single-node k3s
   # apiserver on this same runner and gates its userspace RSS
@@ -302,8 +302,17 @@ jobs:
             --pin-dir /sys/fs/bpf/beep-smoke \
             --out-dir /tmp/beep-ebpf-memory-assert
 
-      - name: Assert the discovered map set is exactly the 7 known maps, under the gross-regression byte ceiling
-        run: bash scripts/assert-ebpf-map-memory.sh /tmp/beep-ebpf-memory-assert/ebpf-map-memory.csv
+      - name: Assert the discovered map set is exactly the 10 known maps, within 1.15x of the expected usage and under the gross-regression byte ceiling
+        run: |
+          set -euo pipefail
+          meta_entries=$(sudo bpftool map dump pinned /sys/fs/bpf/beep-smoke/FRONT_META -j | jq length)
+          endpoint_entries=$(sudo bpftool map dump pinned /sys/fs/bpf/beep-smoke/FRONT_ENDPOINTS -j | jq length)
+          bash scripts/assert-ebpf-map-memory.sh /tmp/beep-ebpf-memory-assert/ebpf-map-memory.csv \
+            --front-meta-entries "$meta_entries" \
+            --front-endpoints-entries "$endpoint_entries"
+
+      - name: Assert the per-entry cost of the front maps with 1000 synthetic rows each (removed afterwards)
+        run: sudo bash scripts/assert-populated-front-memory.sh /sys/fs/bpf/beep-smoke
 
       # get.k3s.io's own installer (systemd unit + start), same source ci.yaml
       # already trusts nowhere else -- scripts/k3s-up.sh uses the identical

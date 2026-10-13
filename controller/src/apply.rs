@@ -14,18 +14,22 @@
 //! `FRONT_META` update to `{g+1, count, flags}`. `FRONT_META` is a HASH map so
 //! that single update is an atomic element replace for concurrent readers;
 //! deleting a front drops its `FRONT_META` entry first, then its endpoints.
-//! Every tick also deletes endpoint generations other than current and `g-1`,
+//! After a commit `g` stays as `g-1` for `PREVIOUS_GENERATION_GRACE` and is
+//! then deleted; every tick also deletes any other non-current generation,
 //! which is what cleans up after a crashed predecessor on startup.
 
 use std::{
     collections::{HashMap, HashSet},
     net::Ipv4Addr,
     path::Path,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
-use aya::maps::{HashMap as AyaHashMap, Map, MapData};
-use beep::front_swap::{apply_fronts, DesiredFront};
+use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapInfo};
+use beep::front_swap::{
+    apply_fronts, DesiredFront, FailureKind, FrontCapacity, FrontFailure, RecentSwaps,
+};
 use beep_common::{
     unmap_ipv4, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
     LbFrontKey, TcpFlowKey,
@@ -39,6 +43,12 @@ use crate::reconcile::DesiredEntries;
 pub struct PinnedMaps {
     front_meta: AyaHashMap<MapData, LbFrontKey, FrontMeta>,
     front_endpoints: AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
+    /// The pinned front maps' `max_entries`, read once at open: the pre-write
+    /// capacity check compares against what the kernel enforces, not what
+    /// this process was started with.
+    front_capacity: FrontCapacity,
+    /// Fronts whose previous generation is still inside its grace.
+    recent_swaps: RecentSwaps,
     pod_targets: AyaHashMap<MapData, [u8; 16], u8>,
     node_allow: AyaHashMap<MapData, [u8; 16], u8>,
     /// Opened for the eviction sweep only (`apply_pod_targets`) -- never
@@ -74,11 +84,23 @@ fn open_hash_map<K: aya::Pod, V: aya::Pod>(
         .with_context(|| format!("map `{name}` is not a BPF_MAP_TYPE_HASH"))
 }
 
+fn pinned_max_entries(pin_dir: &Path, name: &str) -> anyhow::Result<u32> {
+    let path = pin_dir.join(name);
+    Ok(MapInfo::from_pin(&path)
+        .with_context(|| format!("reading pinned map `{name}` info from {}", path.display()))?
+        .max_entries())
+}
+
 impl PinnedMaps {
     pub fn open(pin_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             front_meta: open_hash_map(pin_dir, "FRONT_META")?,
             front_endpoints: open_hash_map(pin_dir, "FRONT_ENDPOINTS")?,
+            front_capacity: FrontCapacity {
+                meta: pinned_max_entries(pin_dir, "FRONT_META")?,
+                endpoints: pinned_max_entries(pin_dir, "FRONT_ENDPOINTS")?,
+            },
+            recent_swaps: RecentSwaps::default(),
             pod_targets: open_hash_map(pin_dir, "POD_TARGETS")?,
             node_allow: open_hash_map(pin_dir, "NODE_ALLOW")?,
             // Both `FWD_PENDING`/`FLOW_TABLE` are `BPF_MAP_TYPE_LRU_HASH`
@@ -161,12 +183,7 @@ impl PinnedMaps {
             None => orphan_walk_error.map_or(Ok(()), Err),
         };
         let fronts_result = if desired.fronts_known {
-            apply_front_maps(
-                &mut self.front_meta,
-                &mut self.front_endpoints,
-                &plan.fronts,
-                plan.prune_fronts,
-            )
+            self.apply_front_maps(&plan.fronts, plan.prune_fronts)
         } else {
             Ok(())
         };
@@ -195,32 +212,93 @@ impl PinnedMaps {
     }
 }
 
-/// Runs `beep::front_swap::apply_fronts` and turns its per-front failures
-/// into logged lines plus one loud reconcile-level error.
-fn apply_front_maps(
-    front_meta: &mut AyaHashMap<MapData, LbFrontKey, FrontMeta>,
-    front_endpoints: &mut AyaHashMap<MapData, FrontEndpointKey, FrontEndpoint>,
-    fronts: &HashMap<LbFrontKey, DesiredFront>,
-    prune_absent: bool,
-) -> anyhow::Result<()> {
-    let failures = apply_fronts(front_meta, front_endpoints, fronts, prune_absent)
+impl PinnedMaps {
+    /// Whether a swapped front's `g-1` grace has run out, so a reconcile pass
+    /// would now delete its rows. A quiet cluster has no other trigger.
+    pub fn previous_generations_due(&self, now: Instant) -> bool {
+        self.recent_swaps.expired(now, PREVIOUS_GENERATION_GRACE)
+    }
+
+    /// Runs `beep::front_swap::apply_fronts` and turns its per-front failures
+    /// into logged lines plus one loud reconcile-level error.
+    fn apply_front_maps(
+        &mut self,
+        fronts: &HashMap<LbFrontKey, DesiredFront>,
+        prune_absent: bool,
+    ) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let held = self.recent_swaps.held(now, PREVIOUS_GENERATION_GRACE);
+        let applied = apply_fronts(
+            &mut self.front_meta,
+            &mut self.front_endpoints,
+            self.front_capacity,
+            fronts,
+            prune_absent,
+            &held,
+        )
         .context("reading FRONT_META/FRONT_ENDPOINTS")?;
-    for (front, message) in &failures {
+        self.recent_swaps
+            .record(&applied.swapped, now, PREVIOUS_GENERATION_GRACE);
+        report_front_failures(&applied.failures)
+    }
+}
+
+/// How long a swapped front keeps its previous generation's rows. A reader
+/// needs them only for the microseconds between its `FRONT_META` and
+/// `FRONT_ENDPOINTS` lookups inside one tc invocation (no sleeping, no I/O),
+/// so even a stalled vCPU is orders of magnitude below this. Two retry polls
+/// (`RETRY_POLL`, 1 s) makes the follow-up pass land on a tick boundary
+/// within about 3 s of the commit.
+const PREVIOUS_GENERATION_GRACE: Duration = Duration::from_secs(2);
+
+fn report_front_failures(failures: &[(LbFrontKey, FrontFailure)]) -> anyhow::Result<()> {
+    for (front, failure) in failures {
         eprintln!(
-            "controller: front {} {message} (front left on its previous endpoints -- map may be \
-             at capacity)",
-            describe_lb_front_key(front)
+            "controller: front {} {}",
+            describe_lb_front_key(front),
+            front_failure_line(failure)
         );
     }
     if !failures.is_empty() {
+        let kinds: Vec<FailureKind> = failures.iter().map(|(_, f)| f.kind).collect();
         anyhow::bail!(
-            "{} front write(s) failed -- see per-front errors above; {} / {}",
+            "{} front write(s) failed -- see per-front errors above{}",
             failures.len(),
-            beep::capacity_hint("FRONT_META"),
-            beep::capacity_hint("FRONT_ENDPOINTS")
+            front_failure_advice(&kinds)
         );
     }
     Ok(())
+}
+
+/// The log line for one failed front write. Only a `Capacity` failure may talk
+/// about a cap: blaming it for ENOMEM sends the operator after the wrong knob.
+fn front_failure_line(failure: &FrontFailure) -> String {
+    let cause = match failure.kind {
+        FailureKind::Capacity => "map at capacity",
+        FailureKind::OutOfMemory => {
+            "kernel out of memory allocating a map element (ENOMEM), not a map-size limit; \
+             retried on the next reconcile"
+        }
+        FailureKind::Other => "unexpected map error",
+    };
+    format!(
+        "{} ({cause}; front left on its previous endpoints)",
+        failure.message
+    )
+}
+
+/// What to tell the operator after a failed apply: the cap flags only when a
+/// cap was actually hit.
+fn front_failure_advice(kinds: &[FailureKind]) -> String {
+    if kinds.contains(&FailureKind::Capacity) {
+        format!(
+            "; {} / {}",
+            beep::capacity_hint("FRONT_META"),
+            beep::capacity_hint("FRONT_ENDPOINTS")
+        )
+    } else {
+        String::new()
+    }
 }
 
 fn describe_lb_front_key(key: &LbFrontKey) -> String {
@@ -545,6 +623,39 @@ mod tests {
     use beep_common::{ipv4_mapped_v6, LbFrontBackend};
 
     type Known = HashMap<[u8; 16], Option<String>>;
+
+    fn failure(kind: FailureKind) -> FrontFailure {
+        FrontFailure {
+            kind,
+            message: "FRONT_ENDPOINTS write failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn enomem_is_never_blamed_on_a_cap() {
+        // Telling an operator to raise a cap on a transient kernel ENOMEM
+        // sends them after the wrong knob during an incident.
+        let line = front_failure_line(&failure(FailureKind::OutOfMemory));
+        assert!(
+            line.contains("ENOMEM") && !line.contains("capacity"),
+            "{line}"
+        );
+        assert!(
+            front_failure_advice(&[FailureKind::OutOfMemory, FailureKind::Other]).is_empty(),
+            "no cap flag advice without a capacity failure"
+        );
+    }
+
+    #[test]
+    fn a_capacity_failure_names_the_cap_flags() {
+        let line = front_failure_line(&failure(FailureKind::Capacity));
+        assert!(line.contains("capacity"), "{line}");
+        let advice = front_failure_advice(&[FailureKind::OutOfMemory, FailureKind::Capacity]);
+        assert!(
+            advice.contains("FRONT_META") && advice.contains("FRONT_ENDPOINTS"),
+            "{advice}"
+        );
+    }
 
     fn ip(n: u32) -> [u8; 16] {
         ipv4_mapped_v6(n)

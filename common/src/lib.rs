@@ -11,6 +11,12 @@
 
 pub mod reject;
 
+/// `BPF_F_NO_PREALLOC`: allocate hash elements on insert instead of reserving
+/// `max_entries` up front. `beep-ebpf` sets it on the controller-written front
+/// maps and the loader compares it on pinned maps, so one definition keeps
+/// both sides agreeing.
+pub const BPF_F_NO_PREALLOC: u32 = 1;
+
 /// TCP/UDP flow-affinity key: IPv6-primary, 37 bytes (16+16+2+2+1), no
 /// padding. A flat byte array rather than a `#[repr(C)]` struct: the kernel
 /// hashes/compares a `BPF_MAP_TYPE_*_HASH` key's raw bytes, and a padded
@@ -282,8 +288,9 @@ pub struct LbFrontBackend {
 /// under `g+1`, (3) replace this value with `{g+1, count, flags, local_count}`. At most
 /// two generations of a front's endpoints exist at any time; a reader that
 /// loaded generation `g` just before step 3 still finds it. Deleting a front
-/// drops its `FRONT_META` entry first, then its endpoints. An unchanged front
-/// keeps `g` and `g-1`; anything older (e.g. crash leftovers) is deleted.
+/// drops its `FRONT_META` entry first, then its endpoints. After the commit
+/// `g` stays as `g-1` for a short grace and is then deleted, as is anything
+/// else that is not the live generation (e.g. crash leftovers).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontMeta {

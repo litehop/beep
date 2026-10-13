@@ -79,7 +79,7 @@ use beep_common::{
     EgressReturnOutcome, FlowDirection, FlowKey, FlowValue, ForwardAdmission, ForwardFlowValue,
     FrontEndpoint, FrontEndpointKey, FrontMeta, FwdPendingPin, IngressSteer, LbFrontBackend,
     LbFrontKey, PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey,
-    UplinkConfig, GENEVE_OPT_CLASS, POD_ID_OPT_LEN, REDIRECTED_RETURN_MARK,
+    UplinkConfig, BPF_F_NO_PREALLOC, GENEVE_OPT_CLASS, POD_ID_OPT_LEN, REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -152,27 +152,35 @@ const UDP_CSUM_V6: usize = L4_OFF_V6 + 6;
 ///
 /// `max_entries` below is a load-time DEFAULT, not the enforced ceiling: the
 /// userspace loader overrides it via `EbpfLoader::map_max_entries`
-/// (`src/lib.rs`'s `load_ebpf`), same pattern as `FWD_PENDING`/`FLOW_TABLE`.
-/// The controller's every-node-is-a-front keying (`ebpf-lb-dataplane.md`'s
-/// "Packet flow" step 1) makes this map's entry count nodes x Service ports,
-/// not just Service ports.
+/// (`src/lib.rs`'s `load_ebpf`) from `--max-fronts`, same pattern as
+/// `FWD_PENDING`/`FLOW_TABLE`. The controller's every-node-is-a-front keying
+/// (`ebpf-lb-dataplane.md`'s "Packet flow" step 1) makes this map's entry count
+/// nodes x Service ports, not just Service ports.
+///
+/// `BPF_F_NO_PREALLOC`: only the controller writes this map (the dataplane
+/// only reads it), so elements are allocated on insert and a small cluster
+/// does not pay for the cap. The loader compares the flag on pinned maps, so
+/// an upgrade recreates an old preallocated pin.
 #[map]
-static FRONT_META: HashMap<LbFrontKey, FrontMeta> = HashMap::with_max_entries(4096, 0);
+static FRONT_META: HashMap<LbFrontKey, FrontMeta> =
+    HashMap::with_max_entries(1024, BPF_F_NO_PREALLOC);
 
 /// Endpoint table: `(front, generation, slot)` -> `{backend_node_ip, pod_ip,
 /// target_port}` (`beep_common::FrontEndpoint`). Ingress-only: it takes the
 /// Geneve remote and the forward option (pod IP and DNAT target port) from
 /// it; the backend node's decap reads both from the option and never
 /// touches this map.
-/// A front has exactly one endpoint (slot 0) today; at most two generations
-/// per front are present (`FrontMeta`'s write protocol).
+/// At most two generations per front are present (`FrontMeta`'s write
+/// protocol): the live one, and the next while it is being written or the
+/// previous during its short post-commit grace.
 ///
-/// `max_entries` below is a load-time DEFAULT, ceiling set by
-/// `--front-endpoints-max-entries`. Two generations per front can coexist
-/// transiently, so the default is twice `FRONT_META`'s.
+/// `max_entries` below is a load-time DEFAULT; the loader derives the real
+/// ceiling as `--max-fronts x --endpoints-per-front x 2` (the 2 is swap
+/// headroom). `BPF_F_NO_PREALLOC` as on `FRONT_META`: unused headroom costs
+/// only its bucket slot.
 #[map]
 static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
-    HashMap::with_max_entries(8192, 0);
+    HashMap::with_max_entries(8192, BPF_F_NO_PREALLOC);
 
 /// Single-slot per-CPU counter: lookups where `FRONT_META` named a front
 /// but its endpoint was missing (or the count was zero). Traffic for that

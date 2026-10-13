@@ -18,10 +18,9 @@ use std::{
 use anyhow::Context;
 use aya::programs::TcAttachType;
 use beep::{
-    attach_and_pin, disable_rp_filter, ensure_geneve_iface, load_ebpf, parse_iface_name,
-    populate_config, populate_uplink_config, DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES,
-    DEFAULT_FRONT_META_MAX_ENTRIES, DEFAULT_NODE_ALLOW_MAX_ENTRIES,
-    DEFAULT_POD_TARGETS_MAX_ENTRIES,
+    attach_and_pin, disable_rp_filter, ensure_geneve_iface, front_map_max_entries, load_ebpf,
+    parse_iface_name, populate_config, populate_uplink_config, DEFAULT_ENDPOINTS_PER_FRONT,
+    DEFAULT_MAX_FRONTS, DEFAULT_NODE_ALLOW_MAX_ENTRIES, DEFAULT_POD_TARGETS_MAX_ENTRIES,
 };
 use beep_controller::{
     apply::PinnedMaps,
@@ -117,13 +116,22 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
     flow_table_max_entries: u32,
 
-    /// `FRONT_META` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_FRONT_META_MAX_ENTRIES)]
-    front_meta_max_entries: u32,
+    /// Most fronts (front address x Service port x protocol) the node can
+    /// hold. Sizes `FRONT_META` (max_fronts rows) and, with
+    /// `--endpoints-per-front`, `FRONT_ENDPOINTS` (max_fronts x
+    /// endpoints_per_front x 2 rows; the 2 is swap headroom). Both maps are
+    /// allocated on use, so unused capacity costs only ~16 B per slot.
+    #[arg(long, env = "BEEP_MAX_FRONTS", default_value_t = DEFAULT_MAX_FRONTS)]
+    max_fronts: u32,
 
-    /// `FRONT_ENDPOINTS` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES)]
-    front_endpoints_max_entries: u32,
+    /// Endpoints each front is sized for; see `--max-fronts` for the
+    /// `FRONT_ENDPOINTS` row formula.
+    #[arg(
+        long,
+        env = "BEEP_ENDPOINTS_PER_FRONT",
+        default_value_t = DEFAULT_ENDPOINTS_PER_FRONT
+    )]
+    endpoints_per_front: u32,
 
     /// `NODE_ALLOW` max_entries: one entry per node underlay address, so a
     /// dual-stack node costs two (see `beep-ebpf`'s doc comment).
@@ -258,7 +266,9 @@ fn apply_reconcile(
     );
 }
 
-/// Re-runs the full reconcile whenever `retry` says a failed apply is due.
+/// Re-runs the full reconcile whenever `retry` says a failed apply is due, and
+/// once a swapped front's previous generation has outlived its grace (a quiet
+/// cluster sends no event that would delete it).
 /// Never returns; `Result` only so it joins with the watches.
 async fn run_retry_loop(
     state: Arc<Mutex<WatchState>>,
@@ -268,9 +278,28 @@ async fn run_retry_loop(
 ) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(RETRY_POLL).await;
-        retry_tick(&retry, Instant::now(), || {
+        let ran = retry_tick(&retry, Instant::now(), || {
             apply_reconcile(&state, &maps, &retry, &node)
         });
+        follow_up_tick(
+            ran,
+            || {
+                maps.lock()
+                    .unwrap()
+                    .previous_generations_due(Instant::now())
+            },
+            || apply_reconcile(&state, &maps, &retry, &node),
+        );
+    }
+}
+
+/// Runs `reconcile` when a swapped front's previous generation has outlived
+/// its grace, unless a retry already reconciled on this tick (that pass has
+/// already deleted whatever was due). `grace_expired` is only asked when no
+/// retry ran.
+fn follow_up_tick(ran: bool, grace_expired: impl FnOnce() -> bool, reconcile: impl FnOnce()) {
+    if !ran && grace_expired() {
+        reconcile();
     }
 }
 
@@ -532,12 +561,14 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&args.pin_dir)
         .with_context(|| format!("creating pin dir {}", args.pin_dir.display()))?;
 
+    let (front_meta_max_entries, front_endpoints_max_entries) =
+        front_map_max_entries(args.max_fronts, args.endpoints_per_front)?;
     let mut ebpf = load_ebpf(
         &args.pin_dir,
         args.fwd_pending_max_entries,
         args.flow_table_max_entries,
-        args.front_meta_max_entries,
-        args.front_endpoints_max_entries,
+        front_meta_max_entries,
+        front_endpoints_max_entries,
         args.node_allow_max_entries,
         args.pod_targets_max_entries,
     )
@@ -732,6 +763,37 @@ mod tests {
         assert_eq!(args.pod_targets_max_entries, 128);
     }
 
+    #[test]
+    fn front_sizing_flags_default_to_the_decided_caps_and_have_env_aliases() {
+        // 1024 fronts x 4 endpoints is the operator-decided small-cluster
+        // cap; a silently different default changes every node's footprint.
+        // The env names are the contract a ConfigMap relies on.
+        use clap::CommandFactory;
+        let args = Args::try_parse_from(REQUIRED).unwrap();
+        assert_eq!((args.max_fronts, args.endpoints_per_front), (1024, 4));
+        assert_eq!(
+            front_map_max_entries(args.max_fronts, args.endpoints_per_front).unwrap(),
+            (1024, 8192)
+        );
+        let cmd = Args::command();
+        for (flag, env) in [
+            ("max_fronts", "BEEP_MAX_FRONTS"),
+            ("endpoints_per_front", "BEEP_ENDPOINTS_PER_FRONT"),
+        ] {
+            let arg = cmd.get_arguments().find(|a| a.get_id() == flag).unwrap();
+            assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env));
+        }
+        assert!(
+            Args::try_parse_from(
+                REQUIRED
+                    .into_iter()
+                    .chain(["--front-meta-max-entries", "16"])
+            )
+            .is_err(),
+            "the raw front max-entries flags were replaced"
+        );
+    }
+
     // An operator with a bigger cluster must be able to raise the caps at
     // deploy time; a flag that parses but is not forwarded would not help,
     // so the field is checked end to end through `Args`.
@@ -907,6 +969,44 @@ mod tests {
             "a successful retry must not run again"
         );
         assert_eq!(runs, 1);
+    }
+
+    #[test]
+    fn expired_grace_triggers_a_reconcile_on_a_quiet_cluster() {
+        // No watch event arrives on a quiet cluster, so without this follow-up
+        // the previous generation's rows would sit in the front map forever.
+        let mut reconciles = 0;
+        follow_up_tick(false, || true, || reconciles += 1);
+        assert_eq!(reconciles, 1);
+    }
+
+    #[test]
+    fn unexpired_grace_does_not_reconcile() {
+        let mut reconciles = 0;
+        follow_up_tick(false, || false, || reconciles += 1);
+        assert_eq!(
+            reconciles, 0,
+            "reconciling every tick would hammer the maps"
+        );
+    }
+
+    #[test]
+    fn a_retry_that_ran_already_swept_the_expired_grace() {
+        // A second back-to-back reconcile would double the write load on the
+        // very tick a failing apply is being retried, and the grace is not
+        // even consulted.
+        let mut reconciles = 0;
+        let mut asked = false;
+        follow_up_tick(
+            true,
+            || {
+                asked = true;
+                true
+            },
+            || reconciles += 1,
+        );
+        assert_eq!(reconciles, 0);
+        assert!(!asked);
     }
 
     #[test]

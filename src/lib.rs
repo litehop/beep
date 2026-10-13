@@ -7,6 +7,7 @@
 //! link pin paths, and map-reopen-from-pin.
 
 pub mod front_swap;
+pub mod pin_migrate;
 
 // build.rs's `.BTF.ext` rewrite; build scripts can't host tests themselves.
 #[cfg(test)]
@@ -16,7 +17,7 @@ mod btf_ext;
 
 use std::{collections::HashSet, net::IpAddr, path::Path};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use aya::{
     include_bytes_aligned,
     maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, MapInfo},
@@ -30,9 +31,13 @@ use aya::{
 };
 use beep_common::{
     decode_tcp_flow_key, ipv4_mapped_v6, wire_ip, Config, FlowDirection, FlowKey, FlowValue,
-    ForwardFlowValue, TcpFlowKey, UplinkConfig, TCP_FLOW_KEY_LEN,
+    ForwardFlowValue, TcpFlowKey, UplinkConfig, BPF_F_NO_PREALLOC, TCP_FLOW_KEY_LEN,
 };
 use clap::ValueEnum;
+use pin_migrate::{
+    apply_restore, couple_front_fates, plan_restore, snapshot_pin, Entry, Fate, FRONT_ENDPOINTS,
+    FRONT_META,
+};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -390,14 +395,40 @@ pub fn evict_pod_flows(
     Ok(())
 }
 
-/// `FRONT_META` holds one entry per front address x Service port, which
-/// scales with nodes x Service ports under the every-node-is-a-front model;
-/// 4096 covers e.g. 100 nodes x 40 Service ports.
-pub const DEFAULT_FRONT_META_MAX_ENTRIES: u32 = 4096;
-/// `FRONT_ENDPOINTS` holds one row per front x endpoint, and up to two
-/// generations of a front coexist during a swap, so the default is twice
-/// `FRONT_META`'s at one endpoint per front.
-pub const DEFAULT_FRONT_ENDPOINTS_MAX_ENTRIES: u32 = 2 * DEFAULT_FRONT_META_MAX_ENTRIES;
+/// Default `--max-fronts`: one `FRONT_META` entry per front address x Service
+/// port x protocol, so nodes x Service ports under the every-node-is-a-front
+/// model.
+pub const DEFAULT_MAX_FRONTS: u32 = 1024;
+/// Default `--endpoints-per-front`: the endpoints each front is sized for.
+pub const DEFAULT_ENDPOINTS_PER_FRONT: u32 = 4;
+
+/// `(FRONT_META, FRONT_ENDPOINTS)` `max_entries` for the derived front-map
+/// sizing flags: `FRONT_META` holds `max_fronts` rows and `FRONT_ENDPOINTS`
+/// `max_fronts x endpoints_per_front x 2` -- the factor 2 is swap headroom,
+/// since a front's new generation is written next to the live one before the
+/// commit. Both maps are `BPF_F_NO_PREALLOC`, so these are ceilings: only the
+/// ~16 B/slot bucket array is paid up front, entries cost memory as they are
+/// used. Prefer values at or just below a power of two; one just above doubles
+/// the bucket array.
+pub fn front_map_max_entries(
+    max_fronts: u32,
+    endpoints_per_front: u32,
+) -> anyhow::Result<(u32, u32)> {
+    if max_fronts == 0 || endpoints_per_front == 0 {
+        bail!("--max-fronts and --endpoints-per-front must be at least 1");
+    }
+    let rows = max_fronts
+        .checked_mul(endpoints_per_front)
+        .and_then(|rows| rows.checked_mul(2))
+        .ok_or_else(|| {
+            anyhow!(
+                "--max-fronts {max_fronts} x --endpoints-per-front {endpoints_per_front} x 2 \
+                 overflows the FRONT_ENDPOINTS row count"
+            )
+        })?;
+    Ok((max_fronts, rows))
+}
+
 /// `NODE_ALLOW` holds one entry per node underlay address, so a dual-stack
 /// node costs two; 32 covers 16 dual-stack nodes.
 pub const DEFAULT_NODE_ALLOW_MAX_ENTRIES: u32 = 32;
@@ -408,20 +439,20 @@ pub const DEFAULT_POD_TARGETS_MAX_ENTRIES: u32 = 128;
 /// Operator-facing advice appended to a failed `NODE_ALLOW`/`POD_TARGETS`/
 /// `FRONT_META`/`FRONT_ENDPOINTS`
 /// write: these maps are capped by `--node-allow-max-entries`/
-/// `--pod-targets-max-entries`/`--front-meta-max-entries`/
-/// `--front-endpoints-max-entries`, and an insert past the cap would otherwise
+/// `--pod-targets-max-entries` and, for the front maps, by `--max-fronts`/
+/// `--endpoints-per-front`, and an insert past the cap would otherwise
 /// surface only the kernel's bare `E2BIG`, leaving a node or pod silently
 /// unreachable with no hint which knob to turn. Empty for any other map.
 pub fn capacity_hint(map_name: &str) -> String {
-    let flag = match map_name {
-        "NODE_ALLOW" => "--node-allow-max-entries",
-        "POD_TARGETS" => "--pod-targets-max-entries",
-        "FRONT_META" => "--front-meta-max-entries",
-        "FRONT_ENDPOINTS" => "--front-endpoints-max-entries",
+    let flags = match map_name {
+        "NODE_ALLOW" => "`--node-allow-max-entries`",
+        "POD_TARGETS" => "`--pod-targets-max-entries`",
+        "FRONT_META" => "`--max-fronts`",
+        "FRONT_ENDPOINTS" => "`--max-fronts` or `--endpoints-per-front`",
         _ => return String::new(),
     };
     format!(
-        "if `{map_name}` is full (E2BIG), raise `{flag}`; a changed cap recreates the pinned \
+        "if `{map_name}` is full (E2BIG), raise {flags}; a changed cap recreates the pinned \
          `{map_name}` on the next loader start"
     )
 }
@@ -439,7 +470,9 @@ pub fn capacity_hint(map_name: &str) -> String {
 /// object. aya itself silently ignores an override for an already-pinned map
 /// (`EbpfLoader::map_max_entries`'s own semantics), so
 /// `recreate_mismatched_pins` first deletes any pin whose type/key/value
-/// size/max_entries differs from the request, logging each one.
+/// size/max_entries/flags differs from the request, logging each one. Entries
+/// of a pin whose layout is unchanged are restored into the recreated map
+/// here, after the load and before the caller attaches any program.
 ///
 /// Shared by the `beep` loader binary and the controller binary (Phase 5's
 /// Service/EndpointSlice watcher) so both embed and load the exact same
@@ -466,7 +499,7 @@ pub fn load_ebpf(
         ("POD_TARGETS", pod_targets_max_entries),
     ];
     let requested = requested_shapes(ebpf_object(), &max_entries)?;
-    recreate_mismatched_pins(&BpffsPins(pin_dir), &requested)?;
+    let recreated = recreate_mismatched_pins(&BpffsPins(pin_dir), &requested)?;
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
         loader.map_pin_path(name, pin_dir.join(name));
@@ -474,9 +507,11 @@ pub fn load_ebpf(
     for &(name, size) in &max_entries {
         loader.map_max_entries(name, size);
     }
-    loader
+    let ebpf = loader
         .load(ebpf_object())
-        .context("loading the beep-ebpf object")
+        .context("loading the beep-ebpf object")?;
+    restore_migrated(pin_dir, recreated, &requested).context("restoring migrated map entries")?;
+    Ok(ebpf)
 }
 
 fn ebpf_object() -> &'static [u8] {
@@ -492,7 +527,13 @@ pub struct MapShape {
     pub key_size: u32,
     pub value_size: u32,
     pub max_entries: u32,
+    pub map_flags: u32,
 }
+
+/// The `map_flags` bits beep itself sets on its maps (`BPF_F_NO_PREALLOC`).
+/// Only these are compared: the kernel may report extra bits on a live map
+/// (e.g. `BPF_F_MMAPABLE`), which must not force a recreate on every restart.
+const COMPARED_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 impl MapShape {
     fn from_info(info: &MapInfo) -> anyhow::Result<Self> {
@@ -501,6 +542,7 @@ impl MapShape {
             key_size: info.key_size(),
             value_size: info.value_size(),
             max_entries: info.max_entries(),
+            map_flags: info.map_flags(),
         })
     }
 }
@@ -516,6 +558,11 @@ pub fn map_shape_mismatches(existing: &MapShape, requested: &MapShape) -> Vec<St
         ("key_size", existing.key_size, requested.key_size),
         ("value_size", existing.value_size, requested.value_size),
         ("max_entries", existing.max_entries, requested.max_entries),
+        (
+            "map_flags",
+            existing.map_flags & COMPARED_MAP_FLAGS,
+            requested.map_flags & COMPARED_MAP_FLAGS,
+        ),
     ] {
         if old != new {
             diffs.push(format!("{field} {old} -> {new}"));
@@ -551,16 +598,18 @@ fn requested_shapes(
                     key_size: map.key_size(),
                     value_size: map.value_size(),
                     max_entries: max,
+                    map_flags: map.map_flags(),
                 },
             ))
         })
         .collect()
 }
 
-/// Where pinned maps live: read a pin's shape, delete a pin.
+/// Where pinned maps live: read a pin's shape and contents, delete a pin.
 trait PinStore {
     /// `None` if no pin exists under `name`.
     fn shape(&self, name: &str) -> anyhow::Result<Option<MapShape>>;
+    fn snapshot(&self, name: &str) -> anyhow::Result<Vec<Entry>>;
     fn remove(&self, name: &str) -> anyhow::Result<()>;
 }
 
@@ -577,50 +626,133 @@ impl PinStore for BpffsPins<'_> {
         MapShape::from_info(&info).map(Some)
     }
 
+    fn snapshot(&self, name: &str) -> anyhow::Result<Vec<Entry>> {
+        snapshot_pin(&self.0.join(name))
+    }
+
     fn remove(&self, name: &str) -> anyhow::Result<()> {
         let pin = self.0.join(name);
         std::fs::remove_file(&pin).with_context(|| format!("removing stale pin {}", pin.display()))
     }
 }
 
+/// A pin `recreate_mismatched_pins` deleted. `snapshot` holds the old entries
+/// when the map's layout is unchanged and they should be restored into the
+/// new map.
+struct Recreated {
+    name: &'static str,
+    snapshot: Option<Vec<Entry>>,
+}
+
+fn pin_fate(existing: &MapShape, wanted: &MapShape) -> Fate {
+    if map_shape_mismatches(existing, wanted).is_empty() {
+        Fate::Keep
+    } else if (existing.map_type, existing.key_size, existing.value_size)
+        == (wanted.map_type, wanted.key_size, wanted.value_size)
+    {
+        Fate::Migrate
+    } else {
+        Fate::RecreateEmpty
+    }
+}
+
 /// Deletes every pin whose shape differs from `requested`, so the load that
-/// follows recreates it empty; matching pins are left alone and reused.
-/// Policy: pre-1.0 recreate-and-log beats refusing to start; conntrack maps
-/// (`FWD_PENDING`/`FLOW_TABLE`) lose their flows, which the log line says.
-/// Returns the names it deleted.
+/// follows recreates it; matching pins are left alone and reused.
+/// A pin differing only in `map_flags`/`max_entries` is snapshotted first so
+/// `restore_migrated` can refill the new map before any program is attached
+/// (an empty front table would send established front flows to the host);
+/// a layout change recreates it empty (pre-1.0: recreate-and-log beats
+/// refusing to start). `FRONT_META`/`FRONT_ENDPOINTS` always share one fate
+/// (`couple_front_fates`). Returns what it deleted.
 ///
 /// Unlinking a pin does not touch the old map: tc programs attached by the
 /// previous loader keep referencing it until the new loader re-attaches, so
 /// right after a restart traffic is still served from the old (stale-shape)
 /// map. Not a correctness hazard -- the old programs only ever see the old map
-/// -- but the new shape takes effect only once attach completes.
+/// -- but the new shape takes effect only once attach completes. Entries the
+/// old programs write after the snapshot (new flows) are not carried over.
 fn recreate_mismatched_pins(
     pins: &dyn PinStore,
     requested: &[(&'static str, MapShape)],
-) -> anyhow::Result<Vec<&'static str>> {
-    let mut removed = Vec::new();
+) -> anyhow::Result<Vec<Recreated>> {
+    let mut fates = Vec::new();
     for &(name, wanted) in requested {
-        let Some(existing) = pins.shape(name)? else {
+        let existing = pins.shape(name)?;
+        let fate = existing.map(|e| pin_fate(&e, &wanted));
+        fates.push((name, existing, wanted, fate));
+    }
+    let fate_of = |name: &str| {
+        fates
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .and_then(|(.., fate)| *fate)
+    };
+    let coupled = couple_front_fates([fate_of(FRONT_META), fate_of(FRONT_ENDPOINTS)]);
+    let mut recreated = Vec::new();
+    for (name, existing, wanted, fate) in fates {
+        let fate = match name {
+            FRONT_META => Some(coupled[0]),
+            FRONT_ENDPOINTS => Some(coupled[1]),
+            _ => fate,
+        };
+        let (Some(existing), Some(fate)) = (existing, fate) else {
             continue;
         };
-        let diffs = map_shape_mismatches(&existing, &wanted);
-        if diffs.is_empty() {
+        if fate == Fate::Keep {
             continue;
         }
-        let lossy = if matches!(name, "FWD_PENDING" | "FLOW_TABLE") {
-            "; its conntrack state is dropped"
-        } else {
-            ""
+        let diffs = map_shape_mismatches(&existing, &wanted);
+        let mut snapshot = None;
+        let outcome = match fate {
+            Fate::Migrate => match pins.snapshot(name) {
+                Ok(entries) => {
+                    let n = entries.len();
+                    snapshot = Some(entries);
+                    format!("migrating its {n} entries")
+                }
+                Err(e) => format!("snapshot failed ({e:#}); recreating it empty"),
+            },
+            _ if matches!(name, "FWD_PENDING" | "FLOW_TABLE") => {
+                "recreating it empty; its conntrack state is dropped".to_owned()
+            }
+            _ => "recreating it empty".to_owned(),
         };
         eprintln!(
-            "beep: pinned map {name} differs from the requested definition ({}); \
-             deleting and recreating it{lossy}",
-            diffs.join(", ")
+            "beep: pinned map {name} differs from the requested definition ({}); {outcome}",
+            if diffs.is_empty() {
+                "paired front map changed".to_owned()
+            } else {
+                diffs.join(", ")
+            }
         );
         pins.remove(name)?;
-        removed.push(name);
+        recreated.push(Recreated { name, snapshot });
     }
-    Ok(removed)
+    Ok(recreated)
+}
+
+/// Refills the maps `recreate_mismatched_pins` snapshotted. Runs after the
+/// load created the new pinned maps and before any program is attached, so no
+/// program ever observes them empty.
+fn restore_migrated(
+    pin_dir: &Path,
+    recreated: Vec<Recreated>,
+    requested: &[(&'static str, MapShape)],
+) -> anyhow::Result<()> {
+    let snapshots: Vec<_> = recreated
+        .into_iter()
+        .filter_map(|r| r.snapshot.map(|s| (r.name, s)))
+        .collect();
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let plan = plan_restore(snapshots, |name| {
+        requested
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(0, |(_, s)| s.max_entries)
+    });
+    apply_restore(pin_dir, &plan)
 }
 
 /// Kernel `IFNAMSIZ` includes the trailing NUL, so a name is at most 15 bytes.
@@ -1147,17 +1279,65 @@ mod tests {
             pod.contains("POD_TARGETS") && pod.contains("--pod-targets-max-entries"),
             "a full POD_TARGETS must tell the operator which flag to raise, got {pod:?}"
         );
-        for (map, flag) in [
-            ("FRONT_META", "--front-meta-max-entries"),
-            ("FRONT_ENDPOINTS", "--front-endpoints-max-entries"),
+        for (map, flags) in [
+            ("FRONT_META", &["--max-fronts"][..]),
+            (
+                "FRONT_ENDPOINTS",
+                &["--max-fronts", "--endpoints-per-front"][..],
+            ),
         ] {
             let hint = capacity_hint(map);
             assert!(
-                hint.contains(map) && hint.contains(flag),
-                "a full {map} leaves fronts unrouted; the error must name {flag}, got {hint:?}"
+                hint.contains(map) && flags.iter().all(|f| hint.contains(f)),
+                "a full {map} leaves fronts unrouted; the error must name {flags:?}, got {hint:?}"
+            );
+            assert!(
+                !hint.contains("max-entries"),
+                "the raw --*-max-entries flags no longer exist for the front maps: {hint:?}"
             );
         }
         assert!(capacity_hint("FLOW_TABLE").is_empty());
+    }
+
+    #[test]
+    fn front_map_rows_are_fronts_times_endpoints_times_two_generations() {
+        // The x2 is the swap headroom: a front's next generation is written
+        // beside the live one, so sizing without it E2BIGs mid-swap.
+        assert_eq!(
+            front_map_max_entries(DEFAULT_MAX_FRONTS, DEFAULT_ENDPOINTS_PER_FRONT).unwrap(),
+            (1024, 8192)
+        );
+        assert_eq!(front_map_max_entries(100, 3).unwrap(), (100, 600));
+    }
+
+    #[test]
+    fn front_map_sizing_rejects_zero_and_overflow_instead_of_wrapping() {
+        // A wrapped product would silently load a tiny map and leave fronts
+        // unrouted; zero would create an unusable one.
+        assert!(front_map_max_entries(0, 4).is_err());
+        assert!(front_map_max_entries(4, 0).is_err());
+        assert!(front_map_max_entries(u32::MAX, 2).is_err());
+        assert!(front_map_max_entries(1 << 20, 1 << 12).is_err());
+    }
+
+    #[test]
+    fn front_maps_are_declared_no_prealloc_in_the_object() {
+        // The loader only compares a pin's flags against the object's, so
+        // this is what makes a fresh node skip preallocation and an upgraded
+        // one recreate its old pin.
+        let shapes = requested_shapes(ebpf_object(), &[]).unwrap();
+        for (name, shape) in &shapes {
+            let expected = if matches!(*name, "FRONT_META" | "FRONT_ENDPOINTS") {
+                BPF_F_NO_PREALLOC
+            } else {
+                0
+            };
+            assert_eq!(
+                shape.map_flags & COMPARED_MAP_FLAGS,
+                expected,
+                "{name} map_flags"
+            );
+        }
     }
 
     #[test]
@@ -1197,7 +1377,39 @@ mod tests {
             key_size: 16,
             value_size: 1,
             max_entries,
+            map_flags: 0,
         }
+    }
+
+    #[test]
+    fn flag_change_is_flagged_so_an_upgrade_does_not_keep_a_preallocated_map() {
+        // aya reuses a pin without comparing flags; a pre-upgrade map created
+        // without BPF_F_NO_PREALLOC would otherwise keep its full
+        // preallocation forever.
+        let no_prealloc = MapShape {
+            map_flags: BPF_F_NO_PREALLOC,
+            ..shape(32)
+        };
+        assert_eq!(
+            map_shape_mismatches(&shape(32), &no_prealloc),
+            ["map_flags 0 -> 1"]
+        );
+    }
+
+    #[test]
+    fn kernel_added_flag_bits_do_not_force_a_recreate() {
+        // The kernel can report bits beep never set; treating them as a
+        // mismatch would recreate the pin (and drop its contents) on every
+        // restart.
+        let reported = MapShape {
+            map_flags: BPF_F_NO_PREALLOC | 1 << 10,
+            ..shape(32)
+        };
+        let requested = MapShape {
+            map_flags: BPF_F_NO_PREALLOC,
+            ..shape(32)
+        };
+        assert!(map_shape_mismatches(&reported, &requested).is_empty());
     }
 
     #[test]
@@ -1223,6 +1435,7 @@ mod tests {
             key_size: 40,
             value_size: 8,
             max_entries: 32,
+            map_flags: 0,
         };
         assert_eq!(
             map_shape_mismatches(&old, &new),
@@ -1247,6 +1460,9 @@ mod tests {
     impl PinStore for FakePins {
         fn shape(&self, name: &str) -> anyhow::Result<Option<MapShape>> {
             Ok(self.pins.borrow().get(name).copied())
+        }
+        fn snapshot(&self, name: &str) -> anyhow::Result<Vec<Entry>> {
+            Ok(vec![(name.as_bytes().to_vec(), vec![1])])
         }
         fn remove(&self, name: &str) -> anyhow::Result<()> {
             self.pins
@@ -1274,9 +1490,41 @@ mod tests {
             ("FRONT_META", shape(8)),
         ];
         let removed = recreate_mismatched_pins(&pins, &requested).unwrap();
-        assert_eq!(removed, ["NODE_ALLOW"]);
+        let names: Vec<_> = removed.iter().map(|r| r.name).collect();
+        assert_eq!(names, ["NODE_ALLOW"]);
         let left: Vec<_> = pins.pins.borrow().keys().copied().collect();
         assert_eq!(left, ["FLOW_TABLE", "POD_TARGETS"]);
+    }
+
+    #[test]
+    fn cap_or_flag_change_snapshots_entries_so_front_flows_survive_the_recreate() {
+        // Recreating a front map empty makes ingress pass its flows to the
+        // host until the controller reconciles; a snapshot is what lets the
+        // loader refill it before attach.
+        let flagged = MapShape {
+            map_flags: BPF_F_NO_PREALLOC,
+            ..shape(32)
+        };
+        let pins = FakePins::new(&[("FRONT_META", shape(32)), ("FRONT_ENDPOINTS", shape(64))]);
+        let requested = [("FRONT_META", flagged), ("FRONT_ENDPOINTS", shape(128))];
+        let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert_eq!(recreated.len(), 2);
+        assert!(recreated.iter().all(|r| r.snapshot.is_some()));
+    }
+
+    #[test]
+    fn layout_change_recreates_empty_and_resets_the_paired_front_map() {
+        // Old rows under a different layout are meaningless, and a META kept
+        // without its ENDPOINTS would point at rows that no longer exist.
+        let wider = MapShape {
+            value_size: 99,
+            ..shape(32)
+        };
+        let pins = FakePins::new(&[("FRONT_META", shape(32)), ("FRONT_ENDPOINTS", shape(32))]);
+        let requested = [("FRONT_META", shape(32)), ("FRONT_ENDPOINTS", wider)];
+        let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert_eq!(recreated.len(), 2, "unchanged META is reset with its pair");
+        assert!(recreated.iter().all(|r| r.snapshot.is_none()));
     }
 
     #[test]
