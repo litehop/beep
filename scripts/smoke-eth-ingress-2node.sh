@@ -216,7 +216,7 @@ echo "==> [7/8] NEGATIVE CONTROL: NODE_ALLOW not seeded -- the round trip must F
 # admission drop happens in beep's hook after geneve0 has counted the packet.
 # Loader PIDs are recorded before and must be identical after, so a crash plus
 # restart cannot pass. The dataplane has no per-reason drop counter (NODE_ALLOW
-# misses return TC_ACT_SHOT uncounted; only FRONT_MISSES/REJECT_BUCKET exist),
+# misses return TC_ACT_SHOT uncounted; only FRONT_MISSES exists),
 # so rx movement cannot separate an admission drop from another in-hook drop.
 NC_PIDS_A="$(loader_pids "$VM_A")"
 NC_PIDS_B="$(loader_pids "$VM_B")"

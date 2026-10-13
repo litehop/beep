@@ -70,7 +70,7 @@ fn endpoint_key(front: LbFrontKey, generation: u32, slot: usize) -> FrontEndpoin
 
 /// Plans the writes that take `(current_meta, current_endpoints)` to
 /// `desired`. A desired front with no endpoints is kept as `count == 0`
-/// (the dataplane rejects new flows to it and lets pinned ones drain); only a
+/// (the dataplane silently drops new flows to it and lets pinned ones drain); only a
 /// front absent from `desired` is deleted. With `prune_absent`, fronts (and orphan endpoints) not in `desired` are
 /// removed; without it, only fronts named in `desired` are touched.
 /// `keep_previous` names fronts still inside their post-swap grace, whose
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn a_front_with_no_ready_endpoints_keeps_its_meta_at_count_zero_and_sheds_its_rows() {
         // Deleting the meta makes ingress pass the packet to the host: new
-        // clients hang instead of being refused. Count 0 keeps the reject.
+        // clients reach the host. Count 0 keeps the meta so they are dropped silently.
         // Pinned flows to a draining pod read their conntrack pin, not these
         // maps, so no endpoint row is needed once the grace is over.
         let f = front(1, 443);

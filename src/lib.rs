@@ -46,13 +46,12 @@ const IPPROTO_UDP: u8 = 17;
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
 // instead of `Ebpf::load` creating an empty set -- an omission here silently
 // drops that map's state on every restart with no build-time signal.
-pub const MAP_NAMES: [&str; 10] = [
+pub const MAP_NAMES: [&str; 9] = [
     "CONFIG",
     "UPLINK_CONFIG",
     "FRONT_META",
     "FRONT_ENDPOINTS",
     "FRONT_MISSES",
-    "REJECT_BUCKET",
     "POD_TARGETS",
     "NODE_ALLOW",
     "FWD_PENDING",
@@ -62,7 +61,7 @@ pub const MAP_NAMES: [&str; 10] = [
 /// Pins an earlier release created for maps that no longer exist. aya
 /// silently reuses any pin it finds, so a stale pin would sit in the pin
 /// dir forever (and a later map reusing the name would inherit its layout).
-const LEGACY_MAP_PINS: [&str; 2] = ["LB_FRONT_MAP", "TARGET_PORTS"];
+const LEGACY_MAP_PINS: [&str; 3] = ["LB_FRONT_MAP", "TARGET_PORTS", "REJECT_BUCKET"];
 
 /// Removes `LEGACY_MAP_PINS` under `pin_dir`; returns the names it removed.
 pub fn remove_legacy_map_pins(pin_dir: &Path) -> anyhow::Result<Vec<&'static str>> {
@@ -1558,18 +1557,26 @@ mod tests {
 
     #[test]
     fn legacy_map_pins_are_removed_so_a_stale_layout_is_never_reused() {
-        // aya reuses whatever pin exists; a leftover LB_FRONT_MAP/TARGET_PORTS
+        // aya reuses whatever pin exists; a leftover LB_FRONT_MAP/TARGET_PORTS/REJECT_BUCKET
         // would linger and pin kernel memory after an upgrade.
         let dir = std::env::temp_dir().join(format!("beep-legacy-pins-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("LB_FRONT_MAP"), b"").unwrap();
         std::fs::write(dir.join("TARGET_PORTS"), b"").unwrap();
+        std::fs::write(dir.join("REJECT_BUCKET"), b"").unwrap();
         std::fs::write(dir.join("POD_TARGETS"), b"").unwrap();
 
         let removed = remove_legacy_map_pins(&dir).unwrap();
 
-        assert_eq!(removed, vec!["LB_FRONT_MAP", "TARGET_PORTS"]);
-        assert!(!dir.join("LB_FRONT_MAP").exists() && !dir.join("TARGET_PORTS").exists());
+        assert_eq!(
+            removed,
+            vec!["LB_FRONT_MAP", "TARGET_PORTS", "REJECT_BUCKET"]
+        );
+        assert!(
+            !dir.join("LB_FRONT_MAP").exists()
+                && !dir.join("TARGET_PORTS").exists()
+                && !dir.join("REJECT_BUCKET").exists()
+        );
         assert!(
             dir.join("POD_TARGETS").exists(),
             "current pins must survive: removing them would drop live state on every restart"

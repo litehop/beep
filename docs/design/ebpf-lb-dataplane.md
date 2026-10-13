@@ -130,11 +130,10 @@ forward-write and return-read).
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
 | `FRONT_META` (front tuple -> live generation, count, flags) | ~17 KiB bucket floor + ~96 B/front used | `BPF_F_NO_PREALLOC`, so only used entries cost memory. `max_entries` = `--max-fronts` (1024 by default): nodes × Service ports. |
 | `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~129 KiB bucket floor + ~128 B/row used | `BPF_F_NO_PREALLOC`. `max_entries` = `--max-fronts` × `--endpoints-per-front` (4) × 2 = 8192 by default; the 2 is swap headroom (a front's next generation is written next to the live one; the previous one is deleted ~2 s after the commit). Full map on every node. |
-| `FRONT_MISSES` | <1 KiB | Per-CPU counter of lookups where `FRONT_META` hit but the endpoint was missing (ingress passes to host, decap drops). |
-| `REJECT_BUCKET` | <1 KiB | Per-CPU token bucket (100 replies/s, burst 25) gating TCP RST / ICMP unreachable replies from fronts with no ready backends; over budget the packet is dropped. |
+| `FRONT_MISSES` | <1 KiB | Per-CPU counter of lookups where `FRONT_META` hit but no endpoint could be chosen (count 0 or an unreadable row: ingress silently drops; decap drops). |
 | Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
 | `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
-| **Total** | **~8–9 MiB** | Independent of vCPU count except `REJECT_BUCKET`, which is per-CPU (<1 KiB per CPU); all other maps are shared. |
+| **Total** | **~8–9 MiB** | Independent of vCPU count except `FRONT_MISSES`, which is per-CPU (<1 KiB per CPU); all other maps are shared. |
 
 All maps pre-allocate their full ceiling — loxilb's "cannot start on 1GB
 node" failure mode (gate 2) — sized for u7s's envelope (<10 nodes/<100
