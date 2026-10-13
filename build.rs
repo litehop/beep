@@ -39,6 +39,8 @@ fn strip_dwarf_keep_btf(object: &Path) -> aya_build::Result<()> {
     let objcopy = locate_llvm_objcopy()?;
     let status = Command::new(&objcopy)
         .arg("--strip-debug")
+        .arg("--remove-section=.rel.BTF.ext")
+        .arg("--remove-section=.rel.BTF")
         .arg(object)
         .status()
         .with_context(|| {
@@ -54,6 +56,36 @@ fn strip_dwarf_keep_btf(object: &Path) -> aya_build::Result<()> {
             objcopy.display(),
             object.display()
         );
+    }
+    let ext = object.with_extension("btfext");
+    let ok = Command::new(&objcopy)
+        .arg(format!("--dump-section=.BTF.ext={}", ext.display()))
+        .arg(object)
+        .status()?
+        .success();
+    if !ok {
+        bail!("dump .BTF.ext failed");
+    }
+    let mut b = std::fs::read(&ext)?;
+    let u32at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+    let (hdr, fo, fl, ll) = (u32at(&b, 4), u32at(&b, 8), u32at(&b, 12), u32at(&b, 20));
+    assert_eq!(u32at(&b, 28), 0, "core relos present");
+    let _ = ll;
+    let mut out = b[..hdr].to_vec();
+    out.extend_from_slice(&b[hdr + fo..hdr + fo + fl]);
+    out[16..20].copy_from_slice(&(fl as u32).to_le_bytes());
+    out[20..24].copy_from_slice(&0u32.to_le_bytes());
+    out[24..28].copy_from_slice(&(fl as u32).to_le_bytes());
+    out[28..32].copy_from_slice(&0u32.to_le_bytes());
+    b = out;
+    std::fs::write(&ext, &b)?;
+    let ok = Command::new(&objcopy)
+        .arg(format!("--update-section=.BTF.ext={}", ext.display()))
+        .arg(object)
+        .status()?
+        .success();
+    if !ok {
+        bail!("update .BTF.ext failed");
     }
     Ok(())
 }
