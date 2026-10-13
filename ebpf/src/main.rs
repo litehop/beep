@@ -380,8 +380,11 @@ static FLOW_TABLE: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries
 #[inline(always)]
 fn flow_table_get_forward(key: FlowKey) -> Option<ForwardFlowValue> {
     // SAFETY: `get_ptr` yields a non-null pointer into the map element,
-    // copied before any other helper call; a concurrent update or eviction
-    // can only make the copy stale.
+    // copied before any other helper call. FLOW_TABLE is written only via
+    // map `insert` (replaces the whole element) and loader `remove`, so a
+    // reader sees a whole old or new value, never a torn one. Invariant:
+    // FLOW_TABLE must never get an in-place writer (`get_ptr_mut`,
+    // BPF_F_LOCK); that would make this copy racy.
     FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).forward })
 }
 
