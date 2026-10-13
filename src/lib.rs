@@ -287,6 +287,12 @@ pub fn stale_flow_table_keys(keys: &[FlowKey], departed_pods: &HashSet<[u8; 16]>
 /// Backend pod IPs named by a forward pin (`FWD_PENDING` entries and
 /// `FLOW_TABLE` Forward rows) that are absent from `live`: pins whose pod left
 /// every EndpointSlice while no controller was running to sweep them.
+///
+/// The walks are not atomic against the dataplane, but a pin present for the
+/// whole walk is never skipped: `bpf_map_get_next_key` iterates the hash
+/// buckets, and only a key deleted mid-walk (LRU eviction) makes the kernel
+/// restart from the first key, which yields duplicates, not gaps. A pin
+/// inserted mid-walk may be missed, which only leaves it to LRU eviction.
 pub fn orphaned_pin_backends(
     fwd_pending: &AyaHashMap<MapData, TcpFlowKey, ForwardFlowValue>,
     flow_table: &AyaHashMap<MapData, FlowKey, FlowValue>,
@@ -302,7 +308,15 @@ pub fn orphaned_pin_backends(
             pinned.insert(value.as_forward().backend.pod_ip);
         }
     }
-    Ok(pinned.difference(live).copied().collect())
+    Ok(backends_absent_from(&pinned, live))
+}
+
+/// Pinned backend IPs that no EndpointSlice names any more.
+pub fn backends_absent_from(
+    pinned: &HashSet<[u8; 16]>,
+    live: &HashSet<[u8; 16]>,
+) -> HashSet<[u8; 16]> {
+    pinned.difference(live).copied().collect()
 }
 
 /// Runs the full conntrack eviction sweep for ALL of a tick's departed pod IPs
@@ -951,6 +965,18 @@ mod tests {
     use super::*;
     use beep_common::{encode_flow_key, encode_tcp_flow_key};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn only_pins_to_backends_no_slice_names_are_orphans() {
+        let ip = |n: u8| [n; 16];
+        let pinned = HashSet::from([ip(1), ip(2), ip(3)]);
+        let live = HashSet::from([ip(2), ip(9)]);
+        assert_eq!(
+            backends_absent_from(&pinned, &live),
+            HashSet::from([ip(1), ip(3)]),
+            "a live backend must not be swept (resets its flows); a departed one must be (else its pins blackhole)"
+        );
+    }
 
     #[test]
     fn uplink_count_at_capacity_ok_one_past_rejected() {
