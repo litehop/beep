@@ -223,13 +223,12 @@ GOOD_CSV="$TMPDIR_TEST/good.csv"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,32,3000"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
-  echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$GOOD_CSV"
 set +e
 bash "$ASSERT_SCRIPT" "$GOOD_CSV" $ENTRY_ARGS >/dev/null 2>&1
 GOOD_EXIT=$?
 set -e
-assert_true "a correct single-tick CSV with all 10 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
+assert_true "a correct single-tick CSV with all 9 known maps passes assert-ebpf-map-memory.sh" "$GOOD_EXIT"
 
 # The usage-based tripwire: FRONT_ENDPOINTS back to a preallocated footprint
 # (8192 x 136 B) is ~8x its expected usage but far under the 6 MiB gross
@@ -306,14 +305,13 @@ DROPPED_CSV="$TMPDIR_TEST/dropped.csv"
   echo "2026-09-05T00:00:00Z,197,NODE_ALLOW,hash,32,3000"
   echo "2026-09-05T00:00:00Z,198,UPLINK_CONFIG,hash,8,4096"
   echo "2026-09-05T00:00:00Z,199,FRONT_MISSES,percpu_array,1,4096"
-  echo "2026-09-05T00:00:00Z,200,REJECT_BUCKET,percpu_array,1,4096"
 } > "$DROPPED_CSV"
 set +e
 DROPPED_OUT="$(bash "$ASSERT_SCRIPT" "$DROPPED_CSV" $ENTRY_ARGS 2>&1)"
 DROPPED_EXIT=$?
 set -e
 if [ "$DROPPED_EXIT" -ne 0 ]; then
-  echo "PASS: a single-tick CSV missing one map (9 of 10) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
+  echo "PASS: a single-tick CSV missing one map (8 of 9) is rejected, not silently summed into a smaller passing total — matches: $DROPPED_OUT"
   PASS=$(( PASS + 1 ))
 else
   echo "FAIL: an 8-of-9-map CSV must not pass — got exit 0: $DROPPED_OUT"

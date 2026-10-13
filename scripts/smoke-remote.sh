@@ -10,7 +10,7 @@
 # beep deployment on the same VM.
 #
 # tcpdump is required: the full-size wire assertions (forward Geneve option
-# bytes, 1588-byte frames) and the reject-reply capture are only checkable on
+# bytes, 1588-byte frames) and the count-0 silence capture are only checkable on
 # the wire, and a silently skipped assertion is not a pass. Without tcpdump the
 # run FAILS. Set BEEP_SMOKE_ALLOW_NO_TCPDUMP=1 on a local dev host to skip
 # those assertions (loudly) and check only payload integrity / client behaviour.
@@ -1124,7 +1124,7 @@ grep -q NEWFLOW "$PEND_BACKEND_OUT" || {
 echo "PIN-STEERING (pending): PASS (a still-FWD_PENDING flow kept its original backend node after the re-point; a fresh flow reached the new endpoint)"
 
 # Drain: the front's ready count drops to 0 (rolling update) while the pinned
-# flow is still open. It must keep forwarding; only a NEW connection is refused.
+# flow is still open. It must keep forwarding; only a NEW connection is silently dropped.
 # Exercises the dataplane path directly: next generation, count 0, the previous
 # generation's rows left in FRONT_ENDPOINTS. The controller does not yet write
 # count 0 (it deletes FRONT_META for an empty set).
@@ -1151,14 +1151,12 @@ grep -q "$PIN_DRAIN_MSG" "$PIN_STEER_BACKEND_IN" 2>/dev/null || {
 }
 echo "PIN-DRAIN (established): PASS (pinned flow kept forwarding with the front at count 0)"
 drain_rc=0
-drain_start=$(date +%s%N)
-ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/" >/dev/null 2>&1 || drain_rc=$?
-drain_ms=$((($(date +%s%N) - drain_start) / 1000000))
-[ "$drain_rc" -eq 7 ] && [ "$drain_ms" -lt 2000 ] || {
-  echo "FAIL: a NEW connection to the count-0 front must be refused immediately (curl rc 7, <2000ms), got rc=$drain_rc after ${drain_ms}ms" >&2
+ip netns exec smoke-client curl -sS -m 2 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/" >/dev/null 2>&1 || drain_rc=$?
+[ "$drain_rc" -eq 28 ] || {
+  echo "FAIL: a NEW connection to the count-0 front must be silently dropped (curl rc 28), got rc=$drain_rc (7 = RST, 0/1/52 = reached a backend or the host)" >&2
   exit 1
 }
-echo "PIN-DRAIN (new flow): PASS (new connection refused after ${drain_ms}ms)"
+echo "PIN-DRAIN (new flow): PASS (new connection timed out, rc=28)"
 # A second swap at count 0: the controller deletes every non-live generation,
 # so no endpoint row of the pinned flow's front survives. The backend must
 # still deliver, because the target port travels in the Geneve option.
@@ -1207,21 +1205,24 @@ grep -q "node-egress-payload" "$NODE_EGRESS_OUT" || {
 }
 echo "NODE-EGRESS: PASS (fresh connection from ${FRONT_IP}, a POD_TARGETS member, passed hook 3 with no FLOW_TABLE reverse entry)"
 
-echo "==> reject: an owned front with no ready backends must answer the client (TCP RST / ICMP(v6) port unreachable) instead of passing to the host"
+echo "==> count-0 drop: an owned front with no ready backends must silently drop new flows (no RST, no ICMP, never the host stack)"
 # Each owned front gets a FRONT_META row with count 0 (inserted directly, like
 # the node-egress phase above) AND a live host listener on the same address:port.
-# Without the listener the host kernel would itself RST/ICMP and the phase could
-# not tell beep's reply from a pass-through; with it, a pass-through connects (TCP)
-# or is swallowed (UDP), so only beep's own reply produces a refusal.
+# A pass-through would connect (TCP) or land in the UDP listener's file, and a
+# reject would RST / send ICMP; only a silent drop leaves the client timing out
+# with nothing on the wire and nothing delivered to the host.
 FRONT_IP6_KEY="32 1 13 184 0 5 0 0 0 0 0 0 0 0 0 1"
 FRONT_IP4_KEY="0 0 0 0 0 0 0 0 0 0 255 255 $(echo "${FRONT_IP}" | tr . ' ')"
-REJECT_TCP4_PORT=19300
-REJECT_UDP4_PORT=19301
-REJECT_TCP6_PORT=19302
-REJECT_UDP6_PORT=19303
+DROP_TCP4_PORT=19300
+DROP_UDP4_PORT=19301
+DROP_TCP6_PORT=19302
+DROP_UDP6_PORT=19303
 CONTROL_TCP4_PORT=19304
 CONTROL_TCP6_PORT=19305
-REJECT_CAPTURE="/tmp/beep-smoke-reject-capture.txt"
+DROP_CAPTURE="/tmp/beep-smoke-drop-capture.txt"
+DROP_UDP4_RX="/tmp/beep-smoke-drop-udp4-rx.txt"
+DROP_UDP6_RX="/tmp/beep-smoke-drop-udp6-rx.txt"
+DROP_PROBE_SECS=2
 
 set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
   bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 0 0 0 0 || {
@@ -1229,60 +1230,67 @@ set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
     exit 1
   }
 }
-host_listener() { # <tcp|udp> <4|6> <addr> <port>
+host_listener() { # <tcp|udp> <4|6> <addr> <port> [rx-file]
   if [ "$1" = tcp ]; then
     nohup timeout 40 bash -c "printf HOSTPASS | nc -$2 -l -N $3 $4" >/dev/null 2>&1 &
   else
-    nohup timeout 40 nc -$2 -u -l "$3" "$4" >/dev/null 2>&1 &
+    nohup timeout 40 nc -$2 -u -l "$3" "$4" >"$5" 2>/dev/null &
   fi
   disown
 }
-set_front_count_zero "$FRONT_IP4_KEY" "$REJECT_TCP4_PORT" 6
-set_front_count_zero "$FRONT_IP4_KEY" "$REJECT_UDP4_PORT" 17
-set_front_count_zero "$FRONT_IP6_KEY" "$REJECT_TCP6_PORT" 6
-set_front_count_zero "$FRONT_IP6_KEY" "$REJECT_UDP6_PORT" 17
-host_listener tcp 4 "$FRONT_IP" "$REJECT_TCP4_PORT"
-host_listener udp 4 "$FRONT_IP" "$REJECT_UDP4_PORT"
-host_listener tcp 6 "$FRONT_IP6" "$REJECT_TCP6_PORT"
-host_listener udp 6 "$FRONT_IP6" "$REJECT_UDP6_PORT"
+: >"$DROP_UDP4_RX"
+: >"$DROP_UDP6_RX"
+set_front_count_zero "$FRONT_IP4_KEY" "$DROP_TCP4_PORT" 6
+set_front_count_zero "$FRONT_IP4_KEY" "$DROP_UDP4_PORT" 17
+set_front_count_zero "$FRONT_IP6_KEY" "$DROP_TCP6_PORT" 6
+set_front_count_zero "$FRONT_IP6_KEY" "$DROP_UDP6_PORT" 17
+host_listener tcp 4 "$FRONT_IP" "$DROP_TCP4_PORT"
+host_listener udp 4 "$FRONT_IP" "$DROP_UDP4_PORT" "$DROP_UDP4_RX"
+host_listener tcp 6 "$FRONT_IP6" "$DROP_TCP6_PORT"
+host_listener udp 6 "$FRONT_IP6" "$DROP_UDP6_PORT" "$DROP_UDP6_RX"
 host_listener tcp 4 "$FRONT_IP" "$CONTROL_TCP4_PORT"
 host_listener tcp 6 "$FRONT_IP6" "$CONTROL_TCP6_PORT"
 sleep 1
 
-REJECT_CAPTURE_PID=""
-if have_tcpdump "reply-on-the-wire reject capture (client-side behaviour is still asserted)"; then
-  ip netns exec smoke-client tcpdump -nn -l -vv -i smoke-veth1 >"$REJECT_CAPTURE" 2>&1 &
-  REJECT_CAPTURE_PID=$!
-  wait_tcpdump_listening "$REJECT_CAPTURE"
+DROP_CAPTURE_PID=""
+if have_tcpdump "on-the-wire silence capture (client-side behaviour is still asserted)"; then
+  ip netns exec smoke-client tcpdump -nn -l -vv -i smoke-veth1 >"$DROP_CAPTURE" 2>&1 &
+  DROP_CAPTURE_PID=$!
+  wait_tcpdump_listening "$DROP_CAPTURE"
 fi
 
-assert_tcp_refused() { # <label> <curl-url> [curl-extra-arg]
-  local start end rc=0 ms
-  start=$(date +%s%N)
-  ip netns exec smoke-client curl -sS -m 5 ${3:-} "$2" >/dev/null 2>&1 || rc=$?
-  end=$(date +%s%N)
-  ms=$(((end - start) / 1000000))
-  [ "$rc" -eq 7 ] && [ "$ms" -lt 2000 ] || {
-    echo "FAIL: $1: expected an immediate connection refusal (curl rc 7, <2000ms) from beep's RST, got rc=$rc after ${ms}ms (rc 28 = the client hung; rc 0/1/52 = the packet passed to the host listener)" >&2
+assert_tcp_dropped() { # <label> <curl-url> [curl-extra-arg]
+  local rc=0
+  ip netns exec smoke-client curl -sS -m "$DROP_PROBE_SECS" ${3:-} "$2" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 28 ] || {
+    echo "FAIL: $1: expected the client to time out (curl rc 28) against a silently dropped count-0 front, got rc=$rc (rc 7 = beep answered with a RST; rc 0/1/52 = the packet passed to the host listener)" >&2
     exit 1
   }
-  echo "REJECT-TCP ($1): PASS (curl rc=7 connection refused after ${ms}ms)"
+  echo "DROP-TCP ($1): PASS (curl rc=28, timed out with no answer)"
 }
-assert_udp_refused() { # <label> <addr> <port>
+assert_udp_dropped() { # <label> <addr> <port> <host-listener-rx-file>
   local out rc=0
-  out=$(ip netns exec smoke-client timeout 6 bash -c 'exec 3<>"/dev/udp/$0/$1"; printf probe >&3; read -r -t 3 -u 3 _' "$2" "$3" 2>&1) || rc=$?
+  out=$(ip netns exec smoke-client timeout $((DROP_PROBE_SECS + 4)) bash -c 'exec 3<>"/dev/udp/$0/$1"; printf probe >&3; read -r -t "$2" -u 3 _' "$2" "$3" "$DROP_PROBE_SECS" 2>&1) || rc=$?
   case "$out" in
-    *"Connection refused"*) echo "REJECT-UDP ($1): PASS (client socket got ECONNREFUSED from beep's ICMP unreachable)" ;;
-    *)
-      echo "FAIL: $1: the UDP probe to the owned count-0 front ${2}:${3} saw no ICMP port unreachable (rc=$rc, output '$out') -- the client would wait out its timeout" >&2
+    *"Connection refused"*)
+      echo "FAIL: $1: the UDP probe to the count-0 front ${2}:${3} got an ICMP port unreachable; a drop must be silent" >&2
       exit 1
       ;;
   esac
+  [ "$rc" -gt 128 ] || {
+    echo "FAIL: $1: expected the UDP probe to time out silently (read rc > 128), got rc=$rc, output '$out'" >&2
+    exit 1
+  }
+  [ ! -s "$4" ] || {
+    echo "FAIL: $1: the datagram reached the host listener on ${2}:${3}; a count-0 front must drop it before the host stack" >&2
+    exit 1
+  }
+  echo "DROP-UDP ($1): PASS (read timed out, no ICMP, nothing reached the host listener)"
 }
-assert_tcp_refused "v4" "http://${FRONT_IP}:${REJECT_TCP4_PORT}/"
-assert_udp_refused "v4" "$FRONT_IP" "$REJECT_UDP4_PORT"
-assert_tcp_refused "v6" "http://[${FRONT_IP6}]:${REJECT_TCP6_PORT}/" -g
-assert_udp_refused "v6" "$FRONT_IP6" "$REJECT_UDP6_PORT"
+assert_tcp_dropped "v4" "http://${FRONT_IP}:${DROP_TCP4_PORT}/"
+assert_udp_dropped "v4" "$FRONT_IP" "$DROP_UDP4_PORT" "$DROP_UDP4_RX"
+assert_tcp_dropped "v6" "http://[${FRONT_IP6}]:${DROP_TCP6_PORT}/" -g
+assert_udp_dropped "v6" "$FRONT_IP6" "$DROP_UDP6_PORT" "$DROP_UDP6_RX"
 
 control4=$(ip netns exec smoke-client nc -w 3 "$FRONT_IP" "$CONTROL_TCP4_PORT" </dev/null 2>&1 || true)
 control6=$(ip netns exec smoke-client nc -6 -w 3 "$FRONT_IP6" "$CONTROL_TCP6_PORT" </dev/null 2>&1 || true)
@@ -1290,71 +1298,33 @@ control6=$(ip netns exec smoke-client nc -6 -w 3 "$FRONT_IP6" "$CONTROL_TCP6_POR
   echo "FAIL: a front beep does not own (no FRONT_META row) must still pass to the host stack; v4 got '$control4', v6 got '$control6', expected HOSTPASS" >&2
   exit 1
 }
-echo "REJECT-CONTROL: PASS (non-owned fronts on v4 and v6 still reach the host listener)"
+echo "DROP-CONTROL: PASS (non-owned fronts on v4 and v6 still reach the host listener)"
 
-if [ -n "$REJECT_CAPTURE_PID" ]; then
+if [ -n "$DROP_CAPTURE_PID" ]; then
   sleep 0.5
-  kill "$REJECT_CAPTURE_PID" 2>/dev/null || true
-  wait "$REJECT_CAPTURE_PID" 2>/dev/null || true
-  # Only beep's replies are judged: the client's own packets show
-  # "incorrect" checksums here because the veth leaves them offloaded.
-  replies=$(grep -E "Flags \[R|unreachable" "$REJECT_CAPTURE" || true)
-  echo "client-side capture of beep's replies (RST flags / unreachable):"
-  echo "$replies"
-  rst_count=$(grep -c "Flags \[R" <<<"$replies" || true)
-  icmp_count=$(grep -c "unreachable" <<<"$replies" || true)
-  if [ "$rst_count" -lt 2 ] || [ "$icmp_count" -lt 2 ]; then
-    echo "FAIL: capture on the client side shows $rst_count RST(s) and $icmp_count unreachable(s), expected at least 2 of each (v4 + v6)" >&2
-    cat "$REJECT_CAPTURE" >&2
+  kill "$DROP_CAPTURE_PID" 2>/dev/null || true
+  wait "$DROP_CAPTURE_PID" 2>/dev/null || true
+  # The probes must be visible (else a dead capture would pass vacuously);
+  # nothing from the node on the count-0 ports (the control ports legitimately
+  # answer) may be a RST, a SYN-ACK or an ICMP(v6) unreachable. The client's
+  # own packets are not judged.
+  syn_count=$(grep "Flags \[S\]" "$DROP_CAPTURE" | grep -c "1930[02]" || true)
+  if [ "$syn_count" -lt 2 ]; then
+    echo "FAIL: capture saw $syn_count client SYN(s), expected at least 2 (v4 + v6): the capture is not seeing the probes" >&2
+    cat "$DROP_CAPTURE" >&2
     exit 1
   fi
-  if grep -E "Flags \[R" <<<"$replies" | grep -qv "(correct)" || grep -qE "incorrect|bad|wrong" <<<"$replies"; then
-    echo "FAIL: a reject reply carried a wrong checksum; a real client would silently drop it" >&2
-    cat "$REJECT_CAPTURE" >&2
+  replies=$(grep -E "Flags \[(R|S\.)|unreachable" "$DROP_CAPTURE" | grep -E "1930[0-3]" || true)
+  if [ -n "$replies" ]; then
+    echo "FAIL: the node answered a count-0 front on the wire; a silent drop must leave no RST, SYN-ACK or unreachable:" >&2
+    echo "$replies" >&2
+    cat "$DROP_CAPTURE" >&2
     exit 1
   fi
+  echo "DROP-WIRE: PASS (client saw $syn_count SYN(s) and no RST, SYN-ACK or unreachable from the node)"
 fi
 pkill -f "nc -[46] -l -N ${FRONT_IP}" 2>/dev/null || true
-echo "REJECT: PASS (owned count-0 fronts refuse TCP and UDP on v4+v6 immediately; non-owned fronts still pass to the host)"
-
-echo "==> reject rate limit: a UDP flood at a count-0 front must draw a bounded number of ICMP replies, and a probe after the flood must still be answered"
-# The bucket is per CPU, and the veth delivers each flood packet to beep on
-# the sender's CPU, so `taskset -c 0` makes one bucket (burst 25, 100/s) serve
-# the whole flood. On a multi-CPU runner CPU 0 must be the only CPU the flood
-# lands on (the bound below is for one bucket; it does not scale with nproc),
-# which holds because the sender is pinned, not because nproc is 1. Replies
-# are counted as frames received on the client veth; the only traffic on it
-# during the flood is beep's replies. Unbounded, every flood packet would be
-# answered.
-FLOOD_PACKETS=3000
-FLOOD_BURST=25
-FLOOD_RATE=100
-rx_packets() { ip netns exec smoke-client cat /sys/class/net/smoke-veth1/statistics/rx_packets; }
-rx_before=$(rx_packets)
-flood_start=$(date +%s%N)
-ip netns exec smoke-client taskset -c 0 bash -c 'for ((i = 0; i < $2; i++)); do echo x >"/dev/udp/$0/$1"; done' "$FRONT_IP" "$REJECT_UDP4_PORT" "$FLOOD_PACKETS" 2>/dev/null || true
-flood_end=$(date +%s%N)
-sleep 1
-rx_after=$(rx_packets)
-flood_ms=$(((flood_end - flood_start) / 1000000))
-flood_replies=$((rx_after - rx_before))
-# Allowed: the burst plus the refill earned while the flood ran (nothing
-# refills once it stops), plus slack for a rounding token and unrelated link
-# traffic (neighbour discovery). Tight on purpose: a gate with burst 100 must
-# fail.
-flood_max=$((FLOOD_BURST + FLOOD_RATE * flood_ms / 1000 + 10))
-echo "FLOOD: sent $FLOOD_PACKETS UDP packets in ${flood_ms}ms, client received $flood_replies frames (allowed <= $flood_max)"
-[ "$flood_replies" -le "$flood_max" ] || {
-  echo "FAIL: $flood_replies replies to $FLOOD_PACKETS flood packets exceeds the reject budget of $flood_max -- a spoofed-source flood at an empty front would be reflected at the victim packet for packet" >&2
-  exit 1
-}
-[ "$flood_replies" -ge 1 ] || {
-  echo "FAIL: the flood drew no replies at all -- the bounded count above proves nothing" >&2
-  exit 1
-}
-sleep 1
-assert_udp_refused "v4 after flood" "$FRONT_IP" "$REJECT_UDP4_PORT"
-echo "REJECT-RATELIMIT: PASS (flood answered with $flood_replies of $FLOOD_PACKETS; a later probe was still refused)"
+echo "DROP: PASS (owned count-0 fronts silently drop TCP and UDP on v4+v6; non-owned fronts still pass to the host)"
 
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
 # This fixture is a self-loop (FRONT_IP is also this node's own address, and

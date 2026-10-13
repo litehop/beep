@@ -9,8 +9,6 @@
 //! & affinity" section and its "Settled wire-format decisions".
 #![cfg_attr(not(test), no_std)]
 
-pub mod reject;
-
 /// `BPF_F_NO_PREALLOC`: allocate hash elements on insert instead of reserving
 /// `max_entries` up front. `beep-ebpf` sets it on the controller-written front
 /// maps and the loader compares it on pinned maps, so one definition keeps
@@ -1160,12 +1158,11 @@ pub fn select_endpoint_slot(hash: u32, ready_count: u16, local_count: u16) -> Op
 /// What ingress does with a packet addressed to a front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngressSteer {
-    /// An owned front with no ready endpoints: answer the client (RST /
-    /// unreachable) so it fails fast. Distinct from a `FRONT_META` miss,
-    /// which is not a front at all and is never seen here.
-    Reject,
-    /// The front has endpoints but the chosen row is unreadable: fail closed
-    /// rather than leak a front-addressed packet to the host stack.
+    /// Silently drop: an owned front with no ready endpoints (the hardened
+    /// edge posture: no RST/ICMP, nothing for a scanner to learn), or one
+    /// whose chosen row is unreadable (fail closed rather than leak a
+    /// front-addressed packet to the host stack). Distinct from a
+    /// `FRONT_META` miss, which is not a front at all and is never seen here.
     Drop,
     /// Send to this backend, stamping `target_port` (wire order) into the
     /// forward option; the caller pins both only if the flow has no pin.
@@ -1182,7 +1179,7 @@ pub enum IngressSteer {
 /// and a front draining to zero ready endpoints must not reset live
 /// connections. A pin carries its own target port, so the backend keeps
 /// delivering to the port the pod was chosen with. Only a flow with no pin is
-/// rejected at count 0, else `select_endpoint_slot` reduces `hash` (a
+/// dropped at count 0, else `select_endpoint_slot` reduces `hash` (a
 /// `flow_hash` of the flow) and the chosen row is read through `endpoint_at`.
 /// A row picked from the local prefix that is not flagged local breaks the
 /// writer's ordering contract and is dropped, not forwarded.
@@ -1201,7 +1198,7 @@ pub fn ingress_steer(
         };
     }
     if meta.count == 0 {
-        return IngressSteer::Reject;
+        return IngressSteer::Drop;
     }
     let Some(slot) = select_endpoint_slot(hash, meta.count, meta.local_count) else {
         return IngressSteer::Drop;
@@ -3132,12 +3129,12 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_flow_on_front_without_endpoints_is_rejected() {
+    fn unpinned_flow_on_front_without_endpoints_is_silently_dropped() {
         let front = test_front();
         let steered = ingress_steer(meta(1, 0), None, None, 0, front, |_| {
             panic!("no row may be read when count is 0")
         });
-        assert_eq!(steered, IngressSteer::Reject);
+        assert_eq!(steered, IngressSteer::Drop);
     }
 
     fn spread_hashes() -> impl Iterator<Item = u32> {
