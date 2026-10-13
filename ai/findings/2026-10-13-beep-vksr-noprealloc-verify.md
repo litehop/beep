@@ -100,6 +100,11 @@ num_entries = atomic_read(&htab->count)` split, i.e. usage-based. I did not
 read a live `bytes_memlock` on 6.6 (the CI leg does not print it), so on 6.6
 the usage-tracking is source-derived, not measured.
 
+Caveat: measurements were built from main before FrontMeta grew to 12 B
+(`front_meta_layout_is_twelve_bytes...` on current main); the kernel rounds
+the value to 8 B, so expect ~+8 B/entry for FRONT_META, not a different
+shape.
+
 ## Q5 Behavioural differences
 
 - **Lookup cost.** Not benchmarked. Both modes run the same
