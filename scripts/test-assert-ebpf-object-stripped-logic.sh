@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Forced-fail test for scripts/assert-ebpf-object-stripped.sh. Runs the REAL
-# script against ELF objects generated here (tiny hand-built ELF64 + objcopy
-# --add-section), so no binary fixtures are committed.
+# script against ELF64 objects assembled here in pure bash (GNU objcopy cannot
+# read EM_BPF objects; no binary fixtures are committed). Needs llvm-readelf
+# or readelf on PATH, like the script itself.
 #
 # Each reverted-strip shape (line_info present, .rel.BTF* present, CO-RE
 # relocs present, .debug_* present) must make the script fail; a clean object
@@ -12,12 +13,6 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/assert-ebpf-object-stripped.sh"
 
-objcopy_bin=""
-for candidate in llvm-objcopy objcopy; do
-  command -v "$candidate" >/dev/null 2>&1 && { objcopy_bin="$candidate"; break; }
-done
-[ -n "$objcopy_bin" ] || { echo "FAIL: neither llvm-objcopy nor objcopy on PATH" >&2; exit 1; }
-
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -27,52 +22,71 @@ assert() {
   if [ "$2" = ok ]; then PASS=$((PASS + 1)); echo "ok: $1"; else FAIL=$((FAIL + 1)); echo "FAIL: $1" >&2; fi
 }
 
-# Empty ELF64 LE relocatable (EM_BPF): null section + .shstrtab only.
-base="$tmp/base.o"
-{
-  printf '\x7fELF\x02\x01\x01\x00\0\0\0\0\0\0\0\0'
-  printf '\x01\x00\xf7\x00\x01\x00\x00\x00'
-  printf '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
-  printf '\x50\0\0\0\0\0\0\0'
-  printf '\0\0\0\0\x40\x00\0\0\0\0\x40\x00\x02\x00\x01\x00'
-  printf '\0.shstrtab\0\0\0\0\0\0'
-  printf '%064d' 0 | tr 0 '\0'
-  printf '\x01\0\0\0\x03\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
-  printf '\x40\0\0\0\0\0\0\0\x0b\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
-  printf '\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
-} > "$base"
-
-# 4-byte-LE helper -> escaped printf string
-le32() {
+# le <nbytes> <value>: little-endian integer as raw bytes
+le() {
   local i
-  for i in 0 8 16 24; do
-    printf '%b' "$(printf '\\x%02x' $(($1 >> i & 255)))"
+  for ((i = 0; i < $1; i++)); do
+    printf '%b' "$(printf '\\x%02x' $(($2 >> (8 * i) & 255)))"
   done
 }
 
-# .BTF.ext: 32-byte header (func_info 8 bytes, line_info $1 bytes, core_relo $2 bytes)
-btf_ext() {
-  local line_len=$1 core_len=$2 f=$3
+# mkelf <out> [name=file ...]: ELF64 LE EM_BPF relocatable with those PROGBITS sections.
+mkelf() {
+  local out=$1 spec name file off=64 n=2 strtab='@.shstrtab@' shstr_name=1
+  shift
+  local -a names=() offs=() sizes=() nameoffs=()
+  : > "$tmp/data"
+  for spec in "$@"; do
+    name=${spec%%=*}
+    file=${spec#*=}
+    names+=("$name")
+    offs+=("$off")
+    sizes+=("$(wc -c < "$file" | tr -d ' ')")
+    nameoffs+=("${#strtab}")
+    strtab+="$name@"
+    cat "$file" >> "$tmp/data"
+    off=$((off + sizes[${#sizes[@]} - 1]))
+    n=$((n + 1))
+  done
+  local shstr_off=$off shstr_size=${#strtab} shoff
+  shoff=$(((shstr_off + shstr_size + 7) / 8 * 8))
   {
-    printf '\x9f\xeb\x01\x00'
-    le32 32
-    le32 0
-    le32 8
-    le32 8
-    le32 "$line_len"
-    le32 $((8 + line_len))
-    le32 "$core_len"
-    head -c $((8 + line_len + core_len)) /dev/zero
-  } > "$f"
+    printf '\x7fELF\x02\x01\x01\x00\0\0\0\0\0\0\0\0'
+    le 2 1; le 2 247; le 4 1; le 8 0; le 8 0; le 8 "$shoff"
+    le 4 0; le 2 64; le 2 0; le 2 0; le 2 64; le 2 "$n"; le 2 $((n - 1))
+    cat "$tmp/data"
+    printf '%s' "$strtab" | tr '@' '\0'
+    head -c $((shoff - shstr_off - shstr_size)) /dev/zero
+    head -c 64 /dev/zero
+    local i
+    for ((i = 0; i < ${#names[@]}; i++)); do
+      le 4 "${nameoffs[i]}"; le 4 1; le 8 0; le 8 0; le 8 "${offs[i]}"; le 8 "${sizes[i]}"
+      le 4 0; le 4 0; le 8 1; le 8 0
+    done
+    le 4 "$shstr_name"; le 4 3; le 8 0; le 8 0; le 8 "$shstr_off"; le 8 "$shstr_size"
+    le 4 0; le 4 0; le 8 1; le 8 0
+  } > "$out"
 }
 
-# build <name> <line_len> <core_len> [extra objcopy args...]
+# .BTF.ext: 32-byte header, func_info 8 bytes, then line_info/core_relo payloads.
+btf_ext() {
+  local line_len=$1 core_len=$2
+  {
+    printf '\x9f\xeb\x01\x00'
+    le 4 32; le 4 0; le 4 8; le 4 8; le 4 "$line_len"; le 4 $((8 + line_len)); le 4 "$core_len"
+    head -c $((8 + line_len + core_len)) /dev/zero
+  }
+}
+
+head -c 16 /dev/zero > "$tmp/btf"
+head -c 8 /dev/zero > "$tmp/junk"
+
+# build <name> <line_len> <core_len> [extra name=file ...]
 build() {
   local name=$1 line_len=$2 core_len=$3
   shift 3
-  head -c 16 /dev/zero > "$tmp/btf"
-  btf_ext "$line_len" "$core_len" "$tmp/ext"
-  "$objcopy_bin" --add-section .BTF="$tmp/btf" --add-section .BTF.ext="$tmp/ext" "$@" "$base" "$tmp/$name.o"
+  btf_ext "$line_len" "$core_len" > "$tmp/ext"
+  mkelf "$tmp/$name.o" .BTF="$tmp/btf" .BTF.ext="$tmp/ext" "$@"
 }
 
 expect_fail() {
@@ -99,14 +113,13 @@ expect_fail "line_info present is rejected (release strip reverted)" "$tmp/line.
 build core 0 16
 expect_fail "core_relo present is rejected (rewrite would drop CO-RE relos)" "$tmp/core.o" "core_relo_len=16"
 
-head -c 8 /dev/zero > "$tmp/rel"
-build rel 0 0 --add-section .rel.BTF.ext="$tmp/rel"
+build rel 0 0 .rel.BTF.ext="$tmp/junk"
 expect_fail ".rel.BTF.ext present is rejected (linker-only reloc strip reverted)" "$tmp/rel.o" "BTF relocation sections"
 
-build relb 0 0 --add-section .rel.BTF="$tmp/rel"
+build relb 0 0 .rel.BTF="$tmp/junk"
 expect_fail ".rel.BTF present is rejected" "$tmp/relb.o" "BTF relocation sections"
 
-build dbg 0 0 --add-section .debug_info="$tmp/rel"
+build dbg 0 0 .debug_info="$tmp/junk"
 expect_fail ".debug_* present is rejected" "$tmp/dbg.o" "debug_"
 
 echo "$PASS passed, $FAIL failed"

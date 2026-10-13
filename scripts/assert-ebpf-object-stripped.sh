@@ -64,37 +64,24 @@ rel_sections="$(printf '%s\n' "$sections" | grep '^\.rela\?\.BTF' || true)"
   exit 1
 }
 
-objcopy_bin=""
-for candidate in llvm-objcopy objcopy; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    objcopy_bin="$candidate"
-    break
-  fi
-done
-[ -n "$objcopy_bin" ] || { echo "FAIL: neither llvm-objcopy nor objcopy found on PATH" >&2; exit 1; }
-
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-# GNU objcopy needs an output file; llvm-objcopy accepts one too.
-"$objcopy_bin" --dump-section .BTF.ext="$tmp/btf_ext" "$object" "$tmp/discard"
-
 # .BTF.ext header (little-endian only): u16 magic 0xeB9F, u8 version, u8 flags,
-# u32 hdr_len, then u32 off/len pairs for func_info (@8), line_info (@16),
-# core_relo (@24; present only when hdr_len >= 32).
+# u32 hdr_len, then u32 off/len pairs for func_info (@8), line_info (@16) and
+# core_relo (@24). Read the first 32 bytes from the section hex dump (GNU and
+# LLVM readelf both print `0xADDR w1 w2 w3 w4 ascii`, words in file byte order).
+hex="$("$readelf_bin" -x .BTF.ext "$object" | awk '$1 ~ /^0x/ && n++ < 2 {print $2 $3 $4 $5}' | tr -d '\n')"
+[ "${#hex}" -eq 64 ] || { echo "FAIL: $object .BTF.ext is shorter than the 32-byte header" >&2; exit 1; }
 u32_at() {
-  local b0 b1 b2 b3
-  read -r b0 b1 b2 b3 < <(od -An -tu1 -j "$1" -N 4 "$tmp/btf_ext")
-  echo $((b0 | b1 << 8 | b2 << 16 | b3 << 24))
+  local w="${hex:$(($1 * 2)):8}"
+  echo $((16#${w:6:2}${w:4:2}${w:2:2}${w:0:2}))
 }
-[ "$(od -An -tx1 -N 2 "$tmp/btf_ext" | tr -d ' ')" = "9feb" ] || {
+[ "${hex:0:4}" = "9feb" ] || {
   echo "FAIL: $object .BTF.ext magic is not 0xeB9F little-endian" >&2
   exit 1
 }
 hdr_len="$(u32_at 4)"
-[ "$hdr_len" -ge 24 ] || { echo "FAIL: $object .BTF.ext hdr_len $hdr_len too short to hold line_info" >&2; exit 1; }
+[ "$hdr_len" -ge 32 ] || { echo "FAIL: $object .BTF.ext hdr_len $hdr_len has no core_relo fields" >&2; exit 1; }
 line_info_len="$(u32_at 20)"
-core_relo_len=0
-[ "$hdr_len" -lt 32 ] || core_relo_len="$(u32_at 28)"
+core_relo_len="$(u32_at 28)"
 [ "$line_info_len" -eq 0 ] || {
   echo "FAIL: $object .BTF.ext line_info_len=$line_info_len -- release line_info strip regressed" >&2
   exit 1
