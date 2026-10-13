@@ -142,11 +142,7 @@ impl PinnedMaps {
         } else {
             None
         };
-        let (orphans, orphan_walk_error) = match orphan_walk {
-            Some(Ok(orphans)) => (Some(orphans), None),
-            Some(Err(e)) => (None, Some(e)),
-            None => (None, None),
-        };
+        let (orphans, orphan_walk_error) = split_orphan_walk(orphan_walk);
         let (fwd_pending, flow_table) = (&mut self.fwd_pending, &mut self.flow_table);
         let mut plan = plan_tick(
             desired,
@@ -155,9 +151,11 @@ impl PinnedMaps {
             orphans.as_ref(),
             |pods| beep::evict_pod_flows(fwd_pending, flow_table, pods),
         );
-        if orphans.is_some() && plan.sweep_error.is_none() {
-            self.orphans_swept = true;
-        }
+        self.orphans_swept = orphans_swept_after(
+            self.orphans_swept,
+            orphans.is_some(),
+            plan.sweep_error.is_some(),
+        );
         let sweep_result = match plan.sweep_error.take() {
             Some(e) => Err(e.context("sweeping flows of departed or reused backend pods")),
             None => orphan_walk_error.map_or(Ok(()), Err),
@@ -307,6 +305,24 @@ fn reused_pod_ips(
 /// "every pin is an orphan"; the walk waits for a non-empty one.
 fn orphan_sweep_due(desired: &DesiredEntries, already_swept: bool) -> bool {
     desired.fronts_known && !already_swept && !desired.cluster_backends.is_empty()
+}
+
+type OrphanWalk = Option<anyhow::Result<HashSet<[u8; 16]>>>;
+
+/// Separates a tick's orphan walk into the orphans to sweep and the walk's
+/// error to report after the maps converge. A failed walk yields no orphans.
+fn split_orphan_walk(walk: OrphanWalk) -> (Option<HashSet<[u8; 16]>>, Option<anyhow::Error>) {
+    match walk {
+        Some(Ok(orphans)) => (Some(orphans), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    }
+}
+
+/// The `orphans_swept` latch after a tick: set only once a walk's orphans were
+/// swept without error, so a failed walk or sweep is retried next tick.
+fn orphans_swept_after(already: bool, walked: bool, sweep_failed: bool) -> bool {
+    already || (walked && !sweep_failed)
 }
 
 /// What one reconcile tick may write after its conntrack sweep.
@@ -698,6 +714,46 @@ mod tests {
             !orphan_sweep_due(&empty, false),
             "an empty first list is untrusted: sweeping against it would reset every live flow"
         );
+    }
+
+    #[test]
+    fn orphan_latch_sets_only_after_a_clean_walk_and_sweep() {
+        assert!(
+            orphans_swept_after(false, true, false),
+            "a clean sweep must latch or every tick re-walks the tables and resets flows pinned since"
+        );
+        assert!(
+            !orphans_swept_after(false, true, true),
+            "a failed sweep must stay unlatched so the next tick retries it"
+        );
+        assert!(
+            !orphans_swept_after(false, false, false),
+            "no walk happened (failed or not due): nothing was swept"
+        );
+        assert!(
+            orphans_swept_after(true, false, false),
+            "the latch never resets"
+        );
+        assert!(
+            orphans_swept_after(true, true, true),
+            "the latch never resets"
+        );
+    }
+
+    #[test]
+    fn failed_orphan_walk_is_reported_and_leaves_the_latch_open() {
+        let (orphans, err) = split_orphan_walk(Some(Err(anyhow::anyhow!("map read failed"))));
+        assert!(orphans.is_none(), "a failed walk has no orphans to sweep");
+        assert!(err.is_some(), "the walk error must reach the tick's result");
+        assert!(
+            !orphans_swept_after(false, orphans.is_some(), false),
+            "a failed walk must be retried next tick, or orphaned pins blackhole until LRU eviction"
+        );
+
+        let (orphans, err) = split_orphan_walk(Some(Ok(set(&[7]))));
+        assert_eq!((orphans, err.is_some()), (Some(set(&[7])), false));
+        let (orphans, err) = split_orphan_walk(None);
+        assert_eq!((orphans, err.is_some()), (None, false));
     }
 
     #[test]

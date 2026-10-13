@@ -776,11 +776,13 @@ impl WatchState {
         // above carries that gate into `DesiredEntries` so `PinnedMaps::apply`
         // knows to leave FRONT_META/FRONT_ENDPOINTS untouched rather than diff them
         // against an empty desired set while the node set isn't known yet.
-        // POD_TARGETS must NOT be gated on the FULL Node LIST the same way:
-        // it's EndpointSlice/local-node-derived (`reconcile::
-        // pod_targets_for_node`), not front-derived, so it's still computed
-        // below even while `nodes_listed` is false. It is still gated, just
-        // on the narrower `pod_targets_known`/`self_node_known` above --
+        // POD_TARGETS is not gated on the FULL Node LIST: it's
+        // EndpointSlice/local-node-derived (`reconcile::pod_targets_for_node`),
+        // not front-derived, so it's still computed below even while
+        // `nodes_listed` is false. Its destructive full-sync is gated on the
+        // narrower `pod_targets_known`/`self_node_known` above, and the
+        // conntrack orphan sweep waits for the full listing (`fronts_known`)
+        // since a partial one would make every pin look orphaned.
         // `pod_targets_for_node` can only match an endpoint once THIS
         // node's own address has resolved, and `PinnedMaps::apply` skips
         // the destructive POD_TARGETS full-sync until then, or a restart
@@ -3249,11 +3251,7 @@ mod tests {
     ) -> HashSet<[u8; 16]> {
         let desired = state.desired(&node(SELF_IP));
         let live: HashSet<[u8; 16]> = desired.cluster_backends.keys().copied().collect();
-        let orphans: HashSet<[u8; 16]> = pinned
-            .iter()
-            .copied()
-            .filter(|ip| !live.contains(ip))
-            .collect();
+        let orphans = beep::backends_absent_from(&pinned.iter().copied().collect(), &live);
         let mut evicted = HashSet::new();
         crate::apply::plan_tick(
             &desired,
