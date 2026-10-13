@@ -50,8 +50,9 @@ use core::mem::MaybeUninit;
 
 use aya_ebpf::{
     bindings::{
-        bpf_tunnel_key, BPF_F_PSEUDO_HDR, BPF_F_TUNINFO_IPV6, TC_ACT_OK, TC_ACT_REDIRECT,
-        TC_ACT_SHOT,
+        bpf_tunnel_key, bpf_tunnel_key__bindgen_ty_1, bpf_tunnel_key__bindgen_ty_2,
+        bpf_tunnel_key__bindgen_ty_3, BPF_F_PSEUDO_HDR, BPF_F_TUNINFO_IPV6, TC_ACT_OK,
+        TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
     helpers::{
         bpf_csum_diff, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_change_head,
@@ -819,6 +820,27 @@ fn set_tunnel_remote(tkey: &mut bpf_tunnel_key, node_ip: &[u8; 16]) -> u64 {
     }
 }
 
+// The kernel reads and writes `bpf_tunnel_key` as raw bytes, so every byte of
+// the zeroed key must be initialised; that holds only while the struct has no
+// padding (4 + 16 + 1 + 1 + 2 + 4 + 16) and each union literal below uses its
+// largest arm.
+const _: () = assert!(core::mem::size_of::<bpf_tunnel_key>() == 44);
+
+#[inline(always)]
+fn zeroed_tunnel_key() -> bpf_tunnel_key {
+    bpf_tunnel_key {
+        tunnel_id: 0,
+        __bindgen_anon_1: bpf_tunnel_key__bindgen_ty_1 {
+            remote_ipv6: [0; 4],
+        },
+        tunnel_tos: 0,
+        tunnel_ttl: 0,
+        __bindgen_anon_2: bpf_tunnel_key__bindgen_ty_2 { tunnel_ext: 0 },
+        tunnel_label: 0,
+        __bindgen_anon_3: bpf_tunnel_key__bindgen_ty_3 { local_ipv6: [0; 4] },
+    }
+}
+
 /// GET-side counterpart of `set_tunnel_remote`: `bpf_skb_get_tunnel_key`
 /// errors outright (`-EPROTO`, `net/core/filter.c`) when its `flags`
 /// argument doesn't match the tunnel's actual family, so a single flags=0
@@ -831,9 +853,7 @@ fn set_tunnel_remote(tkey: &mut bpf_tunnel_key, node_ip: &[u8; 16]) -> u64 {
 /// union field (`tunnel_remote` below).
 #[inline(always)]
 fn get_tunnel_key(ctx: &TcContext) -> Option<(bpf_tunnel_key, bool)> {
-    // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
-    // which all-zero is a valid value.
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
+    let mut tkey = zeroed_tunnel_key();
     let size = core::mem::size_of::<bpf_tunnel_key>() as u32;
     // SAFETY: `ctx.skb.skb` is the live skb; `tkey` is a stack local of
     // exactly `size` bytes.
@@ -902,9 +922,7 @@ fn redirect_to_geneve<const N: usize>(
     mut opt: [u8; N],
     l3_ethertype: u16,
 ) -> Option<i32> {
-    // SAFETY: `bpf_tunnel_key` is plain integers and integer unions, for
-    // which all-zero is a valid value.
-    let mut tkey: bpf_tunnel_key = unsafe { core::mem::zeroed() };
+    let mut tkey = zeroed_tunnel_key();
     let tkey_flags = set_tunnel_remote(&mut tkey, remote);
     tkey.tunnel_id = vni;
     tkey.tunnel_ttl = 64;
