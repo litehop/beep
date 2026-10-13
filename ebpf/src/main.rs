@@ -987,10 +987,10 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     // outside of the packet"). Every `load_direct` offset in
     // `try_uplink_ingress_headers` needs to fold to a literal at compile
     // time, which only a const generic guarantees.
-    let flow = match l2_hlen {
-        0 => try_uplink_ingress_headers::<0>(ctx),
-        ETH_HLEN => try_uplink_ingress_headers::<ETH_HLEN>(ctx),
-        _ => None,
+    let flow = if l2_hlen == 0 || l2_hlen == ETH_HLEN {
+        try_uplink_ingress_dyn(ctx, l2_hlen)
+    } else {
+        None
     };
     // The steering/encap tail takes only register/stack values (no packet
     // pointers), so it is inlined once here instead of once per
@@ -998,6 +998,98 @@ fn try_uplink_ingress(ctx: &TcContext) -> Option<i32> {
     match flow {
         Some(flow) => uplink_ingress_encap(ctx, ingress_ifindex, flow, l2_hlen == 0),
         None => Some(TC_ACT_OK),
+    }
+}
+
+unsafe extern "C" {
+    fn beep_dynptr_from_skb(
+        skb: *mut aya_ebpf::bindings::__sk_buff,
+        flags: u64,
+        ptr: *mut aya_ebpf::bindings::bpf_dynptr,
+    ) -> i32;
+    fn beep_dynptr_slice(
+        ptr: *const aya_ebpf::bindings::bpf_dynptr,
+        offset: u32,
+        buffer: *mut core::ffi::c_void,
+        buffer__szk: u32,
+    ) -> *mut core::ffi::c_void;
+}
+
+#[inline(always)]
+fn dyn_slice<const N: usize>(
+    dp: &aya_ebpf::bindings::bpf_dynptr,
+    off: usize,
+    buf: &mut [u8; N],
+) -> Option<*const u8> {
+    // SAFETY: `dp` was initialised by `bpf_dynptr_from_skb`; `buf` is exactly
+    // `N` writable bytes.
+    let p = unsafe { beep_dynptr_slice(dp, off as u32, buf.as_mut_ptr().cast(), N as u32) };
+    if p.is_null() {
+        None
+    } else {
+        Some(p.cast())
+    }
+}
+
+/// One runtime-offset parse for both families and both L2 shapes.
+#[inline(always)]
+fn try_uplink_ingress_dyn(ctx: &TcContext, l2_hlen: usize) -> Option<IngressFlow> {
+    // SAFETY: all-zero is the documented initial state of a `bpf_dynptr`.
+    let mut dp: aya_ebpf::bindings::bpf_dynptr = unsafe { core::mem::zeroed() };
+    // SAFETY: `ctx.skb.skb` is the live skb; `dp` is a valid out-pointer.
+    if unsafe { beep_dynptr_from_skb(ctx.skb.skb, 0, &mut dp) } != 0 {
+        return None;
+    }
+    let mut b1 = [0u8; 1];
+    let vp = dyn_slice(&dp, l2_hlen, &mut b1)?;
+    // SAFETY: slice of 1 byte returned non-null.
+    let ver = unsafe { *vp } >> 4;
+    if ver == 4 {
+        let mut b = [0u8; 24];
+        let p = dyn_slice(&dp, l2_hlen, &mut b)?;
+        // SAFETY: slice of 24 bytes returned non-null.
+        let h: [u8; 24] = unsafe { core::ptr::read_unaligned(p.cast()) };
+        if h[0] & 0x0f != 5 || (h[9] != IPPROTO_TCP && h[9] != IPPROTO_UDP) {
+            return None;
+        }
+        let dst_ip = u32::from_ne_bytes([h[16], h[17], h[18], h[19]]);
+        let src_ip = u32::from_ne_bytes([h[12], h[13], h[14], h[15]]);
+        Some(IngressFlow {
+            front: LbFrontKey {
+                front_ip: ipv4_mapped_v6(dst_ip),
+                front_port: u16::from_ne_bytes([h[22], h[23]]),
+                proto: h[9],
+                _pad: 0,
+            },
+            client_ip: ipv4_mapped_v6(src_ip),
+            client_port: u16::from_ne_bytes([h[20], h[21]]),
+            ethertype: ETH_P_IPV4,
+        })
+    } else if ver == 6 {
+        let mut b = [0u8; 44];
+        let p = dyn_slice(&dp, l2_hlen, &mut b)?;
+        // SAFETY: slice of 44 bytes returned non-null.
+        let h: [u8; 44] = unsafe { core::ptr::read_unaligned(p.cast()) };
+        if h[6] != IPPROTO_TCP && h[6] != IPPROTO_UDP {
+            return None;
+        }
+        let mut client_ip = [0u8; 16];
+        client_ip.copy_from_slice(&h[8..24]);
+        let mut front_ip = [0u8; 16];
+        front_ip.copy_from_slice(&h[24..40]);
+        Some(IngressFlow {
+            front: LbFrontKey {
+                front_ip,
+                front_port: u16::from_ne_bytes([h[42], h[43]]),
+                proto: h[6],
+                _pad: 0,
+            },
+            client_ip,
+            client_port: u16::from_ne_bytes([h[40], h[41]]),
+            ethertype: ETH_P_IPV6,
+        })
+    } else {
+        None
     }
 }
 
