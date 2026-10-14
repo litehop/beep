@@ -51,8 +51,12 @@
 #   can only see the git-tracked bd export and so misses a bead closed
 #   since the export's last commit, or pruned after closing.
 #
+# STEP F: report (never delete) per-VM `/` disk usage, per-worker dirs under
+#   /home/lima.guest/work, and legacy top-level build dirs for each running
+#   `beep-*` Lima VM. A VM above 80% (VM_DISK_THRESHOLD_PCT) is an anomaly.
+#
 # Exit codes: 0 = clean tick, nothing found. Non-zero = an anomaly for the
-# mayor to look at: either a `git fetch`/`branch` failure in STEP B-D,
+# mayor to look at: a running beep-* VM above 80% disk (STEP F), or either a `git fetch`/`branch` failure in STEP B-D,
 # surfaced via this script's own `set -e` with git's own exit code, or STEP
 # C2 printing a `[hygiene] dirty-worktree: ...` line, or STEP
 # E printing at least one `[hygiene] stale-finding: ...` line (tracked via
@@ -433,6 +437,62 @@ step_e_stale_findings() {
   [ "$stale_count" -eq 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# STEP F -- per-VM disk report. REPORT ONLY: nothing on a VM is ever deleted
+# here. For each running `beep-*` Lima VM, prints `/` usage and the
+# `/home/lima.guest/work/*` per-worker dirs (tagged `live` when the agent id
+# is in --live-agents) plus any legacy top-level build dirs/tarballs outside
+# `work/`. A VM above VM_DISK_THRESHOLD_PCT counts as an anomaly (non-zero
+# exit). A host without `limactl` skips the step.
+# ---------------------------------------------------------------------------
+VM_DISK_THRESHOLD_PCT="${VM_DISK_THRESHOLD_PCT:-80}"
+
+# Integer percent from `df --output=pcent /` output (header line + " 93%").
+df_pcent() {
+  printf '%s\n' "$1" | tr -dc '0-9\n' | { grep -E '^[0-9]+$' || true; } | head -1
+}
+
+# True (exit 0) iff `pct` is strictly above the threshold.
+vm_over_threshold() {
+  [ "$1" -gt "$VM_DISK_THRESHOLD_PCT" ]
+}
+
+step_f_vm_disk() {
+  command -v limactl >/dev/null 2>&1 || return 0
+  local vm pct df_out entry name over=0
+  while IFS= read -r vm; do
+    case "$vm" in beep-*) ;; *) continue ;; esac
+    df_out=$(limactl shell "$vm" -- df --output=pcent / 2>/dev/null) || df_out=""
+    pct=$(df_pcent "$df_out")
+    if [ -z "$pct" ]; then
+      echo "[hygiene] vm-disk: $vm df unreadable -- inspect by hand"
+      over=$(( over + 1 ))
+      continue
+    fi
+    if vm_over_threshold "$pct"; then
+      echo "[hygiene] vm-disk: $vm / at ${pct}% (> ${VM_DISK_THRESHOLD_PCT}%) -- workers stop; recycle only by the VM's assigned worker or operator"
+      over=$(( over + 1 ))
+    else
+      echo "[hygiene] vm-disk: $vm / at ${pct}%"
+    fi
+    # shellcheck disable=SC2016 # expands on the VM, not here
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      name="${entry##*/}"
+      if agent_id_is_live "$name" "$LIVE_AGENTS"; then
+        echo "[hygiene] vm-dir: $vm $entry (live)"
+      else
+        echo "[hygiene] vm-dir: $vm $entry (not live -- report only, operator decides)"
+      fi
+    done < <(limactl shell "$vm" -- sh -c 'du -sh /home/lima.guest/work/* 2>/dev/null | awk "{print \$2}"' 2>/dev/null || true)
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      echo "[hygiene] vm-legacy-dir: $vm $entry (outside work/ -- report only, operator decides)"
+    done < <(limactl shell "$vm" -- sh -c 'ls -d /home/lima.guest/* 2>/dev/null | grep -v "/work$"' 2>/dev/null || true)
+  done < <(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk '$2 == "Running" {print $1}')
+  HYGIENE_ANOMALIES=$(( HYGIENE_ANOMALIES + over ))
+}
+
 main() {
   local live_agents_provided=0 no_live_workers=0
   while [ "$#" -gt 0 ]; do
@@ -494,6 +554,7 @@ main() {
   step_d_gone_upstream_branches
   local e_rc=0
   step_e_stale_findings || e_rc=$?
+  step_f_vm_disk
   [ "$e_rc" -eq 0 ] && [ "$HYGIENE_ANOMALIES" -eq 0 ]
 }
 

@@ -21,7 +21,7 @@ vmType: vz
 
 cpus: 1
 memory: "1GiB"
-disk: "5GiB"
+disk: "10GiB"
 
 # Same `user-v2` network as beep-node-a/beep-node-b (see header) -- this is
 # the whole point of this profile, not an incidental default.
