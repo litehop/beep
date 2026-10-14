@@ -58,8 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend-facing source port, and the reverse/memo rows of finished flows were
   only ever freed by LRU eviction. A TCP flow's rows (backend reverse and
   port-remap memo, ingress forward) are now deleted on RST, or on the first
-  non-FIN packet after a FIN in both directions (a half-closed connection
-  keeps its rows), and an idle sweep reclaims the rest.
+  non-FIN packet of the first-FIN side once both FINs were seen (a
+  half-closed connection keeps its rows), and an idle sweep reclaims the
+  rest.
 
 ### Added
 

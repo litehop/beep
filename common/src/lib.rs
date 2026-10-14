@@ -1286,6 +1286,9 @@ pub const FLOW_FLAG_FIN_POD: u16 = 1 << 1;
 pub const FLOW_FLAG_UDP_PARITY: u16 = 1 << 2;
 /// Idle-GC parity of a TCP row; compared against `Config::tcp_parity`.
 pub const FLOW_FLAG_TCP_PARITY: u16 = 1 << 3;
+/// Set when the second of the two FINs came from the pod side, clear when it
+/// came from the client side; only meaningful once both FIN bits are set.
+pub const FLOW_FLAG_LAST_FIN_POD: u16 = 1 << 4;
 
 /// Which end of the connection sent the packet a backend node is processing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1339,12 +1342,15 @@ pub enum FlowStep {
 /// parity-only touch.
 ///
 /// TCP rows are reclaimed on RST in either direction, or on the first
-/// non-FIN packet after a FIN has been seen in BOTH directions -- the final
-/// ACK, which the row must still carry (deleting at the second FIN would let
-/// that ACK recreate the row, and a return-leg miss would send the pod's
-/// retransmitted FIN out un-encapsulated). The first FIN alone never
-/// reclaims: the other side may keep sending (half-close). A SYN starts a
-/// fresh connection on the same 4-tuple and clears the FIN bits.
+/// non-FIN packet from the side that sent the FIRST FIN, after a FIN has been
+/// seen in BOTH directions -- that is the final ACK, which the row must still
+/// carry (deleting at the second FIN would let that ACK recreate the row, and
+/// a return-leg miss would send the pod's retransmitted FIN out
+/// un-encapsulated). Packets from the second FIN's own side do not count: a
+/// duplicate ACK answering a retransmitted FIN arrives before the real final
+/// ACK and would otherwise delete the row from under it. The first FIN alone
+/// never reclaims: the other side may keep sending (half-close). A SYN starts
+/// a fresh connection on the same 4-tuple and clears the FIN bits.
 ///
 /// Otherwise the row's parity bit is copied from the global parity, written
 /// only when it differs: at most one write per row per sweep interval.
@@ -1362,17 +1368,29 @@ pub fn flow_step(
             return FlowStep::Reclaim;
         }
         if tcp_flags & TCP_FLAG_SYN != 0 {
-            flags &= !(FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD);
+            flags &= !(FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD | FLOW_FLAG_LAST_FIN_POD);
         }
         let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
-        if flags & both == both && tcp_flags & TCP_FLAG_FIN == 0 {
+        let last_fin_from_pod = flags & FLOW_FLAG_LAST_FIN_POD != 0;
+        if flags & both == both
+            && tcp_flags & TCP_FLAG_FIN == 0
+            && (side == FlowSide::Pod) != last_fin_from_pod
+        {
             return FlowStep::Reclaim;
         }
         if tcp_flags & TCP_FLAG_FIN != 0 {
-            flags |= match side {
-                FlowSide::Client => FLOW_FLAG_FIN_CLIENT,
-                FlowSide::Pod => FLOW_FLAG_FIN_POD,
+            let (own, other) = match side {
+                FlowSide::Client => (FLOW_FLAG_FIN_CLIENT, FLOW_FLAG_FIN_POD),
+                FlowSide::Pod => (FLOW_FLAG_FIN_POD, FLOW_FLAG_FIN_CLIENT),
             };
+            if flags & own == 0 && flags & other != 0 {
+                flags = if side == FlowSide::Pod {
+                    flags | FLOW_FLAG_LAST_FIN_POD
+                } else {
+                    flags & !FLOW_FLAG_LAST_FIN_POD
+                };
+            }
+            flags |= own;
         }
     }
     if let Some((bit, global)) = parity_bit(proto, parity) {
@@ -3564,7 +3582,7 @@ mod tests {
 
     #[test]
     fn reclaim_waits_for_the_final_ack_so_it_cannot_recreate_the_row() {
-        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD | FLOW_FLAG_LAST_FIN_POD;
         let first_fin = step_tcp(Some(0), FIN_ACK, FlowSide::Client);
         assert_eq!(first_fin, FlowStep::Write(FLOW_FLAG_FIN_CLIENT));
         // Half-close: the pod keeps sending after the client's FIN.
@@ -3584,6 +3602,31 @@ mod tests {
             step_tcp(Some(both), FIN_ACK, FlowSide::Pod),
             FlowStep::Reclaim,
             "a retransmitted FIN still needs its row to be encapsulated back"
+        );
+    }
+
+    // A TLP/duplicate-ACK exchange around the FINs puts an extra ACK from the
+    // SECOND FIN's sender ahead of the real final ACK. Reclaiming on it dropped
+    // the pod's ACK of the client's FIN at the ingress node (client left in
+    // LAST-ACK for a 200 ms retransmit) in a live run.
+    #[test]
+    fn ack_from_the_second_fins_own_side_does_not_end_the_connection() {
+        let pod_first = step_tcp(Some(0), FIN_ACK, FlowSide::Pod);
+        let FlowStep::Write(after_pod_fin) = pod_first else {
+            panic!("first FIN must be recorded")
+        };
+        let FlowStep::Write(both) = step_tcp(Some(after_pod_fin), FIN_ACK, FlowSide::Client) else {
+            panic!("second FIN must be recorded")
+        };
+        assert_eq!(
+            step_tcp(Some(both), ACK, FlowSide::Client),
+            FlowStep::Keep,
+            "the client's duplicate ACK must not delete the row before the pod's final ACK"
+        );
+        assert_eq!(
+            step_tcp(Some(both), ACK, FlowSide::Pod),
+            FlowStep::Reclaim,
+            "the pod's ACK of the client's FIN is the final packet"
         );
     }
 
