@@ -200,7 +200,7 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
-  pkill -9 -f "nc -l .*${POD_IP} ${REMAP_TARGET_PORT}" 2>/dev/null || true
+  pkill -9 -f "nc -l .*${REMAP_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -6 -l -N ${POD6_B} ${PIN6_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -u -l ${POD_IP} ${PEND_TARGET_PORT}" 2>/dev/null || true
@@ -671,7 +671,17 @@ remap_started=$SECONDS
 # but the pod never closes, leaving A half-closed with its row alive. Flow
 # B's body arrives after a pause so its memo can be read while B is live,
 # then B closes cleanly and its memo must be reclaimed.
-nohup nc -l -d "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
+#
+# nc listens with SO_REUSEPORT, so A's frozen listener would keep winning a
+# share of B's SYNs and B would hang unanswered. A listens on the wildcard
+# address and B on the pod IP: the kernel always prefers the exact-address
+# listener, so only A's own SYN can reach A's listener.
+#
+# A close whose second FIN piggybacks the ACK of the first is left to the idle
+# sweep (the datapath cannot tell it from crossed FINs), so B closes pod-first
+# and the client is frozen across the pod's FIN: its ACK is then a separate
+# packet, and its own FIN follows later.
+nohup nc -l -d "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
 remap_srv_a=$!
 disown
 sleep 0.5
@@ -692,8 +702,8 @@ for _ in $(seq 1 70); do
   [ -z "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ] && break
   sleep 1
 done
-{ printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n'; sleep 8; printf 'REMAPB'; } \
-  | nohup nc -l "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
+{ printf 'HTTP/1.0 200 OK\r\n\r\n'; sleep 8; printf 'REMAPB'; sleep 5; } \
+  | nohup nc -l -N "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
 disown
 sleep 0.5
 remap_rc_file=/tmp/beep-smoke-remap-rc-B
@@ -713,6 +723,9 @@ jq -e 'all(.[]; (.value | length) == 40 and all(.value[2:40][]; . == "0x00"))' <
   echo "FAIL: a port_memo value has non-zero bytes in 2..40 (or is not 40 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
   exit 1
 }
+pkill -STOP -f "curl .*--local-port ${REMAP_CLIENT_PORT}"
+sleep 12
+pkill -CONT -f "curl .*--local-port ${REMAP_CLIENT_PORT}"
 wait "$remap_pid"
 [ "$(cat "$remap_rc_file")" = "0" ] || {
   echo "FAIL: remap round trip via front ${FRONT_IP}:${REMAP_FRONT_PORT_B} (client port ${REMAP_CLIENT_PORT}) did not complete: $(cat /tmp/beep-smoke-remap-err-B)" >&2

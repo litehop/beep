@@ -3627,6 +3627,54 @@ mod tests {
         );
     }
 
+    // The live smoke's port-remap stage: front A's connection is half-closed
+    // (client FIN acked, pod never closes) while front B reuses the same
+    // client port and is remapped; B then closes pod-first with separate ACKs.
+    #[test]
+    fn remapped_connection_closing_releases_its_memo_without_touching_the_live_one() {
+        let (a, b) = (([1; 16], 80), ([2; 16], 80));
+        let port = 40000;
+        let mut m = BackendModel {
+            reclaim: true,
+            ..Default::default()
+        };
+        assert_eq!(m.forward(a, port, TCP_FLAG_SYN), None);
+        m.pod(a, port, SYN_ACK);
+        m.forward(a, port, FIN_ACK);
+        m.pod(a, port, ACK);
+        assert_eq!(m.forward(b, port, TCP_FLAG_SYN), None);
+        assert!(
+            m.memo.contains_key(&port),
+            "B must be remapped while A holds the natural key, or the scenario proves nothing"
+        );
+        m.pod(b, port, SYN_ACK);
+        m.pod(b, port, FIN_ACK);
+        m.forward(b, port, ACK);
+        m.forward(b, port, FIN_ACK);
+        m.pod(b, port, ACK);
+        assert!(
+            m.memo.is_empty(),
+            "a cleanly closed remapped connection must release its port memo"
+        );
+        assert_eq!(
+            m.rev.keys().copied().collect::<Vec<_>>(),
+            [port],
+            "only the half-closed connection's row may remain"
+        );
+    }
+
+    // FIN, FIN+ACK, ACK is indistinguishable by flags from crossed FINs, so
+    // the row is left to the idle sweep rather than risk dropping the pod's
+    // pending ACK of the client's FIN.
+    #[test]
+    fn piggybacked_ack_on_the_second_fin_is_left_to_the_idle_sweep() {
+        assert_eq!(
+            replay(&[(C, FIN_ACK), (P, FIN_ACK), (C, ACK)]),
+            None,
+            "reclaiming here would strand a crossed close's pending ACK"
+        );
+    }
+
     #[test]
     fn reclaim_waits_for_the_final_ack_so_it_cannot_recreate_the_row() {
         // client FIN, pod ACK, pod FIN, client ACK (final): reclaimed there.
