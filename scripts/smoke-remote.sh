@@ -200,14 +200,14 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
-  pkill -f "nc -l -N ${POD_IP} ${REMAP_TARGET_PORT}" 2>/dev/null || true
+  pkill -9 -f "nc -l .*${POD_IP} ${REMAP_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -6 -l -N ${POD6_B} ${PIN6_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -u -l ${POD_IP} ${PEND_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
   pkill -f "tcpdump -nn -l -vv -i smoke-veth1" 2>/dev/null || true
   rm -rf "$PIN_DIR"
-  rm -f /tmp/beep-smoke-response-remap-*.http /tmp/beep-smoke-response-pin6.http
+  rm -f /tmp/beep-smoke-remap-* /tmp/beep-smoke-response-pin6.http
   # Delete the veth (destroys both ends, wherever each lives) BEFORE the
   # netns: deleting the netns first can orphan smoke-veth1's namespace --
   # the veth peer keeps it alive with its bind-mount name already gone,
