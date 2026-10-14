@@ -537,12 +537,19 @@ echo "LEG-C eTP=Local: PASS (ingress=$ING; $IP_B served by both local pods; $IP_
 # keepalive reuse): a quick request records the serving pod, the long wait spans the delete. curl
 # silently re-sends on a fresh connection when a reused one dies, so a flow only counts as surviving
 # if both requests report the same client RemoteAddr (ip:port); a reconnect is a lost flow.
-VICTIM="$(awk -v n="$NODE_B_K8S" '$2==n{print $1; exit}' <<<"$CMAP")"
+# The victim is the pod that actually answered the most flows (read from each flow's streamed first
+# response), not one picked up front: hashing can leave any given pod flowless, and a leg whose
+# victim served nothing proves nothing.
 N_LONG=24
 LONG_OUT="$(mktemp)"
-limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $N_LONG); do ( out=\$(curl -sS -m 50 'http://$IP_A:$P_CLUSTER/' 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -n 's/^Hostname: /H=/p;s/^RemoteAddr: /R=/p'); echo \$out ) & done; wait" >"$LONG_OUT" &
+FLOW_DIR="/tmp/beep-leg-d-flows"
+limactl shell "$VM_CLIENT" -- bash -c "rm -rf $FLOW_DIR; mkdir -p $FLOW_DIR; for i in \$(seq 1 $N_LONG); do ( out=\$(curl -sS -m 50 'http://$IP_A:$P_CLUSTER/' 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -un 's/^Hostname: /H=/p;s/^RemoteAddr: /R=/p' | tee $FLOW_DIR/\$i); echo \$out ) & done; wait" >"$LONG_OUT" &
 LONG_PID=$!
 sleep 8
+FIRST_HITS="$(limactl shell "$VM_CLIENT" -- bash -c "head -qn1 $FLOW_DIR/* | sed -n 's/^H=//p' | sort | uniq -c | sort -rn")"
+echo "LEG-D first-request pods (count pod) at 8s: $(tr '\n' ';' <<<"$FIRST_HITS"); FRONT_ENDPOINTS entries: $(map_entry_count "$VM_A" FRONT_ENDPOINTS) on $VM_A, $(map_entry_count "$VM_B" FRONT_ENDPOINTS) on $VM_B"
+VICTIM="$(awk 'NR==1{print $2}' <<<"$FIRST_HITS")"
+[ -n "$VICTIM" ] || { leg_fail "LEG-D: FAIL (no flow had been answered 8s in; there is no victim to delete)"; VICTIM="none"; }
 kube -n "$NAMESPACE" delete pod "$VICTIM" --grace-period=0 --force >/dev/null 2>&1 || leg_fail "LEG-D: FAIL (could not delete $VICTIM)"
 wait "$LONG_PID" || true
 # Fields are keyed (H=pod, R=client addr) and attributed to a request by the RemoteAddr count, so
