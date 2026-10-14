@@ -104,6 +104,22 @@ transcript "$(printf 'deliverable_type: pr\ndeliverable_ref: https://github.com/
 GH_JSON="$NO_REVIEW"; run_hook critical-reviewer false
 assert "queue-entry deliverable_ref is honoured over later citations" "$(blocks && grep -q 'pr view 55' "$GH_LOG" && echo 1 || echo 0)"
 
+transcript "$(printf 'deliverable_type: findings\ndeliverable_ref: /x/ai/findings/foo.md\n\n## Subagent final message\nReview PR #123 was done earlier')"
+GH_JSON="$NO_REVIEW"; run_hook critical-reviewer false
+assert "non-PR deliverable_ref passes through; a 'Review PR' line in the embedded final message must not anchor enforcement on an unrelated PR" "$([ "$RC" -eq 0 ] && [ ! -s "$GH_LOG" ] && echo 1 || echo 0)"
+
+transcript "Review https://github.com/litehop/beep/pull/101 (bead beep-x)"
+GH_JSON="$NO_REVIEW"; run_hook critical-reviewer false
+assert "accepts 'Review <pull URL>' without the word PR (dispatch phrasing varies; a miss silently disables enforcement)" "$(blocks && grep -q 'pr view 101' "$GH_LOG" && echo 1 || echo 0)"
+
+transcript "Re-review https://github.com/litehop/beep/pull/102"
+GH_JSON="$NO_REVIEW"; run_hook critical-reviewer false
+assert "accepts 'Re-review <pull URL>' without the word PR" "$(blocks && grep -q 'pr view 102' "$GH_LOG" && echo 1 || echo 0)"
+
+transcript "Review #231 conventions in the dispatch docs"
+GH_JSON="$NO_REVIEW"; run_hook critical-reviewer false
+assert "'Review #N' without PR is not an anchor (prose citing an issue must not trigger enforcement)" "$([ "$RC" -eq 0 ] && [ ! -s "$GH_LOG" ] && echo 1 || echo 0)"
+
 transcript "Review PR https://github.com/litehop/beep/pull/66"
 GH_JSON="$NO_REVIEW"
 PAYLOAD=$(jq -nc --arg t "$WORK/t.jsonl" '{session_id:"s1", transcript_path:"/x/main.jsonl", cwd:"/x", permission_mode:"default", hook_event_name:"SubagentStop", stop_hook_active:false, agent_id:"agent-1", agent_type:"critical-reviewer", agent_transcript_path:$t, last_assistant_message:"LGTM", stop_reason:"end_turn"}')

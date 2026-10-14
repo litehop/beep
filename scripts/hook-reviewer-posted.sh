@@ -9,10 +9,15 @@
 # unusable: that is the very message being judged.
 #
 # PR number: the first line of the subagent's own transcript (JSONL) is the
-# prompt it was dispatched with. Only an anchored deliverable counts: a prompt
-# line starting `Review PR ` / `Re-review PR ` followed by a pull URL or `#N`,
-# or a queue-entry line `deliverable_ref: <pull URL>`. Citations elsewhere
-# (decoys) are ignored. No anchored PR = pass through, never guess.
+# prompt it was dispatched with. Only an anchored deliverable counts:
+#  1. If a `deliverable_ref:` line exists (queue format), it alone decides: a
+#     pull URL is enforced, any other ref passes through. The embedded
+#     "Subagent final message" block is never consulted.
+#  2. Otherwise a line starting `Review ` / `Re-review ` followed by a pull URL
+#     (word `PR ` optional) or by `PR #N`. A bare `#N` without `PR ` is not
+#     an anchor.
+# Citations elsewhere (decoys) are ignored. No anchored PR = pass through,
+# never guess.
 #
 # "Posted" = a non-DISMISSED review whose body starts with the `## critical-
 # reviewer findings` marker (the merge gate's own key) on commit == headRefOid.
@@ -35,8 +40,14 @@ if [ ! -r "$TRANSCRIPT" ]; then
   exit 0
 fi
 PROMPT=$(head -n 1 "$TRANSCRIPT" | jq -r '.message.content | if type == "string" then . else map(.text? // "") | join("\n") end' 2>/dev/null || true)
-ANCHOR='^(Re-review|Review) PR (https://github\.com/litehop/beep/pull/|#)?[0-9]+|^deliverable_ref: https://github\.com/litehop/beep/pull/[0-9]+'
-PR=$(printf '%s\n' "$PROMPT" | grep -m1 -oE "$ANCHOR" | grep -oE '[0-9]+$' || true)
+PULL='https://github\.com/litehop/beep/pull/[0-9]+'
+REF=$(printf '%s\n' "$PROMPT" | grep -m1 '^deliverable_ref:' || true)
+if [ -n "$REF" ]; then
+  PR=$(printf '%s\n' "$REF" | grep -m1 -oE "^deliverable_ref: $PULL\$" | grep -oE '[0-9]+$' || true)
+else
+  ANCHOR="^(Re-review|Review) (PR )?$PULL|^(Re-review|Review) PR #[0-9]+"
+  PR=$(printf '%s\n' "$PROMPT" | grep -m1 -oE "$ANCHOR" | grep -oE '[0-9]+$' || true)
+fi
 if [ -z "$PR" ]; then
   echo "hook-reviewer-posted: no anchored 'Review PR <N>' / deliverable_ref in the dispatch prompt; not enforcing" >&2
   exit 0
