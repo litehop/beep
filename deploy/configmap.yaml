@@ -1,0 +1,15 @@
+# Sizing caps for the front maps. Both are read by the controller through
+# `envFrom` in daemonset.yaml; a change needs `kubectl rollout restart
+# ds/servicelb-controller -n kube-system` (deploy/README.md, "Configuration").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: beep-config
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: servicelb-controller
+data:
+  # Most fronts (front address x Service port x protocol) a node can hold.
+  BEEP_MAX_FRONTS: "1024"
+  # Endpoints each front is sized for.
+  BEEP_ENDPOINTS_PER_FRONT: "4"

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes / operator action required
 
+- **New `beep-config` ConfigMap (`deploy/configmap.yaml`) holds the sizing
+  caps.** Apply it before `deploy/daemonset.yaml`, which now loads it with
+  `envFrom` (a missing ConfigMap fails the pod). `BEEP_MAX_FRONTS` (1024) and
+  `BEEP_ENDPOINTS_PER_FRONT` (4) take effect on `kubectl rollout restart
+  ds/servicelb-controller`; the front maps are recreated with their entries
+  carried over and established flows survive. Every option, its default and
+  memory cost is in `deploy/README.md` ("Configuration").
+
 - **Controllers now keep a per-node Lease and prune dead nodes from Service
   ingress.** Apply the updated `deploy/rbac.yaml` (new `beep-leases`
   Namespace holding the Role for `coordination.k8s.io` leases, kept out of

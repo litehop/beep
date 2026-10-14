@@ -111,9 +111,74 @@ the first time, then confirm with "Verify your deployment" below.
   privileged `node-prep` initContainer runs first for the one step that
   needs it (disabling `rp_filter`) — see
   `docs/decisions/servicelb-rp-filter-init-container.md`.
+- `configmap.yaml` — `beep-config`, the sizing caps (see "Configuration").
 - `rbac.yaml` — `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` (plus
   a `Role`/`RoleBinding` for the flow-hash seed Secret and one for the
   per-node Leases) for the above.
+
+## Configuration
+
+`configmap.yaml` (`beep-config`, `kube-system`) holds the sizing caps. The
+DaemonSet loads it with `envFrom`, so each key is an environment variable of
+the controller container. The ConfigMap is required: a pod whose
+`beep-config` is missing stays in `CreateContainerConfigError`. A CLI flag
+(e.g. from a kustomize patch) overrides the env var.
+
+| Option | Env var (ConfigMap key) | Default | Meaning |
+| --- | --- | --- | --- |
+| `--max-fronts` | `BEEP_MAX_FRONTS` | 1024 | Most fronts (front address x Service port x protocol) a node holds. Under the every-node-is-a-front model that is nodes x Service ports. Sets `FRONT_META` `max_entries`. |
+| `--endpoints-per-front` | `BEEP_ENDPOINTS_PER_FRONT` | 4 | Endpoints each front is sized for. Sets `FRONT_ENDPOINTS` `max_entries` = `max-fronts` x `endpoints-per-front` x 2 (8192 by default; the 2 is swap headroom for a front's next generation). |
+
+Both maps are `BPF_F_NO_PREALLOC`, so the caps are ceilings: a node pays
+about 16 B per slot up front (the bucket array) and entries cost memory only
+as they are used.
+
+| Map | Up front | Per used entry | Defaults, all slots used |
+| --- | --- | --- | --- |
+| `FRONT_META` | ~16 B x `max-fronts` | ~96 B per front | ~16 KiB + ~96 KiB |
+| `FRONT_ENDPOINTS` | ~16 B x `max-fronts` x `endpoints-per-front` x 2 | ~128 B per endpoint row | ~128 KiB + ~1 MiB |
+
+Prefer a value at or just below a power of two: the kernel rounds the bucket
+array up, so a cap just above one doubles the up-front cost. A front update
+that would not fit under a map's cap is refused whole with a capacity error
+naming the map, and the front keeps its previous endpoints.
+
+The flags in `daemonset.yaml`'s `args` (`--pod-cidr`, `--node-ip`,
+`--uplink-iface`, ...) are per-cluster or per-node values, not part of the
+ConfigMap (gotchas above). The remaining map caps (`--flow-table-max-entries`
+and similar) are CLI-only flags with defaults; see `beep-controller --help`.
+
+### Changing a cap
+
+Edit the ConfigMap, then restart the DaemonSet. Pods do not reread env vars,
+so nothing happens until you do:
+
+```bash
+kubectl -n kube-system edit configmap beep-config
+kubectl -n kube-system rollout restart daemonset/servicelb-controller
+```
+
+The restarted controller sees a pinned map whose `max_entries` differs from
+its new definition and recreates it (a `MapShape` mismatch), copying the
+old entries into the new map before any program is attached; the
+controller's first reconcile then writes back whatever did not fit. Only
+the front maps change (`FLOW_TABLE` is untouched), so established flows keep
+their conntrack entries. If a cap shrinks below the entries in use, whole
+fronts are kept in key order, the loss is logged with counts, and the
+controller repopulates the rest.
+
+Observed on the k3s rig (2 nodes; `BEEP_MAX_FRONTS` 1024 to 1000;
+`scripts/smoke-k3s-controller.sh`, leg H): the restarted controllers
+showed `BEEP_MAX_FRONTS=1000` in their process environment and the pinned maps
+reported `max_entries` 1000 (`FRONT_META`) and 8000 (`FRONT_ENDPOINTS`). A
+TCP connection established through a front before the change was still the
+same connection (same client port, same backend pod) when its 100 s request
+finished after the rollout (62 s for both nodes). Fresh connections, probed
+about every 0.1 s through each node's front for the whole rollout, saw 0
+failures in 653 probes per node, so no new-connection window longer than one
+probe interval was observed. Expect a gap only if a cap shrinks below the
+fronts in use: the dropped fronts answer nothing until the controller
+repopulates them.
 
 ## Node liveness Leases
 
@@ -222,7 +287,7 @@ kubectl create secret generic beep-controller-kubeconfig -n kube-system \
 
 ## Verify your deployment
 
-Applying `deploy/rbac.yaml` and `deploy/daemonset.yaml` (with your own
+Applying `deploy/rbac.yaml`, `deploy/configmap.yaml` and `deploy/daemonset.yaml` (with your own
 `--pod-cidr` override) leaves every controller Pod `Running` even when
 gotcha #1 above is misconfigured -- a healthy Pod status proves nothing
 about actual delivery, and the WARN log is easy to miss across a fleet of
