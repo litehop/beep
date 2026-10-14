@@ -605,6 +605,65 @@ for ip in "$IP_A" "$IP_B"; do
 done
 echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
 
+# (h) ConfigMap sizing change: editing beep-config and restarting the DaemonSet resizes the front
+# maps on both nodes (the pods read the new value; bpftool shows the new max_entries) while an
+# established flow keeps running (FLOW_TABLE is a separate, unchanged map). Fresh connections are
+# probed throughout; the failure window is reported, and every front must answer again afterwards.
+# Runs before (g), which leaves the DaemonSet on OnDelete (no rollout restart).
+CFG_FRONTS=1000
+CFG_EPF=4
+PROBE_STOP=/tmp/beep-cfg-probe-stop
+PROBE_OUT="$(mktemp)"
+FLOW_OUT="$(mktemp)"
+map_max_entries() { # map_max_entries <vm> <map> -- the pinned map's max_entries
+  limactl shell "$1" -- sudo bpftool map show pinned "$PIN_DIR/$2" --json | jq -r .max_entries
+}
+pod_beep_env() { # pod_beep_env <vm> -- the controller process's BEEP_* env, one per line
+  limactl shell "$1" -- sudo bash -c 'tr "\0" "\n" < /proc/$(pgrep -f beep-controller | head -1)/environ | grep ^BEEP_ | sort'
+}
+echo "==> [13] ConfigMap sizing change (BEEP_MAX_FRONTS=$CFG_FRONTS) + DaemonSet restart: maps resized, established flow survives"
+limactl shell "$VM_CLIENT" -- rm -f "$PROBE_STOP"
+limactl shell "$VM_CLIENT" -- bash -c "( curl -sS -m 150 'http://$IP_A:$FRONT_PORT/' 'http://$IP_A:$FRONT_PORT/?wait=100s' 2>/dev/null | sed -n 's/^Hostname: //p;s/^RemoteAddr: //p' | tr '\n' ' '; echo )" >"$FLOW_OUT" &
+FLOW_PID=$!
+PROBE_PIDS=""
+for ip in "$IP_A" "$IP_B"; do
+  limactl shell "$VM_CLIENT" -- bash -c "while [ ! -e $PROBE_STOP ]; do t=\$(date +%s.%N); if curl -sS -m 2 -o /dev/null http://$ip:$FRONT_PORT/ 2>/dev/null; then echo \"$ip \$t ok\"; else echo \"$ip \$t fail\"; fi; sleep 0.1; done" >>"$PROBE_OUT" &
+  PROBE_PIDS="$PROBE_PIDS $!"
+done
+sleep 5
+kube -n kube-system patch configmap beep-config --type=merge \
+  -p "{\"data\":{\"BEEP_MAX_FRONTS\":\"$CFG_FRONTS\",\"BEEP_ENDPOINTS_PER_FRONT\":\"$CFG_EPF\"}}" >/dev/null
+RESTART_T0=$(date +%s)
+kube -n kube-system rollout restart daemonset/servicelb-controller >/dev/null
+kube -n kube-system rollout status daemonset/servicelb-controller --timeout=180s >/dev/null || leg_fail "LEG-H: FAIL (DaemonSet did not finish rolling out after the ConfigMap change)"
+RESTART_S=$(( $(date +%s) - RESTART_T0 ))
+sleep 10
+limactl shell "$VM_CLIENT" -- touch "$PROBE_STOP"
+# shellcheck disable=SC2086
+wait $PROBE_PIDS || true
+wait "$FLOW_PID" || true
+for vm in "$VM_A" "$VM_B"; do
+  ENV_NOW="$(pod_beep_env "$vm")"
+  FM="$(map_max_entries "$vm" FRONT_META)"
+  FE="$(map_max_entries "$vm" FRONT_ENDPOINTS)"
+  echo "LEG-H $vm env: $(tr '\n' ' ' <<<"$ENV_NOW") FRONT_META.max_entries=$FM FRONT_ENDPOINTS.max_entries=$FE"
+  [ "$ENV_NOW" = "$(printf 'BEEP_ENDPOINTS_PER_FRONT=%s\nBEEP_MAX_FRONTS=%s' "$CFG_EPF" "$CFG_FRONTS")" ] || leg_fail "LEG-H: FAIL ($vm controller did not pick up the ConfigMap env)"
+  [ "$FM" = "$CFG_FRONTS" ] && [ "$FE" = "$((CFG_FRONTS * CFG_EPF * 2))" ] || \
+    leg_fail "LEG-H: FAIL ($vm front maps not resized: FRONT_META=$FM FRONT_ENDPOINTS=$FE, want $CFG_FRONTS/$((CFG_FRONTS * CFG_EPF * 2)))"
+done
+read -r FLOW_POD FLOW_ADDR1 FLOW_POD2 FLOW_ADDR2 <"$FLOW_OUT" || true
+echo "LEG-H established flow (pod addr / pod addr): ${FLOW_POD:-none} ${FLOW_ADDR1:-} ${FLOW_POD2:-} ${FLOW_ADDR2:-}"
+{ [ -n "${FLOW_ADDR1:-}" ] && [ "${FLOW_ADDR1:-}" = "${FLOW_ADDR2:-}" ] && [ "${FLOW_POD:-}" = "${FLOW_POD2:-}" ]; } || \
+  leg_fail "LEG-H: FAIL (the established flow did not survive the restart: '$(cat "$FLOW_OUT")')"
+for ip in "$IP_A" "$IP_B"; do
+  awk -v ip="$ip" -v restart_s="$RESTART_S" '
+    $1==ip { n++; if ($3=="fail") { f++; if (!first) first=$2; last=$2 } }
+    END { printf "LEG-H new connections via %s: %d probes, %d failed, failure window %.1fs (first fail to last fail), rollout took %ds\n", ip, n, f, (f ? last-first : 0), restart_s }' "$PROBE_OUT"
+  awk -v ip="$ip" '$1==ip{last=$3} END{exit last!="ok"}' "$PROBE_OUT" || leg_fail "LEG-H: FAIL (new connections via $ip still failing after the restart)"
+done
+rm -f "$PROBE_OUT" "$FLOW_OUT"
+echo "LEG-H configmap-restart: PASS (pods read the ConfigMap, maps resized, established flow survived)"
+
 # (g) dead-node pruning: a node whose beep pod is gone must leave status.loadBalancer.ingress
 # (its Lease expires and a live controller prunes it) and return when beep comes back.
 # OnDelete keeps node-a's controller (the pruner) running; a nodeSelector to node-a alone makes the
