@@ -129,7 +129,7 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
-  kube -n kube-system delete lease -l app.kubernetes.io/component=node-lease --ignore-not-found >/dev/null 2>&1 || true
+  kube -n beep-leases delete lease -l app.kubernetes.io/component=node-lease --ignore-not-found >/dev/null 2>&1 || true
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   # The tarball above is trap-cleaned, but the locally built+tagged image
   # itself isn't -- without this, every run of a different commit leaves
@@ -627,7 +627,7 @@ poll_ingress() { # poll_ingress <svc> <expected> <seconds> -- echoes seconds wai
 kube -n kube-system patch daemonset servicelb-controller --type=merge \
   -p "{\"spec\":{\"updateStrategy\":{\"type\":\"OnDelete\",\"rollingUpdate\":null},\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$NODE_A_K8S\"}}}}}" >/dev/null
 GONE_AFTER="$(poll_ingress whoami "$IP_A" "$LEASE_PRUNE_BUDGET")"
-[ -n "$GONE_AFTER" ] || { kube -n kube-system get lease -o yaml >&2 || true; kube -n kube-system logs -l app.kubernetes.io/name=servicelb-controller --tail=60 >&2 || true; }
+[ -n "$GONE_AFTER" ] || { kube -n beep-leases get lease -o yaml >&2 || true; kube -n kube-system logs -l app.kubernetes.io/name=servicelb-controller --tail=60 >&2 || true; }
 [ -n "$GONE_AFTER" ] || leg_fail "LEG-G: FAIL ($IP_B still listed in whoami ingress ${LEASE_PRUNE_BUDGET}s after its beep pod was stopped: '$(ingress_of whoami)'; dead nodes are not pruned)"
 echo "LEG-G dead-node prune: PASS ($IP_B left ingress ${GONE_AFTER}s after its beep pod was stopped; $IP_A stays)"
 kube -n kube-system patch daemonset servicelb-controller --type=json \

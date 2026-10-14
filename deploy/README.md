@@ -118,8 +118,10 @@ the first time, then confirm with "Verify your deployment" below.
 ## Node liveness Leases
 
 Each controller renews a `coordination.k8s.io/v1` Lease `beep-node-<node>`
-in `--lease-namespace` (default `kube-system`; `NODE_NAME` supplies the
-node name) every 10 s, with a 40 s duration -- the same timing Kubernetes
+in `--lease-namespace` (default `beep-leases`, created by `rbac.yaml` so the
+Lease Role is not bound in `kube-system`, where write access to Leases could
+let a compromised beep pod hijack control-plane leader election; `NODE_NAME`
+supplies the node name) every 10 s, with a 40 s duration -- the same timing Kubernetes
 uses for node leases. The Lease carries the node's addresses in the
 `beep.litehop.io/node-ips` annotation. Every controller lists these Leases
 every ~10-15 s (10 s plus up to 5 s of jitter) and removes any
@@ -198,7 +200,7 @@ kubectl create clusterrolebinding beep-controller-csr \
   --clusterrole=servicelb-controller --user=beep-controller
 kubectl create rolebinding beep-controller-csr-flow-hash-seed -n kube-system \
   --role=servicelb-controller-flow-hash-seed --user=beep-controller
-kubectl create rolebinding beep-controller-csr-node-lease -n kube-system \
+kubectl create rolebinding beep-controller-csr-node-lease -n beep-leases \
   --role=servicelb-controller-node-lease --user=beep-controller
 
 # 4. Assemble a kubeconfig with exactly the 4 fields beep-kubeconfig reads

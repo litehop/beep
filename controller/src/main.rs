@@ -25,7 +25,7 @@ use beep::{
 use beep_controller::{
     apply::PinnedMaps,
     lease::{
-        lease_name, list_leases, pruned_ingress, renew_lease, LeaseTracker, LEASE_RENEW,
+        lease_name, list_leases, may_prune, pruned_ingress, renew_lease, LeaseTracker, LEASE_RENEW,
         PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
@@ -119,7 +119,7 @@ struct Args {
 
     /// Namespace for the per-node Leases; must be the namespace
     /// `deploy/rbac.yaml` grants Lease access in.
-    #[arg(long, default_value = "kube-system")]
+    #[arg(long, default_value = "beep-leases")]
     lease_namespace: String,
 
     /// `FWD_PENDING` max_entries (see `beep-ebpf`'s doc comment); a
@@ -375,7 +375,7 @@ async fn run_prune_loop(
             }
         }
         let now = Instant::now();
-        if !tracker.warmed_up(now) || !tracker.is_live(&own_lease, now) {
+        if !may_prune(&tracker, &own_lease, now) {
             continue;
         }
         let keys = state.lock().unwrap().service_keys();

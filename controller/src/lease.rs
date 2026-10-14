@@ -232,6 +232,13 @@ impl LeaseTracker {
     }
 }
 
+/// Whether this process may prune at all: it must have observed leases for a
+/// full duration and see its own Lease renewing. If the Lease path is broken
+/// (e.g. RBAC) every node would otherwise look dead.
+pub fn may_prune(tracker: &LeaseTracker, own_lease: &str, now: Instant) -> bool {
+    tracker.warmed_up(now) && tracker.is_live(own_lease, now)
+}
+
 /// Drops every ingress entry whose address is not carried by a live Lease --
 /// an expired Lease and a missing one are both a node whose beep is not
 /// running. Entries without an `ip` (hostname-only) are not beep's and stay.
@@ -434,6 +441,38 @@ mod tests {
         let t = LeaseTracker::new(base);
         assert!(!t.warmed_up(base + LEASE_DURATION - Duration::from_millis(1)));
         assert!(t.warmed_up(base + LEASE_DURATION));
+    }
+
+    // Broken Lease RBAC makes our own create/update fail, so our Lease never
+    // changes; pruning then would wipe every Service's ingress.
+    #[test]
+    fn broken_rbac_must_not_wipe_every_services_ingress() {
+        let base = Instant::now();
+        let mut t = LeaseTracker::new(base);
+        t.observe(vec![listed("beep-node-b", "t0", &["10.0.0.2"])], base);
+        let later = base + LEASE_DURATION + Duration::from_secs(1);
+        t.observe(vec![listed("beep-node-b", "t1", &["10.0.0.2"])], later);
+        assert!(t.warmed_up(later));
+        assert!(
+            !may_prune(&t, "beep-node-a", later),
+            "own Lease absent: pruning would evict healthy peers"
+        );
+    }
+
+    #[test]
+    fn fresh_controller_must_not_prune_even_with_its_own_lease_present() {
+        let base = Instant::now();
+        let t = tracker_with(base, vec![listed("beep-node-a", "t0", &["10.0.0.1"])]);
+        assert!(!may_prune(&t, "beep-node-a", base + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn warmed_up_controller_with_renewing_own_lease_may_prune() {
+        let base = Instant::now();
+        let mut t = tracker_with(base, vec![listed("beep-node-a", "t0", &["10.0.0.1"])]);
+        let later = base + LEASE_DURATION;
+        t.observe(vec![listed("beep-node-a", "t1", &["10.0.0.1"])], later);
+        assert!(may_prune(&t, "beep-node-a", later));
     }
 
     #[test]
