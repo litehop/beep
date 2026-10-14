@@ -111,7 +111,7 @@ echo "node=$NODE_NAME ip=$NODE_IP pod_cidr=$POD_CIDR"
 echo "==> [3/6] starting beep-controller against the live apiserver"
 nohup "$BIN" \
   --uplink-iface "$UPLINK_IFACE" --geneve-iface "$GENEVE_IFACE" --pin-dir "$PIN_DIR" \
-  --pod-cidr "$POD_CIDR" --node-ip "$NODE_IP" --kubeconfig /etc/rancher/k3s/k3s.yaml \
+  --pod-cidr "$POD_CIDR" --node-ip "$NODE_IP" --node-name "$NODE_NAME" --kubeconfig /etc/rancher/k3s/k3s.yaml \
   >"$LOG" 2>&1 &
 controller_pid=$!
 disown

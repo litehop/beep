@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes / operator action required
 
+- **Controllers now keep a per-node Lease and prune dead nodes from Service
+  ingress.** Apply the updated `deploy/rbac.yaml` (new `beep-leases`
+  Namespace holding the Role for `coordination.k8s.io` leases, kept out of
+  `kube-system` so beep cannot touch control-plane leader election; with a
+  CSR kubeconfig also bind it in `beep-leases`, see `deploy/README.md`) and `deploy/daemonset.yaml` (`NODE_NAME`
+  env). The controller requires `--node-name` (env `NODE_NAME`). A node whose
+  beep pod stops renewing (40 s duration, 10 s renew) is removed from every
+  Service's `status.loadBalancer.ingress` within about a minute.
+
 - **Pinned maps are recreated on upgrade, flushing conntrack.** The loader
   deletes and recreates any pinned map whose type, key size, value size or
   `max_entries` differ from the new definition (one log line per map). This
