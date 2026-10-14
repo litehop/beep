@@ -459,8 +459,11 @@ vm_over_threshold() {
 
 step_f_vm_disk() {
   command -v limactl >/dev/null 2>&1 || return 0
-  local vm pct df_out entry name over=0
-  while IFS= read -r vm; do
+  local vm vms pct df_out entry name over=0
+  # Snapshot the VM list: iterating a pipe would let `limactl shell` drain
+  # the loop's stdin and end the report after the first VM.
+  vms=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk '$2 == "Running" {print $1}')
+  for vm in $vms; do
     case "$vm" in beep-*) ;; *) continue ;; esac
     df_out=$(limactl shell "$vm" -- df --output=pcent / 2>/dev/null) || df_out=""
     pct=$(df_pcent "$df_out")
@@ -489,7 +492,7 @@ step_f_vm_disk() {
       [ -n "$entry" ] || continue
       echo "[hygiene] vm-legacy-dir: $vm $entry (outside work/ -- report only, operator decides)"
     done < <(limactl shell "$vm" -- sh -c 'ls -d /home/lima.guest/* 2>/dev/null | grep -v "/work$"' 2>/dev/null || true)
-  done < <(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk '$2 == "Running" {print $1}')
+  done
   HYGIENE_ANOMALIES=$(( HYGIENE_ANOMALIES + over ))
 }
 
