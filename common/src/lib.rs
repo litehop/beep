@@ -167,33 +167,6 @@ pub fn encode_flow_key(
     key
 }
 
-/// QUIC flow-affinity key: a fixed-length prefix of the Destination
-/// Connection ID the LB itself mints into the RFC 9000 SS17.2 Initial-packet
-/// DCID -- not derived from the client's address, so it carries no
-/// TCP-style collision risk (`ebpf-lb-dataplane.md`). Fixed-length because
-/// the 1-RTT short header (RFC 9000 SS17.3.1) has no length field; 8 bytes
-/// is this dataplane's externally-agreed length (one hop, no chained-LB
-/// scheme needed yet).
-pub const QUIC_DCID_KEY_LEN: usize = 8;
-pub type QuicDcidKey = [u8; QUIC_DCID_KEY_LEN];
-
-/// Packs a QUIC DCID key from a minted DCID's leading bytes. Zero-pads a
-/// shorter-than-`QUIC_DCID_KEY_LEN` input rather than panicking -- the LB
-/// always mints exactly this length in practice, but a pure function
-/// should be total.
-pub fn encode_quic_dcid_key(dcid_prefix: &[u8]) -> QuicDcidKey {
-    let mut key = [0u8; QUIC_DCID_KEY_LEN];
-    let n = dcid_prefix.len().min(QUIC_DCID_KEY_LEN);
-    key[..n].copy_from_slice(&dcid_prefix[..n]);
-    key
-}
-
-/// Unpacks a QUIC DCID key; the exact inverse of `encode_quic_dcid_key` for
-/// a full-length input.
-pub fn decode_quic_dcid_key(key: &QuicDcidKey) -> [u8; QUIC_DCID_KEY_LEN] {
-    *key
-}
-
 /// Linux ARPHRD_* value (`uapi/linux/if_arp.h`) for a real Ethernet-framed
 /// device -- the only uplink type `beep-ebpf`'s uplink hooks treat as
 /// carrying a 14-byte L2 header.
@@ -1800,19 +1773,6 @@ mod tests {
             &fwd_key[..TCP_FLOW_KEY_LEN],
             &port_memo_key[..TCP_FLOW_KEY_LEN]
         );
-    }
-
-    #[test]
-    fn quic_dcid_key_round_trips() {
-        let dcid = [1, 2, 3, 4, 5, 6, 7, 8];
-        let key = encode_quic_dcid_key(&dcid);
-        assert_eq!(decode_quic_dcid_key(&key), dcid);
-    }
-
-    #[test]
-    fn quic_dcid_key_zero_pads_a_short_input() {
-        let key = encode_quic_dcid_key(&[9, 9]);
-        assert_eq!(key, [9, 9, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

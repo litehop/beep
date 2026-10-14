@@ -32,8 +32,7 @@ anycast, reconnect) has no pin there at all.
 
 QUIC CIDs are chosen by the receiving endpoint (RFC 9000 section 7.2), so a
 non-terminating dataplane can only observe or route on what the backend
-chose; it cannot mint them. (`QuicDcidKey` in `common/src/lib.rs:164-188`
-assumes an LB that mints the DCID; that contradicts this and is unused.)
+chose; it cannot mint them.
 
 **A. CID-to-flow map.** On the first backend reply, learn the server-chosen
 SCID and insert `CID -> backend` into a map. Needs no backend cooperation, but
