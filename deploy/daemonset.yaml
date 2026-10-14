@@ -92,6 +92,12 @@ spec:
               # optional) now runs ONLY in that privileged initContainer;
               # see its comment above for why.
               add: ["BPF", "NET_ADMIN", "PERFMON"]
+          # BEEP_MAX_FRONTS / BEEP_ENDPOINTS_PER_FRONT (configmap.yaml). Not
+          # optional: a missing ConfigMap fails the pod loudly instead of
+          # silently running the defaults. A CLI arg overrides the env var.
+          envFrom:
+            - configMapRef:
+                name: beep-config
           env:
             # hostNetwork means status.hostIP is this node's own address --
             # exactly the value `--node-ip` needs (`ebpf-lb-dataplane.md`'s
