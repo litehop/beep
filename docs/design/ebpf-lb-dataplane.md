@@ -179,7 +179,7 @@ forward-write and return-read).
 | `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~129 KiB bucket floor + ~128 B/row used | `BPF_F_NO_PREALLOC`. `max_entries` = `--max-fronts` × `--endpoints-per-front` (4) × 2 = 8192 by default; the 2 is swap headroom (a front's next generation is written next to the live one; the previous one is deleted ~2 s after the commit). Full map on every node. |
 | `FRONT_MISSES` | <1 KiB | Per-CPU counter of ingress lookups where `FRONT_META` hit but no endpoint could be chosen (count 0 with no pin, or an unreadable row): silently dropped. |
 | Other maps, shared (`FLOW_TABLE` ~2.25 MiB, `FWD_PENDING`, `POD_TARGETS`, `NODE_ALLOW`, `UPLINK_CONFIG`, `CONFIG`) | ~2.7 MiB | Preallocated at full `max_entries`; ceilings/sizing: `servicelb-flow-admission-affinity.md`. Figure is `EXPECTED_PREALLOCATED_BYTES` in `scripts/assert-ebpf-map-memory.sh` (highest across `memory-smoke` runs). |
-| **Total** | **~10 MiB** | Kernel map memory is ~2.9 MiB at defaults, asserted per map and in total by `scripts/assert-ebpf-map-memory.sh` (1.15× tripwire on expected usage, 6 MiB gross ceiling). Independent of vCPU count except `FRONT_MISSES` (per-CPU, <1 KiB per CPU). |
+| **Total** | **~10 MiB** | ~6.9 MiB control-plane RSS (above) + ~2.9 MiB kernel map memory (`bytes_memlock`) at defaults. The 6 MiB gross ceiling in `scripts/assert-ebpf-map-memory.sh` bounds the kernel-map part only, not this total; that script also asserts per map and in total (1.15× tripwire on expected usage). Independent of vCPU count except `FRONT_MISSES` (per-CPU, <1 KiB per CPU). |
 
 Every map except the two front maps preallocates its full ceiling —
 loxilb's "cannot start on 1GB node" failure mode (gate 2) — sized for
