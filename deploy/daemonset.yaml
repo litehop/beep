@@ -107,7 +107,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
-            # Names this node's liveness Lease (deploy/README.md).
+            # Required (--node-name): names this node's liveness Lease,
+            # beep-node-<node> (deploy/README.md).
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
