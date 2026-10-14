@@ -25,8 +25,8 @@ use beep::{
 use beep_controller::{
     apply::PinnedMaps,
     lease::{
-        lease_name, list_leases, may_prune, pruned_ingress, renew_lease, LeaseTracker, LEASE_RENEW,
-        PRUNE_JITTER_MAX,
+        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, LeaseTracker,
+        PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed},
@@ -364,6 +364,7 @@ async fn run_prune_loop(
 ) -> anyhow::Result<()> {
     let own_lease = lease_name(&node_name);
     let mut tracker = LeaseTracker::new(Instant::now());
+    let suspects = Mutex::new(PruneSuspects::default());
     loop {
         let jitter_ms = beep::random_seed().unwrap_or(0) % PRUNE_JITTER_MAX.as_millis() as u64;
         tokio::time::sleep(LEASE_RENEW + Duration::from_millis(jitter_ms)).await;
@@ -376,12 +377,18 @@ async fn run_prune_loop(
         }
         let now = Instant::now();
         if !may_prune(&tracker, &own_lease, now) {
+            suspects.lock().unwrap().reset();
             continue;
         }
         let keys = state.lock().unwrap().service_keys();
         for key in keys {
             let result = update_ingress(&client, &key.namespace, &key.name, |existing| {
-                pruned_ingress(existing, tracker.leases(), now)
+                confirmed_pruned_ingress(
+                    existing,
+                    tracker.leases(),
+                    now,
+                    &mut suspects.lock().unwrap(),
+                )
             })
             .await;
             if let Err(e) = result {
@@ -391,6 +398,7 @@ async fn run_prune_loop(
                 );
             }
         }
+        suspects.lock().unwrap().end_pass();
     }
 }
 
