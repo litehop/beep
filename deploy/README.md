@@ -202,6 +202,76 @@ does not prune for its first 40 s and never prunes until it sees its own
 Lease renewing, so a missing Lease permission cannot empty every Service's
 ingress. Timings are constants (`controller/src/lease.rs`), not flags.
 
+## Upgrading from 0.4
+
+Apply the new objects before the DaemonSet rolls:
+
+1. `deploy/rbac.yaml` creates the `beep-leases` Namespace and the Lease Role
+   (with a CSR-minted kubeconfig, also bind it in `beep-leases`; see
+   "Kubeconfig").
+2. `deploy/configmap.yaml` creates `beep-config`. The DaemonSet's `envFrom`
+   is required, so pods stay in `CreateContainerConfigError` without it.
+3. `deploy/daemonset.yaml` last. It sets `NODE_NAME`; the controller requires
+   `--node-name` (env `NODE_NAME`) and exits without it.
+
+Two different things reset or keep flows, so do not confuse them:
+
+- **The 0.4 to 0.5 upgrade flushes conntrack once.** `FLOW_TABLE` and
+  `FRONT_META` change layout, so the loader recreates those pinned maps and
+  established flows reset. Schedule the rollout accordingly.
+- **A later 0.5 ConfigMap change plus `rollout restart` does not drop
+  established flows.** Only the front maps are recreated, with their entries
+  copied over; `FLOW_TABLE` is untouched (see "Changing a cap").
+
+Behaviour changes to expect:
+
+- A front with no usable endpoint (count 0: `externalTrafficPolicy: Local`
+  with no usable local pod, or a Service with no ready endpoints) now
+  silently drops new connections. 0.4 answered with a TCP RST or ICMP
+  port-unreachable. Established flows keep forwarding.
+- Services may now spread over every ready endpoint and honour
+  `externalTrafficPolicy` and `spec.trafficDistribution`; see "Service
+  policy".
+- `--front-meta-max-entries` and `--front-endpoints-max-entries` are gone;
+  use `--max-fronts` and `--endpoints-per-front` (see "Configuration").
+
+Full list: `CHANGELOG.md`.
+
+## Service policy
+
+Each node's controller derives a front's endpoints from the Service spec
+(`controller/src/reconcile.rs`):
+
+- `externalTrafficPolicy: Local` uses only endpoints on the ingress node:
+  ready ones, else serving-but-terminating ones, else none (count 0, silent
+  drop). It ignores `spec.trafficDistribution`. A node with no usable local
+  pod removes its own address from `status.loadBalancer.ingress`, so clients
+  are only sent to nodes that can serve them.
+- Otherwise `spec.trafficDistribution` of `PreferSameNode`, `PreferClose` or
+  `PreferSameZone` prefers local endpoints and falls back to all ready ones.
+  beep has no zone model, so the latter two behave as `PreferSameNode`.
+- No `trafficDistribution`, or an unknown value (logged as a WARN), spreads
+  uniformly over all ready endpoints, and every node is listed in `ingress`.
+
+Switching policy does not evict pinned flows; they drain naturally.
+
+## Security & underlay assumptions
+
+**The Geneve underlay MUST prevent IP spoofing.** UDP 6081 is open on every
+node, and `rp_filter` is disabled (see "Node self-prep"). The only
+admission check on tunnelled packets is `NODE_ALLOW`: the outer source IP
+must be a known peer node, otherwise the packet is dropped. That makes the
+outer source IP the trust boundary, and it holds only if hosts on the
+underlay cannot forge a peer's address.
+
+Without anti-spoofing a host on the same L2 can forge a peer's address and
+inject Geneve packets carrying a forged inner client IP into backends (log
+poisoning, IP-ACL and segmentation bypass). Non-peer, off-L2 and routed
+senders are blocked. Close the gap with switch-enforced anti-spoofing (IP
+Source Guard, Dynamic ARP Inspection, port security) or run the underlay
+over WireGuard or IPsec, which makes `NODE_ALLOW` defense in depth.
+Rationale: `docs/decisions/geneve-underlay-trust-model.md`.
+
 ## Deployment model
 
 Per `docs/design/ebpf-lb-dataplane.md`'s "Userspace control plane" section:
