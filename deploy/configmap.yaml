@@ -22,5 +22,7 @@ data:
   # Conntrack rows per node (FLOW_TABLE), preallocated at ~140 B each (2.25
   # MiB at the default). Size for peak concurrent connections across both
   # roles (ingress and backend), including long-idle ones, plus closed ones
-  # not yet reclaimed. Small clusters can lower it.
+  # not yet reclaimed. Small clusters can lower it. Changing it keeps
+  # established flows (rows are copied over) unless it shrinks below the rows
+  # in use; the overflow resets.
   BEEP_FLOW_TABLE_MAX_ENTRIES: "16384"

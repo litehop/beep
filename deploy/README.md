@@ -170,11 +170,13 @@ kubectl -n kube-system rollout restart daemonset/servicelb-controller
 The restarted controller sees a pinned map whose `max_entries` differs from
 its new definition and recreates it (a `MapShape` mismatch), copying the
 old entries into the new map before any program is attached; the
-controller's first reconcile then writes back whatever did not fit. Only
-the front maps change (`FLOW_TABLE` is untouched), so established flows keep
-their conntrack entries. If a cap shrinks below the entries in use, whole
-fronts are kept in key order, the loss is logged with counts, and the
-controller repopulates the rest.
+controller's first reconcile then writes back whatever did not fit. This
+holds for every cap, `BEEP_FLOW_TABLE_MAX_ENTRIES` included: `FLOW_TABLE` is
+an LRU hash, so its rows are copied into the resized map and established
+flows keep their conntrack entries. If a cap shrinks below the entries in
+use, the overflow is lost: for the front maps whole fronts are kept in key
+order and the controller repopulates the rest; for `FLOW_TABLE` the
+connections that did not fit reset, and nothing repopulates them.
 
 Observed on the k3s rig (2 nodes; `BEEP_MAX_FRONTS` 1024 to 1000;
 `scripts/smoke-k3s-controller.sh`, leg H): the restarted controllers
@@ -232,8 +234,9 @@ Two different things reset or keep flows, so do not confuse them:
   the controller's first reconcile, so new flows pass to the host unbalanced
   until then. Schedule the rollout accordingly.
 - **A later 0.5 ConfigMap change plus `rollout restart` does not drop
-  established flows.** Only the front maps are recreated, with their entries
-  copied over; `FLOW_TABLE` is untouched (see "Changing a cap").
+  established flows.** The resized maps are recreated with their entries
+  copied over, `FLOW_TABLE` included; only a shrink below the rows in use
+  loses flows (see "Changing a cap").
 
 A beep pod that crash-loops after the upgrade means a map restore failed. The
 controller posts a `MapRestoreFailed` Warning Event on the node and the pod

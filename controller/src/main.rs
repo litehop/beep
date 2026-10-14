@@ -1172,6 +1172,7 @@ mod tests {
         for (flag, env) in [
             ("udp_idle_sweep_secs", "BEEP_UDP_IDLE_SWEEP_SECS"),
             ("tcp_idle_sweep_secs", "BEEP_TCP_IDLE_SWEEP_SECS"),
+            ("flow_table_max_entries", "BEEP_FLOW_TABLE_MAX_ENTRIES"),
         ] {
             let arg = cmd.get_arguments().find(|a| a.get_id() == flag).unwrap();
             assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env));
