@@ -1308,9 +1308,11 @@ if [ -n "$DROP_CAPTURE_PID" ]; then
   # nothing from the node on the count-0 ports (the control ports legitimately
   # answer) may be a RST, a SYN-ACK or an ICMP(v6) unreachable. The client's
   # own packets are not judged.
-  syn_count=$(grep "Flags \[S\]" "$DROP_CAPTURE" | grep -c "1930[02]" || true)
-  if [ "$syn_count" -lt 2 ]; then
-    echo "FAIL: capture saw $syn_count client SYN(s), expected at least 2 (v4 + v6): the capture is not seeing the probes" >&2
+  # Counted per family: retries from one family must not satisfy the other's bar.
+  syn4_count=$(grep -cF "> ${FRONT_IP}.${DROP_TCP4_PORT}: Flags [S]," "$DROP_CAPTURE" || true)
+  syn6_count=$(grep -cF "> ${FRONT_IP6}.${DROP_TCP6_PORT}: Flags [S]," "$DROP_CAPTURE" || true)
+  if [ "$syn4_count" -lt 1 ] || [ "$syn6_count" -lt 1 ]; then
+    echo "FAIL: capture saw $syn4_count v4 and $syn6_count v6 client SYN(s), expected at least 1 of each: the capture is not seeing the probes of every family" >&2
     cat "$DROP_CAPTURE" >&2
     exit 1
   fi
@@ -1321,10 +1323,14 @@ if [ -n "$DROP_CAPTURE_PID" ]; then
     cat "$DROP_CAPTURE" >&2
     exit 1
   fi
-  echo "DROP-WIRE: PASS (client saw $syn_count SYN(s) and no RST, SYN-ACK or unreachable from the node)"
+  echo "DROP-WIRE: PASS (client saw $syn4_count v4 + $syn6_count v6 SYN(s) and no RST, SYN-ACK or unreachable from the node)"
 fi
 pkill -f "nc -[46] -l -N ${FRONT_IP}" 2>/dev/null || true
-echo "DROP: PASS (owned count-0 fronts silently drop TCP and UDP on v4+v6; non-owned fronts still pass to the host)"
+if [ -n "$DROP_CAPTURE_PID" ]; then
+  echo "DROP: PASS (owned count-0 fronts silently drop TCP and UDP on v4+v6; non-owned fronts still pass to the host)"
+else
+  echo "DROP: PARTIAL (BEEP_SMOKE_ALLOW_NO_TCPDUMP=1: DROP-WIRE capture SKIPPED; client-side drop and host-pass control PASS)"
+fi
 
 echo "==> anti-spoof negative test: removing this fixture's own NODE_ALLOW entry and confirming geneve_ingress now DROPS its (unchanged) outer tunnel source"
 # This fixture is a self-loop (FRONT_IP is also this node's own address, and
