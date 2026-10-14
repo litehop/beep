@@ -239,6 +239,21 @@ pub fn write_config_seed(pin_dir: &Path, seed: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The idle-GC parity of `proto`'s class currently in the pinned `CONFIG` map.
+pub fn read_config_parity(pin_dir: &Path, proto: u8) -> anyhow::Result<bool> {
+    let path = pin_dir.join("CONFIG");
+    let map_data = MapData::from_pin(&path)
+        .with_context(|| format!("opening pinned map `CONFIG` from {}", path.display()))?;
+    let config: AyaArray<_, Config> = AyaArray::try_from(Map::Array(map_data))
+        .context("map `CONFIG` is not a BPF_MAP_TYPE_ARRAY")?;
+    let value = config.get(&0, 0).context("reading CONFIG[0]")?;
+    Ok(if proto == beep_common::IPPROTO_UDP {
+        value.udp_parity
+    } else {
+        value.tcp_parity
+    } != 0)
+}
+
 /// Rewrites only the idle-GC parity byte of `proto`'s class in the pinned
 /// `CONFIG` map. Read-modify-write like `write_config_seed`; safe against it
 /// because the controller runs on a single-threaded runtime and neither

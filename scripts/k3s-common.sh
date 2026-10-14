@@ -262,3 +262,7 @@ k3s_dump_evidence() { # k3s_dump_evidence <vm-a> <vm-b> <pin-dir> -- on any FAIL
   k3s_ev "$limit" "controller logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100
   k3s_ev "$limit" "controller previous logs" kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --tail=100 --previous
 }
+
+k3s_hold_connection() { # k3s_hold_connection <client-vm> <addr> <port> <secs> -- opens one HTTP/1.1 keep-alive connection from the client VM and holds it open for <secs>; run it in the background. Closed connections are reclaimed from FLOW_TABLE by design, so asserting that a flow has a row needs an open one.
+  limactl shell "$1" -- bash -c "exec 3<>/dev/tcp/$2/$3 && printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\n' >&3 && sleep $4"
+}

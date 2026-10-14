@@ -56,8 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections had left stale remap state behind: two Services sharing a pod
   and a client reusing one source port across both remap the second flow's
   backend-facing source port, and the reverse/memo rows of finished flows were
-  only ever freed by LRU eviction. The backend node now deletes a TCP flow's
-  rows (reverse and port-remap memo) on RST, or on the first
+  only ever freed by LRU eviction. A TCP flow's rows (backend reverse and
+  port-remap memo, ingress forward) are now deleted on RST, or on the first
   non-FIN packet of the first-FIN side once both FINs were seen (a
   half-closed connection keeps its rows), and an idle sweep reclaims the
   rest.
@@ -71,8 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go after 1-2 `--udp-idle-sweep-secs` (env `BEEP_UDP_IDLE_SWEEP_SECS`, default
   120); TCP flows that vanish without a close go after 1-2
   `--tcp-idle-sweep-secs` (env `BEEP_TCP_IDLE_SWEEP_SECS`, default 43200 = 12 h).
-  Both are in the `beep-config` ConfigMap; see `deploy/README.md`
-  ("Configuration").
+  Both are in the `beep-config` ConfigMap, as is `BEEP_FLOW_TABLE_MAX_ENTRIES`
+  (`--flow-table-max-entries`, default 16384); see `deploy/README.md`
+  ("Configuration"). The sweep runs on wall-clock interval boundaries and the
+  parity survives a controller restart.
 
 - Front-map write failures are reported by cause: `E2BIG` (capacity), `ENOMEM`
   (kernel out of memory allocating a map element, transient) and other, each

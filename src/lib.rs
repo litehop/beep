@@ -422,21 +422,56 @@ pub fn idle_flow_keys(rows: &[(FlowKey, FlowValue)], proto: u8, parity: GcParity
         {
             continue;
         }
-        let tcp_key: TcpFlowKey = key[..TCP_FLOW_KEY_LEN].try_into().unwrap();
-        let (client_ip, client_port, pod_ip, target_port, _) = decode_tcp_flow_key(&tcp_key);
-        let reverse_key = encode_flow_key(
-            client_ip,
-            value.as_port_memo().backend_src_port,
-            pod_ip,
-            target_port,
-            proto,
-            FlowDirection::Reverse,
-        );
+        let (client_port, reverse_key) = memo_reverse_key(key, value, proto);
         if !port_memo_wanted(client_port, surviving_reverse.get(&reverse_key).copied()) {
             doomed.push(*key);
         }
     }
     doomed
+}
+
+/// The memo's real client port and the key of the `Reverse` row it points at.
+fn memo_reverse_key(key: &FlowKey, value: &FlowValue, proto: u8) -> (u16, FlowKey) {
+    let tcp_key: TcpFlowKey = key[..TCP_FLOW_KEY_LEN].try_into().unwrap();
+    let (client_ip, client_port, pod_ip, target_port, _) = decode_tcp_flow_key(&tcp_key);
+    let reverse_key = encode_flow_key(
+        client_ip,
+        value.as_port_memo().backend_src_port,
+        pod_ip,
+        target_port,
+        proto,
+        FlowDirection::Reverse,
+    );
+    (client_port, reverse_key)
+}
+
+/// Whether `key`, snapshotted as idle, still is by the time it is about to be
+/// deleted. `fresh` reads the current row. A packet that matched the row
+/// since the snapshot copied the new parity into it (and a memo follows its
+/// reverse row), so the deletion is skipped. This shrinks the sweep-vs-packet
+/// race from the whole scan to the gap between this read and the delete.
+pub fn still_idle(
+    key: &FlowKey,
+    proto: u8,
+    parity: GcParity,
+    fresh: &dyn Fn(&FlowKey) -> Option<FlowValue>,
+) -> bool {
+    let Some(value) = fresh(key) else {
+        return false;
+    };
+    match flow_key_direction(key) {
+        Some(FlowDirection::Forward) | Some(FlowDirection::Reverse) => {
+            parity_sweep_deletes(value.flags(), proto, parity)
+        }
+        Some(FlowDirection::PortMemo) => {
+            let (client_port, reverse_key) = memo_reverse_key(key, &value, proto);
+            let surviving = fresh(&reverse_key)
+                .filter(|row| !parity_sweep_deletes(row.flags(), proto, parity))
+                .map(|row| row.as_reverse().original_client_port);
+            !port_memo_wanted(client_port, surviving)
+        }
+        None => false,
+    }
 }
 
 /// One idle-GC pass for one protocol class: deletes `proto`'s rows that no
@@ -452,16 +487,23 @@ pub fn sweep_idle_flows(
     let rows: Vec<(FlowKey, FlowValue)> = flow_table.iter().collect::<Result<_, _>>()?;
     let doomed = idle_flow_keys(&rows, proto, parity);
     let mut failed = 0;
+    let mut deleted = 0;
     for key in &doomed {
-        if let Err(e) = flow_table.remove(key) {
-            failed += 1;
-            eprintln!("controller: FLOW_TABLE idle sweep delete failed: {e:#}");
+        if !still_idle(key, proto, parity, &|k| flow_table.get(k, 0).ok()) {
+            continue;
+        }
+        match flow_table.remove(key) {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("controller: FLOW_TABLE idle sweep delete failed: {e:#}");
+            }
         }
     }
     if failed > 0 {
         anyhow::bail!("{failed} idle-flow delete(s) failed -- see per-entry errors above");
     }
-    Ok((rows.len(), doomed.len()))
+    Ok((rows.len(), deleted))
 }
 
 /// Default `--max-fronts`: one `FRONT_META` entry per front address x Service
@@ -1088,18 +1130,27 @@ pub fn populate_config(
         ebpf.map_mut("CONFIG")
             .ok_or_else(|| anyhow!("no map named `CONFIG` in the eBPF object"))?,
     )?;
+    let existing = config.get(&0, 0)?;
     config.set(
         0,
-        Config {
-            geneve_ifindex,
-            udp_parity: 0,
-            tcp_parity: 0,
-            _pad: [0; 2],
-            flow_hash_seed,
-        },
+        config_keeping_parity(existing, geneve_ifindex, flow_hash_seed),
         0,
     )?;
     Ok(())
+}
+
+/// The `CONFIG` row a (re)start writes: fresh ifindex and seed, but the idle-GC
+/// parities of the pinned row. Resetting them would leave rows carrying the
+/// old parity looking idle (or live) a flip early, and a restart must not
+/// count as a sweep interval.
+fn config_keeping_parity(existing: Config, geneve_ifindex: u32, flow_hash_seed: u64) -> Config {
+    Config {
+        geneve_ifindex,
+        udp_parity: existing.udp_parity,
+        tcp_parity: existing.tcp_parity,
+        _pad: [0; 2],
+        flow_hash_seed,
+    }
 }
 
 /// A random 64-bit flow-hash seed from the OS CSPRNG.
@@ -2324,6 +2375,56 @@ mod tests {
         let mut expected = vec![stale.0, rows[2].0];
         expected.sort();
         assert_eq!(doomed, expected);
+    }
+
+    // A restart that reset the parity to 0 would, with the sweep clock also
+    // reset, never let a node restarted more often than the TCP interval run
+    // the backstop; the flip state must survive the restart.
+    #[test]
+    fn restart_keeps_the_pinned_idle_gc_parity() {
+        let pinned = Config {
+            geneve_ifindex: 3,
+            udp_parity: 1,
+            tcp_parity: 1,
+            _pad: [0; 2],
+            flow_hash_seed: 1,
+        };
+        let restarted = config_keeping_parity(pinned, 7, 9);
+        assert_eq!((restarted.udp_parity, restarted.tcp_parity), (1, 1));
+        assert_eq!((restarted.geneve_ifindex, restarted.flow_hash_seed), (7, 9));
+    }
+
+    // The snapshot is taken before the deletes; on a full table the scan takes
+    // long enough for a live flow to be matched meanwhile. Deleting it anyway
+    // would drop a live connection's row (and its memo) mid-stream.
+    #[test]
+    fn idle_sweep_skips_rows_a_packet_refreshed_after_the_snapshot() {
+        let odd = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        let stale = rev_row(50000, 1234, IPPROTO_UDP, 0);
+        let memo = memo_row(1234, 50000, IPPROTO_UDP);
+        let rows = [stale, memo];
+        assert_eq!(idle_flow_keys(&rows, IPPROTO_UDP, odd).len(), 2);
+
+        let now: std::collections::HashMap<FlowKey, FlowValue> = rows.iter().copied().collect();
+        let fresh = |k: &FlowKey| now.get(k).copied();
+        assert!(still_idle(&stale.0, IPPROTO_UDP, odd, &fresh));
+        assert!(still_idle(&memo.0, IPPROTO_UDP, odd, &fresh));
+
+        let refreshed = rev_row(50000, 1234, IPPROTO_UDP, beep_common::FLOW_FLAG_UDP_PARITY);
+        let now: std::collections::HashMap<FlowKey, FlowValue> =
+            [refreshed, memo].into_iter().collect();
+        let fresh = |k: &FlowKey| now.get(k).copied();
+        assert!(
+            !still_idle(&stale.0, IPPROTO_UDP, odd, &fresh),
+            "a row matched after the snapshot carries the new parity and must survive"
+        );
+        assert!(
+            !still_idle(&memo.0, IPPROTO_UDP, odd, &fresh),
+            "the memo of a surviving reverse row must survive with it"
+        );
     }
 
     #[test]

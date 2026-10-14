@@ -16,6 +16,11 @@ data:
   # Idle-flow sweep intervals, in seconds: a flow row no packet matched for
   # 1-2 intervals is deleted. UDP never sooner than the kernel's 120 s stream
   # timeout; the TCP value only backstops flows that vanish without a close
-  # (closed connections are reclaimed immediately).
+  # (closed connections are reclaimed when their final ACK passes).
   BEEP_UDP_IDLE_SWEEP_SECS: "120"
   BEEP_TCP_IDLE_SWEEP_SECS: "43200"
+  # Conntrack rows per node (FLOW_TABLE), preallocated at ~140 B each (2.25
+  # MiB at the default). Size for peak concurrent connections across both
+  # roles (ingress and backend), including long-idle ones, plus closed ones
+  # not yet reclaimed. Small clusters can lower it.
+  BEEP_FLOW_TABLE_MAX_ENTRIES: "16384"

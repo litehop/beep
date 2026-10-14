@@ -258,15 +258,20 @@ flows pass to the host unbalanced (an absent front is not a front).
   connections are dropped. `FlowValue::flags` (forward and reverse rows)
   carries two FIN-seen bits and one parity bit per protocol class.
   - **TCP close**: the backend node deletes a flow's reverse row and its
-    port memo on RST in either direction, or on the first non-FIN packet
-    from the first-FIN side once both directions have sent a FIN (the final
-    ACK, which still needs the row; an ACK from the second FIN's own side
-    does not count, it can be a duplicate ACK ahead of the real one; a SYN
-    on the same 4-tuple restarts the flags). The first FIN alone never
+    port memo, and the ingress node its forward row, on RST in either
+    direction, or on the first non-FIN packet from the first-FIN side once
+    both directions have sent a FIN and the second-FIN side has ACKed the
+    first FIN (the final ACK, which still needs the row; an ACK from the
+    second FIN's own side does not count, it can be a duplicate ACK ahead
+    of the real one; a SYN on the same 4-tuple restarts the flags). After
+    crossed FINs (simultaneous close) the row waits for both ACKs. A close
+    whose second FIN piggybacks the ACK of the first looks the same as
+    crossed FINs and is left to the idle sweep. The first FIN alone never
     reclaims, so a half-closed connection keeps working.
-    (`beep_common::flow_step`.) Forward rows on the ingress node have no
-    close tracking and are reclaimed by the idle sweep only; a closed
-    flow's stale forward row is harmless (it never occupies a remap slot).
+    (`beep_common::flow_step`.) The flag word is updated by whole-value
+    read-modify-write from several paths, not atomically: a lost race can
+    drop a FIN bit or re-create a just-reclaimed row, a stray row the idle
+    sweep frees (as do late duplicate ACKs).
   - **Idle GC**: `CONFIG` holds a global parity per class (UDP, TCP). A
     matched packet copies it into its row's bit only when it differs (at
     most one write per row per interval). Every interval the controller
@@ -274,8 +279,11 @@ flows pass to the host unbalanced (an absent front is not a front).
     reverse row), then flips the parity; userspace only deletes. A row
     idle 1-2 intervals is reclaimed. Defaults: UDP 120 s (kernel UDP stream
     timeout), TCP backstop 12 h (kube-proxy established 24 h); both are
-    configurable (`deploy/README.md`). Accepted residual: a packet racing a
-    sweep delete re-creates the row, and an idle flow swept after an
+    configurable (`deploy/README.md`). The sweep re-reads each candidate
+    right before deleting it and skips rows refreshed since its snapshot,
+    runs on wall-clock interval boundaries, and the parity is kept across
+    controller restarts, so restarts never starve the backstop. Accepted
+    residual: a packet racing a sweep delete re-creates the row, and an idle flow swept after an
     endpoint change may re-pin to a new backend, as after a NAT timeout.
 
 ## References

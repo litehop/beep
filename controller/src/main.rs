@@ -30,7 +30,7 @@ use beep_controller::{
         PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
-    seed::{converge_seed, load_or_create_seed, write_config_parity},
+    seed::{converge_seed, load_or_create_seed, read_config_parity, write_config_parity},
     status::{ensure_node_ingress, update_ingress},
     watch::{run_list_watch, ServiceKey, WatchState},
 };
@@ -140,7 +140,11 @@ struct Args {
     fwd_pending_max_entries: u32,
 
     /// `FLOW_TABLE` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
+    #[arg(
+        long,
+        env = "BEEP_FLOW_TABLE_MAX_ENTRIES",
+        default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES
+    )]
     flow_table_max_entries: u32,
 
     /// Most fronts (front address x Service port x protocol) the node can
@@ -371,42 +375,55 @@ async fn run_seed_loop(
     }
 }
 
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Index of the wall-clock interval `unix_secs` falls in. A sweep is due when
+/// this exceeds the index of the last one.
+fn sweep_bucket(unix_secs: u64, interval_secs: u64) -> u64 {
+    unix_secs / interval_secs
+}
+
 /// Idle-GC of `FLOW_TABLE`: per protocol class, every interval delete the rows
 /// whose parity bit differs from the class's global parity (rows no packet
 /// matched since the previous flip), then flip that parity in `CONFIG`. A
-/// failed pass leaves the parity alone and is retried next interval. Parity
-/// restarts at 0 with the process, matching the `CONFIG` a fresh start writes.
+/// failed pass leaves the parity alone and is retried next interval. The
+/// parity is read back from `CONFIG` and the sweeps run on wall-clock interval
+/// boundaries (`sweep_bucket`), so neither depends on the process's uptime: a
+/// controller restarted more often than the TCP interval still sweeps.
 async fn run_idle_sweep_loop(
     maps: Arc<Mutex<PinnedMaps>>,
     pin_dir: PathBuf,
     udp_interval: Duration,
     tcp_interval: Duration,
 ) -> anyhow::Result<()> {
-    let mut classes = [
-        (
-            beep_common::IPPROTO_UDP,
-            "udp",
-            udp_interval,
-            Instant::now() + udp_interval,
-            false,
-        ),
-        (
-            beep_common::IPPROTO_TCP,
-            "tcp",
-            tcp_interval,
-            Instant::now() + tcp_interval,
-            false,
-        ),
-    ];
+    let start = unix_secs();
+    let mut classes = Vec::new();
+    for (proto, name, interval) in [
+        (beep_common::IPPROTO_UDP, "udp", udp_interval),
+        (beep_common::IPPROTO_TCP, "tcp", tcp_interval),
+    ] {
+        let secs = interval.as_secs().max(1);
+        let parity = read_config_parity(&pin_dir, proto)
+            .with_context(|| format!("reading the pinned {name} idle-sweep parity"))?;
+        classes.push((proto, name, secs, sweep_bucket(start, secs), parity));
+    }
     loop {
-        let next = classes.iter().map(|c| c.3).min().expect("two classes");
-        tokio::time::sleep(next.saturating_duration_since(Instant::now())).await;
-        let now = Instant::now();
-        for (proto, name, interval, due, parity) in classes.iter_mut() {
-            if *due > now {
+        let next = classes
+            .iter()
+            .map(|(_, _, secs, bucket, _)| (bucket + 1) * secs)
+            .min()
+            .expect("two classes");
+        tokio::time::sleep(Duration::from_secs(next.saturating_sub(unix_secs()).max(1))).await;
+        let now = unix_secs();
+        for (proto, name, secs, bucket, parity) in classes.iter_mut() {
+            if sweep_bucket(now, *secs) <= *bucket {
                 continue;
             }
-            *due = now + *interval;
+            *bucket = sweep_bucket(now, *secs);
             let started = Instant::now();
             let gc = beep_common::GcParity {
                 udp: if *proto == beep_common::IPPROTO_UDP {
@@ -1122,6 +1139,25 @@ mod tests {
             .is_err(),
             "the raw front max-entries flags were replaced"
         );
+    }
+
+    // A controller restarted more often than the TCP interval (rolling
+    // upgrades, OOM kills) must still reach the backstop: the next sweep is
+    // due on the next wall-clock boundary whatever the process's uptime.
+    #[test]
+    fn sweep_is_due_within_one_interval_of_any_restart_time() {
+        let interval = 12 * 60 * 60;
+        for restart_at in [0, 1, interval - 1, interval, 5 * interval + 4321] {
+            let last = sweep_bucket(restart_at, interval);
+            assert!(
+                sweep_bucket(restart_at, interval) <= last,
+                "no sweep at the restart instant itself"
+            );
+            assert!(
+                sweep_bucket(restart_at + interval, interval) > last,
+                "a controller up for one interval from {restart_at} must have swept"
+            );
+        }
     }
 
     // The sweep intervals are the operator's only handle on how long an idle

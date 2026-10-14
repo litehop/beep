@@ -451,10 +451,14 @@ else
   exit 1
 fi
 
-echo "==> [12/12] confirming a conntrack/FLOW_TABLE entry exists on the ingress node"
+echo "==> [12/12] confirming a conntrack/FLOW_TABLE entry exists on the ingress node for a live flow"
+k3s_hold_connection "$VM_CLIENT" "$IP_A" "$PORT_V4" 12 >/dev/null 2>&1 &
+HOLD_PID=$!
+sleep 4
 flow_a=$(map_dump "$VM_A" FLOW_TABLE | jq 'length') || { echo "FAIL: cannot read $VM_A FLOW_TABLE" >&2; dump_evidence; exit 1; }
+wait "$HOLD_PID" || true
 [ "$flow_a" -ge 1 ] || {
-  echo "FAIL: $VM_A's FLOW_TABLE has no entries ($flow_a) after completed round trips" >&2
+  echo "FAIL: $VM_A's FLOW_TABLE has no entries ($flow_a) while a connection through it is open" >&2
   dump_evidence
   exit 1
 }
