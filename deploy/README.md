@@ -217,8 +217,10 @@ Apply the new objects before the DaemonSet rolls:
 Two different things reset or keep flows, so do not confuse them:
 
 - **The 0.4 to 0.5 upgrade flushes conntrack once.** `FLOW_TABLE` and
-  `FRONT_META` change layout, so the loader recreates those pinned maps and
-  established flows reset. Schedule the rollout accordingly.
+  `FRONT_META` change layout, so the loader recreates both empty, and
+  `FRONT_ENDPOINTS` with them (the two front maps always share a fate).
+  Established flows reset until the controller's first reconcile. Schedule the
+  rollout accordingly.
 - **A later 0.5 ConfigMap change plus `rollout restart` does not drop
   established flows.** Only the front maps are recreated, with their entries
   copied over; `FLOW_TABLE` is untouched (see "Changing a cap").
@@ -253,7 +255,9 @@ Each node's controller derives a front's endpoints from the Service spec
 - No `trafficDistribution`, or an unknown value (logged as a WARN), spreads
   uniformly over all ready endpoints, and every node is listed in `ingress`.
 
-Switching policy does not evict pinned flows; they drain naturally.
+Switching policy does not evict pinned flows; they drain naturally. Pins are
+swept only when their backend pod leaves every EndpointSlice or its IP is
+reused.
 
 ## Security & underlay assumptions
 
@@ -266,7 +270,9 @@ underlay cannot forge a peer's address.
 
 Without anti-spoofing a host on the same L2 can forge a peer's address and
 inject Geneve packets carrying a forged inner client IP into backends (log
-poisoning, IP-ACL and segmentation bypass). Non-peer, off-L2 and routed
+poisoning, IP-ACL and segmentation bypass). Decap also takes the target port
+from the peer's Geneve option with no front-map bound, so such a sender (or
+any admitted peer) can name any port on a local pod. Non-peer, off-L2 and routed
 senders are blocked. Close the gap with switch-enforced anti-spoofing (IP
 Source Guard, Dynamic ARP Inspection, port security) or run the underlay
 over WireGuard or IPsec, which makes `NODE_ALLOW` defense in depth.
