@@ -250,77 +250,119 @@ pub fn snapshot_pin(path: &Path) -> anyhow::Result<Vec<Entry>> {
     Ok(out.into_iter().collect())
 }
 
-/// Writes `entries` into the map pinned at `path`; returns how many writes
-/// failed (e.g. `ENOMEM`), each already printed.
-fn write_entries<'a>(
-    path: &Path,
-    entries: impl IntoIterator<Item = &'a Entry>,
-) -> anyhow::Result<Vec<bool>> {
-    let map = MapData::from_pin(path).with_context(|| format!("opening {}", path.display()))?;
-    let fd = map.fd().as_fd().as_raw_fd() as u32;
-    Ok(entries
-        .into_iter()
-        .map(|(key, value)| {
-            let mut attr = ElemAttr {
-                map_fd: fd,
-                _pad: 0,
-                key: key.as_ptr() as u64,
-                value_or_next_key: value.as_ptr() as u64,
-                flags: 0,
-            };
-            match bpf_elem(aya_obj::generated::bpf_cmd::BPF_MAP_UPDATE_ELEM, &mut attr) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("beep: restoring an entry into {}: {e}", path.display());
-                    false
-                }
-            }
-        })
-        .collect())
+/// `BPF_NOEXIST`: a restore only fills gaps. An entry already in the new map
+/// is newer than the parked snapshot (an earlier, interrupted restore landed
+/// it, or a writer has updated it since), so overwriting it would revert live
+/// state.
+const BPF_NOEXIST: u64 = aya_obj::generated::BPF_NOEXIST as u64;
+
+/// Writes one entry into the named map with the given `BPF_*` update flag.
+type EntryWriter<'a> = dyn FnMut(&str, &Entry, u64) -> io::Result<()> + 'a;
+
+/// Whether a restore write counts as done. `EEXIST` is done: the entry is
+/// already in the new map. Anything else (`ENOMEM`, `EINVAL`, an `E2BIG` the
+/// plan did not budget for) means the entry is missing from the new map.
+/// Entries the plan truncated are never written, so they are not failures.
+fn write_landed(result: &io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => e.raw_os_error() == Some(libc::EEXIST),
+    }
 }
 
-/// Applies `plan` to the freshly created pinned maps under `pin_dir`:
-/// endpoint rows of every front first, then the meta rows of the fronts whose
-/// rows all landed.
-pub fn apply_restore(pin_dir: &Path, plan: &RestorePlan) -> anyhow::Result<()> {
+/// Writes `entries` into `map`; one `landed` flag per entry, failures recorded.
+fn write_all<'a>(
+    write: &mut EntryWriter,
+    map: &str,
+    entries: impl IntoIterator<Item = &'a Entry>,
+    failures: &mut Vec<String>,
+) -> Vec<bool> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let result = write(map, entry, BPF_NOEXIST);
+            let landed = write_landed(&result);
+            if let (false, Err(e)) = (landed, &result) {
+                failures.push(format!("{map}: {e}"));
+            }
+            landed
+        })
+        .collect()
+}
+
+/// Applies `plan` through `write`: endpoint rows of every front first, then
+/// the meta rows of the fronts whose rows all landed. Errors if any write
+/// failed unexpectedly (after attempting all of them); the caller must then
+/// keep the parked pins so the next start retries from the source.
+fn apply_plan(plan: &RestorePlan, write: &mut EntryWriter) -> anyhow::Result<()> {
     for line in &plan.losses {
         eprintln!("beep: migration loss: {line}");
     }
+    let mut failures = Vec::new();
     for (name, entries) in &plan.generic {
-        let failed = write_entries(&pin_dir.join(name), entries)?
-            .iter()
-            .filter(|ok| !**ok)
-            .count();
+        let landed = write_all(write, name, entries, &mut failures);
         eprintln!(
             "beep: migrated {} of {} entries into {name}",
-            entries.len() - failed,
+            landed.iter().filter(|ok| **ok).count(),
             entries.len()
         );
     }
-    if plan.fronts.is_empty() {
+    if !plan.fronts.is_empty() {
+        let mut landed = Vec::with_capacity(plan.fronts.len());
+        for front in &plan.fronts {
+            let results = write_all(write, FRONT_ENDPOINTS, &front.rows, &mut failures);
+            landed.push(results.iter().all(|ok| *ok));
+        }
+        let metas: Vec<&Entry> = plan
+            .fronts
+            .iter()
+            .zip(&landed)
+            .filter(|(_, ok)| **ok)
+            .map(|(f, _)| &f.meta)
+            .collect();
+        let written = write_all(write, FRONT_META, metas.iter().copied(), &mut failures)
+            .iter()
+            .filter(|ok| **ok)
+            .count();
+        eprintln!(
+            "beep: migrated {written} of {} fronts into FRONT_META/FRONT_ENDPOINTS",
+            plan.fronts.len()
+        );
+    }
+    if failures.is_empty() {
         return Ok(());
     }
-    let mut landed = Vec::with_capacity(plan.fronts.len());
-    for front in &plan.fronts {
-        let results = write_entries(&pin_dir.join(FRONT_ENDPOINTS), &front.rows)?;
-        landed.push(results.iter().all(|ok| *ok));
-    }
-    let metas: Vec<&Entry> = plan
-        .fronts
+    let shown = failures
         .iter()
-        .zip(&landed)
-        .filter(|(_, ok)| **ok)
-        .map(|(f, _)| &f.meta)
-        .collect();
-    let written = write_entries(&pin_dir.join(FRONT_META), metas.iter().copied())?
-        .iter()
-        .filter(|ok| **ok)
-        .count();
-    eprintln!(
-        "beep: migrated {written} of {} fronts into FRONT_META/FRONT_ENDPOINTS",
-        plan.fronts.len()
-    );
-    Ok(())
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::bail!(
+        "{} unexpected write failures restoring migrated entries (first: {shown})",
+        failures.len()
+    )
+}
+
+/// Applies `plan` to the freshly created pinned maps under `pin_dir`.
+pub fn apply_restore(pin_dir: &Path, plan: &RestorePlan) -> anyhow::Result<()> {
+    let mut maps: HashMap<String, MapData> = HashMap::new();
+    apply_plan(plan, &mut |name, (key, value), flags| {
+        if !maps.contains_key(name) {
+            let path = pin_dir.join(name);
+            let map = MapData::from_pin(&path)
+                .map_err(|e| io::Error::other(format!("opening {}: {e}", path.display())))?;
+            maps.insert(name.to_owned(), map);
+        }
+        let mut attr = ElemAttr {
+            map_fd: maps[name].fd().as_fd().as_raw_fd() as u32,
+            _pad: 0,
+            key: key.as_ptr() as u64,
+            value_or_next_key: value.as_ptr() as u64,
+            flags,
+        };
+        bpf_elem(aya_obj::generated::bpf_cmd::BPF_MAP_UPDATE_ELEM, &mut attr)
+    })
 }
 
 #[cfg(test)]
@@ -479,5 +521,101 @@ mod tests {
         let plan = plan_restore(vec![("POD_TARGETS", entries)], caps(8, 8));
         assert_eq!(plan.generic[0].1.len(), 4);
         assert!(plan.losses[0].contains("2 dropped"), "{}", plan.losses[0]);
+    }
+
+    /// Kernel-like stand-in for the new pinned maps: honours `BPF_NOEXIST` and
+    /// fails writes whose key's first byte is in `fail`.
+    #[derive(Default)]
+    struct FakeMaps {
+        maps: HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>>,
+        fail: Vec<(u8, i32)>,
+    }
+
+    impl FakeMaps {
+        fn write(&mut self, map: &str, (k, v): &Entry, flags: u64) -> io::Result<()> {
+            if let Some((_, errno)) = self.fail.iter().find(|(b, _)| *b == k[0]) {
+                return Err(io::Error::from_raw_os_error(*errno));
+            }
+            let m = self.maps.entry(map.to_owned()).or_default();
+            if flags == BPF_NOEXIST && m.contains_key(k) {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            m.insert(k.clone(), v.clone());
+            Ok(())
+        }
+
+        fn apply(&mut self, plan: &RestorePlan) -> anyhow::Result<()> {
+            apply_plan(plan, &mut |m, e, f| self.write(m, e, f))
+        }
+    }
+
+    fn generic_plan(n: u8, cap: u32) -> RestorePlan {
+        let entries = (0..n).map(|i| (vec![i], vec![i])).collect();
+        plan_restore(vec![("POD_TARGETS", entries)], |_| cap)
+    }
+
+    #[test]
+    fn planned_cap_shrink_truncation_is_not_a_failure_so_the_pin_still_unparks() {
+        // Every restart after a cap shrink has losses; treating them as errors
+        // would leave `_migrating` parked, and retried, forever.
+        let plan = generic_plan(6, 4);
+        assert!(!plan.losses.is_empty());
+        let mut maps = FakeMaps::default();
+        maps.apply(&plan)
+            .expect("truncated entries are never written, so nothing fails");
+        assert_eq!(maps.maps["POD_TARGETS"].len(), 4);
+    }
+
+    #[test]
+    fn unexpected_write_errno_fails_the_restore_so_the_parked_pin_is_kept() {
+        // Ok here would unpark the source and lose the entry for good.
+        for errno in [libc::ENOMEM, libc::EINVAL, libc::E2BIG] {
+            let mut maps = FakeMaps {
+                fail: vec![(2, errno)],
+                ..Default::default()
+            };
+            let err = maps.apply(&generic_plan(4, 8)).unwrap_err().to_string();
+            assert!(err.contains("1 unexpected write failures"), "{err}");
+            assert_eq!(
+                maps.maps["POD_TARGETS"].len(),
+                3,
+                "the remaining entries are still attempted"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_endpoint_row_fails_the_restore_and_withholds_that_fronts_meta() {
+        let (a, b) = (front(1), front(2));
+        let plan = plan_restore(
+            snaps(
+                vec![meta_row(a, 0, 1), meta_row(b, 0, 1)],
+                vec![ep_row(a, 0, 0), ep_row(b, 0, 0)],
+            ),
+            caps(8, 8),
+        );
+        let mut maps = FakeMaps {
+            fail: vec![(1, libc::ENOMEM)],
+            ..Default::default()
+        };
+        assert!(maps.apply(&plan).is_err());
+        let metas = &maps.maps[FRONT_META];
+        assert_eq!(metas.len(), 1, "a meta row must not point at a missing row");
+        assert!(metas.contains_key(&bytes(&b)));
+    }
+
+    #[test]
+    fn rerun_restore_does_not_overwrite_entries_newer_than_the_parked_source() {
+        // A crash after the restore but before the unpark re-restores the same
+        // snapshot on the next start; entries written since must survive.
+        let plan = generic_plan(3, 8);
+        let mut maps = FakeMaps::default();
+        maps.apply(&plan).unwrap();
+        let live = maps.maps.get_mut("POD_TARGETS").unwrap();
+        live.insert(vec![1], vec![99]);
+        maps.apply(&plan)
+            .expect("EEXIST means the entry is already restored");
+        let live = &maps.maps["POD_TARGETS"];
+        assert_eq!(live[&vec![1]], vec![99], "newer value was reverted");
     }
 }

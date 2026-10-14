@@ -1703,6 +1703,25 @@ mod tests {
     }
 
     #[test]
+    fn parked_front_meta_with_a_wanted_shape_plain_front_endpoints_still_migrates_both() {
+        // FRONT_ENDPOINTS already has the wanted shape (it is live data, not a
+        // fresh empty map), yet META restores from its parked pin; the pair
+        // must migrate together so ENDPOINTS' rows are parked, not kept
+        // alongside a META that is about to be rewritten.
+        let pins = FakePins::new(&[
+            ("FRONT_META_migrating", shape(32)),
+            ("FRONT_ENDPOINTS", shape(128)),
+        ]);
+        let requested = [("FRONT_META", shape(64)), ("FRONT_ENDPOINTS", shape(128))];
+        let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert!(recreated.iter().all(|r| r.snapshot.is_some() && r.parked));
+        assert_eq!(
+            pins.names(),
+            ["FRONT_ENDPOINTS_migrating", "FRONT_META_migrating"]
+        );
+    }
+
+    #[test]
     fn leftover_migrating_pin_of_a_changed_layout_is_dropped_not_restored() {
         let wider = MapShape {
             value_size: 99,
