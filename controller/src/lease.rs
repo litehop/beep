@@ -15,7 +15,7 @@
 //! healthy node is dropped.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -248,14 +248,69 @@ pub fn pruned_ingress(
     leases: &HashMap<String, ObservedLease>,
     now: Instant,
 ) -> Option<Vec<Value>> {
-    let is_live = |ip: &str| {
-        leases
-            .values()
-            .any(|l| l.is_live(now) && l.ips.iter().any(|i| i == ip))
-    };
     let kept: Vec<Value> = existing
         .iter()
-        .filter(|entry| entry["ip"].as_str().is_none_or(is_live))
+        .filter(|entry| {
+            entry["ip"]
+                .as_str()
+                .is_none_or(|ip| is_live_ip(leases, now, ip))
+        })
+        .cloned()
+        .collect();
+    (kept.len() != existing.len()).then_some(kept)
+}
+
+fn is_live_ip(leases: &HashMap<String, ObservedLease>, now: Instant, ip: &str) -> bool {
+    leases
+        .values()
+        .any(|l| l.is_live(now) && l.ips.iter().any(|i| i == ip))
+}
+
+/// Addresses found without a live Lease on the previous prune pass. A node's
+/// Lease annotation can lag its published address by up to one renew, so an
+/// address is only pruned once it is unmatched on two consecutive passes.
+#[derive(Debug, Default)]
+pub struct PruneSuspects {
+    previous: HashSet<String>,
+    current: HashSet<String>,
+}
+
+impl PruneSuspects {
+    /// Ends a pass: this pass's unmatched addresses become the suspects the
+    /// next pass may prune.
+    pub fn end_pass(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+
+    /// Forgets all suspicion, e.g. when a pass was skipped: the next pass must
+    /// not treat a stale sighting as the first of two.
+    pub fn reset(&mut self) {
+        self.previous.clear();
+        self.current.clear();
+    }
+}
+
+/// `pruned_ingress` that only drops an address already unmatched on the
+/// previous pass (see `PruneSuspects`). Call `end_pass` after covering every
+/// Service.
+pub fn confirmed_pruned_ingress(
+    existing: &[Value],
+    leases: &HashMap<String, ObservedLease>,
+    now: Instant,
+    suspects: &mut PruneSuspects,
+) -> Option<Vec<Value>> {
+    let kept: Vec<Value> = existing
+        .iter()
+        .filter(|entry| {
+            let Some(ip) = entry["ip"].as_str() else {
+                return true;
+            };
+            if is_live_ip(leases, now, ip) {
+                return true;
+            }
+            suspects.current.insert(ip.to_owned());
+            !suspects.previous.contains(ip)
+        })
         .cloned()
         .collect();
     (kept.len() != existing.len()).then_some(kept)
@@ -430,6 +485,80 @@ mod tests {
         let t = LeaseTracker::new(base);
         let existing = vec![json!({"hostname": "lb.example.com"})];
         assert_eq!(pruned_ingress(&existing, t.leases(), base), None);
+    }
+
+    // A node whose address changed publishes the new IP at once, but its
+    // Lease annotation catches up only on the next renew. A single-pass pruner
+    // in that window would drop the live node's new address.
+    #[test]
+    fn new_ip_published_before_lease_catches_up_survives_the_lagging_pass() {
+        let base = Instant::now();
+        let mut t = tracker_with(base, vec![listed("beep-node-a", "t0", &["10.0.0.1"])]);
+        let existing = ingress(&["10.0.0.2"]);
+        let now = base + Duration::from_secs(5);
+        assert_eq!(
+            pruned_ingress(&existing, t.leases(), now),
+            Some(vec![]),
+            "premise: one-pass pruning does drop the not-yet-annotated new IP"
+        );
+
+        let mut suspects = PruneSuspects::default();
+        assert_eq!(
+            confirmed_pruned_ingress(&existing, t.leases(), now, &mut suspects),
+            None,
+            "a live node's freshly published IP must not be pruned on first sighting"
+        );
+        suspects.end_pass();
+
+        t.observe(
+            vec![listed("beep-node-a", "t1", &["10.0.0.2"])],
+            base + Duration::from_secs(10),
+        );
+        assert_eq!(
+            confirmed_pruned_ingress(
+                &existing,
+                t.leases(),
+                base + Duration::from_secs(10),
+                &mut suspects
+            ),
+            None,
+            "once the Lease carries the new IP it stays"
+        );
+    }
+
+    // The grace must not turn into a leak: a dead node's IP still goes, one
+    // pass later.
+    #[test]
+    fn ip_with_no_live_lease_on_two_consecutive_passes_is_pruned() {
+        let base = Instant::now();
+        let t = tracker_with(base, vec![listed("beep-node-a", "t0", &["10.0.0.1"])]);
+        let existing = ingress(&["10.0.0.1", "10.0.0.9"]);
+        let mut suspects = PruneSuspects::default();
+        assert_eq!(
+            confirmed_pruned_ingress(&existing, t.leases(), base, &mut suspects),
+            None
+        );
+        suspects.end_pass();
+        assert_eq!(
+            confirmed_pruned_ingress(&existing, t.leases(), base, &mut suspects),
+            Some(ingress(&["10.0.0.1"]))
+        );
+    }
+
+    // A skipped pass (pruning disallowed) means the sighting is stale.
+    #[test]
+    fn reset_discards_a_stale_first_sighting() {
+        let base = Instant::now();
+        let t = LeaseTracker::new(base);
+        let existing = ingress(&["10.0.0.9"]);
+        let mut suspects = PruneSuspects::default();
+        let _ = confirmed_pruned_ingress(&existing, t.leases(), base, &mut suspects);
+        suspects.end_pass();
+        suspects.reset();
+        assert_eq!(
+            confirmed_pruned_ingress(&existing, t.leases(), base, &mut suspects),
+            None
+        );
     }
 
     // A controller that just started has seen no renewals; pruning on that
