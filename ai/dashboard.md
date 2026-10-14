@@ -1,48 +1,49 @@
 # Dashboard
 
-**Updated 2026-09-21 · SESSION LIVE (mayor).** Main @ `197dff3`, up to date with origin. **3 loops ARMED. 0 workers, 0 open worker PRs.** **0.3.0 bumped on main — READY TO TAG.**
+**Updated 2026-10-14 · SESSION CLOSED.** Main @ `07d3a06`, up to date. 0 workers · 0 open PRs · loops stopped. Resume: paste `ai/prompts/mayor-bootstrap.md`, re-arm loops (tick `7,22,37,52` · reread `:13` · hygiene `:43`). **Stance** (`bd recall project-stance-2026-10-13`): pre-1.0 break freely · correctness > perf > elegance · merge on green · LE only · no "VIP".
 
-## 🎯 WHAT NEEDS THE OPERATOR NOW
-- **Tag `v0.3.0` (operator-only).** Main `197dff3` is the release commit: all 5 crates at 0.3.0, CHANGELOG dated. Cut it with:
-  `git tag v0.3.0 && git push origin v0.3.0` → fires `delivery.yaml` (Docker image `docker.io/valerauko/beep-lb:v0.3.0` + `:latest`, GitHub Release from CHANGELOG). I do NOT tag/push releases.
-- (Renovate PR #123 — operator handling; mayor hands-off.)
-- `beep-5lw` design fork PARKED (slot-renumbering vs BackendId); impl blocks on eviction epic `beep-03i`.
+## 🎯 NEXT SESSION — first things
+1. **`lo44` (P2) VM hygiene rules first**, before any VM-heavy dispatch: per-worker VM dir + no-delete + stop at 80% disk into worker.md / dispatch template (interim: `bd recall vm-disk-no-delete-rule-2026-10-13`). `beep-client` is at 93% of 3.9G → operator: resize or drop its `.cache`.
+2. Finish multi-endpoint LB epic `5lw`: `5lw.11` (P2) Lease-heartbeat pruning of dead nodes from `status.loadBalancer.ingress` · `5lw.8` design docs (incl. decap trust model, locality matrix from #240).
+3. `p880` (P2) ConfigMap for `BEEP_MAX_FRONTS` / `BEEP_ENDPOINTS_PER_FRONT` + documented options.
+4. Small: `uov3` crash-safe pin migration · `r54o` DROP-WIRE per-family SYN guard + tcpdump strictness · `46t5` leg-d parsing · `thl0` metrics surface (design first).
+5. Leftover: W-AI's dirty worktree `ai/worktrees/agent-a8170ae9c67e7ecbf`. Its edits shipped in #242 (also saved as `wai-242.patch`); safe to remove on operator OK.
 
-## ✅ Merged this session
-- **#125** (beep-1no) — workspace version bump 0.2.0→0.3.0 + CHANGELOG dated.
-- **#124** (beep-9au) — consolidated release notes into root `CHANGELOG.md`; removed `docs/release-notes/*`; repointed `delivery.yaml`.
-- **#121** (beep-5lx) — 0.3.0 gate: valid L2 header on Ethernet client-egress return leg.
-- **#120** (beep-8vn + beep-3e0) — ci.yaml bead-ID leak + 2 ADR citations.
+## 🧭 Decisions this session (all in bead notes `zmzp` `dz73` `vksr` `5lw` `noak` `pyeb` `5lw.4`)
+Floor Linux 6.6 enforced, tested 6.6/6.12/7.2 (CI matrix) + 6.12 (beep-smoke) + 6.8 (rigs) · 128 KiB ceiling kept; BTF strip → object ~65 KB · LE only · no-prealloc front maps, `--max-fronts 1024 × --endpoints-per-front 4`, ×2 retention dropped (2 s grace), migrate on flag/cap recreation · decap trusts NODE_ALLOW peer (no-spoof underlay) · **locality:** uniform default, `PreferSameNode` opt-in (spec.trafficDistribution), eTP=Local local-only + terminating fallback, ingress per-node (Local → nodes with a local pod), count-0 fronts **silently drop** · QUIC migration not v1 · dynptr after next aya/bpf-linker release (`kofb`) · healthCheckNodePort left to kube-proxy (`a3eh`).
 
-## 🗺 v1.0 roadmap
-0.3.0 (ready to tag) → real-hardware [beep-903] → perf+code-quality audit (**beep-uqn**) → security audit → docs. **beep-03i** eviction = FIRM v1 req (NOT built). v6 Geneve *outer*: **beep-8b0** (P3).
+## ✅ Merged this session (30 PRs, #211–#242)
+Renovate #211 #212 · controller #213 #217 #222 #237 #242 · dataplane #216 #221 #226 #229 #241 · smoke/CI #214 #215 #218 #225 #227 #230 #231 #234 #235 #236 · infra #224 · findings #219 #220 #223 #228 #233 #240. **Multi-endpoint LB is live** (all-endpoint emission, eTP/trafficDistribution policy, node-local opt-in, silent drop).
 
-## 🗄 Handoff / START NEXT SESSION
-Beads LOCAL (no remote). Parked: `beep-5lw`. Post-0.3.0 P4 follow-ons: **beep-c9k** (delivery.yaml extraction test), **beep-puf** (cold-cache rig). All VMs FREE. No worktrees.
-- **If session was closed, re-arm loops:** 15m tick `7,22,37,52 * * * *` · 60m reread `13 * * * *` · 60m hygiene `43 * * * *`.
-- **Verify after operator tags `v0.3.0`:** `delivery.yaml` run green + GitHub Release body rendered from CHANGELOG (first use of the new extraction path) + Docker image published. Then bump these dashboard sections to `[0.3.0] shipped`.
+## 🧠 Banked
+`project-stance-2026-10-13` · `quic-migration-not-v1-blocker-2026-10-13` · `reviewer-skips-posting-2026-10-13` · `endianness-le-only-pre-1-0` · `decap-trust-model-2026-10-13` · `mayor-cwd-gotcha-2026-10-13` · `vm-disk-no-delete-rule-2026-10-13` · `curl-reconnect-test-gotcha-2026-10-13`
+
+## 🗄 Handoff notes
+- Beads are LOCAL (no Dolt remote); `.beads/*.jsonl` exports uncommitted (main rejects direct pushes).
+- Reviewer sometimes skips posting → confirm the review is on the CURRENT head before queuing; draft a PR while its fix commits are unreviewed.
+- `bd ready`: 28 (incl. larger features `7qm` IPv6, `eix` multi-iface; decision-gated `4gp`).
 
 ## Cron loops
 <!-- BEGIN AUTO: cron-loops -->
-15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
+Stopped at session close (re-arm on resume).
 <!-- END AUTO: cron-loops -->
 
 ## Open PRs
 <!-- BEGIN AUTO: open-prs -->
-- #123 chore: Configure Renovate (`renovate/configure`) — operator handling.
+None open.
 <!-- END AUTO: open-prs -->
 
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-2026-09-21 — main @ `197dff3`, up to date with origin/main.
+Session close 2026-10-14 — Branch `main` @ `07d3a06`, up to date with origin/main.
 <!-- END AUTO: repo-state -->
 
 ## 🌲 Worktrees
 <!-- BEGIN AUTO: worktrees -->
-None.
+- `ai/worktrees/agent-a8170ae9c67e7ecbf` (`fix-242`): dirty but superseded; awaiting operator OK to remove.
 <!-- END AUTO: worktrees -->
 
 ## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
-0 pending.
+0 pending review-queue entries.
 <!-- END AUTO: review-queue -->

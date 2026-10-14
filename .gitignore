@@ -20,3 +20,5 @@ temp/*
 # Critical-reviewer queue: hook writes review-request markers here; ephemeral.
 .claude/review-queue/*
 !.claude/review-queue/.gitkeep
+
+.beads.gate.lock
