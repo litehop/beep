@@ -176,10 +176,11 @@ static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
 
 /// Single-slot per-CPU counter: lookups where `FRONT_META` named a front
 /// but its endpoint was missing (or the count was zero). Traffic for that
-/// front is not load-balanced: an ingress miss passes the packet to the host
-/// (`TC_ACT_OK`), a decap miss drops it. A non-zero value means the
-/// controller's generation-swap protocol was violated or an endpoint write
-/// failed.
+/// front has no usable endpoint, so the packet is silently dropped
+/// (`TC_ACT_SHOT`). Counted on the ingress path only. A non-zero value means
+/// the front has no endpoint (e.g. `externalTrafficPolicy: Local` without a
+/// local pod), or the controller's generation-swap protocol was violated or an
+/// endpoint write failed.
 #[map]
 static FRONT_MISSES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
