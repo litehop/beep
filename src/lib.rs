@@ -651,9 +651,13 @@ impl PinStore for BpffsPins<'_> {
     }
 
     fn repin(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        // bpffs refuses rename(2): pin a second name, then drop the first.
         let (from, to) = (self.0.join(from), self.0.join(to));
-        std::fs::rename(&from, &to)
-            .with_context(|| format!("re-pinning {} as {}", from.display(), to.display()))
+        MapData::from_pin(&from)
+            .with_context(|| format!("opening {}", from.display()))?
+            .pin(&to)
+            .with_context(|| format!("re-pinning {} as {}", from.display(), to.display()))?;
+        std::fs::remove_file(&from).with_context(|| format!("unpinning {}", from.display()))
     }
 }
 
