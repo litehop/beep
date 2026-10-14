@@ -498,7 +498,13 @@ pub fn load_ebpf(
         ("POD_TARGETS", pod_targets_max_entries),
     ];
     let requested = requested_shapes(ebpf_object(), &max_entries)?;
-    let recreated = recreate_mismatched_pins(&BpffsPins(pin_dir), &requested)?;
+    let pins = BpffsPins(pin_dir);
+    let recreated = recreate_mismatched_pins(&pins, &requested)?;
+    let parked: Vec<_> = recreated
+        .iter()
+        .filter(|r| r.parked)
+        .map(|r| r.name)
+        .collect();
     let mut loader = EbpfLoader::new();
     for name in MAP_NAMES {
         loader.map_pin_path(name, pin_dir.join(name));
@@ -509,7 +515,13 @@ pub fn load_ebpf(
     let ebpf = loader
         .load(ebpf_object())
         .context("loading the beep-ebpf object")?;
+    if !parked.is_empty()
+        && std::env::var_os(FAULT_BEFORE_RESTORE_ENV).is_some_and(|v| !v.is_empty())
+    {
+        bail!("{FAULT_BEFORE_RESTORE_ENV} set: aborting before restoring migrated map entries");
+    }
     restore_migrated(pin_dir, recreated, &requested).context("restoring migrated map entries")?;
+    unpark_migrated(&pins, &parked).context("unpinning the migrated maps")?;
     Ok(ebpf)
 }
 
@@ -604,12 +616,16 @@ fn requested_shapes(
         .collect()
 }
 
-/// Where pinned maps live: read a pin's shape and contents, delete a pin.
+/// Where pinned maps live: read a pin's shape and contents, move or delete a
+/// pin. Names are file names under the pin dir, so a `_migrating` pin is
+/// addressed like any other.
 trait PinStore {
     /// `None` if no pin exists under `name`.
     fn shape(&self, name: &str) -> anyhow::Result<Option<MapShape>>;
     fn snapshot(&self, name: &str) -> anyhow::Result<Vec<Entry>>;
     fn remove(&self, name: &str) -> anyhow::Result<()>;
+    /// Re-pins the map pinned at `from` under `to`, without touching the map.
+    fn repin(&self, from: &str, to: &str) -> anyhow::Result<()>;
 }
 
 struct BpffsPins<'a>(&'a Path);
@@ -633,14 +649,41 @@ impl PinStore for BpffsPins<'_> {
         let pin = self.0.join(name);
         std::fs::remove_file(&pin).with_context(|| format!("removing stale pin {}", pin.display()))
     }
+
+    fn repin(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        // Pin a second name, then drop the first: no rename(2) on the map.
+        let (from, to) = (self.0.join(from), self.0.join(to));
+        MapData::from_pin(&from)
+            .with_context(|| format!("opening {}", from.display()))?
+            .pin(&to)
+            .with_context(|| format!("re-pinning {} as {}", from.display(), to.display()))?;
+        std::fs::remove_file(&from).with_context(|| format!("unpinning {}", from.display()))
+    }
 }
 
-/// A pin `recreate_mismatched_pins` deleted. `snapshot` holds the old entries
+/// Suffix of the pin an old map is parked under while its entries are carried
+/// into the new map. It is removed only after the restore succeeded, so a
+/// crash in between leaves the entries recoverable by the next start. No dot:
+/// bpffs rejects any pin name containing one with `EPERM`.
+const MIGRATING_SUFFIX: &str = "_migrating";
+
+fn migrating_name(name: &str) -> String {
+    format!("{name}{MIGRATING_SUFFIX}")
+}
+
+/// Setting this to a non-empty value makes `load_ebpf` fail after the new
+/// maps are created and before the old entries are restored into them: a test
+/// hook for the crash window the `_migrating` pin protects. Unset in
+/// production.
+pub const FAULT_BEFORE_RESTORE_ENV: &str = "BEEP_FAULT_ABORT_BEFORE_RESTORE";
+
+/// A pin `recreate_mismatched_pins` replaced. `snapshot` holds the old entries
 /// when the map's layout is unchanged and they should be restored into the
-/// new map.
+/// new map; `parked` says the old map is still pinned as `<name>_migrating`.
 struct Recreated {
     name: &'static str,
     snapshot: Option<Vec<Entry>>,
+    parked: bool,
 }
 
 fn pin_fate(existing: &MapShape, wanted: &MapShape) -> Fate {
@@ -655,14 +698,46 @@ fn pin_fate(existing: &MapShape, wanted: &MapShape) -> Fate {
     }
 }
 
-/// Deletes every pin whose shape differs from `requested`, so the load that
-/// follows recreates it; matching pins are left alone and reused.
-/// A pin differing only in `map_flags`/`max_entries` is snapshotted first so
-/// `restore_migrated` can refill the new map before any program is attached
-/// (an empty front table would send established front flows to the host);
-/// a layout change recreates it empty (pre-1.0: recreate-and-log beats
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Plain,
+    Migrating,
+}
+
+/// Which pin holds the entries to carry over. A leftover `_migrating` pin is
+/// the source of truth even when a pin of the wanted shape also exists: that
+/// one is the new map of an interrupted run, empty or partly restored, and the
+/// entries are restored over it. A `_migrating` pin is never `Keep`, since
+/// its entries have not reached the live map yet.
+fn pin_source(
+    plain: Option<MapShape>,
+    migrating: Option<MapShape>,
+    wanted: &MapShape,
+) -> Option<(Source, MapShape, Fate)> {
+    match (migrating, plain) {
+        (Some(m), _) => {
+            let fate = match pin_fate(&m, wanted) {
+                Fate::Keep => Fate::Migrate,
+                other => other,
+            };
+            Some((Source::Migrating, m, fate))
+        }
+        (None, Some(p)) => Some((Source::Plain, p, pin_fate(&p, wanted))),
+        (None, None) => None,
+    }
+}
+
+/// Prepares every pin whose shape differs from `requested` (or whose
+/// migration was interrupted) so the load that follows recreates it; matching
+/// pins are left alone and reused.
+/// A pin differing only in `map_flags`/`max_entries` is snapshotted and its
+/// old map re-pinned as `<name>_migrating`, so `restore_migrated` can refill
+/// the new map before any program is attached (an empty front table would
+/// send established front flows to the host) and a crash before then loses
+/// nothing: the next start finds the `_migrating` pin and migrates from it.
+/// A layout change recreates it empty (pre-1.0: recreate-and-log beats
 /// refusing to start). `FRONT_META`/`FRONT_ENDPOINTS` always share one fate
-/// (`couple_front_fates`). Returns what it deleted.
+/// (`couple_front_fates`). Returns what it replaced.
 ///
 /// Unlinking a pin does not touch the old map: tc programs attached by the
 /// previous loader keep referencing it until the new loader re-attaches, so
@@ -676,34 +751,42 @@ fn recreate_mismatched_pins(
 ) -> anyhow::Result<Vec<Recreated>> {
     let mut fates = Vec::new();
     for &(name, wanted) in requested {
-        let existing = pins.shape(name)?;
-        let fate = existing.map(|e| pin_fate(&e, &wanted));
-        fates.push((name, existing, wanted, fate));
+        let source = pin_source(
+            pins.shape(name)?,
+            pins.shape(&migrating_name(name))?,
+            &wanted,
+        );
+        fates.push((name, source, wanted));
     }
     let fate_of = |name: &str| {
         fates
             .iter()
             .find(|(n, ..)| *n == name)
-            .and_then(|(.., fate)| *fate)
+            .and_then(|(_, source, _)| source.map(|(.., fate)| fate))
     };
     let coupled = couple_front_fates([fate_of(FRONT_META), fate_of(FRONT_ENDPOINTS)]);
     let mut recreated = Vec::new();
-    for (name, existing, wanted, fate) in fates {
-        let fate = match name {
-            FRONT_META => Some(coupled[0]),
-            FRONT_ENDPOINTS => Some(coupled[1]),
-            _ => fate,
-        };
-        let (Some(existing), Some(fate)) = (existing, fate) else {
+    for (name, source, wanted) in fates {
+        let Some((source, existing, fate)) = source else {
             continue;
+        };
+        let fate = match name {
+            FRONT_META => coupled[0],
+            FRONT_ENDPOINTS => coupled[1],
+            _ => fate,
         };
         if fate == Fate::Keep {
             continue;
         }
+        let parked = migrating_name(name);
+        let src_pin = match source {
+            Source::Plain => name,
+            Source::Migrating => &parked,
+        };
         let diffs = map_shape_mismatches(&existing, &wanted);
         let mut snapshot = None;
         let outcome = match fate {
-            Fate::Migrate => match pins.snapshot(name) {
+            Fate::Migrate => match pins.snapshot(src_pin) {
                 Ok(entries) => {
                     let n = entries.len();
                     snapshot = Some(entries);
@@ -716,18 +799,51 @@ fn recreate_mismatched_pins(
             }
             _ => "recreating it empty".to_owned(),
         };
+        let why = if !diffs.is_empty() {
+            diffs.join(", ")
+        } else if source == Source::Migrating {
+            format!("leftover {parked} pin from an interrupted migration")
+        } else {
+            "paired front map changed".to_owned()
+        };
         eprintln!(
-            "beep: pinned map {name} differs from the requested definition ({}); {outcome}",
-            if diffs.is_empty() {
-                "paired front map changed".to_owned()
-            } else {
-                diffs.join(", ")
-            }
+            "beep: pinned map {name} differs from the requested definition ({why}); {outcome}"
         );
-        pins.remove(name)?;
-        recreated.push(Recreated { name, snapshot });
+        let keeps_entries = snapshot.is_some();
+        match (source, keeps_entries) {
+            (Source::Plain, true) => pins.repin(name, &parked)?,
+            (Source::Plain, false) => pins.remove(name)?,
+            (Source::Migrating, true) => {
+                // A plain pin of the wanted shape is the interrupted run's new
+                // map and is reused; any other shape is stale.
+                if let Some(plain) = pins.shape(name)? {
+                    if !map_shape_mismatches(&plain, &wanted).is_empty() {
+                        pins.remove(name)?;
+                    }
+                }
+            }
+            (Source::Migrating, false) => {
+                pins.remove(&parked)?;
+                if pins.shape(name)?.is_some() {
+                    pins.remove(name)?;
+                }
+            }
+        }
+        recreated.push(Recreated {
+            name,
+            snapshot,
+            parked: keeps_entries,
+        });
     }
     Ok(recreated)
+}
+
+/// Unpins the `_migrating` pins once their entries are in the new maps.
+fn unpark_migrated(pins: &dyn PinStore, parked: &[&'static str]) -> anyhow::Result<()> {
+    for name in parked {
+        pins.remove(&migrating_name(name))?;
+    }
+    Ok(())
 }
 
 /// Refills the maps `recreate_mismatched_pins` snapshotted. Runs after the
@@ -1445,14 +1561,20 @@ mod tests {
     const BPF_MAP_TYPE_HASH: u32 = 1;
 
     struct FakePins {
-        pins: std::cell::RefCell<std::collections::BTreeMap<&'static str, MapShape>>,
+        pins: std::cell::RefCell<std::collections::BTreeMap<String, MapShape>>,
     }
 
     impl FakePins {
-        fn new(pins: &[(&'static str, MapShape)]) -> Self {
+        fn new(pins: &[(&str, MapShape)]) -> Self {
             Self {
-                pins: std::cell::RefCell::new(pins.iter().copied().collect()),
+                pins: std::cell::RefCell::new(
+                    pins.iter().map(|&(n, s)| (n.to_owned(), s)).collect(),
+                ),
             }
+        }
+
+        fn names(&self) -> Vec<String> {
+            self.pins.borrow().keys().cloned().collect()
         }
     }
 
@@ -1469,6 +1591,12 @@ mod tests {
                 .remove(name)
                 .map(|_| ())
                 .ok_or_else(|| anyhow!("no pin {name}"))
+        }
+        fn repin(&self, from: &str, to: &str) -> anyhow::Result<()> {
+            let mut pins = self.pins.borrow_mut();
+            let shape = pins.remove(from).ok_or_else(|| anyhow!("no pin {from}"))?;
+            pins.insert(to.to_owned(), shape);
+            Ok(())
         }
     }
 
@@ -1491,8 +1619,121 @@ mod tests {
         let removed = recreate_mismatched_pins(&pins, &requested).unwrap();
         let names: Vec<_> = removed.iter().map(|r| r.name).collect();
         assert_eq!(names, ["NODE_ALLOW"]);
-        let left: Vec<_> = pins.pins.borrow().keys().copied().collect();
-        assert_eq!(left, ["FLOW_TABLE", "POD_TARGETS"]);
+        assert_eq!(
+            pins.names(),
+            ["FLOW_TABLE", "NODE_ALLOW_migrating", "POD_TARGETS"]
+        );
+    }
+
+    #[test]
+    fn migrated_pin_is_parked_not_deleted_so_a_crash_before_restore_loses_nothing() {
+        // Deleting the old pin up front leaves the only copy of the entries in
+        // loader memory; a crash before the restore then leaves an empty map
+        // whose shape matches, so the next start keeps it and established
+        // front flows pass to the host.
+        let pins = FakePins::new(&[("FRONT_META", shape(32)), ("FRONT_ENDPOINTS", shape(64))]);
+        let requested = [("FRONT_META", shape(64)), ("FRONT_ENDPOINTS", shape(128))];
+        let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert!(recreated.iter().all(|r| r.parked));
+        assert_eq!(
+            pins.names(),
+            ["FRONT_ENDPOINTS_migrating", "FRONT_META_migrating"],
+            "the live names are free for the load; the old maps stay pinned"
+        );
+    }
+
+    #[test]
+    fn leftover_migrating_pin_is_restored_over_the_empty_new_pin_of_the_wanted_shape() {
+        // The crashed run created the new (empty) map under the plain name, so
+        // shapes match and a plain Keep would serve it empty. The parked pin
+        // holds the entries and must win.
+        let pins = FakePins::new(&[
+            ("FRONT_META", shape(64)),
+            ("FRONT_META_migrating", shape(32)),
+            ("FRONT_ENDPOINTS", shape(128)),
+            ("FRONT_ENDPOINTS_migrating", shape(64)),
+        ]);
+        let requested = [("FRONT_META", shape(64)), ("FRONT_ENDPOINTS", shape(128))];
+        let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert_eq!(recreated.len(), 2);
+        for r in &recreated {
+            let snap = r
+                .snapshot
+                .as_ref()
+                .expect("entries come from the parked pin");
+            assert_eq!(
+                snap[0].0,
+                migrating_name(r.name).into_bytes(),
+                "{}: snapshot must be read from the _migrating pin, not the empty plain one",
+                r.name
+            );
+            assert!(r.parked);
+        }
+        assert_eq!(pins.names().len(), 4, "the new plain pins are reused as-is");
+    }
+
+    #[test]
+    fn leftover_migrating_pin_with_a_matching_shape_still_migrates() {
+        // A coupled front map is parked even when its own shape was fine, so
+        // its parked shape can equal the request; it must still be restored.
+        let pins = FakePins::new(&[
+            ("NODE_ALLOW_migrating", shape(16)),
+            ("NODE_ALLOW", shape(16)),
+        ]);
+        let recreated = recreate_mismatched_pins(&pins, &[("NODE_ALLOW", shape(16))]).unwrap();
+        assert_eq!(recreated.len(), 1);
+        assert!(recreated[0].snapshot.is_some());
+    }
+
+    #[test]
+    fn crash_between_the_two_front_repins_still_migrates_both_from_their_best_source() {
+        // META was parked, ENDPOINTS was not yet: restarting must treat the
+        // pair as one migration, or META's rows would point at an empty map.
+        let pins = FakePins::new(&[
+            ("FRONT_META_migrating", shape(32)),
+            ("FRONT_ENDPOINTS", shape(64)),
+        ]);
+        let requested = [("FRONT_META", shape(64)), ("FRONT_ENDPOINTS", shape(128))];
+        let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
+        assert!(recreated.iter().all(|r| r.snapshot.is_some() && r.parked));
+        assert_eq!(
+            pins.names(),
+            ["FRONT_ENDPOINTS_migrating", "FRONT_META_migrating"]
+        );
+    }
+
+    #[test]
+    fn leftover_migrating_pin_of_a_changed_layout_is_dropped_not_restored() {
+        let wider = MapShape {
+            value_size: 99,
+            ..shape(32)
+        };
+        let pins = FakePins::new(&[
+            ("NODE_ALLOW_migrating", shape(32)),
+            ("NODE_ALLOW", shape(32)),
+        ]);
+        let recreated = recreate_mismatched_pins(&pins, &[("NODE_ALLOW", wider)]).unwrap();
+        assert!(recreated.iter().all(|r| r.snapshot.is_none() && !r.parked));
+        assert!(pins.names().is_empty());
+    }
+
+    #[test]
+    fn parked_pin_wins_over_a_plain_pin_as_the_entry_source() {
+        let (source, _, fate) = pin_source(Some(shape(64)), Some(shape(32)), &shape(64)).unwrap();
+        assert_eq!((source, fate), (Source::Migrating, Fate::Migrate));
+        let (source, _, fate) = pin_source(Some(shape(64)), None, &shape(64)).unwrap();
+        assert_eq!((source, fate), (Source::Plain, Fate::Keep));
+        assert!(pin_source(None, None, &shape(64)).is_none());
+    }
+
+    #[test]
+    fn unpark_removes_only_the_parked_pins_after_a_restore() {
+        let pins = FakePins::new(&[
+            ("NODE_ALLOW", shape(32)),
+            ("NODE_ALLOW_migrating", shape(16)),
+        ]);
+        unpark_migrated(&pins, &["NODE_ALLOW"]).unwrap();
+        assert_eq!(pins.names(), ["NODE_ALLOW"]);
     }
 
     #[test]

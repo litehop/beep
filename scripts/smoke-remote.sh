@@ -899,6 +899,57 @@ capchg_backend_has "$CAPCHG_PING_AFTER" || {
 echo "CAP-CHANGE RESTART FLOW CONTINUITY: PASS (FRONT_META kept $capchg_fronts_after fronts across a recreating restart; the held flow still delivered '$CAPCHG_PING_AFTER')"
 kill "$capchg_client_pid" 2>/dev/null || true
 
+echo "==> crash-safe migration: a loader that dies after unpinning the old front maps and before restoring them must not lose the entries"
+# The fault hook aborts after the new maps exist and before the restore. Without
+# the _migrating pin the next start finds matching, empty maps and keeps them.
+CRASH_LOADER_LOG="/tmp/beep-smoke-loader-crash.log"
+CRASH_RECOVER_LOG="/tmp/beep-smoke-loader-crash-recover.log"
+stop_loader
+crash_fronts_before=$(map_entry_count "$PIN_DIR/FRONT_META")
+[ "$crash_fronts_before" -gt 0 ] || {
+  echo "FAIL: FRONT_META is empty before the crash-safe migration stage; nothing to protect" >&2
+  exit 1
+}
+if timeout 30 env BEEP_FAULT_ABORT_BEFORE_RESTORE=1 "$BIN" \
+  --uplink-iface smoke-veth0 --uplink-iface "$UPLINK2_IFACE" --geneve-iface geneve0 \
+  --pin-dir "$PIN_DIR" \
+  --pod-cidr "$POD_CIDR" --node-ip "$FRONT_IP" \
+  --max-fronts 1024 \
+  >"$CRASH_LOADER_LOG" 2>&1; then
+  echo "FAIL: the loader survived the injected pre-restore fault. Loader log:" >&2
+  cat "$CRASH_LOADER_LOG" >&2
+  exit 1
+fi
+grep -q "BEEP_FAULT_ABORT_BEFORE_RESTORE" "$CRASH_LOADER_LOG" || {
+  echo "FAIL: the loader exited without hitting the injected fault (timeout or another error). Loader log:" >&2
+  cat "$CRASH_LOADER_LOG" >&2
+  exit 1
+}
+[ -e "$PIN_DIR/FRONT_META_migrating" ] || {
+  echo "FAIL: no FRONT_META_migrating pin after the crash; the old entries are only in the dead loader's memory" >&2
+  exit 1
+}
+nohup "$BIN" \
+  --uplink-iface smoke-veth0 --uplink-iface "$UPLINK2_IFACE" --geneve-iface geneve0 \
+  --pin-dir "$PIN_DIR" \
+  --pod-cidr "$POD_CIDR" --node-ip "$FRONT_IP" \
+  --max-fronts 1024 \
+  >"$CRASH_RECOVER_LOG" 2>&1 &
+loader_pid=$!
+disown
+wait_for_attach "$CRASH_RECOVER_LOG"
+crash_fronts_after=$(map_entry_count "$PIN_DIR/FRONT_META")
+[ "$crash_fronts_after" = "$crash_fronts_before" ] || {
+  echo "FAIL: FRONT_META held $crash_fronts_before fronts before the crashed migration and $crash_fronts_after after the recovery restart. Loader log:" >&2
+  cat "$CRASH_RECOVER_LOG" >&2
+  exit 1
+}
+[ ! -e "$PIN_DIR/FRONT_META_migrating" ] && [ ! -e "$PIN_DIR/FRONT_ENDPOINTS_migrating" ] || {
+  echo "FAIL: a _migrating pin outlived a successful restore" >&2
+  exit 1
+}
+echo "CRASH-SAFE MIGRATION: PASS (FRONT_META recovered $crash_fronts_after fronts after a loader crash between unpin and restore)"
+
 echo "==> restarting the loader with the standard fixtures and default caps (migrates back, refills fixtures)"
 stop_loader
 start_loader "$LOADER_LOG.capchg-restore"
