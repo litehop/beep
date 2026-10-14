@@ -129,6 +129,7 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
+  kube -n kube-system delete lease -l app.kubernetes.io/component=node-lease --ignore-not-found >/dev/null 2>&1 || true
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   # The tarball above is trap-cleaned, but the locally built+tagged image
   # itself isn't -- without this, every run of a different commit leaves
@@ -603,6 +604,37 @@ for ip in "$IP_A" "$IP_B"; do
   [ "$RC" != 0 ] || leg_fail "LEG-E: FAIL (a connection via $ip succeeded with 0 endpoints)"
 done
 echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
+
+# (g) dead-node pruning: a node whose beep pod is gone must leave status.loadBalancer.ingress
+# (its Lease expires and a live controller prunes it) and return when beep comes back.
+# OnDelete keeps node-a's controller (the pruner) running; a nodeSelector to node-a alone makes the
+# DaemonSet controller remove node-b's pod and not recreate it.
+# Budget: pod termination grace (up to 30s) + lease duration 40s + prune
+# interval <=15s, plus slack.
+LEASE_PRUNE_BUDGET=120
+LEASE_RETURN_BUDGET=120
+BOTH_IPS="$(printf '%s\n%s' "$IP_A" "$IP_B" | sort | tr '\n' ' ' | sed 's/ $//')"
+poll_ingress() { # poll_ingress <svc> <expected> <seconds> -- echoes seconds waited, or "" on timeout
+  local waited=0
+  while [ "$waited" -lt "$3" ]; do
+    [ "$(ingress_of "$1")" = "$2" ] && { echo "$waited"; return; }
+    sleep 2
+    waited=$((waited + 2))
+  done
+  echo ""
+}
+[ "$(ingress_of whoami)" = "$BOTH_IPS" ] || leg_fail "LEG-G: FAIL (precondition: whoami ingress should list both nodes before the beep pod is stopped, got '$(ingress_of whoami)')"
+kube -n kube-system patch daemonset servicelb-controller --type=merge \
+  -p "{\"spec\":{\"updateStrategy\":{\"type\":\"OnDelete\",\"rollingUpdate\":null},\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$NODE_A_K8S\"}}}}}" >/dev/null
+GONE_AFTER="$(poll_ingress whoami "$IP_A" "$LEASE_PRUNE_BUDGET")"
+[ -n "$GONE_AFTER" ] || { kube -n kube-system get lease -o yaml >&2 || true; kube -n kube-system logs -l app.kubernetes.io/name=servicelb-controller --tail=60 >&2 || true; }
+[ -n "$GONE_AFTER" ] || leg_fail "LEG-G: FAIL ($IP_B still listed in whoami ingress ${LEASE_PRUNE_BUDGET}s after its beep pod was stopped: '$(ingress_of whoami)'; dead nodes are not pruned)"
+echo "LEG-G dead-node prune: PASS ($IP_B left ingress ${GONE_AFTER}s after its beep pod was stopped; $IP_A stays)"
+kube -n kube-system patch daemonset servicelb-controller --type=json \
+  -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]' >/dev/null
+BACK_AFTER="$(poll_ingress whoami "$BOTH_IPS" "$LEASE_RETURN_BUDGET")"
+[ -n "$BACK_AFTER" ] || leg_fail "LEG-G: FAIL ($IP_B did not return to whoami ingress ${LEASE_RETURN_BUDGET}s after its beep pod came back: '$(ingress_of whoami)')"
+echo "LEG-G node return: PASS ($IP_B re-listed ${BACK_AFTER}s after its beep pod came back)"
 
 echo ""
 if [ "$LEG_FAILURES" -gt 0 ]; then

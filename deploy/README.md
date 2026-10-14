@@ -112,7 +112,28 @@ the first time, then confirm with "Verify your deployment" below.
   needs it (disabling `rp_filter`) — see
   `docs/decisions/servicelb-rp-filter-init-container.md`.
 - `rbac.yaml` — `ServiceAccount` + `ClusterRole` + `ClusterRoleBinding` (plus
-  a `Role`/`RoleBinding` for the flow-hash seed Secret) for the above.
+  a `Role`/`RoleBinding` for the flow-hash seed Secret and one for the
+  per-node Leases) for the above.
+
+## Node liveness Leases
+
+Each controller renews a `coordination.k8s.io/v1` Lease `beep-node-<node>`
+in `--lease-namespace` (default `kube-system`; `NODE_NAME` supplies the
+node name) every 10 s, with a 40 s duration -- the same timing Kubernetes
+uses for node leases. The Lease carries the node's addresses in the
+`beep.litehop.io/node-ips` annotation. Every controller lists these Leases
+every ~10-15 s (10 s plus up to 5 s of jitter) and removes any
+`status.loadBalancer.ingress` entry whose address has no live Lease, so a
+node whose beep pod stopped is dropped from every Service within about
+40 s + one prune interval. When that node's controller returns it renews
+its Lease and re-adds its own entry.
+
+Liveness is judged by observation: a Lease is live while its `renewTime`
+keeps changing as seen by the pruning controller's own monotonic clock, so
+wall-clock skew between nodes is irrelevant. A freshly started controller
+does not prune for its first 40 s and never prunes until it sees its own
+Lease renewing, so a missing Lease permission cannot empty every Service's
+ingress. Timings are constants (`controller/src/lease.rs`), not flags.
 
 ## Deployment model
 
@@ -177,6 +198,8 @@ kubectl create clusterrolebinding beep-controller-csr \
   --clusterrole=servicelb-controller --user=beep-controller
 kubectl create rolebinding beep-controller-csr-flow-hash-seed -n kube-system \
   --role=servicelb-controller-flow-hash-seed --user=beep-controller
+kubectl create rolebinding beep-controller-csr-node-lease -n kube-system \
+  --role=servicelb-controller-node-lease --user=beep-controller
 
 # 4. Assemble a kubeconfig with exactly the 4 fields beep-kubeconfig reads
 kubectl config set-cluster beep --server=https://<api-server>:6443 \

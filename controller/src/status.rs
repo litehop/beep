@@ -114,6 +114,21 @@ pub async fn ensure_node_ingress(
     own_ips: &[IpAddr],
     desired_ips: &[IpAddr],
 ) -> anyhow::Result<()> {
+    update_ingress(client, namespace, name, |existing| {
+        merged_ingress(existing, own_ips, desired_ips)
+    })
+    .await
+}
+
+/// The get-modify-patch loop shared by every writer of the atomic ingress
+/// list: `compute` maps the live list to the corrected one, or `None` to skip
+/// the PATCH.
+pub async fn update_ingress(
+    client: &HyperApiClient,
+    namespace: &str,
+    name: &str,
+    compute: impl Fn(&[Value]) -> Option<Vec<Value>>,
+) -> anyhow::Result<()> {
     let get_path = format!("/api/v1/namespaces/{namespace}/services/{name}");
     let status_path = format!("{get_path}/status");
 
@@ -134,7 +149,7 @@ pub async fn ensure_node_ingress(
             .cloned()
             .unwrap_or_default();
 
-        let Some(new_ingress) = merged_ingress(&existing, own_ips, desired_ips) else {
+        let Some(new_ingress) = compute(&existing) else {
             return Ok(());
         };
 

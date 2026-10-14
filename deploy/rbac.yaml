@@ -54,6 +54,33 @@ subjects:
     name: servicelb-controller
     namespace: kube-system
 ---
+# Per-node liveness Leases (`beep-node-<node>`): each controller renews its
+# own, every controller lists them to prune dead nodes from Service ingress.
+# `create` cannot be limited by resourceNames, so the Role is namespace-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: servicelb-controller-node-lease
+  namespace: kube-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: servicelb-controller-node-lease
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: servicelb-controller-node-lease
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:

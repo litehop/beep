@@ -24,9 +24,13 @@ use beep::{
 };
 use beep_controller::{
     apply::PinnedMaps,
+    lease::{
+        lease_name, list_leases, pruned_ingress, renew_lease, LeaseTracker, LEASE_RENEW,
+        PRUNE_JITTER_MAX,
+    },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed},
-    status::ensure_node_ingress,
+    status::{ensure_node_ingress, update_ingress},
     watch::{run_list_watch, ServiceKey, WatchState},
 };
 use beep_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
@@ -106,6 +110,17 @@ struct Args {
     /// Secret access in.
     #[arg(long, default_value = "kube-system")]
     seed_namespace: String,
+
+    /// This node's Kubernetes name: names its liveness Lease
+    /// (`beep-node-<name>`), which other controllers use to decide whether
+    /// this node may stay in `status.loadBalancer.ingress`.
+    #[arg(long, env = "NODE_NAME", required_unless_present = "node_prep")]
+    node_name: Option<String>,
+
+    /// Namespace for the per-node Leases; must be the namespace
+    /// `deploy/rbac.yaml` grants Lease access in.
+    #[arg(long, default_value = "kube-system")]
+    lease_namespace: String,
 
     /// `FWD_PENDING` max_entries (see `beep-ebpf`'s doc comment); a
     /// load-time DaemonSet config knob, not baked into the eBPF object.
@@ -316,6 +331,66 @@ async fn run_seed_loop(
     loop {
         tokio::time::sleep(SEED_POLL).await;
         current = converge_seed(&client, &namespace, &pin_dir, current).await;
+    }
+}
+
+/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs
+/// immediately so the Lease exists before peers' warm-up ends.
+async fn run_lease_loop(
+    client: Arc<HyperApiClient>,
+    state: Arc<Mutex<WatchState>>,
+    namespace: String,
+    node_name: String,
+    node_ip: IpAddr,
+) -> anyhow::Result<()> {
+    loop {
+        let ips = state.lock().unwrap().own_node_ips(node_ip);
+        if let Err(e) = renew_lease(&client, &namespace, &node_name, &ips).await {
+            eprintln!("controller: WARN renewing node Lease failed (will retry): {e:#}");
+        }
+        tokio::time::sleep(LEASE_RENEW).await;
+    }
+}
+
+/// Removes ingress entries of nodes with no live Lease from every tracked
+/// Service. Skipped until this process has observed leases for a full
+/// duration and sees its own Lease renewing: if the Lease path is broken
+/// (e.g. RBAC) every node would otherwise look dead.
+async fn run_prune_loop(
+    client: Arc<HyperApiClient>,
+    state: Arc<Mutex<WatchState>>,
+    namespace: String,
+    node_name: String,
+) -> anyhow::Result<()> {
+    let own_lease = lease_name(&node_name);
+    let mut tracker = LeaseTracker::new(Instant::now());
+    loop {
+        let jitter_ms = beep::random_seed().unwrap_or(0) % PRUNE_JITTER_MAX.as_millis() as u64;
+        tokio::time::sleep(LEASE_RENEW + Duration::from_millis(jitter_ms)).await;
+        match list_leases(&client, &namespace).await {
+            Ok(listed) => tracker.observe(listed, Instant::now()),
+            Err(e) => {
+                eprintln!("controller: WARN listing node Leases failed: {e:#}");
+                continue;
+            }
+        }
+        let now = Instant::now();
+        if !tracker.warmed_up(now) || !tracker.is_live(&own_lease, now) {
+            continue;
+        }
+        let keys = state.lock().unwrap().service_keys();
+        for key in keys {
+            let result = update_ingress(&client, &key.namespace, &key.name, |existing| {
+                pruned_ingress(existing, tracker.leases(), now)
+            })
+            .await;
+            if let Err(e) = result {
+                eprintln!(
+                    "controller: WARN pruning dead nodes from {}/{} failed: {e:#}",
+                    key.namespace, key.name
+                );
+            }
+        }
     }
 }
 
@@ -754,17 +829,34 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("all 3 hooks attached; watching Service/EndpointSlice/Node");
 
+    let node_name = args
+        .node_name
+        .clone()
+        .expect("clap requires --node-name unless --node-prep, which already returned above");
     let controller = async {
-        let (watches, seed) = tokio::join!(
-            run_controller_loop(Arc::clone(&client), state, maps, node),
+        let (watches, seed, lease, prune) = tokio::join!(
+            run_controller_loop(Arc::clone(&client), Arc::clone(&state), maps, node),
             run_seed_loop(
                 Arc::clone(&client),
                 args.seed_namespace.clone(),
                 args.pin_dir.clone(),
                 flow_hash_seed,
             ),
+            run_lease_loop(
+                Arc::clone(&client),
+                Arc::clone(&state),
+                args.lease_namespace.clone(),
+                node_name.clone(),
+                node.node_ip,
+            ),
+            run_prune_loop(
+                Arc::clone(&client),
+                state,
+                args.lease_namespace.clone(),
+                node_name.clone(),
+            ),
         );
-        watches.and(seed)
+        watches.and(seed).and(lease).and(prune)
     };
 
     #[cfg(feature = "dhat-heap")]
@@ -827,6 +919,8 @@ mod tests {
             "10.0.0.1",
             "--kubeconfig",
             "/tmp/kubeconfig",
+            "--node-name",
+            "node-a",
         ])
         .expect_err("--uplink-iface must stay required when --node-prep is absent");
 
@@ -834,7 +928,7 @@ mod tests {
             .expect("--node-prep must not require --uplink-iface either");
     }
 
-    const REQUIRED: [&str; 9] = [
+    const REQUIRED: [&str; 11] = [
         "beep-controller",
         "--uplink-iface",
         "eth0",
@@ -844,6 +938,8 @@ mod tests {
         "10.0.0.1",
         "--kubeconfig",
         "/tmp/kubeconfig",
+        "--node-name",
+        "node-a",
     ];
 
     // The 17th dual-stack node (or 65th dual-stack pod) is silently
@@ -918,6 +1014,8 @@ mod tests {
             "2001:db8::1",
             "--kubeconfig",
             "/tmp/kubeconfig",
+            "--node-name",
+            "node-a",
         ])
         .expect(
             "--node-ip must accept a v6 literal, or a v6-only node can never start this \
@@ -944,6 +1042,8 @@ mod tests {
             "2001:db8::1",
             "--kubeconfig",
             "/tmp/kubeconfig",
+            "--node-name",
+            "node-a",
         ])
         .expect(
             "--pod-cidr must accept a v6 literal, or a v6-only cluster's pod CIDR can never be \

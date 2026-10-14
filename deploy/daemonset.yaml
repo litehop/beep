@@ -101,6 +101,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
+            # Names this node's liveness Lease (deploy/README.md).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           args:
             # 10.42.0.0/16 is k3s's own default --cluster-cidr (flannel).
             # This MUST match YOUR cluster's real pod CIDR -- override via a
