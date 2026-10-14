@@ -611,7 +611,7 @@ echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
 # probed throughout; the failure window is reported, and every front must answer again afterwards.
 # Runs before (g), which leaves the DaemonSet on OnDelete (no rollout restart).
 CFG_FRONTS=1000
-CFG_EPF=4
+CFG_EPF=3
 PROBE_STOP=/tmp/beep-cfg-probe-stop
 PROBE_OUT="$(mktemp)"
 FLOW_OUT="$(mktemp)"
@@ -619,7 +619,7 @@ map_max_entries() { # map_max_entries <vm> <map> -- the pinned map's max_entries
   limactl shell "$1" -- sudo bpftool map show pinned "$PIN_DIR/$2" --json | jq -r .max_entries
 }
 pod_beep_env() { # pod_beep_env <vm> -- the controller process's BEEP_* env, one per line
-  limactl shell "$1" -- sudo bash -c 'tr "\0" "\n" < /proc/$(pgrep -f beep-controller | head -1)/environ | grep ^BEEP_ | sort'
+  limactl shell "$1" -- sudo bash -c 'tr "\0" "\n" < /proc/$(pgrep -x beep-controller | head -1)/environ | grep ^BEEP_ | sort'
 }
 echo "==> [13] ConfigMap sizing change (BEEP_MAX_FRONTS=$CFG_FRONTS) + DaemonSet restart: maps resized, established flow survives"
 limactl shell "$VM_CLIENT" -- rm -f "$PROBE_STOP"
@@ -669,7 +669,8 @@ echo "LEG-H configmap-restart: PASS (pods read the ConfigMap, maps resized, esta
 # OnDelete keeps node-a's controller (the pruner) running; a nodeSelector to node-a alone makes the
 # DaemonSet controller remove node-b's pod and not recreate it.
 # Budget: pod termination grace (up to 30s) + lease duration 40s + prune
-# interval <=15s, plus slack.
+# interval <=15s x 2 passes (an IP is pruned only after two consecutive unmatched passes) = ~100s,
+# plus slack.
 LEASE_PRUNE_BUDGET=120
 LEASE_RETURN_BUDGET=120
 BOTH_IPS="$(printf '%s\n%s' "$IP_A" "$IP_B" | sort | tr '\n' ' ' | sed 's/ $//')"
