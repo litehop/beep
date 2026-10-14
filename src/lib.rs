@@ -617,7 +617,7 @@ fn requested_shapes(
 }
 
 /// Where pinned maps live: read a pin's shape and contents, move or delete a
-/// pin. Names are file names under the pin dir, so a `.migrating` pin is
+/// pin. Names are file names under the pin dir, so a `_migrating` pin is
 /// addressed like any other.
 trait PinStore {
     /// `None` if no pin exists under `name`.
@@ -651,7 +651,7 @@ impl PinStore for BpffsPins<'_> {
     }
 
     fn repin(&self, from: &str, to: &str) -> anyhow::Result<()> {
-        // bpffs refuses rename(2): pin a second name, then drop the first.
+        // Pin a second name, then drop the first: no rename(2) on the map.
         let (from, to) = (self.0.join(from), self.0.join(to));
         MapData::from_pin(&from)
             .with_context(|| format!("opening {}", from.display()))?
@@ -663,8 +663,9 @@ impl PinStore for BpffsPins<'_> {
 
 /// Suffix of the pin an old map is parked under while its entries are carried
 /// into the new map. It is removed only after the restore succeeded, so a
-/// crash in between leaves the entries recoverable by the next start.
-const MIGRATING_SUFFIX: &str = ".migrating";
+/// crash in between leaves the entries recoverable by the next start. No dot:
+/// bpffs rejects any pin name containing one with `EPERM`.
+const MIGRATING_SUFFIX: &str = "_migrating";
 
 fn migrating_name(name: &str) -> String {
     format!("{name}{MIGRATING_SUFFIX}")
@@ -672,13 +673,13 @@ fn migrating_name(name: &str) -> String {
 
 /// Setting this to a non-empty value makes `load_ebpf` fail after the new
 /// maps are created and before the old entries are restored into them: a test
-/// hook for the crash window the `.migrating` pin protects. Unset in
+/// hook for the crash window the `_migrating` pin protects. Unset in
 /// production.
 pub const FAULT_BEFORE_RESTORE_ENV: &str = "BEEP_FAULT_ABORT_BEFORE_RESTORE";
 
 /// A pin `recreate_mismatched_pins` replaced. `snapshot` holds the old entries
 /// when the map's layout is unchanged and they should be restored into the
-/// new map; `parked` says the old map is still pinned as `<name>.migrating`.
+/// new map; `parked` says the old map is still pinned as `<name>_migrating`.
 struct Recreated {
     name: &'static str,
     snapshot: Option<Vec<Entry>>,
@@ -703,10 +704,10 @@ enum Source {
     Migrating,
 }
 
-/// Which pin holds the entries to carry over. A leftover `.migrating` pin is
+/// Which pin holds the entries to carry over. A leftover `_migrating` pin is
 /// the source of truth even when a pin of the wanted shape also exists: that
 /// one is the new map of an interrupted run, empty or partly restored, and the
-/// entries are restored over it. A `.migrating` pin is never `Keep`, since
+/// entries are restored over it. A `_migrating` pin is never `Keep`, since
 /// its entries have not reached the live map yet.
 fn pin_source(
     plain: Option<MapShape>,
@@ -730,10 +731,10 @@ fn pin_source(
 /// migration was interrupted) so the load that follows recreates it; matching
 /// pins are left alone and reused.
 /// A pin differing only in `map_flags`/`max_entries` is snapshotted and its
-/// old map re-pinned as `<name>.migrating`, so `restore_migrated` can refill
+/// old map re-pinned as `<name>_migrating`, so `restore_migrated` can refill
 /// the new map before any program is attached (an empty front table would
 /// send established front flows to the host) and a crash before then loses
-/// nothing: the next start finds the `.migrating` pin and migrates from it.
+/// nothing: the next start finds the `_migrating` pin and migrates from it.
 /// A layout change recreates it empty (pre-1.0: recreate-and-log beats
 /// refusing to start). `FRONT_META`/`FRONT_ENDPOINTS` always share one fate
 /// (`couple_front_fates`). Returns what it replaced.
@@ -837,7 +838,7 @@ fn recreate_mismatched_pins(
     Ok(recreated)
 }
 
-/// Unpins the `.migrating` pins once their entries are in the new maps.
+/// Unpins the `_migrating` pins once their entries are in the new maps.
 fn unpark_migrated(pins: &dyn PinStore, parked: &[&'static str]) -> anyhow::Result<()> {
     for name in parked {
         pins.remove(&migrating_name(name))?;
@@ -1620,7 +1621,7 @@ mod tests {
         assert_eq!(names, ["NODE_ALLOW"]);
         assert_eq!(
             pins.names(),
-            ["FLOW_TABLE", "NODE_ALLOW.migrating", "POD_TARGETS"]
+            ["FLOW_TABLE", "NODE_ALLOW_migrating", "POD_TARGETS"]
         );
     }
 
@@ -1636,7 +1637,7 @@ mod tests {
         assert!(recreated.iter().all(|r| r.parked));
         assert_eq!(
             pins.names(),
-            ["FRONT_ENDPOINTS.migrating", "FRONT_META.migrating"],
+            ["FRONT_ENDPOINTS_migrating", "FRONT_META_migrating"],
             "the live names are free for the load; the old maps stay pinned"
         );
     }
@@ -1648,9 +1649,9 @@ mod tests {
         // holds the entries and must win.
         let pins = FakePins::new(&[
             ("FRONT_META", shape(64)),
-            ("FRONT_META.migrating", shape(32)),
+            ("FRONT_META_migrating", shape(32)),
             ("FRONT_ENDPOINTS", shape(128)),
-            ("FRONT_ENDPOINTS.migrating", shape(64)),
+            ("FRONT_ENDPOINTS_migrating", shape(64)),
         ]);
         let requested = [("FRONT_META", shape(64)), ("FRONT_ENDPOINTS", shape(128))];
         let recreated = recreate_mismatched_pins(&pins, &requested).unwrap();
@@ -1663,7 +1664,7 @@ mod tests {
             assert_eq!(
                 snap[0].0,
                 migrating_name(r.name).into_bytes(),
-                "{}: snapshot must be read from the .migrating pin, not the empty plain one",
+                "{}: snapshot must be read from the _migrating pin, not the empty plain one",
                 r.name
             );
             assert!(r.parked);
@@ -1676,7 +1677,7 @@ mod tests {
         // A coupled front map is parked even when its own shape was fine, so
         // its parked shape can equal the request; it must still be restored.
         let pins = FakePins::new(&[
-            ("NODE_ALLOW.migrating", shape(16)),
+            ("NODE_ALLOW_migrating", shape(16)),
             ("NODE_ALLOW", shape(16)),
         ]);
         let recreated = recreate_mismatched_pins(&pins, &[("NODE_ALLOW", shape(16))]).unwrap();
@@ -1689,7 +1690,7 @@ mod tests {
         // META was parked, ENDPOINTS was not yet: restarting must treat the
         // pair as one migration, or META's rows would point at an empty map.
         let pins = FakePins::new(&[
-            ("FRONT_META.migrating", shape(32)),
+            ("FRONT_META_migrating", shape(32)),
             ("FRONT_ENDPOINTS", shape(64)),
         ]);
         let requested = [("FRONT_META", shape(64)), ("FRONT_ENDPOINTS", shape(128))];
@@ -1697,7 +1698,7 @@ mod tests {
         assert!(recreated.iter().all(|r| r.snapshot.is_some() && r.parked));
         assert_eq!(
             pins.names(),
-            ["FRONT_ENDPOINTS.migrating", "FRONT_META.migrating"]
+            ["FRONT_ENDPOINTS_migrating", "FRONT_META_migrating"]
         );
     }
 
@@ -1708,7 +1709,7 @@ mod tests {
             ..shape(32)
         };
         let pins = FakePins::new(&[
-            ("NODE_ALLOW.migrating", shape(32)),
+            ("NODE_ALLOW_migrating", shape(32)),
             ("NODE_ALLOW", shape(32)),
         ]);
         let recreated = recreate_mismatched_pins(&pins, &[("NODE_ALLOW", wider)]).unwrap();
@@ -1729,7 +1730,7 @@ mod tests {
     fn unpark_removes_only_the_parked_pins_after_a_restore() {
         let pins = FakePins::new(&[
             ("NODE_ALLOW", shape(32)),
-            ("NODE_ALLOW.migrating", shape(16)),
+            ("NODE_ALLOW_migrating", shape(16)),
         ]);
         unpark_migrated(&pins, &["NODE_ALLOW"]).unwrap();
         assert_eq!(pins.names(), ["NODE_ALLOW"]);

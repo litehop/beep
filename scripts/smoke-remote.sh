@@ -901,7 +901,7 @@ kill "$capchg_client_pid" 2>/dev/null || true
 
 echo "==> crash-safe migration: a loader that dies after unpinning the old front maps and before restoring them must not lose the entries"
 # The fault hook aborts after the new maps exist and before the restore. Without
-# the .migrating pin the next start finds matching, empty maps and keeps them.
+# the _migrating pin the next start finds matching, empty maps and keeps them.
 CRASH_LOADER_LOG="/tmp/beep-smoke-loader-crash.log"
 CRASH_RECOVER_LOG="/tmp/beep-smoke-loader-crash-recover.log"
 stop_loader
@@ -925,8 +925,8 @@ grep -q "BEEP_FAULT_ABORT_BEFORE_RESTORE" "$CRASH_LOADER_LOG" || {
   cat "$CRASH_LOADER_LOG" >&2
   exit 1
 }
-[ -e "$PIN_DIR/FRONT_META.migrating" ] || {
-  echo "FAIL: no FRONT_META.migrating pin after the crash; the old entries are only in the dead loader's memory" >&2
+[ -e "$PIN_DIR/FRONT_META_migrating" ] || {
+  echo "FAIL: no FRONT_META_migrating pin after the crash; the old entries are only in the dead loader's memory" >&2
   exit 1
 }
 nohup "$BIN" \
@@ -944,8 +944,8 @@ crash_fronts_after=$(map_entry_count "$PIN_DIR/FRONT_META")
   cat "$CRASH_RECOVER_LOG" >&2
   exit 1
 }
-[ ! -e "$PIN_DIR/FRONT_META.migrating" ] && [ ! -e "$PIN_DIR/FRONT_ENDPOINTS.migrating" ] || {
-  echo "FAIL: a .migrating pin outlived a successful restore" >&2
+[ ! -e "$PIN_DIR/FRONT_META_migrating" ] && [ ! -e "$PIN_DIR/FRONT_ENDPOINTS_migrating" ] || {
+  echo "FAIL: a _migrating pin outlived a successful restore" >&2
   exit 1
 }
 echo "CRASH-SAFE MIGRATION: PASS (FRONT_META recovered $crash_fronts_after fronts after a loader crash between unpin and restore)"
