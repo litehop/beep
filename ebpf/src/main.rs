@@ -422,32 +422,21 @@ fn gc_parity() -> GcParity {
     }
 }
 
-/// Refreshes the parity/FIN flags of a matched forward row, or deletes it when
-/// the connection is over. The caller still forwards the current packet from
-/// its own copy of `value`. Written as a whole-value `insert` like every other
-/// `FLOW_TABLE` write; a lost race with another writer of the same row costs at
-/// most one early parity refresh or a missed FIN bit, never a wrong forwarding
-/// decision.
+/// Copies the global parity into a matched forward row, only when it
+/// differs. Written as a whole-value `insert` like every other `FLOW_TABLE`
+/// write; a lost race with another writer of the same row costs at most one
+/// early parity refresh, never a wrong forwarding decision. Forward rows have
+/// no close tracking: only the idle sweep reclaims them.
 #[inline(always)]
-fn touch_forward_row(
-    key: FlowKey,
-    value: ForwardFlowValue,
-    proto: u8,
-    tcp_flags: u8,
-    side: FlowSide,
-) {
-    match flow_step(Some(value.flags), proto, tcp_flags, side, gc_parity()) {
-        FlowStep::Keep => {}
-        FlowStep::Write(flags) => {
-            let _ = FLOW_TABLE.insert(
-                key,
-                FlowValue::from_forward(ForwardFlowValue { flags, ..value }),
-                0,
-            );
-        }
-        FlowStep::Reclaim => {
-            let _ = FLOW_TABLE.remove(key);
-        }
+fn touch_forward_parity(key: FlowKey, value: ForwardFlowValue, proto: u8) {
+    if let FlowStep::Write(flags) =
+        flow_step(Some(value.flags), proto, 0, FlowSide::Client, gc_parity())
+    {
+        let _ = FLOW_TABLE.insert(
+            key,
+            FlowValue::from_forward(ForwardFlowValue { flags, ..value }),
+            0,
+        );
     }
 }
 
@@ -490,7 +479,6 @@ fn ingress_backend(
     flow_key: TcpFlowKey,
     fwd_key: FlowKey,
     ingress_ifindex: u32,
-    tcp_flags: u8,
 ) -> Result<(LbFrontBackend, u16), i32> {
     let Some(meta) = front_meta_get(front) else {
         return Err(TC_ACT_OK);
@@ -500,7 +488,7 @@ fn ingress_backend(
     };
     let established = flow_table_get_forward(fwd_key);
     if let Some(value) = established {
-        touch_forward_row(fwd_key, value, front.proto, tcp_flags, FlowSide::Client);
+        touch_forward_parity(fwd_key, value, front.proto);
     }
     let pending = if established.is_some() {
         None
@@ -872,7 +860,6 @@ struct IngressFlow {
     client_ip: [u8; 16],
     client_port: u16,
     ethertype: u16,
-    tcp_flags: u8,
 }
 
 /// Steers `flow` to a backend and Geneve-encapsulates toward it. `l3_only`
@@ -908,7 +895,6 @@ fn uplink_ingress_encap(
         flow_key,
         fwd_key,
         ingress_ifindex,
-        flow.tcp_flags,
     ) {
         Ok(chosen) => chosen,
         Err(verdict) => return Some(verdict),
@@ -985,11 +971,6 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) -> Optio
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
     let src_ip: u32 = load_direct(ctx, ip_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
-    let tcp_flags: u8 = if proto == IPPROTO_TCP {
-        load_direct(ctx, l4_off + 13)?
-    } else {
-        0
-    };
     Some(IngressFlow {
         front: LbFrontKey {
             front_ip: ipv4_mapped_v6(dst_ip),
@@ -1000,7 +981,6 @@ fn try_uplink_ingress_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) -> Optio
         client_ip: ipv4_mapped_v6(src_ip),
         client_port: src_port,
         ethertype: ETH_P_IPV4,
-        tcp_flags,
     })
 }
 
@@ -1036,11 +1016,6 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) -> Optio
     let dst_port: u16 = load_direct(ctx, l4_dport)?;
     let client_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
     let src_port: u16 = load_direct(ctx, l4_sport)?;
-    let tcp_flags: u8 = if proto == IPPROTO_TCP {
-        load_direct(ctx, l4_off + 13)?
-    } else {
-        0
-    };
     Some(IngressFlow {
         front: LbFrontKey {
             front_ip: front_ip_v6,
@@ -1051,7 +1026,6 @@ fn try_uplink_ingress_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) -> Optio
         client_ip: client_ip_v6,
         client_port: src_port,
         ethertype: ETH_P_IPV6,
-        tcp_flags,
     })
 }
 
@@ -1665,27 +1639,23 @@ fn try_geneve_decap_return_v4(
     // admitted on (stamped by `try_uplink_ingress_headers` at mint time)
     // MUST already be sitting in this same lookup
     // (`docs/decisions/servicelb-multi-symmetric-uplink.md`).
-    let tcp_flags = tcp_flags_direct(ctx, proto, L4_OFF)?;
     let existing_forward = flow_table_get_forward(fwd_key);
     let forward_value = if let Some(value) = existing_forward {
-        touch_forward_row(fwd_key, value, proto, tcp_flags, FlowSide::Pod);
+        touch_forward_parity(fwd_key, value, proto);
         Some(value)
     } else {
         let pending_value = fwd_pending_get(key);
         match return_authorization(false, pending_value.is_some()) {
             ReturnAuthorization::Promote => {
                 let mut value = pending_value?;
-                match flow_step(None, proto, tcp_flags, FlowSide::Pod, gc_parity()) {
-                    FlowStep::Reclaim => {}
-                    step => {
-                        if let FlowStep::Write(flags) = step {
-                            value.flags = flags;
-                        }
-                        FLOW_TABLE
-                            .insert(fwd_key, FlowValue::from_forward(value), 0)
-                            .ok()?;
-                    }
+                if let FlowStep::Write(flags) =
+                    flow_step(None, proto, 0, FlowSide::Client, gc_parity())
+                {
+                    value.flags = flags;
                 }
+                FLOW_TABLE
+                    .insert(fwd_key, FlowValue::from_forward(value), 0)
+                    .ok()?;
                 let _ = FWD_PENDING.remove(key);
                 Some(value)
             }
@@ -1771,27 +1741,23 @@ fn try_geneve_decap_return_v6(
         proto,
         FlowDirection::Forward,
     );
-    let tcp_flags = tcp_flags_direct(ctx, proto, L4_OFF_V6)?;
     let existing_forward = flow_table_get_forward(fwd_key);
     let forward_value = if let Some(value) = existing_forward {
-        touch_forward_row(fwd_key, value, proto, tcp_flags, FlowSide::Pod);
+        touch_forward_parity(fwd_key, value, proto);
         Some(value)
     } else {
         let pending_value = fwd_pending_get(key);
         match return_authorization(false, pending_value.is_some()) {
             ReturnAuthorization::Promote => {
                 let mut value = pending_value?;
-                match flow_step(None, proto, tcp_flags, FlowSide::Pod, gc_parity()) {
-                    FlowStep::Reclaim => {}
-                    step => {
-                        if let FlowStep::Write(flags) = step {
-                            value.flags = flags;
-                        }
-                        FLOW_TABLE
-                            .insert(fwd_key, FlowValue::from_forward(value), 0)
-                            .ok()?;
-                    }
+                if let FlowStep::Write(flags) =
+                    flow_step(None, proto, 0, FlowSide::Client, gc_parity())
+                {
+                    value.flags = flags;
                 }
+                FLOW_TABLE
+                    .insert(fwd_key, FlowValue::from_forward(value), 0)
+                    .ok()?;
                 let _ = FWD_PENDING.remove(key);
                 Some(value)
             }

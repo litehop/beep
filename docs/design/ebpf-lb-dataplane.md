@@ -258,13 +258,15 @@ flows pass to the host unbalanced (an absent front is not a front).
   connections are dropped. `FlowValue::flags` (forward and reverse rows)
   carries two FIN-seen bits and one parity bit per protocol class.
   - **TCP close**: the backend node deletes a flow's reverse row and its
-    port memo, and the ingress node its forward row, on RST in either
-    direction, or on the first non-FIN packet from the first-FIN side once
-    both directions have sent a FIN (the final ACK, which still needs the
-    row; an ACK from the second FIN's own side does not count, it can be a
-    duplicate ACK ahead of the real one; a SYN on the same 4-tuple restarts
-    the flags). The first FIN alone never reclaims, so a half-closed
-    connection keeps working. (`beep_common::flow_step`.)
+    port memo on RST in either direction, or on the first non-FIN packet
+    from the first-FIN side once both directions have sent a FIN (the final
+    ACK, which still needs the row; an ACK from the second FIN's own side
+    does not count, it can be a duplicate ACK ahead of the real one; a SYN
+    on the same 4-tuple restarts the flags). The first FIN alone never
+    reclaims, so a half-closed connection keeps working.
+    (`beep_common::flow_step`.) Forward rows on the ingress node have no
+    close tracking and are reclaimed by the idle sweep only; a closed
+    flow's stale forward row is harmless (it never occupies a remap slot).
   - **Idle GC**: `CONFIG` holds a global parity per class (UDP, TCP). A
     matched packet copies it into its row's bit only when it differs (at
     most one write per row per interval). Every interval the controller
