@@ -270,12 +270,79 @@ fn write_landed(result: &io::Result<()>) -> bool {
     }
 }
 
+/// One restore write that did not land.
+#[derive(Debug, PartialEq, Eq)]
+struct WriteFailure {
+    map: String,
+    errno: Option<i32>,
+    text: String,
+}
+
+/// A restore that left entries out of the new maps for a reason the plan did
+/// not budget for. The parked pins are kept; the start fails.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RestoreFailure {
+    /// Map of the first failed write.
+    pub map: String,
+    /// `errno` of the first failed write; `None` if it was not a syscall error.
+    pub errno: Option<i32>,
+    pub count: usize,
+    /// Up to five failure lines.
+    pub first: Vec<String>,
+}
+
+impl std::fmt::Display for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} unexpected write failures restoring migrated entries (first: {}); \
+             map {} {}: {}",
+            self.count,
+            self.first.join("; "),
+            self.map,
+            self.errno.map_or("error", errno_name),
+            restore_remediation(self.errno)
+        )
+    }
+}
+
+impl std::error::Error for RestoreFailure {}
+
+pub fn errno_name(errno: i32) -> &'static str {
+    match errno {
+        libc::ENOMEM => "ENOMEM",
+        libc::E2BIG => "E2BIG",
+        libc::EINVAL => "EINVAL",
+        libc::EFAULT => "EFAULT",
+        libc::EPERM => "EPERM",
+        libc::EACCES => "EACCES",
+        _ => "errno",
+    }
+}
+
+/// What an operator should do about a restore write failing with `errno`.
+pub fn restore_remediation(errno: Option<i32>) -> &'static str {
+    match errno {
+        Some(libc::ENOMEM) => {
+            "no-prealloc maps allocate per insert, charged to the pod memory cgroup: raise the \
+             pod memory limit or relieve node memory pressure"
+        }
+        Some(libc::E2BIG | libc::EINVAL | libc::EFAULT) => {
+            "restore plan/layout mismatch, a beep bug: please report, with the log"
+        }
+        Some(libc::EPERM | libc::EACCES) => {
+            "missing BPF capabilities or LSM denial: check the DaemonSet securityContext"
+        }
+        _ => "unexpected restore error: please report, with the log",
+    }
+}
+
 /// Writes `entries` into `map`; one `landed` flag per entry, failures recorded.
 fn write_all<'a>(
     write: &mut EntryWriter,
     map: &str,
     entries: impl IntoIterator<Item = &'a Entry>,
-    failures: &mut Vec<String>,
+    failures: &mut Vec<WriteFailure>,
 ) -> Vec<bool> {
     entries
         .into_iter()
@@ -283,7 +350,11 @@ fn write_all<'a>(
             let result = write(map, entry, BPF_NOEXIST);
             let landed = write_landed(&result);
             if let (false, Err(e)) = (landed, &result) {
-                failures.push(format!("{map}: {e}"));
+                failures.push(WriteFailure {
+                    map: map.to_owned(),
+                    errno: e.raw_os_error(),
+                    text: format!("{map}: {e}"),
+                });
             }
             landed
         })
@@ -329,19 +400,16 @@ fn apply_plan(plan: &RestorePlan, write: &mut EntryWriter) -> anyhow::Result<()>
             plan.fronts.len()
         );
     }
-    if failures.is_empty() {
+    let Some(first) = failures.first() else {
         return Ok(());
+    };
+    Err(RestoreFailure {
+        map: first.map.clone(),
+        errno: first.errno,
+        count: failures.len(),
+        first: failures.iter().take(5).map(|f| f.text.clone()).collect(),
     }
-    let shown = failures
-        .iter()
-        .take(5)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("; ");
-    anyhow::bail!(
-        "{} unexpected write failures restoring migrated entries (first: {shown})",
-        failures.len()
-    )
+    .into())
 }
 
 /// Applies `plan` to the freshly created pinned maps under `pin_dir`.
@@ -582,6 +650,46 @@ mod tests {
                 "the remaining entries are still attempted"
             );
         }
+    }
+
+    #[test]
+    fn remediation_names_the_action_for_each_errno_class() {
+        // The operator only sees this text (log and Event); a wrong class sends
+        // them to the wrong knob.
+        let cases = [
+            (libc::ENOMEM, "pod memory limit"),
+            (libc::E2BIG, "a beep bug"),
+            (libc::EINVAL, "a beep bug"),
+            (libc::EFAULT, "a beep bug"),
+            (libc::EPERM, "securityContext"),
+            (libc::EACCES, "securityContext"),
+        ];
+        for (errno, needle) in cases {
+            let text = restore_remediation(Some(errno));
+            assert!(text.contains(needle), "errno {errno}: {text}");
+        }
+        assert!(restore_remediation(None).contains("report"));
+        assert!(restore_remediation(Some(libc::EIO)).contains("report"));
+    }
+
+    #[test]
+    fn restore_failure_survives_context_wrapping_with_map_errno_and_remediation() {
+        // The controller downcasts the load error to build the Event; a
+        // stringified error would lose the errno and the failing map.
+        let mut maps = FakeMaps {
+            fail: vec![(2, libc::ENOMEM)],
+            ..Default::default()
+        };
+        let err = maps
+            .apply(&generic_plan(4, 8))
+            .map_err(|e| e.context("restoring migrated map entries"))
+            .unwrap_err();
+        let failure = err.downcast_ref::<RestoreFailure>().expect("typed error");
+        assert_eq!(failure.map, "POD_TARGETS");
+        assert_eq!(failure.errno, Some(libc::ENOMEM));
+        let shown = failure.to_string();
+        assert!(shown.contains("map POD_TARGETS ENOMEM"), "{shown}");
+        assert!(shown.contains("pod memory limit"), "{shown}");
     }
 
     #[test]

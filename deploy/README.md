@@ -219,11 +219,20 @@ Two different things reset or keep flows, so do not confuse them:
 - **The 0.4 to 0.5 upgrade flushes conntrack once.** `FLOW_TABLE` and
   `FRONT_META` change layout, so the loader recreates both empty, and
   `FRONT_ENDPOINTS` with them (the two front maps always share a fate).
-  Established flows reset until the controller's first reconcile. Schedule the
-  rollout accordingly.
+  Established flows reset at the upgrade, and the front maps stay empty until
+  the controller's first reconcile, so new flows pass to the host unbalanced
+  until then. Schedule the rollout accordingly.
 - **A later 0.5 ConfigMap change plus `rollout restart` does not drop
   established flows.** Only the front maps are recreated, with their entries
   copied over; `FLOW_TABLE` is untouched (see "Changing a cap").
+
+A beep pod that crash-loops after the upgrade means a map restore failed. The
+controller posts a `MapRestoreFailed` Warning Event on the node and the pod
+(`kubectl describe node <n>`, `kubectl get events -A --field-selector
+reason=MapRestoreFailed`) naming the map, the errno and the remediation (for
+`ENOMEM`, raise the pod memory limit). The previous programs keep serving on
+the old maps meanwhile. Posting needs the Event `create` Roles in
+`deploy/rbac.yaml`; without them the same text is only in the pod log.
 
 Behaviour changes to expect:
 

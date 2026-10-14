@@ -210,7 +210,13 @@ program attaches; the parked pin is removed only after the restore. Restore
 writes use `BPF_NOEXIST`, so repeating it after a crash never overwrites a
 newer entry. Entries dropped by a cap shrink are logged and do not block the
 unpark; any other write failure (`ENOMEM`, `EINVAL`, ...) fails the start with
-the parked pin kept, and the next start retries from it. Dev/test hook:
+the parked pin kept, and the next start retries from it. A crash-looping start
+leaves the dataplane on the previous maps: the programs of the last successful
+start stay attached and keep serving from the old pins. The controller posts a
+best-effort `MapRestoreFailed` Warning Event (Node and Pod) with an
+errno-specific remediation before exiting non-zero. Only `HASH`/`LRU_HASH`
+pins are migrated (`BPF_NOEXIST` on an `ARRAY` slot never writes); any other
+resized type is recreated empty. Dev/test hook:
 `BEEP_FAULT_ABORT_BEFORE_RESTORE=1` makes the loader exit after creating the
 new maps and before restoring them, to exercise that recovery
 (`scripts/smoke-remote.sh`, "crash-safe migration").

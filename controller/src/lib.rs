@@ -9,6 +9,7 @@
 //! crate -- unlike `reconcile` alone -- only builds on Linux.
 
 pub mod apply;
+pub mod event;
 pub mod lease;
 pub mod reconcile;
 pub mod seed;

@@ -686,11 +686,23 @@ struct Recreated {
     parked: bool,
 }
 
+/// Map types whose entries a `BPF_NOEXIST` restore can fill. An ARRAY slot
+/// always exists, so `BPF_NOEXIST` reports `EEXIST` without writing and the
+/// restore would count the entry as landed while losing it.
+fn restorable_map_type(map_type: u32) -> bool {
+    [BPF_MAP_TYPE_HASH_ID, BPF_MAP_TYPE_LRU_HASH_ID].contains(&map_type)
+}
+
+const BPF_MAP_TYPE_HASH_ID: u32 = aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_HASH as u32;
+const BPF_MAP_TYPE_LRU_HASH_ID: u32 =
+    aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_LRU_HASH as u32;
+
 fn pin_fate(existing: &MapShape, wanted: &MapShape) -> Fate {
     if map_shape_mismatches(existing, wanted).is_empty() {
         Fate::Keep
     } else if (existing.map_type, existing.key_size, existing.value_size)
         == (wanted.map_type, wanted.key_size, wanted.value_size)
+        && restorable_map_type(wanted.map_type)
     {
         Fate::Migrate
     } else {
@@ -1451,6 +1463,43 @@ mod tests {
                 shape.map_flags & COMPARED_MAP_FLAGS,
                 expected,
                 "{name} map_flags"
+            );
+        }
+    }
+
+    #[test]
+    fn resized_array_pin_is_recreated_empty_not_migrated_because_noexist_never_writes_it() {
+        // BPF_NOEXIST on an ARRAY slot is always EEXIST: a Migrate fate would
+        // report every entry as landed and write none.
+        let array = |max_entries| MapShape {
+            map_type: aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_ARRAY as u32,
+            ..shape(max_entries)
+        };
+        assert_eq!(pin_fate(&array(1), &array(2)), Fate::RecreateEmpty);
+        assert_eq!(pin_fate(&shape(1), &shape(2)), Fate::Migrate);
+        let lru = |max_entries| MapShape {
+            map_type: aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_LRU_HASH as u32,
+            ..shape(max_entries)
+        };
+        assert_eq!(pin_fate(&lru(1), &lru(2)), Fate::Migrate);
+    }
+
+    #[test]
+    fn every_cap_sized_map_in_the_object_is_hash_or_lru_hash_so_its_entries_survive_a_resize() {
+        let shapes = requested_shapes(ebpf_object(), &[]).unwrap();
+        for name in [
+            "FWD_PENDING",
+            "FLOW_TABLE",
+            "FRONT_META",
+            "FRONT_ENDPOINTS",
+            "NODE_ALLOW",
+            "POD_TARGETS",
+        ] {
+            let (_, shape) = shapes.iter().find(|(n, _)| *n == name).unwrap();
+            assert!(
+                restorable_map_type(shape.map_type),
+                "{name} has map_type {}: a resize would drop its entries",
+                shape.map_type
             );
         }
     }

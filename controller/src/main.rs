@@ -24,6 +24,7 @@ use beep::{
 };
 use beep_controller::{
     apply::PinnedMaps,
+    event::{report_restore_failure, PodRef},
     lease::{
         confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, LeaseTracker,
         PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
@@ -116,6 +117,17 @@ struct Args {
     /// this node may stay in `status.loadBalancer.ingress`.
     #[arg(long, env = "NODE_NAME", required_unless_present = "node_prep")]
     node_name: Option<String>,
+
+    /// This pod's name and namespace (downward API): with both set, a failed
+    /// map restore also posts its Event on the pod.
+    #[arg(long, env = "POD_NAME")]
+    pod_name: Option<String>,
+
+    #[arg(long, env = "POD_NAMESPACE")]
+    pod_namespace: Option<String>,
+
+    #[arg(long, env = "POD_UID")]
+    pod_uid: Option<String>,
 
     /// Namespace for the per-node Leases; must be the namespace
     /// `deploy/rbac.yaml` grants Lease access in.
@@ -738,24 +750,6 @@ async fn main() -> anyhow::Result<()> {
 
     let (front_meta_max_entries, front_endpoints_max_entries) =
         front_map_max_entries(args.max_fronts, args.endpoints_per_front)?;
-    let mut ebpf = load_ebpf(
-        &args.pin_dir,
-        args.fwd_pending_max_entries,
-        args.flow_table_max_entries,
-        front_meta_max_entries,
-        front_endpoints_max_entries,
-        args.node_allow_max_entries,
-        args.pod_targets_max_entries,
-    )
-    .context("loading beep-ebpf")?;
-
-    // The privileged initContainer's `--node-prep` run already created
-    // `geneve0` and disabled its RPF exception before this container
-    // started (`docs/decisions/servicelb-rp-filter-init-container.md`).
-    // Re-running the idempotent iface check here is a no-op in that case,
-    // and a clear error instead of a silent skip if it somehow didn't run.
-    ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
-
     let kubeconfig = args
         .kubeconfig
         .as_deref()
@@ -768,6 +762,40 @@ async fn main() -> anyhow::Result<()> {
         connector,
         bearer: None,
     });
+
+    let mut ebpf =
+        match load_ebpf(
+            &args.pin_dir,
+            args.fwd_pending_max_entries,
+            args.flow_table_max_entries,
+            front_meta_max_entries,
+            front_endpoints_max_entries,
+            args.node_allow_max_entries,
+            args.pod_targets_max_entries,
+        ) {
+            Ok(ebpf) => ebpf,
+            Err(e) => {
+                let node_name = args.node_name.as_deref().expect(
+                    "clap requires --node-name unless --node-prep, which already returned above",
+                );
+                let pod = args.pod_name.clone().zip(args.pod_namespace.clone()).map(
+                    |(name, namespace)| PodRef {
+                        name,
+                        namespace,
+                        uid: args.pod_uid.clone(),
+                    },
+                );
+                report_restore_failure(&client, node_name, pod.as_ref(), &e).await;
+                return Err(e.context("loading beep-ebpf"));
+            }
+        };
+
+    // The privileged initContainer's `--node-prep` run already created
+    // `geneve0` and disabled its RPF exception before this container
+    // started (`docs/decisions/servicelb-rp-filter-init-container.md`).
+    // Re-running the idempotent iface check here is a no-op in that case,
+    // and a clear error instead of a silent skip if it somehow didn't run.
+    ensure_geneve_iface(&args.geneve_iface).context("ensuring geneve tunnel device exists")?;
 
     // Before attach: a classifier must never run with a seed other nodes
     // don't share. Failing here (apiserver down, RBAC missing) restarts the
