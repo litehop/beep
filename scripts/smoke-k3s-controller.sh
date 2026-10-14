@@ -709,7 +709,7 @@ for vm in "$VM_A" "$VM_B"; do
   FM="$(map_max_entries "$vm" FRONT_META)"
   FE="$(map_max_entries "$vm" FRONT_ENDPOINTS)"
   echo "LEG-H $vm env: $(tr '\n' ' ' <<<"$ENV_NOW") FRONT_META.max_entries=$FM FRONT_ENDPOINTS.max_entries=$FE"
-  [ "$(grep -v '_IDLE_SWEEP_SECS=' <<<"$ENV_NOW")" = "$(printf 'BEEP_ENDPOINTS_PER_FRONT=%s\nBEEP_MAX_FRONTS=%s' "$CFG_EPF" "$CFG_FRONTS")" ] || leg_fail "LEG-H: FAIL ($vm controller did not pick up the ConfigMap env)"
+  [ "$(grep -Ev '_IDLE_SWEEP_SECS=|BEEP_FLOW_TABLE_MAX_ENTRIES=' <<<"$ENV_NOW")" = "$(printf 'BEEP_ENDPOINTS_PER_FRONT=%s\nBEEP_MAX_FRONTS=%s' "$CFG_EPF" "$CFG_FRONTS")" ] || leg_fail "LEG-H: FAIL ($vm controller did not pick up the ConfigMap env)"
   [ "$FM" = "$CFG_FRONTS" ] && [ "$FE" = "$((CFG_FRONTS * CFG_EPF * 2))" ] || \
     leg_fail "LEG-H: FAIL ($vm front maps not resized: FRONT_META=$FM FRONT_ENDPOINTS=$FE, want $CFG_FRONTS/$((CFG_FRONTS * CFG_EPF * 2)))"
 done
