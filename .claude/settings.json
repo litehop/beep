@@ -67,6 +67,12 @@
         "hooks": [
           { "type": "command", "command": "bash scripts/critical-reviewer-dispatch.sh", "timeout": 30 }
         ]
+      },
+      {
+        "matcher": "critical-reviewer",
+        "hooks": [
+          { "type": "command", "command": "bash scripts/hook-reviewer-posted.sh", "timeout": 30 }
+        ]
       }
     ]
   },

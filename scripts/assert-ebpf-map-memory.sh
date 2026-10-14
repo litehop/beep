@@ -58,9 +58,9 @@ esac
 # max_entries, so it is a function of their default caps and the kernel's
 # per-element overhead, which differs between the kernel-smoke legs). Refresh by
 # summing the `bytes_memlock` column of every row except FRONT_META and
-# FRONT_ENDPOINTS in a CI memory-smoke CSV; this is the highest value seen
-# across the memory-smoke runs and a local 6.12 VM reads ~2.67 MB.
-EXPECTED_PREALLOCATED_BYTES=2828056
+# FRONT_ENDPOINTS in a CI memory-smoke CSV; this is the value from CI run
+# 38495427471 (main, 2026-10-14) and a local 6.12 VM reads ~2.67 MB.
+EXPECTED_PREALLOCATED_BYTES=2675240
 FRONT_HEADER_BYTES=1024
 FRONT_META_ENTRY_BYTES=96
 FRONT_ENDPOINTS_ENTRY_BYTES=128

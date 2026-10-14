@@ -57,10 +57,11 @@ controller derives two separate address sets per node from Node
 is the ExternalIP when configured, else the InternalIP; the underlay
 address (Geneve remote, `NODE_ALLOW`) is the InternalIP when configured,
 else the ExternalIP. (2)
-Ingress hashes to a ready backend, writes a flow-affinity entry keyed on
-the forward tuple `(CLIENT_IP, SRC_PORT, FRONT_IP, FRONT_PORT, proto)`,
-and (3) stamps Geneve metadata (remote = backend node, fixed VNI, a
-pod-identifier option), redirects to `geneve0`; inner packet untouched.
+Ingress picks a backend (see Backend selection), writes a flow-affinity
+entry keyed on the forward tuple `(CLIENT_IP, SRC_PORT, FRONT_IP,
+FRONT_PORT, proto)`, and (3) stamps Geneve metadata (remote = backend
+node, fixed VNI, a 24-byte pod-identifier option carrying pod IP and
+target port), redirects to `geneve0`; inner packet untouched.
 (4) Backend decaps, reads `FRONT_IP:FRONT_PORT` off the still-untouched
 inner dst *before* rewriting anything, writes a reverse-flow entry
 storing that front IP plus the ingress node's address, rewrites dst to
@@ -74,6 +75,52 @@ node **echoing the stored `FRONT_IP:FRONT_PORT`**, redirects to
 `geneve0`. (7) Ingress decaps, reads `CLIENT_IP:SRC_PORT` off the inner
 dst and `FRONT_IP:FRONT_PORT` off the echo, looks up its step-2 entry,
 rewrites `src` to the recovered front IP, routes.
+
+## Backend selection
+
+The controller writes each front's endpoints as dense slots `0..count-1`
+in `FRONT_ENDPOINTS` plus one `FRONT_META` row (`generation`, `count`,
+`local_count`); committing the `FRONT_META` replace swaps generations
+atomically. Ingress, per packet, in this order:
+
+1. **No `FRONT_META` row**: not a front; pass to the host.
+2. **Existing pin** (`FLOW_TABLE` forward entry, else `FWD_PENDING`): the
+   pinned backend and its target port win over everything below, including
+   count 0. Re-slotting after an endpoint change therefore never moves a
+   live flow.
+3. **Count 0**: silent drop (no RST/ICMP; nothing for a scanner to learn),
+   counted in `FRONT_MISSES`. Applies to every owned front with no usable
+   endpoint, including `externalTrafficPolicy: Local` on a node without a
+   local pod, matching kube-proxy.
+4. **Hash**: `slot = flow_hash(seed, client_ip, client_port, front) × N >>
+   32`, where N is `local_count` if non-zero (local pods occupy slots
+   `0..local_count`), else `count`. Deterministic, unweighted.
+
+What the controller emits, from `spec.externalTrafficPolicy` and
+`spec.trafficDistribution` (never EndpointSlice hints):
+
+| Service | Slots (per front family) | `local_count` | Published node addresses (`status.loadBalancer.ingress`) |
+|---|---|---|---|
+| default (eTP=Cluster) | all ready, non-terminating, sorted by pod IP | 0: uniform | every node with a ready beep |
+| `trafficDistribution: PreferSameNode` (`PreferClose`/`PreferSameZone` map to it: no zone model) | same, local pods first | local pod count: local preferred while any exist, else uniform | every node with a ready beep |
+| eTP=Local (wins over `trafficDistribution`) | local ready pods only; if none, local serving-terminating pods; else none | = `count` | only nodes with a usable local pod |
+
+Uniform slot order depends on pod IP alone, so one flow hashes to the
+same pod from any ingress node. Terminating pods get no new flows;
+pinned flows drain. Switching eTP between Cluster and Local does not
+evict pinned flows. `healthCheckNodePort` is not served by beep.
+
+## Decap trust model
+
+Decap admits a packet if its outer source is in `NODE_ALLOW` and the
+option's pod IP is in the node's local `POD_TARGETS`; it takes
+`target_port` from the option with no per-front bound, so any
+`NODE_ALLOW` peer can name any port on a local pod. Accepted
+(operator decision 2026-10-13): the underlay is not assumed trusted but
+is assumed to prevent IP spoofing (cloud VPC/VPS network, or a LAN behind
+a router), so `NODE_ALLOW` source-IP admission is the trust boundary.
+Reopen, adding a per-pod published-target-port check at decap, if
+spoofing becomes an observable risk.
 
 ## Conntrack & affinity
 
@@ -130,14 +177,15 @@ forward-write and return-read).
 | eBPF programs, all tc-bpf (4 points) | ~0 MiB (kernel-resident) | JIT'd, 5–50 KiB each. |
 | `FRONT_META` (front tuple -> live generation, count, flags) | ~17 KiB bucket floor + ~96 B/front used | `BPF_F_NO_PREALLOC`, so only used entries cost memory. `max_entries` = `--max-fronts` (1024 by default): nodes × Service ports. |
 | `FRONT_ENDPOINTS` ((front, generation, slot) -> backend node, pod, target port) | ~129 KiB bucket floor + ~128 B/row used | `BPF_F_NO_PREALLOC`. `max_entries` = `--max-fronts` × `--endpoints-per-front` (4) × 2 = 8192 by default; the 2 is swap headroom (a front's next generation is written next to the live one; the previous one is deleted ~2 s after the commit). Full map on every node. |
-| `FRONT_MISSES` | <1 KiB | Per-CPU counter of lookups where `FRONT_META` hit but no endpoint could be chosen (count 0 or an unreadable row: ingress silently drops; decap drops). |
-| Flow-affinity maps, shared (two-tier, TCP/UDP + QUIC) | ~1–2 MiB | Ceilings/sizing: `servicelb-flow-admission-affinity.md`. |
-| `vni_to_pod` (backend, local) | <5 KiB | <20 entries. |
-| **Total** | **~8–9 MiB** | Independent of vCPU count except `FRONT_MISSES`, which is per-CPU (<1 KiB per CPU); all other maps are shared. |
+| `FRONT_MISSES` | <1 KiB | Per-CPU counter of ingress lookups where `FRONT_META` hit but no endpoint could be chosen (count 0 with no pin, or an unreadable row): silently dropped. |
+| Other maps, shared (`FLOW_TABLE` ~2.25 MiB, `FWD_PENDING`, `POD_TARGETS`, `NODE_ALLOW`, `UPLINK_CONFIG`, `CONFIG`) | ~2.55 MiB | Preallocated at full `max_entries`; ceilings/sizing: `servicelb-flow-admission-affinity.md`. Figure is `EXPECTED_PREALLOCATED_BYTES` in `scripts/assert-ebpf-map-memory.sh` (highest across `memory-smoke` runs). |
+| **Total** | **~9.6 MiB** | ~6.9 MiB control-plane RSS (above) + ~2.7 MiB kernel map memory (`bytes_memlock` 2827720 B) at defaults. The 6 MiB gross ceiling in `scripts/assert-ebpf-map-memory.sh` bounds the kernel-map part only, not this total; that script also asserts per map and in total (1.15× tripwire on expected usage). Independent of vCPU count except `FRONT_MISSES` (per-CPU, <1 KiB per CPU). |
 
-All maps pre-allocate their full ceiling — loxilb's "cannot start on 1GB
-node" failure mode (gate 2) — sized for u7s's envelope (<10 nodes/<100
-Services/<1000 endpoints).
+Every map except the two front maps preallocates its full ceiling —
+loxilb's "cannot start on 1GB node" failure mode (gate 2) — sized for
+u7s's envelope (<10 nodes/<100 Services/<1000 endpoints). The front maps
+cost their bucket floor plus used rows only; the defaults (1024 fronts × 4
+endpoints) are far above the envelope.
 
 ## Userspace control plane
 

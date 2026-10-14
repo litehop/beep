@@ -821,6 +821,26 @@ assert "a VM after an unreadable-df VM is still reported -- one bad VM must not 
 assert "unreadable df step exits 0 (the anomaly is counted, not a crash)" \
   "$([ "$G_RC" -eq 0 ] && echo 1 || echo 0)"
 
+# Real `limactl shell` reads stdin; a stub that does too proves STEP F's VM
+# iteration cannot be truncated after the first VM.
+STUB_LIMACTL_STDIN="$SANDBOX_ROOT/stub-limactl-stdin"
+mkdir -p "$STUB_LIMACTL_STDIN"
+cat > "$STUB_LIMACTL_STDIN/limactl" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  list) printf 'beep-client Running\nbeep-node-a Running\nbeep-node-b Running\nbeep-smoke Running\n' ;;
+  shell)
+    cat >/dev/null
+    case "$*" in
+      *df*) printf 'Use%%\n 30%%\n' ;;
+    esac ;;
+esac
+EOF
+chmod +x "$STUB_LIMACTL_STDIN/limactl"
+H_OUT=$(PATH="$STUB_LIMACTL_STDIN:$PATH" bash "$SCRIPT" __call step_f_vm_disk 2>&1)
+assert "every running beep-* VM is reported even when limactl shell drains stdin -- fails if STEP F stops after the first VM" \
+  "$([ "$(printf '%s\n' "$H_OUT" | grep -c 'vm-disk: beep-.* / at 30%')" -eq 4 ] && echo 1 || echo 0)"
+
 # STEP F is report-only: the only limactl verbs allowed are list and read-only df/du/ls inside shell.
 : > "$LIMACTL_LOG"
 LIMACTL_LOG="$LIMACTL_LOG" PATH="$STUB_LIMACTL_EMPTYDF:$PATH" bash "$SCRIPT" __call step_f_vm_disk >/dev/null 2>&1 || true

@@ -24,9 +24,7 @@ backend (RFC 9000 section 7.2), so beep cannot mint them. Analysis:
 Migrating clients lose affinity (stateless reset, reconnect) until the
 server_id route exists. Building it later obliges beep to own server_id
 assignment and distribution (Envoy publishes none), plus backend injection
-and, for encrypted CIDs, a lockstep-rotated secret. The unused
-`QuicDcidKey` helpers in `beep-common` assume an LB-minted DCID and should
-be removed.
+and, for encrypted CIDs, a lockstep-rotated secret.
 
 ## Alternatives
 
