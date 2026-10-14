@@ -280,9 +280,9 @@ Then post it yourself, per deliverable type:
   or `needs-discussion`. For supersede, append notes to whichever bead the
   checklist's investigation implicates (original, superseding, or both).
 
-Final message: per "Done when" (review URL first for a PR), then how many
-findings were anchored inline vs. left in the body / bead ID updated /
-follow-on bead ID if any — not the findings block itself.
+After the "Done when" lead, report how many findings were anchored inline vs.
+left in the body / bead ID updated / follow-on bead ID if any — not the
+findings block itself.
 
 ## Constraints
 
