@@ -127,7 +127,8 @@ map_entry_count() { # map_entry_count <vm> <map-name> -- entries in a pinned map
 dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 
 cleanup() {
-  kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
+  kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || \
+    echo "WARN: namespace $NAMESPACE was not deleted within 120s; it may still be terminating and can leak into the next run" >&2
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   kube -n beep-leases delete lease -l app.kubernetes.io/component=node-lease --ignore-not-found >/dev/null 2>&1 || true
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
@@ -539,12 +540,21 @@ echo "LEG-C eTP=Local: PASS (ingress=$ING; $IP_B served by both local pods; $IP_
 VICTIM="$(awk -v n="$NODE_B_K8S" '$2==n{print $1; exit}' <<<"$CMAP")"
 N_LONG=24
 LONG_OUT="$(mktemp)"
-limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $N_LONG); do ( out=\$(curl -sS -m 50 'http://$IP_A:$P_CLUSTER/' 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -n 's/^Hostname: //p;s/^RemoteAddr: //p'); echo \$out ) & done; wait" >"$LONG_OUT" &
+limactl shell "$VM_CLIENT" -- bash -c "for i in \$(seq 1 $N_LONG); do ( out=\$(curl -sS -m 50 'http://$IP_A:$P_CLUSTER/' 'http://$IP_A:$P_CLUSTER/?wait=30s' 2>/dev/null | sed -n 's/^Hostname: /H=/p;s/^RemoteAddr: /R=/p'); echo \$out ) & done; wait" >"$LONG_OUT" &
 LONG_PID=$!
 sleep 8
 kube -n "$NAMESPACE" delete pod "$VICTIM" --grace-period=0 --force >/dev/null 2>&1 || leg_fail "LEG-D: FAIL (could not delete $VICTIM)"
 wait "$LONG_PID" || true
-FLOWS="$(awk '{print ($1 ? $1 : "FAIL"), ($3 && $4 == $2 ? $3 : "FAIL")}' "$LONG_OUT")"
+# Fields are keyed (H=pod, R=client addr) and attributed to a request by the RemoteAddr count, so
+# a request with no Hostname line yields FAIL instead of shifting RemoteAddr into the pod column.
+FLOWS="$(awk '{
+  nr = 0; h[1] = h[2] = r[1] = r[2] = ""
+  for (i = 1; i <= NF; i++) {
+    if ($i ~ /^H=/ && nr < 2) h[nr + 1] = substr($i, 3)
+    else if ($i ~ /^R=/ && nr < 2) r[++nr] = substr($i, 3)
+  }
+  print (h[1] != "" && r[1] != "" ? h[1] : "FAIL"), (h[2] != "" && r[1] != "" && r[2] == r[1] ? h[2] : "FAIL")
+}' "$LONG_OUT")"
 rm -f "$LONG_OUT"
 echo "LEG-D flows per pod before delete:"
 awk '{print $1}' <<<"$FLOWS" | sort | uniq -c
@@ -611,7 +621,7 @@ echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
 # probed throughout; the failure window is reported, and every front must answer again afterwards.
 # Runs before (g), which leaves the DaemonSet on OnDelete (no rollout restart).
 CFG_FRONTS=1000
-CFG_EPF=4
+CFG_EPF=3
 PROBE_STOP=/tmp/beep-cfg-probe-stop
 PROBE_OUT="$(mktemp)"
 FLOW_OUT="$(mktemp)"
@@ -619,7 +629,7 @@ map_max_entries() { # map_max_entries <vm> <map> -- the pinned map's max_entries
   limactl shell "$1" -- sudo bpftool map show pinned "$PIN_DIR/$2" --json | jq -r .max_entries
 }
 pod_beep_env() { # pod_beep_env <vm> -- the controller process's BEEP_* env, one per line
-  limactl shell "$1" -- sudo bash -c 'tr "\0" "\n" < /proc/$(pgrep -f beep-controller | head -1)/environ | grep ^BEEP_ | sort'
+  limactl shell "$1" -- sudo bash -c 'tr "\0" "\n" < /proc/$(pgrep -x beep-controller | head -1)/environ | grep ^BEEP_ | sort'
 }
 echo "==> [13] ConfigMap sizing change (BEEP_MAX_FRONTS=$CFG_FRONTS) + DaemonSet restart: maps resized, established flow survives"
 limactl shell "$VM_CLIENT" -- rm -f "$PROBE_STOP"
@@ -669,7 +679,8 @@ echo "LEG-H configmap-restart: PASS (pods read the ConfigMap, maps resized, esta
 # OnDelete keeps node-a's controller (the pruner) running; a nodeSelector to node-a alone makes the
 # DaemonSet controller remove node-b's pod and not recreate it.
 # Budget: pod termination grace (up to 30s) + lease duration 40s + prune
-# interval <=15s, plus slack.
+# interval <=15s x 2 passes (an IP is pruned only after two consecutive unmatched passes) = ~100s,
+# plus slack.
 LEASE_PRUNE_BUDGET=120
 LEASE_RETURN_BUDGET=120
 BOTH_IPS="$(printf '%s\n%s' "$IP_A" "$IP_B" | sort | tr '\n' ' ' | sed 's/ $//')"
