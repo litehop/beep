@@ -622,6 +622,42 @@ for ip in "$IP_A" "$IP_B"; do
 done
 echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
 
+# (i) colliding source ports across two fronts sharing one pod: the same client port is used for a
+# connection via node-a and then via node-b, each closed before the next. The second collides on the
+# backend's reverse key with whatever the first left behind, so every closed-but-unreclaimed row used
+# up one of the 16 remap slots until new colliding connections were dropped. `nc -p` pins the source
+# port (curl --local-port cannot rebind a port a previous connection used); the server closes first
+# (HTTP/1.0), so the client side holds no TIME_WAIT and the port can be reused at once.
+N_COLLIDE=24
+COLLIDE_BASE=41000
+flow_rows_b() { # flow_rows_b <tag> -- FLOW_TABLE rows of one role tag (00 fwd, 01 reverse, 02 memo) on the backend node
+  limactl shell "$VM_B" -- sudo bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" --json 2>/dev/null | jq --arg t "0x$1" '[.[] | select(.key[37] == $t)] | length'
+}
+echo "==> [12i] colliding source ports: $N_COLLIDE closed pairs through $IP_A and $IP_B (one pod), then more"
+ROWS_BEFORE="$(flow_rows_b 01)"
+COLLIDE_OUT="$(limactl shell "$VM_CLIENT" -- bash -c "
+ok=0; fail=0; first_fail=''
+for i in \$(seq 0 $((N_COLLIDE - 1))); do
+  p=\$(($COLLIDE_BASE + i))
+  for ip in $IP_A $IP_B; do
+    if printf 'GET / HTTP/1.0\r\nHost: beep\r\n\r\n' | timeout 6 nc -p \$p \$ip $FRONT_PORT 2>/dev/null | grep -q '^Hostname: '; then
+      ok=\$((ok + 1))
+    else
+      fail=\$((fail + 1)); [ -n \"\$first_fail\" ] || first_fail=\"pair \$i port \$p via \$ip\"
+    fi
+    sleep 0.3
+  done
+done
+echo \"ok=\$ok fail=\$fail first_fail=\$first_fail\"
+")"
+echo "LEG-I $COLLIDE_OUT; backend reverse rows before=$ROWS_BEFORE after=$(flow_rows_b 01) memo rows=$(flow_rows_b 02)"
+case "$COLLIDE_OUT" in
+  "ok=$((N_COLLIDE * 2)) fail=0 "*) ;;
+  *) leg_fail "LEG-I: FAIL (colliding-port connections were refused: $COLLIDE_OUT)" ;;
+esac
+[ "$(flow_rows_b 02)" = 0 ] || leg_fail "LEG-I: FAIL (port-remap memo rows survived $N_COLLIDE closed pairs: $(flow_rows_b 02))"
+echo "LEG-I colliding-source-ports: PASS ($((N_COLLIDE * 2)) connections over $N_COLLIDE colliding pairs all answered; no memo rows left)"
+
 # (h) ConfigMap sizing change: editing beep-config and restarting the DaemonSet resizes the front
 # maps on both nodes (the pods read the new value; bpftool shows the new max_entries) while an
 # established flow keeps running (FLOW_TABLE is a separate, unchanged map). Fresh connections are
@@ -664,7 +700,7 @@ for vm in "$VM_A" "$VM_B"; do
   FM="$(map_max_entries "$vm" FRONT_META)"
   FE="$(map_max_entries "$vm" FRONT_ENDPOINTS)"
   echo "LEG-H $vm env: $(tr '\n' ' ' <<<"$ENV_NOW") FRONT_META.max_entries=$FM FRONT_ENDPOINTS.max_entries=$FE"
-  [ "$ENV_NOW" = "$(printf 'BEEP_ENDPOINTS_PER_FRONT=%s\nBEEP_MAX_FRONTS=%s' "$CFG_EPF" "$CFG_FRONTS")" ] || leg_fail "LEG-H: FAIL ($vm controller did not pick up the ConfigMap env)"
+  [ "$(grep -v '_IDLE_SWEEP_SECS=' <<<"$ENV_NOW")" = "$(printf 'BEEP_ENDPOINTS_PER_FRONT=%s\nBEEP_MAX_FRONTS=%s' "$CFG_EPF" "$CFG_FRONTS")" ] || leg_fail "LEG-H: FAIL ($vm controller did not pick up the ConfigMap env)"
   [ "$FM" = "$CFG_FRONTS" ] && [ "$FE" = "$((CFG_FRONTS * CFG_EPF * 2))" ] || \
     leg_fail "LEG-H: FAIL ($vm front maps not resized: FRONT_META=$FM FRONT_ENDPOINTS=$FE, want $CFG_FRONTS/$((CFG_FRONTS * CFG_EPF * 2)))"
 done

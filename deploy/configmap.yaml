@@ -13,3 +13,9 @@ data:
   BEEP_MAX_FRONTS: "1024"
   # Endpoints each front is sized for.
   BEEP_ENDPOINTS_PER_FRONT: "4"
+  # Idle-flow sweep intervals, in seconds: a flow row no packet matched for
+  # 1-2 intervals is deleted. UDP never sooner than the kernel's 120 s stream
+  # timeout; the TCP value only backstops flows that vanish without a close
+  # (closed connections are reclaimed immediately).
+  BEEP_UDP_IDLE_SWEEP_SECS: "120"
+  BEEP_TCP_IDLE_SWEEP_SECS: "43200"

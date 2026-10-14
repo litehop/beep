@@ -50,7 +50,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FRONT_META` holds `max-fronts` rows and `FRONT_ENDPOINTS`
   `max-fronts x endpoints-per-front x 2` (the 2 is swap headroom).
 
+### Fixed
+
+- New connections were refused (dropped at the backend node) once 16 closed
+  connections had left stale remap state behind: two Services sharing a pod
+  and a client reusing one source port across both remap the second flow's
+  backend-facing source port, and the reverse/memo rows of finished flows were
+  only ever freed by LRU eviction. The backend node now deletes a TCP flow's
+  rows on RST, or on the first non-FIN packet after a FIN in both directions
+  (a half-closed connection keeps its rows), and an idle sweep reclaims the
+  rest.
+
 ### Added
+
+- Idle `FLOW_TABLE` GC, swept by the controller: flow rows carry a parity bit
+  that the dataplane copies from a global parity (`CONFIG`) when a packet
+  matches; every sweep interval the controller deletes the rows whose bit
+  differs (with their port-remap memos), then flips the parity. Idle UDP flows
+  go after 1-2 `--udp-idle-sweep-secs` (env `BEEP_UDP_IDLE_SWEEP_SECS`, default
+  120); TCP flows that vanish without a close go after 1-2
+  `--tcp-idle-sweep-secs` (env `BEEP_TCP_IDLE_SWEEP_SECS`, default 43200 = 12 h).
+  Both are in the `beep-config` ConfigMap; see `deploy/README.md`
+  ("Configuration").
 
 - Front-map write failures are reported by cause: `E2BIG` (capacity), `ENOMEM`
   (kernel out of memory allocating a map element, transient) and other, each

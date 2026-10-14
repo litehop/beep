@@ -388,7 +388,13 @@ pub fn front_endpoint_key(front: LbFrontKey, meta: FrontMeta) -> Option<FrontEnd
 #[derive(Clone, Copy)]
 pub struct Config {
     pub geneve_ifindex: u32,
-    pub _pad: u32,
+    /// Current idle-GC parity of UDP `FLOW_TABLE` rows (`GcParity`); written
+    /// only by the controller's sweep, which flips it after deleting every row
+    /// whose `FLOW_FLAG_UDP_PARITY` bit differs.
+    pub udp_parity: u8,
+    /// Same as `udp_parity`, for the TCP backstop sweep.
+    pub tcp_parity: u8,
+    pub _pad: [u8; 2],
     /// Cluster-wide secret keying `flow_hash`; every node must hold the same
     /// value or backend selection disagrees across ingress nodes. Never log.
     pub flow_hash_seed: u64,
@@ -427,7 +433,9 @@ pub struct ForwardFlowValue {
     /// Wire-order port the backend node DNATs to, pinned with the pod so a
     /// flow keeps its target port when its front is re-pointed or drained.
     pub target_port: u16,
-    pub _pad: u16,
+    /// `FLOW_FLAG_*` bits. Sits at the same offset as `RevFlowValue::flags`
+    /// so `FlowValue::flags` reads either role.
+    pub flags: u16,
 }
 
 /// Union of the three roles `FLOW_TABLE` stores, discriminated by the
@@ -460,9 +468,19 @@ impl FlowValue {
                 },
                 ingress_ifindex: 0,
                 target_port: 0,
-                _pad: 0,
+                flags: 0,
             },
         }
+    }
+
+    /// The `FLOW_FLAG_*` word of a `Forward` or `Reverse` row (not a
+    /// `PortMemo` row, which has none). Both arms keep it at offset 38; the
+    /// asserts below pin that.
+    pub fn flags(&self) -> u16 {
+        // SAFETY: every arm is padding-free plain data, so any bytes are a
+        // valid `u16`; the layout asserts below make the `forward` arm's
+        // `flags` the same bytes as the `reverse` arm's.
+        unsafe { self.forward.flags }
     }
 
     pub const fn from_forward(forward: ForwardFlowValue) -> Self {
@@ -488,6 +506,10 @@ impl FlowValue {
 // zeroed only if that arm spans it, so uninitialised stack never reaches
 // FLOW_TABLE through a smaller arm.
 const _: () = assert!(size_of::<ForwardFlowValue>() == size_of::<FlowValue>());
+const _: () = assert!(size_of::<FlowValue>() == 40);
+const _: () = assert!(
+    core::mem::offset_of!(ForwardFlowValue, flags) == core::mem::offset_of!(RevFlowValue, flags)
+);
 
 /// Backend-side reverse-flow: captured at decap+DNAT time (step 4, BEFORE
 /// the dst rewrite) so the egress classifier (step 6) can recover the
@@ -517,6 +539,9 @@ pub struct RevFlowValue {
     pub front_ip: [u8; 16],
     pub front_port: u16,
     pub original_client_port: u16,
+    pub _pad: u16,
+    /// `FLOW_FLAG_*` bits.
+    pub flags: u16,
 }
 
 /// Backend-side persisted port-remap decision, keyed under
@@ -608,11 +633,13 @@ impl_pod!(ForwardFlowValue {
     backend: LbFrontBackend,
     ingress_ifindex: u32,
     target_port: u16,
-    _pad: u16
+    flags: u16
 });
 impl_pod!(Config {
     geneve_ifindex: u32,
-    _pad: u32,
+    udp_parity: u8,
+    tcp_parity: u8,
+    _pad: [u8; 2],
     flow_hash_seed: u64
 });
 impl_pod!(UplinkConfig { l2_hlen: u32 });
@@ -620,7 +647,9 @@ impl_pod!(RevFlowValue {
     ingress_node_ip: [u8; 16],
     front_ip: [u8; 16],
     front_port: u16,
-    original_client_port: u16
+    original_client_port: u16,
+    _pad: u16,
+    flags: u16
 });
 impl_pod!(PortMemoValue {
     backend_src_port: u16
@@ -644,6 +673,18 @@ impl FlowValue {
         // `impl_pod!`), so any bytes are a valid value of any arm; a wrong
         // arm yields wrong data, not UB.
         unsafe { self.forward }
+    }
+
+    /// As `as_forward`, for a `Reverse`-tagged row.
+    pub fn as_reverse(&self) -> RevFlowValue {
+        // SAFETY: as `as_forward`.
+        unsafe { self.reverse }
+    }
+
+    /// As `as_forward`, for a `PortMemo`-tagged row.
+    pub fn as_port_memo(&self) -> PortMemoValue {
+        // SAFETY: as `as_forward`.
+        unsafe { self.port_memo }
     }
 }
 
@@ -1229,6 +1270,132 @@ pub fn backend_port_resolution(memoized_port: Option<u16>) -> BackendPortResolut
     }
 }
 
+pub const IPPROTO_TCP: u8 = 6;
+pub const IPPROTO_UDP: u8 = 17;
+pub const TCP_FLAG_FIN: u8 = 0x01;
+pub const TCP_FLAG_SYN: u8 = 0x02;
+pub const TCP_FLAG_RST: u8 = 0x04;
+
+/// `FlowValue::flags` bits (`Forward` and `Reverse` rows).
+///
+/// A FIN was seen from the client side (backend node: client->pod leg).
+pub const FLOW_FLAG_FIN_CLIENT: u16 = 1 << 0;
+/// A FIN was seen from the pod side (backend node: pod->client leg).
+pub const FLOW_FLAG_FIN_POD: u16 = 1 << 1;
+/// Idle-GC parity of a UDP row; compared against `Config::udp_parity`.
+pub const FLOW_FLAG_UDP_PARITY: u16 = 1 << 2;
+/// Idle-GC parity of a TCP row; compared against `Config::tcp_parity`.
+pub const FLOW_FLAG_TCP_PARITY: u16 = 1 << 3;
+
+/// Which end of the connection sent the packet a backend node is processing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowSide {
+    Client,
+    Pod,
+}
+
+/// The two global idle-GC parities (`Config::udp_parity`/`tcp_parity`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct GcParity {
+    pub udp: bool,
+    pub tcp: bool,
+}
+
+/// The parity bit a row of `proto` carries, and the global parity it is
+/// compared against. `None` for protocols the dataplane never stores.
+fn parity_bit(proto: u8, parity: GcParity) -> Option<(u16, bool)> {
+    match proto {
+        IPPROTO_UDP => Some((FLOW_FLAG_UDP_PARITY, parity.udp)),
+        IPPROTO_TCP => Some((FLOW_FLAG_TCP_PARITY, parity.tcp)),
+        _ => None,
+    }
+}
+
+/// Whether the controller's idle sweep deletes a row: its parity bit differs
+/// from the global parity, i.e. no packet matched it since the parity before
+/// the last flip. Rows of any other protocol are never swept.
+pub fn parity_sweep_deletes(flags: u16, proto: u8, parity: GcParity) -> bool {
+    match parity_bit(proto, parity) {
+        Some((bit, global)) => (flags & bit != 0) != global,
+        None => false,
+    }
+}
+
+/// What the datapath does with the `FLOW_TABLE` row a packet just matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowStep {
+    /// Leave the row as is (no write).
+    Keep,
+    /// Rewrite the row's flags to this value.
+    Write(u16),
+    /// The connection is over: delete the row (and its port memo) and, for a
+    /// packet with no row yet, do not create one.
+    Reclaim,
+}
+
+/// Per-matched-packet decision on a flow row's flags, shared by the
+/// forward-decap (`FlowSide::Client`) and uplink-egress (`FlowSide::Pod`)
+/// hooks of the backend node and, with `tcp_flags == 0`, the ingress node's
+/// parity-only touch.
+///
+/// TCP rows are reclaimed on RST in either direction, or on the first
+/// non-FIN packet after a FIN has been seen in BOTH directions -- the final
+/// ACK, which the row must still carry (deleting at the second FIN would let
+/// that ACK recreate the row, and a return-leg miss would send the pod's
+/// retransmitted FIN out un-encapsulated). The first FIN alone never
+/// reclaims: the other side may keep sending (half-close). A SYN starts a
+/// fresh connection on the same 4-tuple and clears the FIN bits.
+///
+/// Otherwise the row's parity bit is copied from the global parity, written
+/// only when it differs: at most one write per row per sweep interval.
+/// `existing`: the row's flags, `None` when the packet has no row.
+pub fn flow_step(
+    existing: Option<u16>,
+    proto: u8,
+    tcp_flags: u8,
+    side: FlowSide,
+    parity: GcParity,
+) -> FlowStep {
+    let mut flags = existing.unwrap_or(0);
+    if proto == IPPROTO_TCP {
+        if tcp_flags & TCP_FLAG_RST != 0 {
+            return FlowStep::Reclaim;
+        }
+        if tcp_flags & TCP_FLAG_SYN != 0 {
+            flags &= !(FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD);
+        }
+        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        if flags & both == both && tcp_flags & TCP_FLAG_FIN == 0 {
+            return FlowStep::Reclaim;
+        }
+        if tcp_flags & TCP_FLAG_FIN != 0 {
+            flags |= match side {
+                FlowSide::Client => FLOW_FLAG_FIN_CLIENT,
+                FlowSide::Pod => FLOW_FLAG_FIN_POD,
+            };
+        }
+    }
+    if let Some((bit, global)) = parity_bit(proto, parity) {
+        flags = if global { flags | bit } else { flags & !bit };
+    }
+    if existing == Some(flags) {
+        FlowStep::Keep
+    } else {
+        FlowStep::Write(flags)
+    }
+}
+
+/// Whether a `PortMemo` row is still wanted by the sweep: some surviving
+/// `Reverse` row sits under the memoized backend port and records this memo's
+/// client port as its `original_client_port`. Memos carry no parity bit of
+/// their own -- a flow whose only live direction is pod->client never touches
+/// its memo -- so they live and die with their reverse row.
+/// `reverse_original_port`: that reverse row's `original_client_port`, if the
+/// row survives.
+pub fn port_memo_wanted(memo_client_port: u16, reverse_original_port: Option<u16>) -> bool {
+    reverse_original_port == Some(memo_client_port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,7 +1448,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<Config>(), 16);
         assert_eq!(core::mem::align_of::<Config>(), 8);
         assert_eq!(core::mem::offset_of!(Config, geneve_ifindex), 0);
-        assert_eq!(core::mem::offset_of!(Config, _pad), 4);
+        assert_eq!(core::mem::offset_of!(Config, udp_parity), 4);
+        assert_eq!(core::mem::offset_of!(Config, tcp_parity), 5);
         assert_eq!(core::mem::offset_of!(Config, flow_hash_seed), 8);
     }
 
@@ -1411,7 +1579,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<ForwardFlowValue>(), 40);
         assert_eq!(core::mem::offset_of!(ForwardFlowValue, ingress_ifindex), 32);
         assert_eq!(core::mem::offset_of!(ForwardFlowValue, target_port), 36);
-        assert_eq!(core::mem::offset_of!(ForwardFlowValue, _pad), 38);
+        assert_eq!(core::mem::offset_of!(ForwardFlowValue, flags), 38);
     }
 
     #[test]
@@ -1422,7 +1590,7 @@ mod tests {
         // would silently change FLOW_TABLE's reverse-tagged value layout,
         // desyncing the kernel-side write from a userspace reader of the
         // identical slot via aya::Pod.
-        assert_eq!(core::mem::size_of::<RevFlowValue>(), 36);
+        assert_eq!(core::mem::size_of::<RevFlowValue>(), 40);
     }
 
     #[test]
@@ -1482,13 +1650,15 @@ mod tests {
             },
             ingress_ifindex: 9,
             target_port: wire_port(8080),
-            _pad: 0,
+            flags: 0,
         };
         let rev = RevFlowValue {
             ingress_node_ip: [1; 16],
             front_ip: [2; 16],
             front_port: 80,
             original_client_port: 1234,
+            _pad: 0,
+            flags: 0,
         };
         // SAFETY: each value is read back through the arm its constructor wrote.
         assert_eq!(unsafe { FlowValue::from_forward(fwd).forward }, fwd);
@@ -1723,6 +1893,8 @@ mod tests {
             front_ip: ipv4_mapped_v6(front_wire),
             front_port: wire_port(80),
             original_client_port: wire_port(443),
+            _pad: 0,
+            flags: 0,
         };
         assert_eq!(
             unmap_ipv4(&value.ingress_node_ip),
@@ -2337,7 +2509,7 @@ mod tests {
             },
             ingress_ifindex: 7,
             target_port: wire_port(8080),
-            _pad: 0,
+            flags: 0,
         };
         assert_eq!(
             fwd_pending_affinity_pin(None, candidate),
@@ -2359,7 +2531,7 @@ mod tests {
             },
             ingress_ifindex: 7,
             target_port: wire_port(8080),
-            _pad: 0,
+            flags: 0,
         };
         let candidate = ForwardFlowValue {
             backend: LbFrontBackend {
@@ -2368,7 +2540,7 @@ mod tests {
             },
             ingress_ifindex: 9,
             target_port: wire_port(9090),
-            _pad: 0,
+            flags: 0,
         };
         assert_eq!(
             fwd_pending_affinity_pin(Some(pinned), candidate),
@@ -2897,7 +3069,7 @@ mod tests {
             backend: backend_n(n),
             ingress_ifindex: 2,
             target_port: port_n(n),
-            _pad: 0,
+            flags: 0,
         }
     }
 
@@ -2963,7 +3135,7 @@ mod tests {
                     backend,
                     ingress_ifindex: 2,
                     target_port,
-                    _pad: 0,
+                    flags: 0,
                 };
                 for after in [&[1u8, 2, 3, 4, 5][..], &[4, 3, 2, 1], &[9], &[7, 8]] {
                     let steered = ingress_steer(
@@ -3243,5 +3415,285 @@ mod tests {
         m.flags = ENDPOINT_FLAG_IS_LOCAL;
         let steered = ingress_steer(m, None, None, 0, front, table_local(&[1, 2], 0));
         assert_eq!(steered, forward_n(1));
+    }
+
+    const ACK: u8 = 0x10;
+    const SYN_ACK: u8 = TCP_FLAG_SYN | ACK;
+    const FIN_ACK: u8 = TCP_FLAG_FIN | ACK;
+    const P0: GcParity = GcParity {
+        udp: false,
+        tcp: false,
+    };
+
+    fn step_tcp(existing: Option<u16>, tcp_flags: u8, side: FlowSide) -> FlowStep {
+        flow_step(existing, IPPROTO_TCP, tcp_flags, side, P0)
+    }
+
+    // A model of one client's reverse rows on a backend node, driven by the
+    // same pure functions the datapath calls, to prove the remap window
+    // survives many closed connections (the production failure was every new
+    // colliding connection dropped once 16 stale rows pinned the window).
+    // (front, original client port, flags)
+    type ModelRow = (([u8; 16], u16), u16, u16);
+
+    #[derive(Default)]
+    struct BackendModel {
+        // backend src port -> ((front, original port), flags)
+        rev: std::collections::HashMap<u16, ModelRow>,
+        // natural client port -> remapped backend port
+        memo: std::collections::HashMap<u16, u16>,
+        reclaim: bool,
+    }
+
+    impl BackendModel {
+        fn forward(
+            &mut self,
+            front: ([u8; 16], u16),
+            port: u16,
+            tcp_flags: u8,
+        ) -> Option<BackendPortDecision> {
+            let backend_port = match self.memo.get(&port) {
+                Some(p) => *p,
+                None => {
+                    let natural = self.rev.get(&port).map(|r| (r.0, r.1));
+                    let rev = &self.rev;
+                    let decision = resolve_backend_src_port(natural, front, port, |c| {
+                        occupant_conflicts(rev.get(&c).map(|r| (r.0, r.1)), front, port)
+                    });
+                    match decision {
+                        BackendPortDecision::NoRemap => port,
+                        BackendPortDecision::Remap(p) => {
+                            self.memo.insert(port, p);
+                            p
+                        }
+                        BackendPortDecision::Exhausted => return Some(decision),
+                    }
+                }
+            };
+            self.touch(front, port, backend_port, tcp_flags, FlowSide::Client, true);
+            None
+        }
+
+        fn pod(&mut self, front: ([u8; 16], u16), port: u16, tcp_flags: u8) {
+            let backend_port = self.memo.get(&port).copied().unwrap_or(port);
+            self.touch(front, port, backend_port, tcp_flags, FlowSide::Pod, false);
+        }
+
+        fn touch(
+            &mut self,
+            front: ([u8; 16], u16),
+            port: u16,
+            backend_port: u16,
+            tcp_flags: u8,
+            side: FlowSide,
+            creates: bool,
+        ) {
+            let mine = self
+                .rev
+                .get(&backend_port)
+                .filter(|r| r.0 == front && r.1 == port)
+                .map(|r| r.2);
+            if !creates && mine.is_none() {
+                return;
+            }
+            let step = if self.reclaim {
+                flow_step(mine, IPPROTO_TCP, tcp_flags, side, P0)
+            } else {
+                FlowStep::Write(mine.unwrap_or(0))
+            };
+            match step {
+                FlowStep::Keep => {}
+                FlowStep::Write(f) => {
+                    self.rev.insert(backend_port, (front, port, f));
+                }
+                FlowStep::Reclaim => {
+                    if mine.is_some() {
+                        self.rev.remove(&backend_port);
+                    }
+                    if backend_port != port {
+                        self.memo.remove(&port);
+                    }
+                }
+            }
+        }
+
+        fn close(&mut self, front: ([u8; 16], u16), port: u16) {
+            self.forward(front, port, FIN_ACK);
+            self.pod(front, port, FIN_ACK);
+            self.forward(front, port, ACK);
+        }
+    }
+
+    fn run_colliding_pairs(reclaim: bool, pairs: u16) -> Option<u16> {
+        let (a, b) = (([1; 16], 80), ([2; 16], 80));
+        let mut m = BackendModel {
+            reclaim,
+            ..Default::default()
+        };
+        for port in 1000..1000 + pairs {
+            for front in [a, b] {
+                if m.forward(front, port, TCP_FLAG_SYN).is_some() {
+                    return Some(port);
+                }
+                m.pod(front, port, SYN_ACK);
+            }
+            m.close(a, port);
+            m.close(b, port);
+        }
+        None
+    }
+
+    #[test]
+    fn stale_rows_without_reclaim_exhaust_the_remap_window_at_the_sixteenth_pair() {
+        // Reproduces the production cut: this is why reclaim exists.
+        assert_eq!(
+            run_colliding_pairs(false, 100),
+            Some(1000 + PROBE_LIMIT),
+            "without reclaim the 17th colliding connection must be refused"
+        );
+    }
+
+    #[test]
+    fn closed_connections_release_their_remap_slots_so_new_ones_keep_working() {
+        assert_eq!(
+            run_colliding_pairs(true, 500),
+            None,
+            "a colliding connection was refused although every earlier one had closed cleanly"
+        );
+    }
+
+    #[test]
+    fn reclaim_waits_for_the_final_ack_so_it_cannot_recreate_the_row() {
+        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        let first_fin = step_tcp(Some(0), FIN_ACK, FlowSide::Client);
+        assert_eq!(first_fin, FlowStep::Write(FLOW_FLAG_FIN_CLIENT));
+        // Half-close: the pod keeps sending after the client's FIN.
+        assert_eq!(
+            step_tcp(Some(FLOW_FLAG_FIN_CLIENT), ACK, FlowSide::Pod),
+            FlowStep::Keep,
+            "a half-closed connection must keep its row so the pod can still reply"
+        );
+        let second_fin = step_tcp(Some(FLOW_FLAG_FIN_CLIENT), FIN_ACK, FlowSide::Pod);
+        assert_eq!(second_fin, FlowStep::Write(both));
+        assert_eq!(
+            step_tcp(Some(both), ACK, FlowSide::Client),
+            FlowStep::Reclaim,
+            "the final ACK after both FINs ends the connection"
+        );
+        assert_ne!(
+            step_tcp(Some(both), FIN_ACK, FlowSide::Pod),
+            FlowStep::Reclaim,
+            "a retransmitted FIN still needs its row to be encapsulated back"
+        );
+    }
+
+    #[test]
+    fn rst_in_either_direction_reclaims_even_without_a_row() {
+        for side in [FlowSide::Client, FlowSide::Pod] {
+            assert_eq!(
+                step_tcp(Some(0), TCP_FLAG_RST, side),
+                FlowStep::Reclaim,
+                "RST from {side:?}"
+            );
+        }
+        assert_eq!(
+            step_tcp(None, TCP_FLAG_RST, FlowSide::Client),
+            FlowStep::Reclaim,
+            "a stray RST must not create a row"
+        );
+    }
+
+    #[test]
+    fn syn_on_a_lingering_closed_row_starts_a_fresh_connection() {
+        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        assert_eq!(
+            step_tcp(Some(both), TCP_FLAG_SYN, FlowSide::Client),
+            FlowStep::Write(0),
+            "reusing the 4-tuple must not reclaim the new connection's row"
+        );
+    }
+
+    #[test]
+    fn udp_never_reclaims_on_flag_bits() {
+        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        let step = flow_step(
+            Some(both),
+            IPPROTO_UDP,
+            TCP_FLAG_RST,
+            FlowSide::Pod,
+            GcParity::default(),
+        );
+        assert_ne!(
+            step,
+            FlowStep::Reclaim,
+            "UDP payload bytes are not TCP flags"
+        );
+    }
+
+    #[test]
+    fn matched_packet_copies_parity_once_per_interval() {
+        let odd = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        assert_eq!(
+            flow_step(Some(0), IPPROTO_UDP, 0, FlowSide::Client, odd),
+            FlowStep::Write(FLOW_FLAG_UDP_PARITY)
+        );
+        assert_eq!(
+            flow_step(
+                Some(FLOW_FLAG_UDP_PARITY),
+                IPPROTO_UDP,
+                0,
+                FlowSide::Client,
+                odd
+            ),
+            FlowStep::Keep,
+            "a row already at the global parity must cost no write"
+        );
+        assert_eq!(
+            flow_step(
+                Some(FLOW_FLAG_UDP_PARITY),
+                IPPROTO_UDP,
+                0,
+                FlowSide::Pod,
+                P0
+            ),
+            FlowStep::Write(0),
+            "the parity bit follows the global value back down"
+        );
+    }
+
+    #[test]
+    fn sweep_deletes_only_rows_untouched_since_the_previous_flip() {
+        let odd = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        // Touched this interval: bit == global parity.
+        assert!(!parity_sweep_deletes(
+            FLOW_FLAG_UDP_PARITY,
+            IPPROTO_UDP,
+            odd
+        ));
+        // Idle: still carries the previous parity.
+        assert!(parity_sweep_deletes(0, IPPROTO_UDP, odd));
+        // Each class is judged by its own bit and parity.
+        assert!(!parity_sweep_deletes(0, IPPROTO_TCP, odd));
+        assert!(parity_sweep_deletes(FLOW_FLAG_TCP_PARITY, IPPROTO_TCP, P0));
+        assert!(
+            !parity_sweep_deletes(0, 1, odd),
+            "protocols the dataplane never stores are never swept"
+        );
+    }
+
+    #[test]
+    fn port_memo_survives_only_with_its_reverse_row() {
+        assert!(port_memo_wanted(1234, Some(1234)));
+        assert!(!port_memo_wanted(1234, None), "orphaned memo");
+        assert!(
+            !port_memo_wanted(1234, Some(999)),
+            "the reverse row now belongs to another flow"
+        );
     }
 }

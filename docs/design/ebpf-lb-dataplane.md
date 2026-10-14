@@ -252,6 +252,29 @@ flows pass to the host unbalanced (an absent front is not a front).
   a cross-Service collision (shared Pod:targetPort, reused client source
   port), remap the backend's source port, un-remapping on return —
   closes UDP. QUIC is **not** exempt (see Conntrack).
+- **Flow-row reclaim and idle GC**: the remap window is 16 synthetic
+  ports per front, so rows of finished flows must not live on until LRU
+  eviction, or stale rows from other fronts pin it shut and new colliding
+  connections are dropped. `FlowValue::flags` (forward and reverse rows)
+  carries two FIN-seen bits and one parity bit per protocol class.
+  - **TCP close**: the backend node deletes a flow's reverse row and its
+    port memo on RST in either direction, or on the first non-FIN packet after
+    a FIN in both directions (the final ACK, which still needs the row; a
+    SYN on the same 4-tuple restarts the flags). The first FIN alone never
+    reclaims, so a half-closed connection keeps working.
+    (`beep_common::flow_step`.)
+  - **Idle GC**: `CONFIG` holds a global parity per class (UDP, TCP). A
+    matched packet copies it into its row's bit only when it differs (at
+    most one write per row per interval). Every interval the controller
+    deletes the class's rows whose bit differs (and memos with no surviving
+    reverse row), then flips the parity; userspace only deletes. A row
+    idle 1-2 intervals is reclaimed. Defaults: UDP 120 s (kernel UDP stream
+    timeout), TCP backstop 12 h (kube-proxy established 24 h); both are
+    configurable (`deploy/README.md`). Accepted residual: a packet racing a
+    sweep delete re-creates the row, and an idle flow swept after an
+    endpoint change may re-pin to a new backend, as after a NAT timeout.
+  - Forward rows on the ingress node have no close tracking (the ingress
+    sees both legs but only parity GC reclaims them).
 
 ## References
 

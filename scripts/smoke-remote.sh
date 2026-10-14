@@ -664,39 +664,47 @@ remap_started=$SECONDS
 # reverse key (client, 40000, pod, target), so front B's flow is remapped and
 # its decision memoized under key tag 02. The memo's value is 2 bytes of a 40
 # byte slot; the other 38 must be zero rather than eBPF stack residue.
-printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nREMAPA' > /tmp/beep-smoke-response-remap-A.http
-printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nREMAPB' > /tmp/beep-smoke-response-remap-B.http
-for remap_leg in A B; do
-  remap_front_port_var="REMAP_FRONT_PORT_${remap_leg}"
-  nohup nc -l -N "$POD_IP" "$REMAP_TARGET_PORT" < "/tmp/beep-smoke-response-remap-${remap_leg}.http" >/dev/null 2>&1 &
-  disown
-  sleep 0.5
-  # The previous leg's client socket sits in TIME_WAIT on the fixed source
-  # port and curl's explicit bind() cannot reuse it (rc 45, EADDRINUSE).
-  # Destroy it if the kernel allows, else wait it out.
-  ip netns exec smoke-client ss -K -tan sport = ":${REMAP_CLIENT_PORT}" >/dev/null 2>&1 || true
-  if [ -n "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ]; then
-    echo "WARN: ss -K did not free client port ${REMAP_CLIENT_PORT} (kernel likely lacks CONFIG_INET_DIAG_DESTROY); waiting out TIME_WAIT (up to 70s)" >&2
-  fi
-  for _ in $(seq 1 70); do
-    [ -z "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ] && break
-    sleep 1
-  done
-  remap_rc=0
-  remap_body=$(ip netns exec smoke-client curl -sS -m 5 --local-port "$REMAP_CLIENT_PORT" "http://${FRONT_IP}:${!remap_front_port_var}/") || remap_rc=$?
-  [ "$remap_rc" -eq 0 ] || {
-    echo "FAIL: remap round trip via front ${FRONT_IP}:${!remap_front_port_var} (client port ${REMAP_CLIENT_PORT}, leg ${remap_leg}) did not complete (curl rc ${remap_rc}; 45 = client bind, 28 = timeout)" >&2
-    ip netns exec smoke-client ss -tan sport = ":${REMAP_CLIENT_PORT}" >&2 || true
-    map_json "$PIN_DIR/FLOW_TABLE" | jq -c '.[]' >&2 || true
-    exit 1
-  }
-  [ "$remap_body" = "REMAP${remap_leg}" ] || {
-    echo "FAIL: expected body 'REMAP${remap_leg}' via front ${!remap_front_port_var}, got: $remap_body" >&2
-    exit 1
-  }
+#
+# Flow A must still hold its row when B arrives, and a cleanly closed
+# connection's rows are reclaimed. So A's pod-side listener is frozen
+# (SIGSTOP) after accepting: the client's FIN is acknowledged by the kernel
+# but the pod never closes, leaving A half-closed with its row alive. Flow
+# B's body arrives after a pause so its memo can be read while B is live,
+# then B closes cleanly and its memo must be reclaimed.
+nohup nc -l -d "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
+remap_srv_a=$!
+disown
+sleep 0.5
+{ printf 'GET / HTTP/1.0\r\nHost: beep\r\n\r\n'; sleep 10; } \
+  | timeout 3 ip netns exec smoke-client nc -p "$REMAP_CLIENT_PORT" "$FRONT_IP" "$REMAP_FRONT_PORT_A" >/dev/null 2>&1 &
+remap_cli_a=$!
+sleep 1
+kill -STOP "$remap_srv_a"
+wait "$remap_cli_a" || true
+# The killed client's socket lingers on the fixed source port and curl's
+# explicit bind() cannot reuse it (rc 45, EADDRINUSE). Destroy it if the
+# kernel allows, else wait it out.
+ip netns exec smoke-client ss -K -tan sport = ":${REMAP_CLIENT_PORT}" >/dev/null 2>&1 || true
+if [ -n "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ]; then
+  echo "WARN: ss -K did not free client port ${REMAP_CLIENT_PORT} (kernel likely lacks CONFIG_INET_DIAG_DESTROY); waiting out the lingering socket (up to 70s)" >&2
+fi
+for _ in $(seq 1 70); do
+  [ -z "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ] && break
+  sleep 1
 done
+{ printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n'; sleep 8; printf 'REMAPB'; } \
+  | nohup nc -l "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
+disown
+sleep 0.5
+remap_rc_file=/tmp/beep-smoke-remap-rc-B
+rm -f "$remap_rc_file"
+( rc=0; ip netns exec smoke-client curl -sS -m 30 --local-port "$REMAP_CLIENT_PORT" \
+    "http://${FRONT_IP}:${REMAP_FRONT_PORT_B}/" > /tmp/beep-smoke-remap-body-B 2> /tmp/beep-smoke-remap-err-B || rc=$?
+  echo "$rc" > "$remap_rc_file" ) &
+remap_pid=$!
+sleep 2.5
 remap_memos=$(map_json "$PIN_DIR/FLOW_TABLE" | jq -c '[.[] | select(.key[37] == "0x02")]')
-echo "port_memo entries (key tag 02): $remap_memos"
+echo "port_memo entries while flow B is live (key tag 02): $remap_memos"
 [ "$(jq 'length' <<<"$remap_memos")" -ge 1 ] || {
   echo "FAIL: no port_memo (key tag 02) FLOW_TABLE entry after two fronts onto ${POD_IP}:${REMAP_TARGET_PORT} from client port ${REMAP_CLIENT_PORT} -- the remap path was never exercised, so the zero-tail check proves nothing" >&2
   exit 1
@@ -705,7 +713,25 @@ jq -e 'all(.[]; (.value | length) == 40 and all(.value[2:40][]; . == "0x00"))' <
   echo "FAIL: a port_memo value has non-zero bytes in 2..40 (or is not 40 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
   exit 1
 }
-echo "PORT-REMAP: PASS in $((SECONDS - remap_started))s (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero)"
+wait "$remap_pid"
+[ "$(cat "$remap_rc_file")" = "0" ] || {
+  echo "FAIL: remap round trip via front ${FRONT_IP}:${REMAP_FRONT_PORT_B} (client port ${REMAP_CLIENT_PORT}) did not complete: $(cat /tmp/beep-smoke-remap-err-B)" >&2
+  map_json "$PIN_DIR/FLOW_TABLE" | jq -c '.[]' >&2 || true
+  exit 1
+}
+[ "$(cat /tmp/beep-smoke-remap-body-B)" = "REMAPB" ] || {
+  echo "FAIL: expected body 'REMAPB' via front ${REMAP_FRONT_PORT_B}, got: $(cat /tmp/beep-smoke-remap-body-B)" >&2
+  exit 1
+}
+sleep 1
+remap_memos_left=$(map_json "$PIN_DIR/FLOW_TABLE" | jq -c '[.[] | select(.key[37] == "0x02")] | length')
+[ "$remap_memos_left" = "0" ] || {
+  echo "FAIL: ${remap_memos_left} port_memo row(s) left after the remapped connection closed cleanly (FIN both ways) -- a closed connection must release its memo" >&2
+  map_json "$PIN_DIR/FLOW_TABLE" | jq -c '.[]' >&2 || true
+  exit 1
+}
+kill -9 "$remap_srv_a" 2>/dev/null || true
+echo "PORT-REMAP: PASS in $((SECONDS - remap_started))s (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero; the memo was reclaimed on clean close)"
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
 # The three round trips above (two fronts on the first uplink, one on the

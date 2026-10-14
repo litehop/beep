@@ -30,17 +30,15 @@ use aya::{
     Ebpf, EbpfLoader,
 };
 use beep_common::{
-    decode_tcp_flow_key, ipv4_mapped_v6, wire_ip, Config, FlowDirection, FlowKey, FlowValue,
-    ForwardFlowValue, TcpFlowKey, UplinkConfig, BPF_F_NO_PREALLOC, TCP_FLOW_KEY_LEN,
+    decode_tcp_flow_key, encode_flow_key, ipv4_mapped_v6, parity_sweep_deletes, port_memo_wanted,
+    wire_ip, Config, FlowDirection, FlowKey, FlowValue, ForwardFlowValue, GcParity, TcpFlowKey,
+    UplinkConfig, BPF_F_NO_PREALLOC, IPPROTO_TCP, IPPROTO_UDP, TCP_FLOW_KEY_LEN,
 };
 use clap::ValueEnum;
 use pin_migrate::{
     apply_restore, couple_front_fates, plan_restore, snapshot_pin, Entry, Fate, FRONT_ENDPOINTS,
     FRONT_META,
 };
-
-const IPPROTO_TCP: u8 = 6;
-const IPPROTO_UDP: u8 = 17;
 
 // Every map `beep-ebpf` declares (`ebpf/src/main.rs`'s
 // `#[map]` statics). Pinned by name below so a loader restart reuses them
@@ -392,6 +390,78 @@ pub fn evict_pod_flows(
         anyhow::bail!("{failed} conntrack eviction delete(s) failed -- see per-entry errors above");
     }
     Ok(())
+}
+
+/// `FLOW_TABLE` keys of `proto` rows the idle sweep deletes: Forward/Reverse
+/// rows whose parity bit differs from the global parity
+/// (`beep_common::parity_sweep_deletes`), plus every PortMemo row whose reverse
+/// row is not among the survivors (`beep_common::port_memo_wanted`). Pure so
+/// the keep/delete decision is testable without a kernel map.
+pub fn idle_flow_keys(rows: &[(FlowKey, FlowValue)], proto: u8, parity: GcParity) -> Vec<FlowKey> {
+    let mut doomed = Vec::new();
+    let mut surviving_reverse: std::collections::HashMap<FlowKey, u16> =
+        std::collections::HashMap::new();
+    for (key, value) in rows {
+        if key[TCP_FLOW_KEY_LEN - 1] != proto {
+            continue;
+        }
+        match flow_key_direction(key) {
+            Some(FlowDirection::Forward) | Some(FlowDirection::Reverse) => {
+                if parity_sweep_deletes(value.flags(), proto, parity) {
+                    doomed.push(*key);
+                } else if flow_key_direction(key) == Some(FlowDirection::Reverse) {
+                    surviving_reverse.insert(*key, value.as_reverse().original_client_port);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (key, value) in rows {
+        if key[TCP_FLOW_KEY_LEN - 1] != proto
+            || flow_key_direction(key) != Some(FlowDirection::PortMemo)
+        {
+            continue;
+        }
+        let tcp_key: TcpFlowKey = key[..TCP_FLOW_KEY_LEN].try_into().unwrap();
+        let (client_ip, client_port, pod_ip, target_port, _) = decode_tcp_flow_key(&tcp_key);
+        let reverse_key = encode_flow_key(
+            client_ip,
+            value.as_port_memo().backend_src_port,
+            pod_ip,
+            target_port,
+            proto,
+            FlowDirection::Reverse,
+        );
+        if !port_memo_wanted(client_port, surviving_reverse.get(&reverse_key).copied()) {
+            doomed.push(*key);
+        }
+    }
+    doomed
+}
+
+/// One idle-GC pass for one protocol class: deletes `proto`'s rows that no
+/// packet matched since the previous flip (`idle_flow_keys`). The caller flips
+/// the class's `Config` parity afterwards. Only ever deletes; a live row's
+/// value is never rewritten from userspace. Collects before deleting, like
+/// `evict_pod_flows`, since the map is an LRU hash.
+pub fn sweep_idle_flows(
+    flow_table: &mut AyaHashMap<MapData, FlowKey, FlowValue>,
+    proto: u8,
+    parity: GcParity,
+) -> anyhow::Result<(usize, usize)> {
+    let rows: Vec<(FlowKey, FlowValue)> = flow_table.iter().collect::<Result<_, _>>()?;
+    let doomed = idle_flow_keys(&rows, proto, parity);
+    let mut failed = 0;
+    for key in &doomed {
+        if let Err(e) = flow_table.remove(key) {
+            failed += 1;
+            eprintln!("controller: FLOW_TABLE idle sweep delete failed: {e:#}");
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} idle-flow delete(s) failed -- see per-entry errors above");
+    }
+    Ok((rows.len(), doomed.len()))
 }
 
 /// Default `--max-fronts`: one `FRONT_META` entry per front address x Service
@@ -1022,7 +1092,9 @@ pub fn populate_config(
         0,
         Config {
             geneve_ifindex,
-            _pad: 0,
+            udp_parity: 0,
+            tcp_parity: 0,
+            _pad: [0; 2],
             flow_hash_seed,
         },
         0,
@@ -1982,7 +2054,7 @@ mod tests {
             },
             ingress_ifindex: 2,
             target_port: 0,
-            _pad: 0,
+            flags: 0,
         }
     }
 
@@ -2189,6 +2261,77 @@ mod tests {
             vec![pod_v6.octets()],
             "a v6 fixture's pod_ip must land in POD_TARGETS as its raw octets, not silently \
              dropped or corrupted by v4-only wire-encode logic"
+        );
+    }
+
+    fn rev_row(client_port: u16, orig_port: u16, proto: u8, flags: u16) -> (FlowKey, FlowValue) {
+        let key = encode_flow_key(
+            [1; 16],
+            client_port,
+            [2; 16],
+            80,
+            proto,
+            FlowDirection::Reverse,
+        );
+        let value = FlowValue::from_reverse(beep_common::RevFlowValue {
+            ingress_node_ip: [0; 16],
+            front_ip: [3; 16],
+            front_port: 80,
+            original_client_port: orig_port,
+            _pad: 0,
+            flags,
+        });
+        (key, value)
+    }
+
+    fn memo_row(client_port: u16, backend_port: u16, proto: u8) -> (FlowKey, FlowValue) {
+        let key = encode_flow_key(
+            [1; 16],
+            client_port,
+            [2; 16],
+            80,
+            proto,
+            FlowDirection::PortMemo,
+        );
+        let value = FlowValue::from_port_memo(beep_common::PortMemoValue {
+            backend_src_port: backend_port,
+        });
+        (key, value)
+    }
+
+    // The remap window only frees up if the sweep takes a remapped flow's
+    // reverse row AND its memo together; a leftover memo would pin the next
+    // connection on that client port to a stale synthetic port.
+    #[test]
+    fn idle_sweep_deletes_a_stale_reverse_row_with_its_memo_and_keeps_live_ones() {
+        let odd = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        let live_flags = beep_common::FLOW_FLAG_UDP_PARITY;
+        let stale = rev_row(50000, 1234, IPPROTO_UDP, 0);
+        let live = rev_row(50001, 1235, IPPROTO_UDP, live_flags);
+        let rows = [
+            stale,
+            live,
+            memo_row(1234, 50000, IPPROTO_UDP),
+            memo_row(1235, 50001, IPPROTO_UDP),
+            // Other class: untouched by a UDP sweep even though its bit differs.
+            rev_row(50002, 1236, IPPROTO_TCP, beep_common::FLOW_FLAG_TCP_PARITY),
+        ];
+        let mut doomed = idle_flow_keys(&rows, IPPROTO_UDP, odd);
+        doomed.sort();
+        let mut expected = vec![stale.0, rows[2].0];
+        expected.sort();
+        assert_eq!(doomed, expected);
+    }
+
+    #[test]
+    fn idle_sweep_deletes_an_orphaned_memo_whose_reverse_row_was_evicted() {
+        let rows = [memo_row(1234, 50000, IPPROTO_TCP)];
+        assert_eq!(
+            idle_flow_keys(&rows, IPPROTO_TCP, GcParity::default()),
+            vec![rows[0].0]
         );
     }
 }

@@ -128,8 +128,16 @@ the controller container. The ConfigMap is required: a pod whose
 | --- | --- | --- | --- |
 | `--max-fronts` | `BEEP_MAX_FRONTS` | 1024 | Most fronts (front address x Service port x protocol) a node holds. Under the every-node-is-a-front model that is nodes x Service ports. Sets `FRONT_META` `max_entries`. |
 | `--endpoints-per-front` | `BEEP_ENDPOINTS_PER_FRONT` | 4 | Endpoints each front is sized for. Sets `FRONT_ENDPOINTS` `max_entries` = `max-fronts` x `endpoints-per-front` x 2 (8192 by default; the 2 is swap headroom for a front's next generation). |
+| `--udp-idle-sweep-secs` | `BEEP_UDP_IDLE_SWEEP_SECS` | 120 | Idle-flow sweep interval for UDP. A UDP flow row no packet matched for 1-2 intervals is deleted, so the interval is also the shortest quiet gap a UDP flow can lose its backend pin after. |
+| `--tcp-idle-sweep-secs` | `BEEP_TCP_IDLE_SWEEP_SECS` | 43200 (12 h) | Backstop sweep interval for TCP rows. Closed connections are reclaimed at once (RST, or FIN both ways); this only frees connections that vanished without either. |
 
-Both maps are `BPF_F_NO_PREALLOC`, so the caps are ceilings: a node pays
+The defaults follow the usual timeouts: kube-proxy's TCP established timeout
+is 24 h and the kernel's UDP stream timeout 30 s / 120 s, so UDP is never swept
+sooner than 2 min and TCP never later than a day. A swept flow that is still
+alive is re-pinned to a backend on its next packet (same hash, so usually the
+same backend), like after a NAT timeout.
+
+The two front maps are `BPF_F_NO_PREALLOC`, so their caps are ceilings: a node pays
 about 16 B per slot up front (the bucket array) and entries cost memory only
 as they are used.
 
