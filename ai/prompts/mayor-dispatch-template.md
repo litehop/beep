@@ -484,9 +484,16 @@ a genuine, passing dual-stack cross-node round trip built on it.
   on exit, success or failure) — unlike a pool of long-lived host processes
   that outlive a worktree, there is nothing for a worker to reap by hand
   after a dispatch. If a VM is ever left in a bad state (stuck fixture,
-  stale binary), `limactl stop <vm>` + `limactl start <vm>` resets it; a full
-  `limactl delete --force` + reprovision from `lima/beep.yaml` is the last
-  resort, not a routine step.
+  stale binary), `limactl stop <vm>` + `limactl start <vm>` resets it, and
+  `limactl delete --force` + reprovision from `lima/<name>.yaml` is
+  acceptable: VMs are ephemeral (operator, 2026-10-14).
+- **VM hygiene (every dispatch with an assigned VM).** The worker builds only
+  under `/home/lima.guest/work/<agent-id>` and removes it before returning;
+  checks `df` before heavy builds and, above 80%, recycles its ASSIGNED VM
+  or stops and reports. A worker never deletes anything on, or recycles, a
+  VM it was not assigned. On pod eviction or a blocked command it STOPS and
+  reports. `scripts/worktree-hygiene.sh` reports per-VM `/` usage and stale
+  `work/*` dirs (report only; non-zero above 80%).
 - Reserve `smoke-wg-2node.sh` for beads that actually need the cross-node
   path — it's slower (two VM boots + a real WireGuard handshake) than
   `smoke.sh`, and today it can only ever confirm everything up to the

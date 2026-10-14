@@ -673,6 +673,12 @@ exit 0
 EOF
 chmod +x "$STUB_GH_EMPTY/gh"
 
+# Hermetic: main() must never reach the developer's real Lima VMs.
+STUB_LIMACTL_NONE="$SANDBOX_ROOT/stub-limactl-none"
+mkdir -p "$STUB_LIMACTL_NONE"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_LIMACTL_NONE/limactl"
+chmod +x "$STUB_LIMACTL_NONE/limactl"
+
 NLW_REPO="$SANDBOX_ROOT/no-live-workers-repo"
 new_sandbox "$NLW_REPO"
 printf 'line one\n' > "$NLW_REPO/file.txt"
@@ -680,7 +686,7 @@ git -C "$NLW_REPO" add -A
 git -C "$NLW_REPO" commit -q -m initial
 
 NLW_RC=0
-NLW_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_REPO" PATH="$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers 2>&1) || NLW_RC=$?
+NLW_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_REPO" PATH="$STUB_LIMACTL_NONE:$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers 2>&1) || NLW_RC=$?
 assert "worktree-hygiene --no-live-workers runs STEP B/C/D/E (not the fail-safe refusal) on a verifiably clean zero-worker tree, exiting 0 instead of crying wolf on every idle cron tick" \
   "$([ "$NLW_RC" -eq 0 ] && echo 1 || echo 0)"
 assert "...proven by dry-run step output actually appearing, not just a bare exit 0 that could equally mean 'refused before running anything'" \
@@ -737,11 +743,55 @@ git -C "$CLEAN_E_REPO" add -A
 git -C "$CLEAN_E_REPO" commit -q -m "seed finding"
 
 CLEAN_RC=0
-CLEAN_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$CLEAN_E_REPO" PATH="$STUB_BD_OPEN:$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers 2>&1) || CLEAN_RC=$?
+CLEAN_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$CLEAN_E_REPO" PATH="$STUB_LIMACTL_NONE:$STUB_BD_OPEN:$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers 2>&1) || CLEAN_RC=$?
 assert "worktree-hygiene exits 0 on a verifiably clean repo with a beep-* finding for a genuinely open bead -- fails if the spurious no-message exit 1 returns" \
   "$([ "$CLEAN_RC" -eq 0 ] && echo 1 || echo 0)"
 assert "...and no [hygiene] anomaly line is printed for a genuinely open bead (nothing to act on)" \
   "$(! printf '%s' "$CLEAN_OUT" | grep -q '\[hygiene\]' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 10. STEP F -- per-VM disk report. A VM above 80% is what precedes kubelet
+#     evictions mid-smoke, so it must flip the exit code; report lines must
+#     never delete anything.
+# ---------------------------------------------------------------------------
+
+assert "df_pcent parses the percent out of df --output=pcent" \
+  "$([ "$(call df_pcent $'Use%\n 93%')" = "93" ] && echo 1 || echo 0)"
+assert "80% exactly is NOT over the threshold (stop is strictly above 80)" \
+  "$(call vm_over_threshold 80 && echo 0 || echo 1)"
+assert "81% is over the threshold" \
+  "$(call vm_over_threshold 81 && echo 1 || echo 0)"
+
+STUB_LIMACTL_FULL="$SANDBOX_ROOT/stub-limactl-full"
+mkdir -p "$STUB_LIMACTL_FULL"
+cat > "$STUB_LIMACTL_FULL/limactl" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  list) printf 'beep-client Running\nbeep-node-a Stopped\nlima-other Running\n' ;;
+  shell)
+    case "$*" in
+      *df*) printf 'Use%%\n 93%%\n' ;;
+      *du*) printf '/home/lima.guest/work/abc123\n/home/lima.guest/work/dead9\n' ;;
+      *) printf '/home/lima.guest/fix3.tgz\n' ;;
+    esac ;;
+esac
+EOF
+chmod +x "$STUB_LIMACTL_FULL/limactl"
+
+F_OUT=$(PATH="$STUB_LIMACTL_FULL:$PATH" LIVE_AGENTS="abc123" bash "$SCRIPT" __call step_f_vm_disk 2>&1)
+assert "a running beep-* VM at 93% is reported with its percent" \
+  "$(printf '%s' "$F_OUT" | grep -q 'beep-client / at 93%' && echo 1 || echo 0)"
+assert "stopped and non-beep VMs are not probed" \
+  "$(! printf '%s' "$F_OUT" | grep -qE 'beep-node-a|lima-other' && echo 1 || echo 0)"
+assert "a live agent's work dir is tagged live, a dead one is not" \
+  "$(printf '%s' "$F_OUT" | grep 'work/abc123' | grep -q '(live)' && printf '%s' "$F_OUT" | grep 'work/dead9' | grep -q 'not live' && echo 1 || echo 0)"
+assert "legacy top-level build artefacts are listed" \
+  "$(printf '%s' "$F_OUT" | grep -q 'vm-legacy-dir: beep-client /home/lima.guest/fix3.tgz' && echo 1 || echo 0)"
+
+F_MAIN_RC=0
+(cd "$NLW_REPO" && DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_REPO" PATH="$STUB_LIMACTL_FULL:$STUB_GH_EMPTY:$PATH" bash "$SCRIPT" --no-live-workers >/dev/null 2>&1) || F_MAIN_RC=$?
+assert "worktree-hygiene exits non-zero when a running VM is above 80% disk -- the mayor must see it" \
+  "$([ "$F_MAIN_RC" -ne 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
