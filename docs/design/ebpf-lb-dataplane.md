@@ -260,13 +260,14 @@ flows pass to the host unbalanced (an absent front is not a front).
   - **TCP close**: the backend node deletes a flow's reverse row and its
     port memo, and the ingress node its forward row, on RST in either
     direction, or on the first non-FIN packet from the first-FIN side once
-    both directions have sent a FIN and the second-FIN side has ACKed the
-    first FIN (the final ACK, which still needs the row; an ACK from the
+    both directions have sent a FIN (the final ACK, which still needs the row; an ACK from the
     second FIN's own side does not count, it can be a duplicate ACK ahead
-    of the real one; a SYN on the same 4-tuple restarts the flags). After
-    crossed FINs (simultaneous close) the row waits for both ACKs. A close
-    whose second FIN piggybacks the ACK of the first looks the same as
-    crossed FINs and is left to the idle sweep. The first FIN alone never
+    of the real one; a SYN on the same 4-tuple restarts the flags). A close
+    whose second FIN piggybacks the ACK of the first reclaims like any
+    other. After truly crossed FINs (simultaneous close) the first-FIN
+    side's ACK reclaims before the other side's ACK has passed; that ACK
+    misses its row and the peer retransmits its FIN (about 200 ms), which
+    recreates the row, with no data lost. The first FIN alone never
     reclaims, so a half-closed connection keeps working.
     (`beep_common::flow_step`.) The flag word is updated by whole-value
     read-modify-write from several paths, not atomically: a lost race can

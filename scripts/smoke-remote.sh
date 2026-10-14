@@ -676,11 +676,6 @@ remap_started=$SECONDS
 # share of B's SYNs and B would hang unanswered. A listens on the wildcard
 # address and B on the pod IP: the kernel always prefers the exact-address
 # listener, so only A's own SYN can reach A's listener.
-#
-# A close whose second FIN piggybacks the ACK of the first is left to the idle
-# sweep (the datapath cannot tell it from crossed FINs), so B closes pod-first
-# and the client is frozen across the pod's FIN: its ACK is then a separate
-# packet, and its own FIN follows later.
 nohup nc -l -d "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
 remap_srv_a=$!
 disown
@@ -702,8 +697,8 @@ for _ in $(seq 1 70); do
   [ -z "$(ip netns exec smoke-client ss -Htan sport = ":${REMAP_CLIENT_PORT}")" ] && break
   sleep 1
 done
-{ printf 'HTTP/1.0 200 OK\r\n\r\n'; sleep 8; printf 'REMAPB'; sleep 5; } \
-  | nohup nc -l -N "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
+{ printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n'; sleep 8; printf 'REMAPB'; } \
+  | nohup nc -l "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
 disown
 sleep 0.5
 remap_rc_file=/tmp/beep-smoke-remap-rc-B
@@ -723,9 +718,6 @@ jq -e 'all(.[]; (.value | length) == 40 and all(.value[2:40][]; . == "0x00"))' <
   echo "FAIL: a port_memo value has non-zero bytes in 2..40 (or is not 40 bytes) -- the FlowValue constructor leaks eBPF stack into the map" >&2
   exit 1
 }
-pkill -STOP -f "curl .*--local-port ${REMAP_CLIENT_PORT}"
-sleep 12
-pkill -CONT -f "curl .*--local-port ${REMAP_CLIENT_PORT}"
 wait "$remap_pid"
 [ "$(cat "$remap_rc_file")" = "0" ] || {
   echo "FAIL: remap round trip via front ${FRONT_IP}:${REMAP_FRONT_PORT_B} (client port ${REMAP_CLIENT_PORT}) did not complete: $(cat /tmp/beep-smoke-remap-err-B)" >&2
@@ -756,6 +748,21 @@ echo "==> demonstrating the anti-flush property: a burst of new-flow-only packet
 # source ports -- a stand-in for an off-path spoofed-source flood -- and
 # confirm FLOW_TABLE's established entries survive untouched while
 # FWD_PENDING absorbs the churn.
+#
+# The round trips above closed cleanly, so their rows were reclaimed. Hold
+# three fresh connections open (one per front, one on the second uplink) so
+# their forward and reverse rows exist for the flood to (not) evict.
+for hold in "${POD_IP}:${TARGET_PORT}:smoke-client:${FRONT_IP}:${FRONT_PORT}" \
+            "${POD_IP}:${TARGET_PORT2}:smoke-client:${FRONT_IP}:${FRONT_PORT2}" \
+            "${POD_IP}:${UPLINK2_TARGET_PORT}:${UPLINK2_NETNS}:${UPLINK2_FRONT_IP}:${UPLINK2_FRONT_PORT}"; do
+  IFS=: read -r hold_pod hold_target hold_ns hold_front hold_front_port <<<"$hold"
+  nohup bash -c "sleep 40 | nc -l -N ${hold_pod} ${hold_target} >/dev/null 2>&1" >/dev/null 2>&1 &
+  disown
+  sleep 0.5
+  nohup ip netns exec "$hold_ns" bash -c "{ printf 'hold'; sleep 40; } | nc ${hold_front} ${hold_front_port} >/dev/null 2>&1" >/dev/null 2>&1 &
+  disown
+done
+sleep 1.5
 flow_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 pending_before=$(map_entry_count "$PIN_DIR/FWD_PENDING")
 [ -n "$flow_before" ] && [ "$flow_before" -ge 6 ] || {
@@ -785,6 +792,13 @@ echo "after flood: FLOW_TABLE=$flow_after entries, FWD_PENDING=$pending_after en
   exit 1
 }
 echo "ANTI-FLUSH: PASS (FLOW_TABLE unchanged at $flow_after entries across a $FLOOD_COUNT-packet forward-only flood that grew FWD_PENDING from $pending_before to $pending_after)"
+pkill -f "nc ${FRONT_IP} ${FRONT_PORT}" 2>/dev/null || true
+pkill -f "nc ${FRONT_IP} ${FRONT_PORT2}" 2>/dev/null || true
+pkill -f "nc ${UPLINK2_FRONT_IP} ${UPLINK2_FRONT_PORT}" 2>/dev/null || true
+pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
+pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT2}" 2>/dev/null || true
+pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
+sleep 1
 
 echo "==> establishing a flow to hold open across a loader restart (a DaemonSet rollout/eviction/OOM kill must not silently drop an established connection)"
 # The backend sends chunk 1, then blocks on a single `read` from a second
@@ -1052,17 +1066,23 @@ EVICT_FRONT_POD_IP="$POD_IP"
 stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"
 wait_for_attach "$EVICT_LOADER_LOG_REUSE"
-printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nREUSE' > "$REUSE_RESPONSE_FILE"
-nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" < "$REUSE_RESPONSE_FILE" >"$REUSE_BACKEND_LOG" 2>&1 &
+# A cleanly closed connection's rows are reclaimed, so the row is checked
+# while the response is still pending.
+{ printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n'; sleep 4; printf 'REUSE'; } \
+  | nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" >"$REUSE_BACKEND_LOG" 2>&1 &
 disown
 sleep 0.5
-reuse_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
-[ "$reuse_body" = "REUSE" ] || {
-  echo "FAIL: expected response body 'REUSE' from the reused pod IP, got: $reuse_body" >&2
+ip netns exec smoke-client curl -sS -m 15 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/" > "$REUSE_RESPONSE_FILE" 2>&1 &
+reuse_pid=$!
+sleep 2
+flow_table_has_pod "$POD_IP" || {
+  echo "FAIL: FLOW_TABLE has no row decoding to pod ${POD_IP} while the reused-IP flow is live -- the flow can't have actually routed through beep-ebpf's conntrack path, so this isn't proving anything about pod-IP reuse" >&2
   exit 1
 }
-flow_table_has_pod "$POD_IP" || {
-  echo "FAIL: FLOW_TABLE has no row decoding to pod ${POD_IP} after the reused-IP round trip succeeded -- the flow can't have actually routed through beep-ebpf's conntrack path, so this isn't proving anything about pod-IP reuse" >&2
+wait "$reuse_pid" || true
+reuse_body=$(cat "$REUSE_RESPONSE_FILE")
+[ "$reuse_body" = "REUSE" ] || {
+  echo "FAIL: expected response body 'REUSE' from the reused pod IP, got: $reuse_body" >&2
   exit 1
 }
 echo "POD-IP-REUSE ROUND-TRIP: PASS (fresh flow through reused pod IP ${POD_IP} routes correctly; provably NOT a resurrected stale entry, since the EVICTION ASSERTION above already proved zero rows for this pod survived before this new flow was ever established)"
