@@ -449,7 +449,7 @@ VM_DISK_THRESHOLD_PCT="${VM_DISK_THRESHOLD_PCT:-80}"
 
 # Integer percent from `df --output=pcent /` output (header line + " 93%").
 df_pcent() {
-  printf '%s\n' "$1" | tr -dc '0-9\n' | grep -E '^[0-9]+$' | head -1
+  printf '%s\n' "$1" | tr -dc '0-9\n' | { grep -E '^[0-9]+$' || true; } | head -1
 }
 
 # True (exit 0) iff `pct` is strictly above the threshold.

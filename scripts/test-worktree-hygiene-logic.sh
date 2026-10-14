@@ -793,6 +793,42 @@ F_MAIN_RC=0
 assert "worktree-hygiene exits non-zero when a running VM is above 80% disk -- the mayor must see it" \
   "$([ "$F_MAIN_RC" -ne 0 ] && echo 1 || echo 0)"
 
+# An unreadable df must not abort the loop: later VMs still need reporting.
+STUB_LIMACTL_EMPTYDF="$SANDBOX_ROOT/stub-limactl-emptydf"
+mkdir -p "$STUB_LIMACTL_EMPTYDF"
+cat > "$STUB_LIMACTL_EMPTYDF/limactl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$LIMACTL_LOG"
+case "$1" in
+  list) printf 'beep-client Running\nbeep-node-b Running\n' ;;
+  shell)
+    case "$*" in
+      *beep-client*df*) ;;
+      *df*) printf 'Use%%\n 42%%\n' ;;
+      *) ;;
+    esac ;;
+esac
+EOF
+chmod +x "$STUB_LIMACTL_EMPTYDF/limactl"
+LIMACTL_LOG="$SANDBOX_ROOT/limactl-emptydf.log"
+: > "$LIMACTL_LOG"
+G_RC=0
+G_OUT=$(LIMACTL_LOG="$LIMACTL_LOG" PATH="$STUB_LIMACTL_EMPTYDF:$PATH" bash "$SCRIPT" __call step_f_vm_disk 2>&1) || G_RC=$?
+assert "empty df output reports the VM as unreadable -- fails if df_pcent aborts the script under pipefail" \
+  "$(printf '%s' "$G_OUT" | grep -q 'beep-client df unreadable' && echo 1 || echo 0)"
+assert "a VM after an unreadable-df VM is still reported -- one bad VM must not hide the rest" \
+  "$(printf '%s' "$G_OUT" | grep -q 'beep-node-b / at 42%' && echo 1 || echo 0)"
+assert "unreadable df step exits 0 (the anomaly is counted, not a crash)" \
+  "$([ "$G_RC" -eq 0 ] && echo 1 || echo 0)"
+
+# STEP F is report-only: the only limactl verbs allowed are list and read-only df/du/ls inside shell.
+: > "$LIMACTL_LOG"
+LIMACTL_LOG="$LIMACTL_LOG" PATH="$STUB_LIMACTL_EMPTYDF:$PATH" bash "$SCRIPT" __call step_f_vm_disk >/dev/null 2>&1 || true
+assert "STEP F issues no destructive limactl command (rm/delete/stop/start/prune/mv)" \
+  "$(! grep -qE '(^| )(rm|delete|stop|start|prune|mv|remove|restart)( |$)' "$LIMACTL_LOG" && [ -s "$LIMACTL_LOG" ] && echo 1 || echo 0)"
+assert "every STEP F limactl call is list or a shell running only df/du/ls" \
+  "$(! grep -vE '^(list |shell [^ ]+ -- (df |sh -c (du|ls) ))' "$LIMACTL_LOG" | grep -q . && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
