@@ -30,7 +30,7 @@ use beep_controller::{
         PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
-    seed::{converge_seed, load_or_create_seed},
+    seed::{converge_seed, load_or_create_seed, read_config_parity, write_config_parity},
     status::{ensure_node_ingress, update_ingress, ServiceGone},
     watch::{
         deleted_service_key, run_list_watch, stale_ingress_key, stale_ingress_keys, ServiceKey,
@@ -143,7 +143,11 @@ struct Args {
     fwd_pending_max_entries: u32,
 
     /// `FLOW_TABLE` max_entries (see `beep-ebpf`'s doc comment).
-    #[arg(long, default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES)]
+    #[arg(
+        long,
+        env = "BEEP_FLOW_TABLE_MAX_ENTRIES",
+        default_value_t = DEFAULT_FLOW_TABLE_MAX_ENTRIES
+    )]
     flow_table_max_entries: u32,
 
     /// Most fronts (front address x Service port x protocol) the node can
@@ -172,7 +176,33 @@ struct Args {
     /// dual-stack pod costs two (see `beep-ebpf`'s doc comment).
     #[arg(long, default_value_t = DEFAULT_POD_TARGETS_MAX_ENTRIES)]
     pod_targets_max_entries: u32,
+
+    /// Idle-flow sweep interval for UDP conntrack rows, in seconds: a UDP row
+    /// no packet matched for 1-2 intervals is deleted. Never set it below the
+    /// longest quiet gap a UDP flow must survive.
+    #[arg(
+        long,
+        env = "BEEP_UDP_IDLE_SWEEP_SECS",
+        default_value_t = DEFAULT_UDP_IDLE_SWEEP_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    udp_idle_sweep_secs: u64,
+
+    /// Idle-flow sweep interval for TCP conntrack rows, in seconds. TCP rows
+    /// are marked closed on close (RST, or FIN both ways) and then go with the
+    /// UDP sweep; this is the backstop for connections that vanish without
+    /// either.
+    #[arg(
+        long,
+        env = "BEEP_TCP_IDLE_SWEEP_SECS",
+        default_value_t = DEFAULT_TCP_IDLE_SWEEP_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    tcp_idle_sweep_secs: u64,
 }
+
+const DEFAULT_UDP_IDLE_SWEEP_SECS: u64 = 120;
+const DEFAULT_TCP_IDLE_SWEEP_SECS: u64 = 12 * 60 * 60;
 
 fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr, String> {
     let (network, prefix_len) = s
@@ -346,6 +376,89 @@ async fn run_seed_loop(
     loop {
         tokio::time::sleep(SEED_POLL).await;
         current = converge_seed(&client, &namespace, &pin_dir, current).await;
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Index of the wall-clock interval `unix_secs` falls in. A sweep is due when
+/// this exceeds the index of the last one.
+fn sweep_bucket(unix_secs: u64, interval_secs: u64) -> u64 {
+    unix_secs / interval_secs
+}
+
+/// Idle-GC of `FLOW_TABLE`: per protocol class, every interval delete the rows
+/// whose parity bit differs from the class's global parity (rows no packet
+/// matched since the previous flip), then flip that parity in `CONFIG`. A
+/// failed pass leaves the parity alone and is retried next interval. The
+/// parity is read back from `CONFIG` and the sweeps run on wall-clock interval
+/// boundaries (`sweep_bucket`), so neither depends on the process's uptime: a
+/// controller restarted more often than the TCP interval still sweeps.
+async fn run_idle_sweep_loop(
+    maps: Arc<Mutex<PinnedMaps>>,
+    pin_dir: PathBuf,
+    udp_interval: Duration,
+    tcp_interval: Duration,
+) -> anyhow::Result<()> {
+    let start = unix_secs();
+    let mut classes = Vec::new();
+    for (proto, name, interval) in [
+        (beep_common::IPPROTO_UDP, "udp", udp_interval),
+        (beep_common::IPPROTO_TCP, "tcp", tcp_interval),
+    ] {
+        let secs = interval.as_secs().max(1);
+        let parity = read_config_parity(&pin_dir, proto)
+            .with_context(|| format!("reading the pinned {name} idle-sweep parity"))?;
+        classes.push((proto, name, secs, sweep_bucket(start, secs), parity));
+    }
+    loop {
+        let next = classes
+            .iter()
+            .map(|(_, _, secs, bucket, _)| (bucket + 1) * secs)
+            .min()
+            .expect("two classes");
+        tokio::time::sleep(Duration::from_secs(next.saturating_sub(unix_secs()).max(1))).await;
+        let now = unix_secs();
+        for (proto, name, secs, bucket, parity) in classes.iter_mut() {
+            if sweep_bucket(now, *secs) <= *bucket {
+                continue;
+            }
+            *bucket = sweep_bucket(now, *secs);
+            let started = Instant::now();
+            let gc = beep_common::GcParity {
+                udp: if *proto == beep_common::IPPROTO_UDP {
+                    *parity
+                } else {
+                    false
+                },
+                tcp: if *proto == beep_common::IPPROTO_TCP {
+                    *parity
+                } else {
+                    false
+                },
+            };
+            let swept = maps.lock().unwrap().sweep_idle_flows(*proto, gc);
+            match swept {
+                Ok((scanned, deleted)) => {
+                    match write_config_parity(&pin_dir, *proto, !*parity) {
+                        Ok(()) => *parity = !*parity,
+                        Err(e) => eprintln!(
+                            "controller: WARN flipping {name} idle-sweep parity failed: {e:#}"
+                        ),
+                    }
+                    eprintln!(
+                        "controller: idle sweep {name}: scanned {scanned} flow rows, deleted \
+                         {deleted}, took {:?}",
+                        started.elapsed()
+                    );
+                }
+                Err(e) => eprintln!("controller: WARN {name} idle sweep failed: {e:#}"),
+            }
+        }
     }
 }
 
@@ -963,8 +1076,13 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .expect("clap requires --node-name unless --node-prep, which already returned above");
     let controller = async {
-        let (watches, seed, lease, prune) = tokio::join!(
-            run_controller_loop(Arc::clone(&client), Arc::clone(&state), maps, node),
+        let (watches, seed, lease, prune, sweep) = tokio::join!(
+            run_controller_loop(
+                Arc::clone(&client),
+                Arc::clone(&state),
+                Arc::clone(&maps),
+                node
+            ),
             run_seed_loop(
                 Arc::clone(&client),
                 args.seed_namespace.clone(),
@@ -984,8 +1102,14 @@ async fn main() -> anyhow::Result<()> {
                 args.lease_namespace.clone(),
                 node_name.clone(),
             ),
+            run_idle_sweep_loop(
+                maps,
+                args.pin_dir.clone(),
+                Duration::from_secs(args.udp_idle_sweep_secs),
+                Duration::from_secs(args.tcp_idle_sweep_secs),
+            ),
         );
-        watches.and(seed).and(lease).and(prune)
+        watches.and(seed).and(lease).and(prune).and(sweep)
     };
 
     #[cfg(feature = "dhat-heap")]
@@ -1108,6 +1232,49 @@ mod tests {
             )
             .is_err(),
             "the raw front max-entries flags were replaced"
+        );
+    }
+
+    // A controller restarted more often than the TCP interval (rolling
+    // upgrades, OOM kills) must still reach the backstop: the next sweep is
+    // due on the next wall-clock boundary whatever the process's uptime.
+    #[test]
+    fn sweep_is_due_within_one_interval_of_any_restart_time() {
+        let interval = 12 * 60 * 60;
+        for restart_at in [0, 1, interval - 1, interval, 5 * interval + 4321] {
+            let last = sweep_bucket(restart_at, interval);
+            assert!(
+                sweep_bucket(restart_at, interval) <= last,
+                "no sweep at the restart instant itself"
+            );
+            assert!(
+                sweep_bucket(restart_at + interval, interval) > last,
+                "a controller up for one interval from {restart_at} must have swept"
+            );
+        }
+    }
+
+    // The sweep intervals are the operator's only handle on how long an idle
+    // flow's row survives; the env names are what the ConfigMap sets.
+    #[test]
+    fn idle_sweep_intervals_default_and_have_env_aliases() {
+        use clap::CommandFactory;
+        let args = Args::try_parse_from(REQUIRED).unwrap();
+        assert_eq!(args.udp_idle_sweep_secs, 120);
+        assert_eq!(args.tcp_idle_sweep_secs, 12 * 60 * 60);
+        let cmd = Args::command();
+        for (flag, env) in [
+            ("udp_idle_sweep_secs", "BEEP_UDP_IDLE_SWEEP_SECS"),
+            ("tcp_idle_sweep_secs", "BEEP_TCP_IDLE_SWEEP_SECS"),
+            ("flow_table_max_entries", "BEEP_FLOW_TABLE_MAX_ENTRIES"),
+        ] {
+            let arg = cmd.get_arguments().find(|a| a.get_id() == flag).unwrap();
+            assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env));
+        }
+        assert!(
+            Args::try_parse_from(REQUIRED.into_iter().chain(["--udp-idle-sweep-secs", "0"]))
+                .is_err(),
+            "a zero interval would sweep in a busy loop"
         );
     }
 

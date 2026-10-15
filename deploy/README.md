@@ -137,8 +137,17 @@ the controller container. The ConfigMap is required: a pod whose
 | --- | --- | --- | --- |
 | `--max-fronts` | `BEEP_MAX_FRONTS` | 1024 | Most fronts (front address x Service port x protocol) a node holds. Under the every-node-is-a-front model that is nodes x Service ports. Sets `FRONT_META` `max_entries`. |
 | `--endpoints-per-front` | `BEEP_ENDPOINTS_PER_FRONT` | 4 | Endpoints each front is sized for. Sets `FRONT_ENDPOINTS` `max_entries` = `max-fronts` x `endpoints-per-front` x 2 (8192 by default; the 2 is swap headroom for a front's next generation). |
+| `--udp-idle-sweep-secs` | `BEEP_UDP_IDLE_SWEEP_SECS` | 120 | Idle-flow sweep interval for UDP. A UDP flow row no packet matched for 1-2 intervals is deleted, so the interval is also the shortest quiet gap a UDP flow can lose its backend pin after. Closed TCP rows are swept here too. |
+| `--tcp-idle-sweep-secs` | `BEEP_TCP_IDLE_SWEEP_SECS` | 43200 (12 h) | Backstop sweep interval for TCP rows. Closed connections (RST, or FIN in both directions) are marked closed, keep forwarding retransmits, and are reclaimed by the UDP-interval sweep (ingress forward row and backend reverse/memo rows alike); this only frees connections that vanished without either, plus stray rows from late packets. |
+| `--flow-table-max-entries` | `BEEP_FLOW_TABLE_MAX_ENTRIES` | 16384 | Conntrack rows per node (`FLOW_TABLE`), preallocated at ~140 B each (~2.25 MiB at the default). Size for the peak concurrent connections per node across both roles (ingress and backend), including long-idle ones, plus closed connections not yet reclaimed. A small cluster can lower it (a 3-node cluster with under 100 external connections needs far less). |
 
-Both maps are `BPF_F_NO_PREALLOC`, so the caps are ceilings: a node pays
+The defaults follow the usual timeouts: kube-proxy's TCP established timeout
+is 24 h and the kernel's UDP stream timeout 30 s / 120 s, so UDP is never swept
+sooner than 2 min and TCP never later than a day. A swept flow that is still
+alive is re-pinned to a backend on its next packet (same hash, so usually the
+same backend), like after a NAT timeout.
+
+The two front maps are `BPF_F_NO_PREALLOC`, so their caps are ceilings: a node pays
 about 16 B per slot up front (the bucket array) and entries cost memory only
 as they are used.
 
@@ -154,8 +163,8 @@ naming the map, and the front keeps its previous endpoints.
 
 The flags in `daemonset.yaml`'s `args` (`--pod-cidr`, `--node-ip`,
 `--uplink-iface`, ...) are per-cluster or per-node values, not part of the
-ConfigMap (gotchas above). The remaining map caps (`--flow-table-max-entries`
-and similar) are CLI-only flags with defaults; see `beep-controller --help`.
+ConfigMap (gotchas above). The remaining map caps are CLI-only flags with
+defaults; see `beep-controller --help`.
 
 ### Changing a cap
 
@@ -170,11 +179,13 @@ kubectl -n kube-system rollout restart daemonset/servicelb-controller
 The restarted controller sees a pinned map whose `max_entries` differs from
 its new definition and recreates it (a `MapShape` mismatch), copying the
 old entries into the new map before any program is attached; the
-controller's first reconcile then writes back whatever did not fit. Only
-the front maps change (`FLOW_TABLE` is untouched), so established flows keep
-their conntrack entries. If a cap shrinks below the entries in use, whole
-fronts are kept in key order, the loss is logged with counts, and the
-controller repopulates the rest.
+controller's first reconcile then writes back whatever did not fit. This
+holds for every cap, `BEEP_FLOW_TABLE_MAX_ENTRIES` included: `FLOW_TABLE` is
+an LRU hash, so its rows are copied into the resized map and established
+flows keep their conntrack entries. If a cap shrinks below the entries in
+use, the overflow is lost: for the front maps whole fronts are kept in key
+order and the controller repopulates the rest; for `FLOW_TABLE` the
+connections that did not fit reset, and nothing repopulates them.
 
 Observed on the k3s rig (2 nodes; `BEEP_MAX_FRONTS` 1024 to 1000;
 `scripts/smoke-k3s-controller.sh`, leg H): the restarted controllers
@@ -232,8 +243,9 @@ Two different things reset or keep flows, so do not confuse them:
   the controller's first reconcile, so new flows pass to the host unbalanced
   until then. Schedule the rollout accordingly.
 - **A later 0.5 ConfigMap change plus `rollout restart` does not drop
-  established flows.** Only the front maps are recreated, with their entries
-  copied over; `FLOW_TABLE` is untouched (see "Changing a cap").
+  established flows.** The resized maps are recreated with their entries
+  copied over, `FLOW_TABLE` included; only a shrink below the rows in use
+  loses flows (see "Changing a cap").
 
 A beep pod that crash-loops after the upgrade means a map restore failed. The
 controller posts a `MapRestoreFailed` Warning Event on the node and the pod

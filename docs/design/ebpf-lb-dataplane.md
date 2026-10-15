@@ -252,6 +252,46 @@ flows pass to the host unbalanced (an absent front is not a front).
   a cross-Service collision (shared Pod:targetPort, reused client source
   port), remap the backend's source port, un-remapping on return —
   closes UDP. QUIC is **not** exempt (see Conntrack).
+- **Flow-row reclaim and idle GC**: the remap window is 16 synthetic
+  ports per front, so rows of finished flows must not live on until LRU
+  eviction, or stale rows from other fronts pin it shut and new colliding
+  connections are dropped. `FlowValue::flags` (forward and reverse rows)
+  carries two FIN-seen bits, a closed bit and one parity bit per protocol
+  class.
+  - **TCP close**: no packet ever deletes a row, since the packet that
+    triggers a delete can itself be lost on the underlay and leave the peer
+    retransmitting into a miss (the pod's FIN into a return-path miss left
+    it in LAST-ACK). Instead, on RST in either direction, or once a FIN has
+    been seen in both directions, the datapath marks the row closed, like
+    TIME_WAIT. A closed row keeps forwarding both ways (the pod's
+    retransmitted FIN, the client's final ACK), and the controller's short
+    (UDP-interval) sweep reclaims it with its port memo; a closed TCP row
+    is not subject to the TCP backstop. Every packet a closed row still
+    passes renews the linger. A SYN on the same 4-tuple clears the FIN and
+    closed bits, so a reused tuple is a new connection, not a row doomed by
+    the sweep. The remap occupancy probe treats a closed row as free, so a
+    burst of short connections does not pin the 16-slot window until the
+    sweep; the new connection overwrites that row. A late packet of the old
+    connection (a retransmit within the linger) then meets the new flow's
+    row, the same exposure as TIME_WAIT assassination. The first FIN alone
+    never closes, so a half-closed connection keeps working. An RST for a
+    flow with no row creates none. (`beep_common::flow_step`.) The flag word
+    is updated by whole-value read-modify-write from several paths, not
+    atomically: a lost race can drop a FIN or closed bit, a stray row the
+    idle sweep frees.
+  - **Idle GC**: `CONFIG` holds a global parity per class (UDP, TCP). A
+    matched packet copies it into its row's bit only when it differs (at
+    most one write per row per interval). Every interval the controller
+    deletes the class's rows whose bit differs (and memos with no surviving
+    reverse row), then flips the parity; userspace only deletes. A row
+    idle 1-2 intervals is reclaimed. Defaults: UDP 120 s (kernel UDP stream
+    timeout), TCP backstop 12 h (kube-proxy established 24 h); both are
+    configurable (`deploy/README.md`). The sweep re-reads each candidate
+    right before deleting it and skips rows refreshed since its snapshot,
+    runs on wall-clock interval boundaries, and the parity is kept across
+    controller restarts, so restarts never starve the backstop. Accepted
+    residual: a packet racing a sweep delete re-creates the row, and an idle flow swept after an
+    endpoint change may re-pin to a new backend, as after a NAT timeout.
 
 ## References
 

@@ -213,6 +213,17 @@ impl PinnedMaps {
 }
 
 impl PinnedMaps {
+    /// One idle-GC delete pass over `FLOW_TABLE` for `proto`'s class: returns
+    /// `(rows scanned, rows deleted)`. The caller flips that class's parity
+    /// only after this succeeds.
+    pub fn sweep_idle_flows(
+        &mut self,
+        proto: u8,
+        parity: beep_common::GcParity,
+    ) -> anyhow::Result<(usize, usize)> {
+        beep::sweep_idle_flows(&mut self.flow_table, proto, parity)
+    }
+
     /// Whether a swapped front's `g-1` grace has run out, so a reconcile pass
     /// would now delete its rows. A quiet cluster has no other trigger.
     pub fn previous_generations_due(&self, now: Instant) -> bool {
