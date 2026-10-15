@@ -7,8 +7,8 @@
 use std::time::SystemTime;
 
 use beep::pin_migrate::{errno_name, restore_remediation, RestoreFailure};
-use beep_kubeconfig::HyperApiClient;
 use hyper::Method;
+use politeia::HyperApiClient;
 use serde_json::{json, Value};
 
 use crate::lease::micro_time;

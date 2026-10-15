@@ -186,4 +186,6 @@ Design docs: `docs/design/ebpf-lb-dataplane.md` and the ADRs in `docs/decisions/
   `beep-common` — never duplicated — to keep map layouts identical.
 - `beep-ebpf` is cross-built by `build.rs` (aya-build) and embedded into the
   loader via `include_bytes_aligned!`; there is no separate build step for it.
+- Dependencies are crates.io-only, except `politeia` (kubeconfig/mTLS/API
+  client), which is a git dependency pinned to a release tag.
 - Imported from the u7s monorepo (u7s@4f898a4d) with git history preserved.

@@ -157,7 +157,7 @@ spec:
           hostPath:
             path: /sys/fs/bpf
             type: Directory
-        # beep-kubeconfig only parses an X.509 client-cert kubeconfig (no
+        # politeia only parses an X.509 client-cert kubeconfig (no
         # in-cluster ServiceAccount token support yet) -- this Secret must
         # hold one with (at least) the RBAC this DaemonSet's ClusterRole
         # grants (rbac.yaml). Provisioning it is left to the cluster

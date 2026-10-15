@@ -46,7 +46,7 @@
 # run that needs no Lima rig. See scripts/controller-rss.sh's header for the
 # measured baseline the shared ceilings are set against.
 #
-# KUBECONFIG: beep-kubeconfig (controller/src/main.rs's --kubeconfig) only
+# KUBECONFIG: politeia (controller/src/main.rs's --kubeconfig) only
 # parses an X.509 client-cert kubeconfig -- no in-cluster ServiceAccount
 # token support yet. This gate extracts k3s's own admin kubeconfig
 # (/etc/rancher/k3s/k3s.yaml) from node-a, rewrites its `server:` from

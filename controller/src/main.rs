@@ -34,8 +34,8 @@ use beep_controller::{
     status::{ensure_node_ingress, update_ingress},
     watch::{run_list_watch, ServiceKey, WatchState},
 };
-use beep_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use clap::Parser;
+use politeia::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use serde_json::Value;
 
 // Heap-profiling build only: routes every allocation through dhat so a

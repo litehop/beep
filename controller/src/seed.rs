@@ -13,8 +13,8 @@ use aya::maps::{Array as AyaArray, Map, MapData};
 use base64::Engine;
 use beep::random_seed;
 use beep_common::Config;
-use beep_kubeconfig::HyperApiClient;
 use hyper::{Method, StatusCode};
+use politeia::HyperApiClient;
 use serde_json::{json, Value};
 
 pub const SEED_SECRET_NAME: &str = "servicelb-flow-hash-seed";
