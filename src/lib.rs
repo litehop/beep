@@ -795,6 +795,11 @@ fn migrating_name(name: &str) -> String {
 /// production.
 pub const FAULT_BEFORE_RESTORE_ENV: &str = "BEEP_FAULT_ABORT_BEFORE_RESTORE";
 
+/// Setting this to a non-empty value makes the first restore write fail with
+/// `ENOMEM`, so the start fails with a `RestoreFailure` and the controller
+/// posts its `MapRestoreFailed` Events: a test hook. Unset in production.
+pub const FAULT_FAIL_RESTORE_WRITE_ENV: &str = "BEEP_FAULT_FAIL_RESTORE_WRITE";
+
 /// A pin `recreate_mismatched_pins` replaced. `snapshot` holds the old entries
 /// when the map's layout is unchanged and they should be restored into the
 /// new map; `parked` says the old map is still pinned as `<name>_migrating`.

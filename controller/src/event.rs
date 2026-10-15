@@ -4,12 +4,16 @@
 //! these Events tell `kubectl describe node|pod` why. Posting is never allowed
 //! to change the exit behaviour or hide the original error.
 
-use std::time::SystemTime;
+use std::{
+    future::Future,
+    time::{Duration, SystemTime},
+};
 
 use beep::pin_migrate::{errno_name, restore_remediation, RestoreFailure};
-use hyper::Method;
+use hyper::{Method, StatusCode};
 use politeia::HyperApiClient;
 use serde_json::{json, Value};
+use tokio::time::timeout;
 
 use crate::lease::micro_time;
 
@@ -102,20 +106,40 @@ pub async fn report_restore_failure(
     };
     let message = restore_failed_message(failure);
     let now = micro_time(SystemTime::now());
-    for (namespace, body) in restore_failed_events(node, pod, &message, &now) {
-        let path = format!("/api/v1/namespaces/{namespace}/events");
-        match client
-            .request(Method::POST, &path, Some(body.to_string()))
-            .await
-        {
-            Ok((status, _)) if status.is_success() => {
-                eprintln!("controller: posted {REASON} Event in {namespace}");
+    let events = restore_failed_events(node, pod, &message, &now);
+    post_all(events, POST_DEADLINE, |path, body| async move {
+        client.request(Method::POST, &path, Some(body)).await
+    })
+    .await;
+}
+
+/// Both POSTs together may not hold up the crash exit longer than this; the
+/// client's own per-request timeout would otherwise stack once per Event.
+const POST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Posts every `(namespace, body)` through `post` within `deadline` overall.
+/// Failures and a missed deadline are logged and swallowed.
+async fn post_all<F, Fut>(events: Vec<(String, Value)>, deadline: Duration, mut post: F)
+where
+    F: FnMut(String, String) -> Fut,
+    Fut: Future<Output = anyhow::Result<(StatusCode, String)>>,
+{
+    let all = async {
+        for (namespace, body) in events {
+            let path = format!("/api/v1/namespaces/{namespace}/events");
+            match post(path.clone(), body.to_string()).await {
+                Ok((status, _)) if status.is_success() => {
+                    eprintln!("controller: posted {REASON} Event in {namespace}");
+                }
+                Ok((status, resp)) => {
+                    eprintln!("controller: WARN posting {REASON} Event to {path} returned HTTP {status}: {resp}");
+                }
+                Err(e) => eprintln!("controller: WARN posting {REASON} Event to {path}: {e:#}"),
             }
-            Ok((status, resp)) => {
-                eprintln!("controller: WARN posting {REASON} Event to {path} returned HTTP {status}: {resp}");
-            }
-            Err(e) => eprintln!("controller: WARN posting {REASON} Event to {path}: {e:#}"),
         }
+    };
+    if timeout(deadline, all).await.is_err() {
+        eprintln!("controller: WARN posting {REASON} Events exceeded {deadline:?}; giving up");
     }
 }
 
@@ -152,6 +176,37 @@ mod tests {
         assert_eq!(pod_ev["involvedObject"]["name"], "beep-x");
         assert_eq!(pod_ev["involvedObject"]["namespace"], "kube-system");
         assert_eq!(pod_ev["involvedObject"]["uid"], "u-1");
+    }
+
+    #[tokio::test]
+    async fn hung_apiserver_cannot_delay_the_crash_exit_past_the_deadline() {
+        // Without the overall deadline, two hung POSTs stack their per-request
+        // timeouts and the crash-looping pod exits ~60 s late.
+        let events = restore_failed_events("n1", Some(&pod()), "msg", "T");
+        let started = std::time::Instant::now();
+        post_all(events, Duration::from_millis(50), |_, _| {
+            std::future::pending::<anyhow::Result<(StatusCode, String)>>()
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_post_does_not_stop_the_pod_post() {
+        let events = restore_failed_events("n1", Some(&pod()), "msg", "T");
+        let mut seen = Vec::new();
+        post_all(events, Duration::from_secs(5), |path, _| {
+            seen.push(path);
+            async { Err(anyhow::anyhow!("boom")) }
+        })
+        .await;
+        assert_eq!(
+            seen,
+            [
+                "/api/v1/namespaces/default/events",
+                "/api/v1/namespaces/kube-system/events"
+            ]
+        );
     }
 
     #[test]
