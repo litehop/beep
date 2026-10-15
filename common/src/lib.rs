@@ -3714,13 +3714,36 @@ mod tests {
     fn retransmitted_fin_after_close_still_finds_its_row() {
         let closed = replay(&[(C, FIN_ACK), (P, ACK), (P, FIN_ACK), (C, ACK)]);
         assert!(is_closed(closed), "FIN in both directions closes the row");
+        let rst_closed = replay(&[(C, ACK), (P, TCP_FLAG_RST)]);
+        assert!(is_closed(rst_closed), "RST closes the row");
+        assert_eq!(
+            flow_step(
+                Some(rst_closed),
+                IPPROTO_TCP,
+                ACK,
+                P,
+                GcParity {
+                    udp: true,
+                    tcp: false
+                }
+            ),
+            FlowStep::Write(rst_closed | FLOW_FLAG_UDP_PARITY),
+            "a packet on an RST-closed row must not reopen it"
+        );
+        let flipped = GcParity {
+            udp: true,
+            tcp: false,
+        };
         for (side, flags) in [(P, FIN_ACK), (C, ACK), (C, FIN_ACK), (P, ACK)] {
-            assert!(
-                matches!(
-                    step_tcp(Some(closed), flags, side),
-                    FlowStep::Keep | FlowStep::Write(_)
-                ),
-                "{side:?} {flags:#x} after close must still resolve the row"
+            assert_eq!(
+                step_tcp(Some(closed), flags, side),
+                FlowStep::Keep,
+                "{side:?} {flags:#x} on a current-parity closed row must not write"
+            );
+            assert_eq!(
+                flow_step(Some(closed), IPPROTO_TCP, flags, side, flipped),
+                FlowStep::Write(closed | FLOW_FLAG_UDP_PARITY),
+                "{side:?} {flags:#x} must keep CLOSED set and renew the linger parity"
             );
         }
     }

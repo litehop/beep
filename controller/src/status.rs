@@ -120,6 +120,18 @@ pub async fn ensure_node_ingress(
     .await
 }
 
+/// The Service no longer exists (GET returned 404); the field is the GET path.
+#[derive(Debug)]
+pub struct ServiceGone(pub String);
+
+impl std::fmt::Display for ServiceGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GET {} returned HTTP 404", self.0)
+    }
+}
+
+impl std::error::Error for ServiceGone {}
+
 /// The get-modify-patch loop shared by every writer of the atomic ingress
 /// list: `compute` maps the live list to the corrected one, or `None` to skip
 /// the PATCH.
@@ -137,6 +149,9 @@ pub async fn update_ingress(
             .request(Method::GET, &get_path, None)
             .await
             .with_context(|| format!("GET {get_path}"))?;
+        if status == hyper::StatusCode::NOT_FOUND {
+            anyhow::bail!(ServiceGone(get_path));
+        }
         if !status.is_success() {
             anyhow::bail!("GET {get_path} returned HTTP {status}");
         }
@@ -339,6 +354,25 @@ mod tests {
             merged,
             vec![other_node, json!({"ip": "10.0.0.5"})],
             "another node's entry must survive a prune of this node's own stale family"
+        );
+    }
+
+    // The clear for a Service that left LoadBalancer is a merge with no
+    // desired addresses: each node withdraws only its own entries.
+    #[test]
+    fn clearing_withdraws_this_nodes_entries_and_keeps_other_nodes() {
+        let own = [v4(10, 0, 0, 5), v6(5)];
+        let other_node = json!({"ip": "10.0.0.6"});
+        let existing = vec![
+            other_node.clone(),
+            json!({"ip": "10.0.0.5"}),
+            json!({"ip": "2001:db8::5"}),
+        ];
+        let merged = merged_ingress(&existing, &own, &[]).expect("own entries must be dropped");
+        assert_eq!(
+            merged,
+            vec![other_node],
+            "a node clearing a non-LoadBalancer Service must not strip another node's entry"
         );
     }
 

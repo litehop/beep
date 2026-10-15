@@ -98,6 +98,15 @@ the first time, then confirm with "Verify your deployment" below.
    (symmetric return) — there's no separate egress interface to configure.
    Design rationale: `docs/decisions/servicelb-multi-symmetric-uplink.md`.
 
+6. **beep must be the cluster's only L4 load balancer.** It serves every
+   `type: LoadBalancer` Service and ignores `spec.loadBalancerClass`, so a
+   second controller would write `status.loadBalancer.ingress` on the same
+   Services. On k3s, install with `--disable=servicelb` (the Lima rig does
+   this in `scripts/k3s-up.sh`). Do not run MetalLB, kube-vip or a cloud LB
+   controller alongside. L7 ingress controllers (Traefik, nginx) are fine:
+   they are exposed through their own `LoadBalancer` Service, which beep
+   serves.
+
 ## Files
 
 - `daemonset.yaml` — one controller pod per node (`hostNetwork: true`),

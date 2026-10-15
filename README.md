@@ -16,7 +16,7 @@ For now, you supply the loader with static FRONT_IP:PORT -> backend-node/PodIP:T
 
 ## Deploying to Kubernetes
 
-To run beep on a real Kubernetes cluster as a DaemonSet, rather than standalone with `--fixture`, see the setup guide in `deploy/README.md`. Read its "Required per-cluster configuration & gotchas" section before deploying to any cluster other than the dev rig, and use "Verify your deployment" to confirm the install worked.
+To run beep on a real Kubernetes cluster as a DaemonSet, rather than standalone with `--fixture`, see the setup guide in `deploy/README.md`. Read its "Required per-cluster configuration & gotchas" section before deploying to any cluster other than the dev rig, and use "Verify your deployment" to confirm the install worked. beep must be the cluster's only L4 load balancer (on k3s, install with `--disable=servicelb`).
 
 ## Building
 
