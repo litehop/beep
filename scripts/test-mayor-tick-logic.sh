@@ -51,8 +51,8 @@ call() {  # runs the real script's __call entry point, capturing stdout
   bash "$SCRIPT" __call "$@"
 }
 
-file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scripts/
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+file_inode() {  # tmp-file + mv replacement allocates a new inode
+  ls -i "$1" | awk '{print $1}'
 }
 
 # Builds an isolated single-worktree scratch git repo (one worktree, no
@@ -463,15 +463,15 @@ assert "...still leaves the DECISION POINT section untouched" \
 # replace (sentinel already exists, from the steady-state re-run above) and
 # the fresh-append (brand-new sentinel id, never seen before).
 DASH_BEFORE_CONTENT=$(cat "$DASH")
-DASH_BEFORE_MTIME=$(file_mtime "$DASH")
+DASH_BEFORE_INODE=$(file_inode "$DASH")
 MAYOR_TICK_DASHBOARD_FILE="$DASH" MAYOR_TICK_DRY_RUN=1 call splice_dashboard_section \
   "open-prs" '^## .*Open PRs' '🔎 Open PRs' "- #999 should never actually be written" >/dev/null
 MAYOR_TICK_DASHBOARD_FILE="$DASH" MAYOR_TICK_DRY_RUN=1 call splice_dashboard_section \
   "brand-new-dry-run-section" '^## .*Nonexistent Heading' 'Nonexistent Heading' "should never actually be written" >/dev/null
 DASH_AFTER_CONTENT=$(cat "$DASH")
-DASH_AFTER_MTIME=$(file_mtime "$DASH")
-assert "MAYOR_TICK_DRY_RUN=1 leaves the dashboard file's mtime unchanged (replace path)" \
-  "$([ "$DASH_BEFORE_MTIME" = "$DASH_AFTER_MTIME" ] && echo 1 || echo 0)"
+DASH_AFTER_INODE=$(file_inode "$DASH")
+assert "MAYOR_TICK_DRY_RUN=1 never replaces the dashboard file (same inode, replace path)" \
+  "$([ -n "$DASH_BEFORE_INODE" ] && [ "$DASH_BEFORE_INODE" = "$DASH_AFTER_INODE" ] && echo 1 || echo 0)"
 assert "MAYOR_TICK_DRY_RUN=1 leaves the dashboard file's content byte-identical (replace + append paths)" \
   "$([ "$DASH_BEFORE_CONTENT" = "$DASH_AFTER_CONTENT" ] && echo 1 || echo 0)"
 assert "...the dry-run replace content never actually lands in the file" \
