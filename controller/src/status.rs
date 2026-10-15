@@ -342,6 +342,25 @@ mod tests {
         );
     }
 
+    // The clear for a Service that left LoadBalancer is a merge with no
+    // desired addresses: each node withdraws only its own entries.
+    #[test]
+    fn clearing_withdraws_this_nodes_entries_and_keeps_other_nodes() {
+        let own = [v4(10, 0, 0, 5), v6(5)];
+        let other_node = json!({"ip": "10.0.0.6"});
+        let existing = vec![
+            other_node.clone(),
+            json!({"ip": "10.0.0.5"}),
+            json!({"ip": "2001:db8::5"}),
+        ];
+        let merged = merged_ingress(&existing, &own, &[]).expect("own entries must be dropped");
+        assert_eq!(
+            merged,
+            vec![other_node],
+            "a node clearing a non-LoadBalancer Service must not strip another node's entry"
+        );
+    }
+
     // A node that used to be published by its InternalIP and now fronts its
     // ExternalIP (the underlay/front split) must not leave the InternalIP
     // behind: clients would keep being sent to a private address that is no

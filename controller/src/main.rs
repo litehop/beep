@@ -32,7 +32,7 @@ use beep_controller::{
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed},
     status::{ensure_node_ingress, update_ingress},
-    watch::{run_list_watch, ServiceKey, WatchState},
+    watch::{run_list_watch, stale_ingress_key, stale_ingress_keys, ServiceKey, WatchState},
 };
 use beep_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use clap::Parser;
@@ -506,6 +506,20 @@ fn publish_ingress_for(
     publish_ingress(client, pending, key, own_ips, desired_ips);
 }
 
+/// Withdraws this node's own entries from `key`'s ingress: a Service that left
+/// `type=LoadBalancer` is no longer fronted. Other nodes' entries are theirs to
+/// withdraw (`status::merged_ingress` with no desired addresses).
+fn clear_ingress_for(
+    client: &Arc<HyperApiClient>,
+    pending: &Arc<Mutex<PublishRetry>>,
+    state: &Mutex<WatchState>,
+    node: &NodeContext,
+    key: ServiceKey,
+) {
+    let own_ips = state.lock().unwrap().own_node_ips(node.node_ip);
+    publish_ingress(client, pending, key, own_ips, Vec::new());
+}
+
 /// Services whose ingress publish failed, re-published with `RetryBackoff`
 /// delays until it succeeds: without it a node that just lost its last
 /// `externalTrafficPolicy: Local` pod stays listed until the next event.
@@ -619,6 +633,9 @@ async fn run_controller_loop(
             if let Some(key) = changed {
                 publish_ingress_for(&client, &pending, &state, &node, key);
             }
+            if let Some(key) = stale_ingress_key(&event) {
+                clear_ingress_for(&client, &pending, &state, &node, key);
+            }
         }
     };
     let on_services_relist = {
@@ -632,6 +649,9 @@ async fn run_controller_loop(
             apply_reconcile(&state, &maps, &retry, &node);
             for key in keys {
                 publish_ingress_for(&client, &pending, &state, &node, key);
+            }
+            for key in stale_ingress_keys(&items) {
+                clear_ingress_for(&client, &pending, &state, &node, key);
             }
             Ok(())
         }
