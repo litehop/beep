@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kube-proxy must run in iptables or nftables mode. See `deploy/README.md`
   ("Required per-cluster configuration & gotchas").
 
+- **The loader refuses to start on kernels older than 6.6** (TCX attach).
+  Upgrade nodes to Linux 6.6 or newer before rolling out 0.5.0.
+
 - **New `beep-config` ConfigMap (`deploy/configmap.yaml`) holds the sizing
   caps.** Apply it before `deploy/daemonset.yaml`, which now loads it with
   `envFrom` (a missing ConfigMap fails the pod). `BEEP_MAX_FRONTS` (1024) and
@@ -154,6 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - kube-proxy IPVS mode is unsupported: kube-proxy binds the published ingress
   addresses (including node addresses) to `kube-ipvs0`, which breaks node
   connectivity. Use iptables or nftables mode.
+- Minimum kernel is Linux 6.6; the loader fails fast on older kernels.
 - Supported Kubernetes: the latest two minor versions (currently 1.36 and
   1.37), rolling forward with upstream. Older versions are unsupported.
 
