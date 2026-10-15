@@ -1348,6 +1348,15 @@ DROP_UDP4_RX="/tmp/beep-smoke-drop-udp4-rx.txt"
 DROP_UDP6_RX="/tmp/beep-smoke-drop-udp6-rx.txt"
 DROP_PROBE_SECS=2
 
+# Prints the lines of a `tcpdump -vv` capture that answer a count-0 probe: a
+# RST or SYN-ACK whose SOURCE port is a count-0 port, or any ICMP(v6)
+# unreachable. The port is anchored as the source (`.1930N >`) because an
+# unanchored match also hits digits inside timestamps/seq numbers, and NDP/MLD
+# noise (router solicitations) never matches either alternative.
+count0_wire_replies() { # <capture-file>
+  grep -E "\.1930[0-3] > .*Flags \[(R|S\.)|unreachable" "$1" || true
+}
+
 set_front_count_zero() { # <key-ip-bytes> <port> <proto-number>
   bpftool map update pinned "$PIN_DIR/FRONT_META" key $1 $(($2 >> 8)) $(($2 & 255)) $3 0 value 0 0 0 0 0 0 0 0 0 0 0 0 || {
     echo "FAIL: could not insert a count-0 FRONT_META row (key ip bytes '$1', port $2)" >&2
@@ -1440,7 +1449,7 @@ if [ -n "$DROP_CAPTURE_PID" ]; then
     cat "$DROP_CAPTURE" >&2
     exit 1
   fi
-  replies=$(grep -E "Flags \[(R|S\.)|unreachable" "$DROP_CAPTURE" | grep -E "1930[0-3]" || true)
+  replies=$(count0_wire_replies "$DROP_CAPTURE")
   if [ -n "$replies" ]; then
     echo "FAIL: the node answered a count-0 front on the wire; a silent drop must leave no RST, SYN-ACK or unreachable:" >&2
     echo "$replies" >&2
