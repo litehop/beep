@@ -71,6 +71,10 @@ PIN_DIR="/sys/fs/bpf/beep"
 KUBECONFIG_SECRET="beep-controller-kubeconfig"
 CLIENT_KUBECONFIG="/tmp/e2e-lb-k3s-kubeconfig"
 CLIENT_JUNIT="/tmp/e2e-lb-k3s-junit.xml"
+# The ETP=Local spec derives a /16 from the node InternalIP (192.168.0.0/16
+# on Lima) and treats any client address inside it as masqueraded, so the
+# client's source toward the nodes must lie outside that range.
+CLIENT_ALT_IP="172.31.104.15"
 
 for tool in limactl jq; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
@@ -87,7 +91,9 @@ cleanup() {
     | while read -r ns; do kube delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true; done || true
   k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
   limactl shell "$VM_CLIENT" -- rm -f "$CLIENT_KUBECONFIG" "$CLIENT_JUNIT" >/dev/null 2>&1 || true
+  limactl shell "$VM_CLIENT" -- sudo bash -c "ip route del ${IP_A:-}/32 dev eth0; ip route del ${IP_B:-}/32 dev eth0; ip addr del $CLIENT_ALT_IP/32 dev eth0" >/dev/null 2>&1 || true
   for vm in "$VM_A" "$VM_B"; do
+    limactl shell "$vm" -- sudo ip route del "$CLIENT_ALT_IP/32" dev eth0 >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
   done
@@ -117,6 +123,16 @@ for vm in "$VM_A" "$VM_B"; do
     sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
     sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   '
+done
+
+echo "==> [2b/7] giving $VM_CLIENT source $CLIENT_ALT_IP toward the nodes (outside the node-derived /16, routed on-link, no SNAT)"
+limactl shell "$VM_CLIENT" -- sudo bash -c "
+  ip addr replace $CLIENT_ALT_IP/32 dev eth0
+  ip route replace $IP_A/32 dev eth0 src $CLIENT_ALT_IP
+  ip route replace $IP_B/32 dev eth0 src $CLIENT_ALT_IP
+"
+for vm in "$VM_A" "$VM_B"; do
+  limactl shell "$vm" -- sudo ip route replace "$CLIENT_ALT_IP/32" dev eth0
 done
 
 echo "==> [3/7] provisioning kubeconfigs (controller Secret on $VM_A, e2e client copy on $VM_CLIENT)"

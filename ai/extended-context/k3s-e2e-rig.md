@@ -74,22 +74,18 @@ Secret, `geneve0`, and any leftover e2e Namespaces regardless of outcome.
 It's a manual/nightly Lima-tier gate, not wired into `ci.yaml` --
 GitHub-hosted runners can't host this 3-VM rig.
 
-**What PASS looks like.** The last full run (bead beep-lbs) recorded 4/7
-PASS: 2 specs failed on a since-fixed harness gap (`beep-client` had no
-standalone `kubectl` on `PATH`, blocking the two specs that `exec` into a
-pod -- fixed by beep-bol, now on `main`), so a current run lands **6/7**,
-the observed result (beep-bol, PR #60). The remaining failure is spec 1
-(`... should work for type=LoadBalancer`): its own log shows beep
-correctly delivered the client's real, unmasqueraded IP, but the spec's
-cloud-provider heuristic derives a `/16` from the node's internal address
-and calls any client IP inside that `/16` "not preserved" -- which only
-holds when the node's internal subnet is disjoint from the client's, true on
-a real cloud VPC but false on Lima, where `k3s-up.sh` puts node-a, node-b,
-and `beep-client` on the same flat `192.168.104.0/24` subnet nested inside
-that `/16`. Treat a spec-1 FAIL alone as this known Lima-topology artifact,
-not a beep regression; a FAIL on any other spec is a real signal -- both
-scripts print `dump_evidence()`'s bpftool/`ip -s link`/controller-log dump
-automatically on failure.
+**What PASS looks like.** A full run is **7/7** (`SUCCESS! -- 7 Passed | 0
+Failed`). Spec 1 (`... should work for type=LoadBalancer`) derives a `/16`
+from the node's internal address and calls any client IP inside it "not
+preserved"; on Lima `beep-client` shares the nodes' flat `192.168.104.0/24`,
+nested inside that `/16`. Step 2b of the script therefore gives `beep-client`
+a second address (`172.31.104.15/32`), pins its source toward each node with
+a `/32 ... src` route, and adds an on-link `/32` route back to it on both
+nodes -- no SNAT, so the spec's log shows `ClientIP detected by target pod
+using VIP:SvcPort is 172.31.104.15:<port>`. Cleanup removes the address and
+routes. Any FAIL, spec 1 included, is a real signal -- both scripts print
+`dump_evidence()`'s bpftool/`ip -s link`/controller-log dump automatically on
+failure.
 
 `--dry-run` validates the focus-list without running anything live (`Will
 run 7 of 7579 specs`); use it after touching `FOCUS` before spending the
