@@ -154,6 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - kube-proxy IPVS mode is unsupported: kube-proxy binds the published ingress
   addresses (including node addresses) to `kube-ipvs0`, which breaks node
   connectivity. Use iptables or nftables mode.
+- Supported Kubernetes: the latest two minor versions (currently 1.36 and
+  1.37), rolling forward with upstream. Older versions are unsupported.
 
 ## [0.4.0] - 2026-10-09
 
