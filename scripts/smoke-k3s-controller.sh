@@ -751,11 +751,12 @@ done
 echo "LEG-H2 events:"
 kube get events -A --field-selector reason=MapRestoreFailed
 restore_events | jq -r '.items[0].message' | sed 's/^/LEG-H2 message: /'
+# Clear the fault before any assert: leg_fail returns under --keep-going and later legs must not run with it set.
+kube -n kube-system set env daemonset/servicelb-controller BEEP_FAULT_FAIL_RESTORE_WRITE- >/dev/null
 [ "$(restore_events | jq '[.items[] | select(.involvedObject.kind == "Node" and .metadata.namespace == "default")] | length')" -ge 1 ] || \
   leg_fail "LEG-H2: FAIL (no MapRestoreFailed Event on a Node in default)"
 [ "$(restore_events | jq '[.items[] | select(.involvedObject.kind == "Pod" and .metadata.namespace == "kube-system")] | length')" -ge 1 ] || \
   leg_fail "LEG-H2: FAIL (no MapRestoreFailed Event on a Pod in kube-system)"
-kube -n kube-system set env daemonset/servicelb-controller BEEP_FAULT_FAIL_RESTORE_WRITE- >/dev/null
 # Dropping the env restores the pre-fault pod template, so a node whose pod never restarted keeps its old sizing.
 kube -n kube-system rollout restart daemonset/servicelb-controller >/dev/null
 kube -n kube-system rollout status daemonset/servicelb-controller --timeout=240s >/dev/null || leg_fail "LEG-H2: FAIL (DaemonSet did not recover once the fault was removed)"
