@@ -63,16 +63,17 @@ use aya_ebpf::{
 use beep_common::{
     address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
     decode_pod_id_option, egress_return_admission, egress_return_outcome, encode_flow_key,
-    encode_pod_id_option, encode_tcp_flow_key, flow_hash, flow_step, forward_admission,
-    fwd_pending_affinity_pin, ingress_steer, ipv4_mapped_v6, is_redirected_return_mark,
-    occupant_conflicts, peer_node_admission, resolve_backend_src_port, return_authorization,
-    reverse_occupant, tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums, BackendPortDecision,
-    BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
-    EgressReturnOutcome, FlowDirection, FlowKey, FlowSide, FlowStep, FlowValue, ForwardAdmission,
-    ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta, FwdPendingPin, GcParity,
-    IngressSteer, LbFrontBackend, LbFrontKey, PeerNodeAdmission, PortMemoValue,
-    ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig, BPF_F_NO_PREALLOC,
-    GENEVE_OPT_CLASS, IPPROTO_TCP, IPPROTO_UDP, POD_ID_OPT_LEN, REDIRECTED_RETURN_MARK,
+    encode_pod_id_option, encode_tcp_flow_key, flow_hash, flow_step, flow_step_flags,
+    forward_admission, fwd_pending_affinity_pin, ingress_steer, ipv4_mapped_v6,
+    is_redirected_return_mark, occupant_conflicts, peer_node_admission, resolve_backend_src_port,
+    return_authorization, reverse_occupant, tunnel_remote_addr, unmap_ipv4,
+    AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
+    DecapForwardPodAdmission, EgressReturnAdmission, EgressReturnOutcome, FlowDirection, FlowKey,
+    FlowSide, FlowStep, FlowValue, ForwardAdmission, ForwardFlowValue, FrontEndpoint,
+    FrontEndpointKey, FrontMeta, FwdPendingPin, GcParity, IngressSteer, LbFrontBackend, LbFrontKey,
+    PeerNodeAdmission, PortMemoValue, ReturnAuthorization, RevFlowValue, TcpFlowKey, UplinkConfig,
+    BPF_F_NO_PREALLOC, GENEVE_OPT_CLASS, IPPROTO_TCP, IPPROTO_UDP, POD_ID_OPT_LEN,
+    REDIRECTED_RETURN_MARK,
 };
 
 /// VNI stamped on the forward leg (ingress -> backend). Host order -- see
@@ -1106,8 +1107,10 @@ fn commit_reverse_row(
             rev_value.original_client_port,
         )
     });
-    let step = flow_step(
-        mine.map(|v| v.flags),
+    let mine_flags = mine.map_or(0, |v| v.flags);
+    let step = flow_step_flags(
+        mine.is_some(),
+        mine_flags,
         proto,
         tcp_flags,
         FlowSide::Client,
@@ -1118,7 +1121,7 @@ fn commit_reverse_row(
     }
     rev_value.flags = match step {
         FlowStep::Write(flags) => flags,
-        _ => mine.map_or(0, |v| v.flags),
+        _ => mine_flags,
     };
     if stored != Some(rev_value) {
         FLOW_TABLE

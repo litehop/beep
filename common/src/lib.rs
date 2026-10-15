@@ -1388,13 +1388,35 @@ pub fn flow_step(
     side: FlowSide,
     parity: GcParity,
 ) -> FlowStep {
-    let mut flags = existing.unwrap_or(0);
+    flow_step_flags(
+        existing.is_some(),
+        existing.unwrap_or(0),
+        proto,
+        tcp_flags,
+        side,
+        parity,
+    )
+}
+
+/// `flow_step` with the row split into a presence bool and its flags (`0`
+/// when absent). The eBPF caller uses this form: an `Option<u16>` built from a
+/// map lookup carries an undefined payload when `None`, which the optimizer
+/// may read as a scalar and the verifier rejects as pointer arithmetic.
+pub fn flow_step_flags(
+    exists: bool,
+    existing_flags: u16,
+    proto: u8,
+    tcp_flags: u8,
+    side: FlowSide,
+    parity: GcParity,
+) -> FlowStep {
+    let mut flags = existing_flags;
     if proto == IPPROTO_TCP {
         if tcp_flags & TCP_FLAG_SYN != 0 {
             flags &= !(FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD | FLOW_FLAG_CLOSED);
         }
         if tcp_flags & TCP_FLAG_RST != 0 {
-            if existing.is_none() {
+            if !exists {
                 return FlowStep::Skip;
             }
             flags |= FLOW_FLAG_CLOSED;
@@ -1413,7 +1435,7 @@ pub fn flow_step(
     if let Some((bit, global)) = parity_bit(proto, flags, parity) {
         flags = if global { flags | bit } else { flags & !bit };
     }
-    if existing == Some(flags) {
+    if exists && existing_flags == flags {
         FlowStep::Keep
     } else {
         FlowStep::Write(flags)
