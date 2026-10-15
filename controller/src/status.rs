@@ -28,8 +28,8 @@
 use std::{net::IpAddr, time::Duration};
 
 use anyhow::Context;
-use beep_kubeconfig::HyperApiClient;
 use hyper::Method;
+use politeia::HyperApiClient;
 use serde_json::{json, Value};
 
 /// Computes the corrected `status.loadBalancer.ingress` list for THIS node,

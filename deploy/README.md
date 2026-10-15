@@ -318,7 +318,7 @@ revisit trigger.
 
 ## Kubeconfig
 
-`beep-kubeconfig` only parses an X.509 client-cert kubeconfig file (no
+`politeia` only parses an X.509 client-cert kubeconfig file (no
 in-cluster ServiceAccount token support yet), so `--kubeconfig` points at a
 Secret-mounted kubeconfig, not the ServiceAccount's own projected token.
 Provisioning that Secret (`beep-controller-kubeconfig` in `kube-system`) is
@@ -362,7 +362,7 @@ kubectl create rolebinding beep-controller-csr-flow-hash-seed -n kube-system \
 kubectl create rolebinding beep-controller-csr-node-lease -n beep-leases \
   --role=servicelb-controller-node-lease --user=beep-controller
 
-# 4. Assemble a kubeconfig with exactly the 4 fields beep-kubeconfig reads
+# 4. Assemble a kubeconfig with exactly the 4 fields politeia reads
 kubectl config set-cluster beep --server=https://<api-server>:6443 \
   --certificate-authority=<cluster-ca.crt> --embed-certs \
   --kubeconfig=beep-controller.kubeconfig

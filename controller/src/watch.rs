@@ -1,5 +1,5 @@
 //! Watches `Service` (type=LoadBalancer) + `EndpointSlice` (+ `Node`, to
-//! resolve a backend's hosting-node IP) via `beep_kubeconfig::HyperApiClient`
+//! resolve a backend's hosting-node IP) via `politeia::HyperApiClient`
 //! and folds the parsed events into `reconcile::reconcile_service`'s inputs.
 //!
 //! Split into two layers on purpose (Rule 14): the JSON-parsing and
@@ -15,8 +15,8 @@ use std::{collections::HashMap, net::IpAddr, time::Duration};
 
 use anyhow::Context;
 use beep::tunnel_remote_v6;
-use beep_kubeconfig::HyperApiClient;
 use hyper::Method;
+use politeia::HyperApiClient;
 use serde_json::Value;
 
 use crate::reconcile::{

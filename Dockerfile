@@ -10,7 +10,7 @@
 #
 # debian:trixie-slim ships glibc 2.41, newer than the pinned glibc 2.36
 # floor the binaries were linked against (forward-compatible). No
-# ca-certificates package is needed: beep-kubeconfig builds its TLS root
+# ca-certificates package is needed: politeia builds its TLS root
 # store from the CA cert embedded in the mounted kubeconfig/ServiceAccount
 # token, not the OS trust store. The DaemonSet grants CAP_BPF/CAP_NET_ADMIN
 # at the pod level (deploy/daemonset.yaml).

@@ -21,8 +21,8 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use beep_kubeconfig::HyperApiClient;
 use hyper::{Method, StatusCode};
+use politeia::HyperApiClient;
 use serde_json::{json, Value};
 
 pub const LEASE_DURATION: Duration = Duration::from_secs(40);
