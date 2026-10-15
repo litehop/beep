@@ -56,11 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections had left stale remap state behind: two Services sharing a pod
   and a client reusing one source port across both remap the second flow's
   backend-facing source port, and the reverse/memo rows of finished flows were
-  only ever freed by LRU eviction. A TCP flow's rows (backend reverse and
-  port-remap memo, ingress forward) are now deleted on RST, or on the first
-  non-FIN packet of the first-FIN side once both FINs were seen (a
-  half-closed connection keeps its rows), and an idle sweep reclaims the
-  rest.
+  only ever freed by LRU eviction. A TCP flow's rows are now marked closed on
+  RST, or once a FIN was seen in both directions (a half-closed connection
+  stays live). A closed row keeps forwarding, so a retransmitted FIN or final
+  ACK still finds it, and a new connection may reuse its remap slot; the short
+  (UDP-interval) idle sweep then reclaims it with its port-remap memo, and the
+  sweeps reclaim the rest.
 
 ### Added
 

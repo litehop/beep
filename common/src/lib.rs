@@ -1056,6 +1056,18 @@ pub fn occupant_conflicts(
     matches!(occupant, Some(identity) if identity != (resolving_front, resolving_client_port))
 }
 
+/// The `occupant_conflicts` identity of a stored reverse row, or `None` when
+/// the row is closed: a closed row only lingers for retransmits, so a new
+/// connection may take its slot. Without this, rows lingering until the sweep
+/// would pin the 16-slot remap window shut under a burst of short connections.
+pub fn reverse_occupant(row: &RevFlowValue) -> Option<(([u8; 16], u16), u16)> {
+    if row.flags & FLOW_FLAG_CLOSED != 0 {
+        None
+    } else {
+        Some(((row.front_ip, row.front_port), row.original_client_port))
+    }
+}
+
 /// IANA dynamic/private port range (RFC 6335 SS6) -- this dataplane
 /// controls both ends of the backend<->Pod segment the remapped port is
 /// visible on, so it doesn't need to avoid the client's own ephemeral
@@ -1286,9 +1298,9 @@ pub const FLOW_FLAG_FIN_POD: u16 = 1 << 1;
 pub const FLOW_FLAG_UDP_PARITY: u16 = 1 << 2;
 /// Idle-GC parity of a TCP row; compared against `Config::tcp_parity`.
 pub const FLOW_FLAG_TCP_PARITY: u16 = 1 << 3;
-/// Set when the second of the two FINs came from the pod side, clear when it
-/// came from the client side; only meaningful once both FIN bits are set.
-pub const FLOW_FLAG_LAST_FIN_POD: u16 = 1 << 4;
+/// The TCP connection ended (RST, or FIN in both directions). Written only by
+/// the datapath; the row keeps forwarding and the short sweep reclaims it.
+pub const FLOW_FLAG_CLOSED: u16 = 1 << 4;
 
 /// Which end of the connection sent the packet a backend node is processing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1304,10 +1316,21 @@ pub struct GcParity {
     pub tcp: bool,
 }
 
-/// The parity bit a row of `proto` carries, and the global parity it is
-/// compared against. `None` for protocols the dataplane never stores.
-fn parity_bit(proto: u8, parity: GcParity) -> Option<(u16, bool)> {
-    match proto {
+/// The idle sweep that owns a row: its protocol's, except that a closed TCP
+/// row lingers only for the short (UDP-interval) sweep, not the TCP backstop.
+pub fn sweep_class(flags: u16, proto: u8) -> u8 {
+    if proto == IPPROTO_TCP && flags & FLOW_FLAG_CLOSED != 0 {
+        IPPROTO_UDP
+    } else {
+        proto
+    }
+}
+
+/// The parity bit a row carries (that of its `sweep_class`), and the global
+/// parity it is compared against. `None` for protocols the dataplane never
+/// stores.
+fn parity_bit(proto: u8, flags: u16, parity: GcParity) -> Option<(u16, bool)> {
+    match sweep_class(flags, proto) {
         IPPROTO_UDP => Some((FLOW_FLAG_UDP_PARITY, parity.udp)),
         IPPROTO_TCP => Some((FLOW_FLAG_TCP_PARITY, parity.tcp)),
         _ => None,
@@ -1316,9 +1339,12 @@ fn parity_bit(proto: u8, parity: GcParity) -> Option<(u16, bool)> {
 
 /// Whether the controller's idle sweep deletes a row: its parity bit differs
 /// from the global parity, i.e. no packet matched it since the parity before
-/// the last flip. Rows of any other protocol are never swept.
+/// the last flip. Rows of any other protocol are never swept. The caller must
+/// only ask for rows of the sweep that owns them (`sweep_class`): evaluated
+/// mid-interval by the other sweep, a bit that is merely not yet refreshed
+/// reads as idle.
 pub fn parity_sweep_deletes(flags: u16, proto: u8, parity: GcParity) -> bool {
-    match parity_bit(proto, parity) {
+    match parity_bit(proto, flags, parity) {
         Some((bit, global)) => (flags & bit != 0) != global,
         None => false,
     }
@@ -1331,36 +1357,29 @@ pub enum FlowStep {
     Keep,
     /// Rewrite the row's flags to this value.
     Write(u16),
-    /// The connection is over: delete the row (and its port memo) and, for a
-    /// packet with no row yet, do not create one.
-    Reclaim,
+    /// The packet ends a connection that has no row: do not create one.
+    Skip,
 }
 
 /// Per-matched-packet decision on a flow row's flags, shared by the
 /// forward-decap (`FlowSide::Client`) and uplink-egress (`FlowSide::Pod`)
-/// hooks of the backend node and, with `tcp_flags == 0`, the ingress node's
-/// parity-only touch.
+/// hooks of the backend node and the ingress node's forward row.
 ///
-/// TCP rows are reclaimed on RST in either direction, or on the first
-/// non-FIN packet from the side that sent the FIRST FIN, after a FIN has been
-/// seen in BOTH directions -- that is the final ACK, which the row must still
-/// carry (deleting at the second FIN would let that ACK recreate the row, and
-/// a return-leg miss would send the pod's retransmitted FIN out
-/// un-encapsulated). Packets from the second FIN's own side do not count: a
-/// duplicate ACK answering a retransmitted FIN arrives before the real final
-/// ACK and would otherwise delete the row from under it. The first FIN alone
-/// never reclaims: the other side may keep sending (half-close). A SYN starts
-/// a fresh connection on the same 4-tuple and clears the FIN bits.
+/// A TCP row is marked `FLOW_FLAG_CLOSED` on RST in either direction, or once
+/// a FIN has been seen in BOTH directions (the first FIN alone is a
+/// half-close). The mark never drops a packet: a closed row keeps forwarding
+/// both ways, so the pod's retransmitted FIN and the client's final ACK still
+/// resolve their row. Deleting on a packet is never loss-safe -- the packet
+/// that triggers it can itself be lost after the row is gone, leaving the
+/// peer retransmitting into a miss. A closed row is reclaimed only by the
+/// controller's short sweep (`sweep_class`), like TIME_WAIT. A SYN starts a
+/// fresh connection on the same 4-tuple and clears the FIN and closed bits.
+/// An RST for a flow with no row creates none (`FlowStep::Skip`).
 ///
-/// A close whose second FIN piggybacks the ACK of the first (FIN, FIN+ACK,
-/// ACK) is an ordinary close and is reclaimed at the final ACK. After truly
-/// crossed FINs the first-FIN side's ACK reclaims the row before the other
-/// side's ACK has passed; that ACK then misses the row and the peer
-/// retransmits its FIN (about 200 ms), which recreates the row. No data is
-/// lost.
-///
-/// Otherwise the row's parity bit is copied from the global parity, written
-/// only when it differs: at most one write per row per sweep interval.
+/// The row's parity bit is copied from the global parity, written only when it
+/// differs: at most one write per row per sweep interval. A closed row carries
+/// the bit of its `sweep_class`, so every packet it still passes renews the
+/// linger.
 /// `existing`: the row's flags, `None` when the packet has no row.
 pub fn flow_step(
     existing: Option<u16>,
@@ -1371,36 +1390,27 @@ pub fn flow_step(
 ) -> FlowStep {
     let mut flags = existing.unwrap_or(0);
     if proto == IPPROTO_TCP {
-        if tcp_flags & TCP_FLAG_RST != 0 {
-            return FlowStep::Reclaim;
-        }
         if tcp_flags & TCP_FLAG_SYN != 0 {
-            flags &= !(FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD | FLOW_FLAG_LAST_FIN_POD);
+            flags &= !(FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD | FLOW_FLAG_CLOSED);
         }
-        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
-        let last_fin_from_pod = flags & FLOW_FLAG_LAST_FIN_POD != 0;
-        if flags & both == both
-            && tcp_flags & TCP_FLAG_FIN == 0
-            && (side == FlowSide::Pod) != last_fin_from_pod
-        {
-            return FlowStep::Reclaim;
+        if tcp_flags & TCP_FLAG_RST != 0 {
+            if existing.is_none() {
+                return FlowStep::Skip;
+            }
+            flags |= FLOW_FLAG_CLOSED;
         }
         if tcp_flags & TCP_FLAG_FIN != 0 {
-            let (own, other) = match side {
-                FlowSide::Client => (FLOW_FLAG_FIN_CLIENT, FLOW_FLAG_FIN_POD),
-                FlowSide::Pod => (FLOW_FLAG_FIN_POD, FLOW_FLAG_FIN_CLIENT),
+            flags |= match side {
+                FlowSide::Client => FLOW_FLAG_FIN_CLIENT,
+                FlowSide::Pod => FLOW_FLAG_FIN_POD,
             };
-            if flags & own == 0 && flags & other != 0 {
-                flags = if side == FlowSide::Pod {
-                    flags | FLOW_FLAG_LAST_FIN_POD
-                } else {
-                    flags & !FLOW_FLAG_LAST_FIN_POD
-                };
-            }
-            flags |= own;
+        }
+        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        if flags & both == both {
+            flags |= FLOW_FLAG_CLOSED;
         }
     }
-    if let Some((bit, global)) = parity_bit(proto, parity) {
+    if let Some((bit, global)) = parity_bit(proto, flags, parity) {
         flags = if global { flags | bit } else { flags & !bit };
     }
     if existing == Some(flags) {
@@ -3454,18 +3464,23 @@ mod tests {
         flow_step(existing, IPPROTO_TCP, tcp_flags, side, P0)
     }
 
-    /// Replays a packet sequence on one row; returns the index of the packet
-    /// whose step reclaimed it, if any.
-    fn replay(seq: &[(FlowSide, u8)]) -> Option<usize> {
-        let mut row = Some(0);
-        for (i, (side, flags)) in seq.iter().enumerate() {
-            match step_tcp(row, *flags, *side) {
+    /// Replays a packet sequence on one row; returns its final flags. Panics
+    /// if any packet is told to skip its row: every packet of an established
+    /// connection, retransmits included, must still find it.
+    fn replay(seq: &[(FlowSide, u8)]) -> u16 {
+        let mut row = 0;
+        for (side, flags) in seq {
+            match step_tcp(Some(row), *flags, *side) {
                 FlowStep::Keep => {}
-                FlowStep::Write(f) => row = Some(f),
-                FlowStep::Reclaim => return Some(i),
+                FlowStep::Write(f) => row = f,
+                FlowStep::Skip => panic!("{side:?} {flags:#x} lost its row"),
             }
         }
-        None
+        row
+    }
+
+    fn is_closed(flags: u16) -> bool {
+        flags & FLOW_FLAG_CLOSED != 0
     }
 
     use FlowSide::{Client as C, Pod as P};
@@ -3483,7 +3498,7 @@ mod tests {
         rev: std::collections::HashMap<u16, ModelRow>,
         // natural client port -> remapped backend port
         memo: std::collections::HashMap<u16, u16>,
-        reclaim: bool,
+        track_close: bool,
     }
 
     impl BackendModel {
@@ -3496,10 +3511,20 @@ mod tests {
             let backend_port = match self.memo.get(&port) {
                 Some(p) => *p,
                 None => {
-                    let natural = self.rev.get(&port).map(|r| (r.0, r.1));
+                    let occupant = |r: &ModelRow| {
+                        reverse_occupant(&RevFlowValue {
+                            ingress_node_ip: [0; 16],
+                            front_ip: r.0 .0,
+                            front_port: r.0 .1,
+                            original_client_port: r.1,
+                            _pad: 0,
+                            flags: r.2,
+                        })
+                    };
+                    let natural = self.rev.get(&port).and_then(occupant);
                     let rev = &self.rev;
                     let decision = resolve_backend_src_port(natural, front, port, |c| {
-                        occupant_conflicts(rev.get(&c).map(|r| (r.0, r.1)), front, port)
+                        occupant_conflicts(rev.get(&c).and_then(occupant), front, port)
                     });
                     match decision {
                         BackendPortDecision::NoRemap => port,
@@ -3537,24 +3562,13 @@ mod tests {
             if !creates && mine.is_none() {
                 return;
             }
-            let step = if self.reclaim {
+            let step = if self.track_close {
                 flow_step(mine, IPPROTO_TCP, tcp_flags, side, P0)
             } else {
                 FlowStep::Write(mine.unwrap_or(0))
             };
-            match step {
-                FlowStep::Keep => {}
-                FlowStep::Write(f) => {
-                    self.rev.insert(backend_port, (front, port, f));
-                }
-                FlowStep::Reclaim => {
-                    if mine.is_some() {
-                        self.rev.remove(&backend_port);
-                    }
-                    if backend_port != port {
-                        self.memo.remove(&port);
-                    }
-                }
+            if let FlowStep::Write(f) = step {
+                self.rev.insert(backend_port, (front, port, f));
             }
         }
 
@@ -3566,10 +3580,10 @@ mod tests {
         }
     }
 
-    fn run_colliding_pairs(reclaim: bool, pairs: u16) -> Option<u16> {
+    fn run_colliding_pairs(track_close: bool, pairs: u16) -> Option<u16> {
         let (a, b) = (([1; 16], 80), ([2; 16], 80));
         let mut m = BackendModel {
-            reclaim,
+            track_close,
             ..Default::default()
         };
         for port in 1000..1000 + pairs {
@@ -3586,17 +3600,19 @@ mod tests {
     }
 
     #[test]
-    fn stale_rows_without_reclaim_exhaust_the_remap_window_at_the_sixteenth_pair() {
-        // Reproduces the production cut: this is why reclaim exists.
+    fn rows_never_marked_closed_exhaust_the_remap_window_at_the_sixteenth_pair() {
+        // Reproduces the production cut: this is why the closed mark exists.
         assert_eq!(
             run_colliding_pairs(false, 100),
             Some(1000 + PROBE_LIMIT),
-            "without reclaim the 17th colliding connection must be refused"
+            "without the closed mark the 17th colliding connection must be refused"
         );
     }
 
+    // Closed rows linger until the sweep, so the window only stays open if a
+    // new connection may take a closed row's slot.
     #[test]
-    fn closed_connections_release_their_remap_slots_so_new_ones_keep_working() {
+    fn lingering_closed_rows_do_not_pin_the_remap_window_shut() {
         assert_eq!(
             run_colliding_pairs(true, 500),
             None,
@@ -3604,15 +3620,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_closed_row_is_not_an_occupant_but_a_live_one_is() {
+        let row = |flags| RevFlowValue {
+            ingress_node_ip: [0; 16],
+            front_ip: [1; 16],
+            front_port: 80,
+            original_client_port: 1000,
+            _pad: 0,
+            flags,
+        };
+        assert_eq!(
+            reverse_occupant(&row(0)),
+            Some((([1; 16], 80), 1000)),
+            "a live row must keep blocking other flows from its slot"
+        );
+        assert_eq!(
+            reverse_occupant(&row(FLOW_FLAG_CLOSED)),
+            None,
+            "a closed row lingering for retransmits must not block new connections"
+        );
+    }
+
     // The live smoke's port-remap stage: front A's connection is half-closed
     // (client FIN acked, pod never closes) while front B reuses the same
     // client port and is remapped; B then closes pod-first with separate ACKs.
+    // A half-closed connection must stay live and keep its slot.
     #[test]
-    fn remapped_connection_closing_releases_its_memo_without_touching_the_live_one() {
+    fn remapped_connection_closing_is_marked_closed_without_touching_the_live_one() {
         let (a, b) = (([1; 16], 80), ([2; 16], 80));
         let port = 40000;
         let mut m = BackendModel {
-            reclaim: true,
+            track_close: true,
             ..Default::default()
         };
         assert_eq!(m.forward(a, port, TCP_FLAG_SYN), None);
@@ -3630,119 +3669,163 @@ mod tests {
         m.forward(b, port, FIN_ACK);
         m.pod(b, port, ACK);
         assert!(
-            m.memo.is_empty(),
-            "a cleanly closed remapped connection must release its port memo"
+            m.rev
+                .get(&port)
+                .is_some_and(|r| r.0 == a && !is_closed(r.2)),
+            "the half-closed connection's row must stay live"
         );
         assert_eq!(
-            m.rev.keys().copied().collect::<Vec<_>>(),
-            [port],
-            "only the half-closed connection's row may remain"
+            m.rev.len(),
+            2,
+            "the closed remapped connection's row lingers until the sweep"
         );
+        assert!(
+            m.rev.values().any(|r| r.0 == b && is_closed(r.2)),
+            "B's row must be marked closed, not deleted"
+        );
+    }
+
+    // The lost-final-ACK failure: the pod retransmits its FIN because the
+    // client's final ACK was lost. Deleting the row at the ACK left that FIN
+    // without a row, so the pod stuck in LAST-ACK.
+    #[test]
+    fn retransmitted_fin_after_close_still_finds_its_row() {
+        let closed = replay(&[(C, FIN_ACK), (P, ACK), (P, FIN_ACK), (C, ACK)]);
+        assert!(is_closed(closed), "FIN in both directions closes the row");
+        for (side, flags) in [(P, FIN_ACK), (C, ACK), (C, FIN_ACK), (P, ACK)] {
+            assert!(
+                matches!(
+                    step_tcp(Some(closed), flags, side),
+                    FlowStep::Keep | FlowStep::Write(_)
+                ),
+                "{side:?} {flags:#x} after close must still resolve the row"
+            );
+        }
     }
 
     // Servers that close as soon as they read EOF send FIN+ACK with no
-    // separate ACK; leaving that to the idle sweep strands a row (and its
-    // remap memo) per ordinary connection.
+    // separate ACK; any FIN order must end up closed.
     #[test]
-    fn piggybacked_ack_on_the_second_fin_is_reclaimed_at_close() {
+    fn fin_in_both_directions_closes_in_any_order() {
         for (first, second) in [(C, P), (P, C)] {
-            assert_eq!(
-                replay(&[(first, FIN_ACK), (second, FIN_ACK), (first, ACK)]),
-                Some(2),
-                "first-FIN side {first:?}: FIN, FIN+ACK, ACK must reclaim"
+            assert!(
+                is_closed(replay(&[(first, FIN_ACK), (second, FIN_ACK)])),
+                "first FIN from {first:?}: FIN, FIN+ACK must close"
             );
         }
     }
 
-    // Accepted cost of not special-casing crossed FINs: the first-FIN side's
-    // ACK reclaims before the other side's ACK has passed. That ACK misses its
-    // row, the peer retransmits its FIN, and the retransmit recreates the row.
     #[test]
-    fn crossed_fins_reclaim_at_the_first_ack_and_a_retransmitted_fin_recreates_the_row() {
-        assert_eq!(
-            replay(&[(C, FIN_ACK), (P, FIN_ACK), (C, ACK), (P, ACK)]),
-            Some(2),
-            "the first-FIN side's ACK after both FINs ends the connection"
+    fn a_half_closed_connection_stays_live_so_the_pod_can_still_reply() {
+        assert!(
+            !is_closed(replay(&[(C, FIN_ACK), (P, ACK), (P, ACK), (P, ACK)])),
+            "one FIN is a half-close, not the end of the connection"
         );
         assert!(
-            matches!(step_tcp(None, FIN_ACK, P), FlowStep::Write(_)),
-            "the retransmitted FIN must recreate the row, not be dropped"
+            !is_closed(replay(&[(C, ACK), (P, ACK), (C, ACK)])),
+            "ordinary traffic must not close the row"
         );
     }
 
     #[test]
-    fn reclaim_waits_for_the_final_ack_so_it_cannot_recreate_the_row() {
-        // client FIN, pod ACK, pod FIN, client ACK (final): reclaimed there.
-        assert_eq!(
-            replay(&[(C, FIN_ACK), (P, ACK), (P, FIN_ACK), (C, ACK)]),
-            Some(3),
-            "the final ACK after both FINs ends the connection"
-        );
-        assert_eq!(
-            replay(&[(C, FIN_ACK), (P, ACK), (P, FIN_ACK), (P, FIN_ACK)]),
-            None,
-            "a retransmitted FIN still needs its row to be encapsulated back"
-        );
-        assert_eq!(
-            replay(&[(C, FIN_ACK), (P, ACK), (P, ACK), (P, ACK)]),
-            None,
-            "a half-closed connection must keep its row so the pod can still reply"
-        );
-    }
-
-    // A TLP/duplicate-ACK exchange around the FINs puts an extra ACK from the
-    // SECOND FIN's sender ahead of the real final ACK. Reclaiming on it dropped
-    // the pod's ACK of the client's FIN at the ingress node (client left in
-    // LAST-ACK for a 200 ms retransmit) in a live run.
-    #[test]
-    fn ack_from_the_second_fins_own_side_does_not_end_the_connection() {
-        assert_eq!(
-            replay(&[(P, FIN_ACK), (C, ACK), (C, FIN_ACK), (C, ACK), (P, ACK)]),
-            Some(4),
-            "the client's duplicate ACK must not delete the row before the pod's final ACK"
-        );
-    }
-
-    #[test]
-    fn rst_in_either_direction_reclaims_even_without_a_row() {
+    fn rst_marks_an_existing_row_closed_and_never_creates_one() {
         for side in [FlowSide::Client, FlowSide::Pod] {
-            assert_eq!(
-                step_tcp(Some(0), TCP_FLAG_RST, side),
-                FlowStep::Reclaim,
-                "RST from {side:?}"
-            );
+            let FlowStep::Write(flags) = step_tcp(Some(0), TCP_FLAG_RST, side) else {
+                panic!("RST from {side:?} must write the closed mark");
+            };
+            assert!(is_closed(flags), "RST from {side:?}");
         }
         assert_eq!(
             step_tcp(None, TCP_FLAG_RST, FlowSide::Client),
-            FlowStep::Reclaim,
+            FlowStep::Skip,
             "a stray RST must not create a row"
         );
     }
 
     #[test]
     fn syn_on_a_lingering_closed_row_starts_a_fresh_connection() {
-        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        let closed = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD | FLOW_FLAG_CLOSED;
         assert_eq!(
-            step_tcp(Some(both), TCP_FLAG_SYN, FlowSide::Client),
+            step_tcp(Some(closed), TCP_FLAG_SYN, FlowSide::Client),
             FlowStep::Write(0),
-            "reusing the 4-tuple must not reclaim the new connection's row"
+            "a reused 4-tuple must not inherit the old connection's closed mark: the short sweep \
+             would delete its live row"
         );
     }
 
     #[test]
-    fn udp_never_reclaims_on_flag_bits() {
-        let both = FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+    fn udp_never_closes_on_flag_bits() {
         let step = flow_step(
-            Some(both),
+            Some(0),
             IPPROTO_UDP,
-            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_FIN,
             FlowSide::Pod,
             GcParity::default(),
         );
-        assert_ne!(
-            step,
-            FlowStep::Reclaim,
-            "UDP payload bytes are not TCP flags"
+        assert_eq!(step, FlowStep::Keep, "UDP payload bytes are not TCP flags");
+    }
+
+    #[test]
+    fn closing_moves_a_tcp_row_to_the_short_sweep() {
+        let odd_udp = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        let live = FLOW_FLAG_TCP_PARITY;
+        assert_eq!(sweep_class(0, IPPROTO_TCP), IPPROTO_TCP);
+        assert_eq!(sweep_class(FLOW_FLAG_CLOSED, IPPROTO_TCP), IPPROTO_UDP);
+        let FlowStep::Write(closed) = flow_step(
+            Some(live),
+            IPPROTO_TCP,
+            TCP_FLAG_RST,
+            FlowSide::Pod,
+            odd_udp,
+        ) else {
+            panic!("RST must write the closed mark");
+        };
+        assert!(
+            closed & FLOW_FLAG_UDP_PARITY != 0,
+            "the closed row must carry the short sweep's current parity so the linger starts now"
+        );
+    }
+
+    #[test]
+    fn short_sweep_reclaims_a_closed_tcp_row_but_not_a_live_one() {
+        // The short sweep ran at udp=false; its parity is now udp=true, so
+        // rows untouched since carry the stale (clear) bit.
+        let after_flip = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        assert!(
+            parity_sweep_deletes(FLOW_FLAG_CLOSED, IPPROTO_TCP, after_flip),
+            "a closed row untouched for a full short interval must be reclaimed, not kept 12 h"
+        );
+        assert!(
+            !parity_sweep_deletes(
+                FLOW_FLAG_CLOSED | FLOW_FLAG_UDP_PARITY,
+                IPPROTO_TCP,
+                after_flip
+            ),
+            "a closed row still passing retransmits must outlive the sweep"
+        );
+        assert!(
+            !parity_sweep_deletes(0, IPPROTO_TCP, after_flip),
+            "a live TCP row is on the long backstop and must not be reclaimed by the short sweep"
+        );
+    }
+
+    #[test]
+    fn retransmits_on_a_closed_row_renew_its_linger() {
+        let closed = FLOW_FLAG_CLOSED | FLOW_FLAG_FIN_CLIENT | FLOW_FLAG_FIN_POD;
+        let odd_udp = GcParity {
+            udp: true,
+            tcp: false,
+        };
+        assert_eq!(
+            flow_step(Some(closed), IPPROTO_TCP, FIN_ACK, FlowSide::Pod, odd_udp),
+            FlowStep::Write(closed | FLOW_FLAG_UDP_PARITY),
+            "the pod's retransmitted FIN must keep the row until the final ACK passes"
         );
     }
 

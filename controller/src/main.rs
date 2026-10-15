@@ -186,8 +186,9 @@ struct Args {
     udp_idle_sweep_secs: u64,
 
     /// Idle-flow sweep interval for TCP conntrack rows, in seconds. TCP rows
-    /// are normally reclaimed on close (RST, or FIN both ways); this is the
-    /// backstop for connections that vanish without either.
+    /// are marked closed on close (RST, or FIN both ways) and then go with the
+    /// UDP sweep; this is the backstop for connections that vanish without
+    /// either.
     #[arg(
         long,
         env = "BEEP_TCP_IDLE_SWEEP_SECS",

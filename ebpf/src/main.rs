@@ -66,7 +66,7 @@ use beep_common::{
     encode_pod_id_option, encode_tcp_flow_key, flow_hash, flow_step, forward_admission,
     fwd_pending_affinity_pin, ingress_steer, ipv4_mapped_v6, is_redirected_return_mark,
     occupant_conflicts, peer_node_admission, resolve_backend_src_port, return_authorization,
-    tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums, BackendPortDecision,
+    reverse_occupant, tunnel_remote_addr, unmap_ipv4, AddressRewriteChecksums, BackendPortDecision,
     BackendPortResolution, Config, DecapForwardPodAdmission, EgressReturnAdmission,
     EgressReturnOutcome, FlowDirection, FlowKey, FlowSide, FlowStep, FlowValue, ForwardAdmission,
     ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta, FwdPendingPin, GcParity,
@@ -422,9 +422,9 @@ fn gc_parity() -> GcParity {
     }
 }
 
-/// Refreshes the parity/FIN flags of a matched forward row, or deletes it when
-/// the connection is over. The caller still forwards the current packet from
-/// its own copy of `value`. Written as a whole-value `insert` like every other
+/// Refreshes the parity/FIN/closed flags of a matched forward row; rows are
+/// never deleted here. The caller still forwards the current packet from its
+/// own copy of `value`. Written as a whole-value `insert` like every other
 /// `FLOW_TABLE` write; a lost race with another writer of the same row costs at
 /// most one early parity refresh or a missed FIN bit, never a wrong forwarding
 /// decision.
@@ -437,16 +437,13 @@ fn touch_forward_row(
     side: FlowSide,
 ) {
     match flow_step(Some(value.flags), proto, tcp_flags, side, gc_parity()) {
-        FlowStep::Keep => {}
+        FlowStep::Keep | FlowStep::Skip => {}
         FlowStep::Write(flags) => {
             let _ = FLOW_TABLE.insert(
                 key,
                 FlowValue::from_forward(ForwardFlowValue { flags, ..value }),
                 0,
             );
-        }
-        FlowStep::Reclaim => {
-            let _ = FLOW_TABLE.remove(key);
         }
     }
 }
@@ -1088,19 +1085,18 @@ pub fn geneve_ingress(ctx: TcContext) -> i32 {
     }
 }
 
-/// Records (or refreshes, or reclaims) the backend node's reverse row for a
-/// client->pod packet. The row can legitimately change under the SAME key
+/// Records (or refreshes, or marks closed) the backend node's reverse row for
+/// a client->pod packet. The row can legitimately change under the SAME key
 /// (e.g. the ingress node for the flow changes), so a write is skipped only
-/// when it would be a byte-for-byte no-op. A row held by a different
-/// `(front, original port)` identity is never reclaimed from under its owner.
+/// when it would be a byte-for-byte no-op. A live row held by a different
+/// `(front, original port)` identity is never taken from under its owner; a
+/// closed one is replaced.
 #[inline(always)]
 fn commit_reverse_row(
     rev_key: FlowKey,
-    port_memo_key: FlowKey,
     mut rev_value: RevFlowValue,
     proto: u8,
     tcp_flags: u8,
-    remapped: bool,
 ) -> Option<()> {
     let stored = flow_table_get_reverse(rev_key);
     let mine = stored.filter(|v| {
@@ -1117,13 +1113,7 @@ fn commit_reverse_row(
         FlowSide::Client,
         gc_parity(),
     );
-    if let FlowStep::Reclaim = step {
-        if mine.is_some() {
-            let _ = FLOW_TABLE.remove(rev_key);
-            if remapped {
-                let _ = FLOW_TABLE.remove(port_memo_key);
-            }
-        }
+    if let FlowStep::Skip = step {
         return Some(());
     }
     rev_value.flags = match step {
@@ -1278,8 +1268,8 @@ fn try_geneve_decap_forward_v4(
             // no `unmap_ipv4` round-trip needed (that round-trip used to be required
             // because this probe was `u32`-only; widened once a genuine, non-mapped
             // v6 front became possible to parse at all).
-            let existing_occupant = flow_table_get_reverse(natural_rev_key)
-                .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
+            let existing_occupant =
+                flow_table_get_reverse(natural_rev_key).and_then(|v| reverse_occupant(&v));
             let new_front = (front_ip_v6, front_port);
             // The probe's occupancy check: FLOW_TABLE's reverse-tagged entries are
             // the source of truth for which candidate ports are actually free, not
@@ -1308,8 +1298,8 @@ fn try_geneve_decap_forward_v4(
             );
             let is_reverse_key_taken = |candidate_port: u16| {
                 candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
-                let occupant = flow_table_get_reverse(candidate_key)
-                    .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
+                let occupant =
+                    flow_table_get_reverse(candidate_key).and_then(|v| reverse_occupant(&v));
                 occupant_conflicts(occupant, new_front, client_port)
             };
             match resolve_backend_src_port(
@@ -1357,11 +1347,9 @@ fn try_geneve_decap_forward_v4(
     };
     commit_reverse_row(
         rev_key,
-        port_memo_key,
         rev_value,
         proto,
         tcp_flags_direct(ctx, proto, L4_OFF)?,
-        backend_src_port != client_port,
     )?;
 
     // Remap only touches the backend<->Pod segment: the client's real src
@@ -1458,8 +1446,8 @@ fn try_geneve_decap_forward_v6(
             port,
         ),
         BackendPortResolution::Probe => {
-            let existing_occupant = flow_table_get_reverse(natural_rev_key)
-                .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
+            let existing_occupant =
+                flow_table_get_reverse(natural_rev_key).and_then(|v| reverse_occupant(&v));
             let new_front = (front_ip_v6, front_port);
             let mut candidate_key = encode_flow_key(
                 client_ip_v6,
@@ -1471,8 +1459,8 @@ fn try_geneve_decap_forward_v6(
             );
             let is_reverse_key_taken = |candidate_port: u16| {
                 candidate_key[32..34].copy_from_slice(&candidate_port.to_ne_bytes());
-                let occupant = flow_table_get_reverse(candidate_key)
-                    .map(|v| ((v.front_ip, v.front_port), v.original_client_port));
+                let occupant =
+                    flow_table_get_reverse(candidate_key).and_then(|v| reverse_occupant(&v));
                 occupant_conflicts(occupant, new_front, client_port)
             };
             match resolve_backend_src_port(
@@ -1509,11 +1497,9 @@ fn try_geneve_decap_forward_v6(
     };
     commit_reverse_row(
         rev_key,
-        port_memo_key,
         rev_value,
         proto,
         tcp_flags_direct(ctx, proto, L4_OFF_V6)?,
-        backend_src_port != client_port,
     )?;
 
     rewrite_l4_port(
@@ -1676,7 +1662,7 @@ fn try_geneve_decap_return_v4(
             ReturnAuthorization::Promote => {
                 let mut value = pending_value?;
                 match flow_step(None, proto, tcp_flags, FlowSide::Pod, gc_parity()) {
-                    FlowStep::Reclaim => {}
+                    FlowStep::Skip => {}
                     step => {
                         if let FlowStep::Write(flags) = step {
                             value.flags = flags;
@@ -1782,7 +1768,7 @@ fn try_geneve_decap_return_v6(
             ReturnAuthorization::Promote => {
                 let mut value = pending_value?;
                 match flow_step(None, proto, tcp_flags, FlowSide::Pod, gc_parity()) {
-                    FlowStep::Reclaim => {}
+                    FlowStep::Skip => {}
                     step => {
                         if let FlowStep::Write(flags) = step {
                             value.flags = flags;
@@ -1823,21 +1809,11 @@ fn try_geneve_decap_return_v6(
     redirect_client_bound(ingress_ifindex)
 }
 
-/// Refreshes or reclaims the reverse row a pod->client packet just matched.
-/// The caller still un-DNATs and encapsulates the packet from the copy it
-/// already holds, so the packet that ends the connection is still delivered.
-#[allow(clippy::too_many_arguments)]
+/// Refreshes or marks closed the reverse row a pod->client packet just
+/// matched; rows are never deleted here. The caller still un-DNATs and
+/// encapsulates the packet from the copy it already holds.
 #[inline(always)]
-fn touch_return_row(
-    key: FlowKey,
-    rev: RevFlowValue,
-    client_ip: [u8; 16],
-    pod_ip: [u8; 16],
-    target_port: u16,
-    backend_dst_port: u16,
-    proto: u8,
-    tcp_flags: u8,
-) {
+fn touch_return_row(key: FlowKey, rev: RevFlowValue, proto: u8, tcp_flags: u8) {
     match flow_step(
         Some(rev.flags),
         proto,
@@ -1845,26 +1821,13 @@ fn touch_return_row(
         FlowSide::Pod,
         gc_parity(),
     ) {
-        FlowStep::Keep => {}
+        FlowStep::Keep | FlowStep::Skip => {}
         FlowStep::Write(flags) => {
             let _ = FLOW_TABLE.insert(
                 key,
                 FlowValue::from_reverse(RevFlowValue { flags, ..rev }),
                 0,
             );
-        }
-        FlowStep::Reclaim => {
-            let _ = FLOW_TABLE.remove(key);
-            if rev.original_client_port != backend_dst_port {
-                let _ = FLOW_TABLE.remove(encode_flow_key(
-                    client_ip,
-                    rev.original_client_port,
-                    pod_ip,
-                    target_port,
-                    proto,
-                    FlowDirection::PortMemo,
-                ));
-            }
         }
     }
 }
@@ -1993,16 +1956,7 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
         return Some(TC_ACT_OK);
     }
     let rev = rev_lookup?;
-    touch_return_row(
-        key,
-        rev,
-        ipv4_mapped_v6(client_ip),
-        ipv4_mapped_v6(pod_ip),
-        target_port,
-        backend_dst_port,
-        proto,
-        tcp_flags_direct(ctx, proto, l4_off)?,
-    );
+    touch_return_row(key, rev, proto, tcp_flags_direct(ctx, proto, l4_off)?);
 
     // Un-remap: restore the client's real port before this packet re-enters
     // the Geneve tunnel -- the ingress node's return-decap step rebuilds its
@@ -2087,16 +2041,7 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
         return Some(TC_ACT_OK);
     }
     let rev = rev_lookup?;
-    touch_return_row(
-        key,
-        rev,
-        client_ip_v6,
-        pod_ip_v6,
-        target_port,
-        backend_dst_port,
-        proto,
-        tcp_flags_direct(ctx, proto, l4_off)?,
-    );
+    touch_return_row(key, rev, proto, tcp_flags_direct(ctx, proto, l4_off)?);
 
     rewrite_l4_port(
         ctx,

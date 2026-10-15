@@ -665,12 +665,12 @@ remap_started=$SECONDS
 # its decision memoized under key tag 02. The memo's value is 2 bytes of a 40
 # byte slot; the other 38 must be zero rather than eBPF stack residue.
 #
-# Flow A must still hold its row when B arrives, and a cleanly closed
-# connection's rows are reclaimed. So A's pod-side listener is frozen
+# Flow A must still hold a live row when B arrives, and a cleanly closed
+# connection's row is marked closed. So A's pod-side listener is frozen
 # (SIGSTOP) after accepting: the client's FIN is acknowledged by the kernel
 # but the pod never closes, leaving A half-closed with its row alive. Flow
 # B's body arrives after a pause so its memo can be read while B is live,
-# then B closes cleanly and its memo must be reclaimed.
+# then B closes cleanly and its row must be marked closed.
 #
 # nc listens with SO_REUSEPORT, so A's frozen listener would keep winning a
 # share of B's SYNs and B would hang unanswered. A listens on the wildcard
@@ -729,14 +729,22 @@ wait "$remap_pid"
   exit 1
 }
 sleep 1
-remap_memos_left=$(map_json "$PIN_DIR/FLOW_TABLE" | jq -c '[.[] | select(.key[37] == "0x02")] | length')
-[ "$remap_memos_left" = "0" ] || {
-  echo "FAIL: ${remap_memos_left} port_memo row(s) left after the remapped connection closed cleanly (FIN both ways) -- a closed connection must release its memo" >&2
+# A closed connection's row is marked closed (bit 0x10 of the flags word at
+# value byte 38), not deleted: it keeps passing retransmits until the sweep.
+# Of the reverse rows carrying the fixed client port, A's (half-closed) must be
+# live and B's must be closed.
+remap_closed=$(map_json "$PIN_DIR/FLOW_TABLE" | jq -c '
+  def hexb: ltrimstr("0x") | ascii_downcase | explode | map(if . > 96 then . - 87 else . - 48 end) | .[0] * 16 + .[1];
+  [.[] | select(.key[37] == "0x01"
+      and ((.value[34] == "0x40" and .value[35] == "0x9c") or (.value[34] == "0x9c" and .value[35] == "0x40")))
+    | ((.value[38] | hexb) / 16 | floor) % 2 == 1] | sort')
+[ "$remap_closed" = "[false,true]" ] || {
+  echo "FAIL: reverse rows for client port ${REMAP_CLIENT_PORT} closed-flags (live=false, closed=true) are ${remap_closed}, want [false,true] -- the cleanly closed remapped connection must be marked closed while the half-closed one stays live" >&2
   map_json "$PIN_DIR/FLOW_TABLE" | jq -c '.[]' >&2 || true
   exit 1
 }
 kill -9 "$remap_srv_a" 2>/dev/null || true
-echo "PORT-REMAP: PASS in $((SECONDS - remap_started))s (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero; the memo was reclaimed on clean close)"
+echo "PORT-REMAP: PASS in $((SECONDS - remap_started))s (both fronts round-tripped from client port ${REMAP_CLIENT_PORT}; port_memo value bytes 2..40 are zero; the closed connection's row is marked closed and the half-closed one stays live)"
 
 echo "==> demonstrating the anti-flush property: a burst of new-flow-only packets must never evict an established FLOW_TABLE entry"
 # The three round trips above (two fronts on the first uplink, one on the
@@ -749,7 +757,7 @@ echo "==> demonstrating the anti-flush property: a burst of new-flow-only packet
 # confirm FLOW_TABLE's established entries survive untouched while
 # FWD_PENDING absorbs the churn.
 #
-# The round trips above closed cleanly, so their rows were reclaimed. Hold
+# The round trips above closed cleanly, so their rows are marked closed. Hold
 # three fresh connections open (one per front, one on the second uplink) so
 # their forward and reverse rows exist for the flood to (not) evict.
 for hold in "${POD_IP}:${TARGET_PORT}:smoke-client:${FRONT_IP}:${FRONT_PORT}" \
@@ -1066,7 +1074,7 @@ EVICT_FRONT_POD_IP="$POD_IP"
 stop_loader
 start_loader "$EVICT_LOADER_LOG_REUSE"
 wait_for_attach "$EVICT_LOADER_LOG_REUSE"
-# A cleanly closed connection's rows are reclaimed, so the row is checked
+# A cleanly closed connection's rows are marked closed, so the row is checked
 # while the response is still pending.
 { printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n'; sleep 4; printf 'REUSE'; } \
   | nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" >"$REUSE_BACKEND_LOG" 2>&1 &

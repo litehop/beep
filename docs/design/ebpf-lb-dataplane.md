@@ -256,23 +256,29 @@ flows pass to the host unbalanced (an absent front is not a front).
   ports per front, so rows of finished flows must not live on until LRU
   eviction, or stale rows from other fronts pin it shut and new colliding
   connections are dropped. `FlowValue::flags` (forward and reverse rows)
-  carries two FIN-seen bits and one parity bit per protocol class.
-  - **TCP close**: the backend node deletes a flow's reverse row and its
-    port memo, and the ingress node its forward row, on RST in either
-    direction, or on the first non-FIN packet from the first-FIN side once
-    both directions have sent a FIN (the final ACK, which still needs the row; an ACK from the
-    second FIN's own side does not count, it can be a duplicate ACK ahead
-    of the real one; a SYN on the same 4-tuple restarts the flags). A close
-    whose second FIN piggybacks the ACK of the first reclaims like any
-    other. After truly crossed FINs (simultaneous close) the first-FIN
-    side's ACK reclaims before the other side's ACK has passed; that ACK
-    misses its row and the peer retransmits its FIN (about 200 ms), which
-    recreates the row, with no data lost. The first FIN alone never
-    reclaims, so a half-closed connection keeps working.
-    (`beep_common::flow_step`.) The flag word is updated by whole-value
-    read-modify-write from several paths, not atomically: a lost race can
-    drop a FIN bit or re-create a just-reclaimed row, a stray row the idle
-    sweep frees (as do late duplicate ACKs).
+  carries two FIN-seen bits, a closed bit and one parity bit per protocol
+  class.
+  - **TCP close**: no packet ever deletes a row, since the packet that
+    triggers a delete can itself be lost on the underlay and leave the peer
+    retransmitting into a miss (the pod's FIN into a return-path miss left
+    it in LAST-ACK). Instead, on RST in either direction, or once a FIN has
+    been seen in both directions, the datapath marks the row closed, like
+    TIME_WAIT. A closed row keeps forwarding both ways (the pod's
+    retransmitted FIN, the client's final ACK), and the controller's short
+    (UDP-interval) sweep reclaims it with its port memo; a closed TCP row
+    is not subject to the TCP backstop. Every packet a closed row still
+    passes renews the linger. A SYN on the same 4-tuple clears the FIN and
+    closed bits, so a reused tuple is a new connection, not a row doomed by
+    the sweep. The remap occupancy probe treats a closed row as free, so a
+    burst of short connections does not pin the 16-slot window until the
+    sweep; the new connection overwrites that row. A late packet of the old
+    connection (a retransmit within the linger) then meets the new flow's
+    row, the same exposure as TIME_WAIT assassination. The first FIN alone
+    never closes, so a half-closed connection keeps working. An RST for a
+    flow with no row creates none. (`beep_common::flow_step`.) The flag word
+    is updated by whole-value read-modify-write from several paths, not
+    atomically: a lost race can drop a FIN or closed bit, a stray row the
+    idle sweep frees.
   - **Idle GC**: `CONFIG` holds a global parity per class (UDP, TCP). A
     matched packet copies it into its row's bit only when it differs (at
     most one write per row per interval). Every interval the controller

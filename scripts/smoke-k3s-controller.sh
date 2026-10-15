@@ -628,8 +628,9 @@ echo "LEG-E scale-to-0: PASS (connections via both nodes do not succeed)"
 
 # (i) colliding source ports across two fronts sharing one pod: the same client port is used for a
 # connection via node-a and then via node-b, each closed before the next. The second collides on the
-# backend's reverse key with whatever the first left behind, so every closed-but-unreclaimed row used
-# up one of the 16 remap slots until new colliding connections were dropped. `nc -p` pins the source
+# backend's reverse key with whatever the first left behind, so every stale row used up one of the 16
+# remap slots until new colliding connections were dropped; closed rows linger until the sweep but
+# must not hold a slot. `nc -p` pins the source
 # port (curl --local-port cannot rebind a port a previous connection used); the server closes first
 # (HTTP/1.0), so the client side holds no TIME_WAIT and the port can be reused at once.
 N_COLLIDE=24
@@ -638,6 +639,11 @@ flow_rows() { # flow_rows <vm> <tag> -- FLOW_TABLE rows of one role tag (00 forw
   limactl shell "$1" -- sudo bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" --json 2>/dev/null | jq --arg t "0x$2" '[.[] | select(.key[37] == $t)] | length'
 }
 flow_rows_b() { flow_rows "$VM_B" "$1"; }
+closed_rows() { # closed_rows <vm> <tag> -- rows of one role tag whose closed flag (0x10 of the flags word at value byte 38) is set
+  limactl shell "$1" -- sudo bpftool map dump pinned "$PIN_DIR/FLOW_TABLE" --json 2>/dev/null | jq --arg t "0x$2" '
+    def hexb: ltrimstr("0x") | ascii_downcase | explode | map(if . > 96 then . - 87 else . - 48 end) | .[0] * 16 + .[1];
+    [.[] | select(.key[37] == $t and ((((.value[38] | hexb) / 16 | floor) % 2) == 1))] | length'
+}
 echo "==> [12i] colliding source ports: $N_COLLIDE closed pairs through $IP_A and $IP_B (one pod), then more"
 ROWS_BEFORE="$(flow_rows_b 01)"
 FWD_BEFORE="$(flow_rows "$VM_A" 00)"
@@ -663,9 +669,11 @@ case "$COLLIDE_OUT" in
   "ok=$((N_COLLIDE * 2)) fail=0 "*) ;;
   *) leg_fail "LEG-I: FAIL (colliding-port connections were refused: $COLLIDE_OUT)" ;;
 esac
-[ "$(flow_rows_b 02)" = 0 ] || leg_fail "LEG-I: FAIL (port-remap memo rows survived $N_COLLIDE closed pairs: $(flow_rows_b 02))"
-[ "$((FWD_AFTER - FWD_BEFORE))" -le 4 ] || leg_fail "LEG-I: FAIL ($N_COLLIDE closed connections through $VM_A left $((FWD_AFTER - FWD_BEFORE)) forward rows behind; closed connections must release their ingress row)"
-echo "LEG-I colliding-source-ports: PASS ($((N_COLLIDE * 2)) connections over $N_COLLIDE colliding pairs all answered; no memo rows left; ingress forward rows reclaimed)"
+[ "$(flow_rows_b 02)" -le "$N_COLLIDE" ] || leg_fail "LEG-I: FAIL (more port-remap memo rows than remapped connections after $N_COLLIDE closed pairs: $(flow_rows_b 02))"
+CLOSED_FWD="$(closed_rows "$VM_A" 00)"
+[ "$((FWD_AFTER - FWD_BEFORE))" -le "$((N_COLLIDE + 4))" ] || leg_fail "LEG-I: FAIL ($N_COLLIDE closed connections through $VM_A left $((FWD_AFTER - FWD_BEFORE)) new forward rows)"
+[ "$CLOSED_FWD" -ge "$((N_COLLIDE / 2))" ] || leg_fail "LEG-I: FAIL (only $CLOSED_FWD of $N_COLLIDE closed connections through $VM_A have their forward row marked closed)"
+echo "LEG-I colliding-source-ports: PASS ($((N_COLLIDE * 2)) connections over $N_COLLIDE colliding pairs all answered although closed rows linger; $CLOSED_FWD ingress forward rows marked closed)"
 
 # (h) ConfigMap sizing change: editing beep-config and restarting the DaemonSet resizes the front
 # maps on both nodes (the pods read the new value; bpftool shows the new max_entries) while an
