@@ -8,7 +8,7 @@
 //! process idles between watch events.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -32,7 +32,10 @@ use beep_controller::{
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed},
     status::{ensure_node_ingress, update_ingress},
-    watch::{run_list_watch, stale_ingress_key, stale_ingress_keys, ServiceKey, WatchState},
+    watch::{
+        deleted_service_key, run_list_watch, stale_ingress_key, stale_ingress_keys, ServiceKey,
+        WatchState,
+    },
 };
 use beep_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use clap::Parser;
@@ -469,6 +472,7 @@ fn publish_ingress(
     key: ServiceKey,
     own_ips: Vec<IpAddr>,
     desired_ips: Vec<IpAddr>,
+    clear: bool,
 ) {
     let client = Arc::clone(client);
     let pending = Arc::clone(pending);
@@ -484,7 +488,7 @@ fn publish_ingress(
         pending
             .lock()
             .unwrap()
-            .record(&key, result.is_ok(), Instant::now());
+            .record(&key, result.is_ok(), clear, Instant::now());
     });
 }
 
@@ -503,7 +507,7 @@ fn publish_ingress_for(
             state.ips_to_publish(&key, node.node_ip),
         )
     };
-    publish_ingress(client, pending, key, own_ips, desired_ips);
+    publish_ingress(client, pending, key, own_ips, desired_ips, false);
 }
 
 /// Withdraws this node's own entries from `key`'s ingress: a Service that left
@@ -517,44 +521,113 @@ fn clear_ingress_for(
     key: ServiceKey,
 ) {
     let own_ips = state.lock().unwrap().own_node_ips(node.node_ip);
-    publish_ingress(client, pending, key, own_ips, Vec::new());
+    publish_ingress(client, pending, key, own_ips, Vec::new(), true);
 }
 
-/// Services whose ingress publish failed, re-published with `RetryBackoff`
+/// What to do with one Service's published ingress.
+#[derive(Debug, PartialEq, Eq)]
+enum IngressWork {
+    /// Re-assert this node's entries for the families it fronts.
+    Publish,
+    /// Withdraw this node's entries: the Service left `type=LoadBalancer`.
+    Clear,
+    /// Nothing to publish or clear: stop retrying.
+    Forget,
+}
+
+/// The work a Service watch event calls for. A delete forgets any pending
+/// retry; a non-LB Service still carrying ingress is cleared.
+fn service_event_work(
+    changed: Option<ServiceKey>,
+    event: &Value,
+) -> Vec<(IngressWork, ServiceKey)> {
+    changed
+        .map(|key| (IngressWork::Publish, key))
+        .into_iter()
+        .chain(stale_ingress_key(event).map(|key| (IngressWork::Clear, key)))
+        .chain(deleted_service_key(event).map(|key| (IngressWork::Forget, key)))
+        .collect()
+}
+
+/// `service_event_work` over a complete Service LIST.
+fn services_relist_work(keys: Vec<ServiceKey>, items: &[Value]) -> Vec<(IngressWork, ServiceKey)> {
+    keys.into_iter()
+        .map(|key| (IngressWork::Publish, key))
+        .chain(
+            stale_ingress_keys(items)
+                .into_iter()
+                .map(|key| (IngressWork::Clear, key)),
+        )
+        .collect()
+}
+
+/// What a retry of a failed publish (`clear == false`) or clear
+/// (`clear == true`) should do now. A Service that is tracked again is
+/// published whatever failed; an untracked one still has a stale ingress to
+/// clear if a clear failed, and nothing to do if a publish failed.
+fn retry_work(tracked: bool, clear: bool) -> IngressWork {
+    match (tracked, clear) {
+        (true, _) => IngressWork::Publish,
+        (false, true) => IngressWork::Clear,
+        (false, false) => IngressWork::Forget,
+    }
+}
+
+fn run_ingress_work(
+    client: &Arc<HyperApiClient>,
+    pending: &Arc<Mutex<PublishRetry>>,
+    state: &Mutex<WatchState>,
+    node: &NodeContext,
+    work: IngressWork,
+    key: ServiceKey,
+) {
+    match work {
+        IngressWork::Publish => publish_ingress_for(client, pending, state, node, key),
+        IngressWork::Clear => clear_ingress_for(client, pending, state, node, key),
+        IngressWork::Forget => pending
+            .lock()
+            .unwrap()
+            .record(&key, true, false, Instant::now()),
+    }
+}
+
+/// Services whose ingress publish or clear failed, retried with `RetryBackoff`
 /// delays until it succeeds: without it a node that just lost its last
-/// `externalTrafficPolicy: Local` pod stays listed until the next event.
+/// `externalTrafficPolicy: Local` pod, or a Service that left `LoadBalancer`,
+/// stays advertised until the next event. The value is whether the failed
+/// operation was a clear.
 #[derive(Default)]
 struct PublishRetry {
-    keys: HashSet<ServiceKey>,
+    keys: HashMap<ServiceKey, bool>,
     backoff: RetryBackoff,
 }
 
 impl PublishRetry {
-    fn record(&mut self, key: &ServiceKey, ok: bool, now: Instant) {
+    fn record(&mut self, key: &ServiceKey, ok: bool, clear: bool, now: Instant) {
         if ok {
             self.keys.remove(key);
             if self.keys.is_empty() {
                 self.backoff = RetryBackoff::default();
             }
         } else {
-            self.keys.insert(key.clone());
+            self.keys.insert(key.clone(), clear);
             self.backoff.record(false, now);
         }
     }
 
-    /// The keys to re-publish now. Disarms the deadline so the next poll does
-    /// not re-publish while these are in flight; a failure re-arms it.
-    fn take_due(&mut self, now: Instant) -> Vec<ServiceKey> {
+    /// The keys to retry now, each with whether it was a clear. Disarms the
+    /// deadline so the next poll does not retry while these are in flight; a
+    /// failure re-arms it.
+    fn take_due(&mut self, now: Instant) -> Vec<(ServiceKey, bool)> {
         if !self.backoff.due(now) {
             return Vec::new();
         }
         self.backoff.retry_at = None;
-        self.keys.iter().cloned().collect()
+        self.keys.iter().map(|(k, c)| (k.clone(), *c)).collect()
     }
 }
 
-/// Re-publishes failed ingress publishes when due. A key whose Service is no
-/// longer tracked is dropped: its publish can never succeed. Never returns.
+/// Retries failed ingress publishes and clears when due. Never returns.
 async fn run_publish_retry_loop(
     client: Arc<HyperApiClient>,
     pending: Arc<Mutex<PublishRetry>>,
@@ -569,12 +642,9 @@ async fn run_publish_retry_loop(
         }
         let tracked: HashSet<ServiceKey> =
             state.lock().unwrap().service_keys().into_iter().collect();
-        for key in due {
-            if tracked.contains(&key) {
-                publish_ingress_for(&client, &pending, &state, &node, key);
-            } else {
-                pending.lock().unwrap().record(&key, true, Instant::now());
-            }
+        for (key, clear) in due {
+            let work = retry_work(tracked.contains(&key), clear);
+            run_ingress_work(&client, &pending, &state, &node, work, key);
         }
     }
 }
@@ -630,11 +700,8 @@ async fn run_controller_loop(
         move |event: Value| {
             let changed = state.lock().unwrap().apply_service_event(&event);
             apply_reconcile(&state, &maps, &retry, &node);
-            if let Some(key) = changed {
-                publish_ingress_for(&client, &pending, &state, &node, key);
-            }
-            if let Some(key) = stale_ingress_key(&event) {
-                clear_ingress_for(&client, &pending, &state, &node, key);
+            for (work, key) in service_event_work(changed, &event) {
+                run_ingress_work(&client, &pending, &state, &node, work, key);
             }
         }
     };
@@ -647,11 +714,8 @@ async fn run_controller_loop(
         move |items: Vec<Value>| {
             let keys = state.lock().unwrap().replace_services(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
-            for key in keys {
-                publish_ingress_for(&client, &pending, &state, &node, key);
-            }
-            for key in stale_ingress_keys(&items) {
-                clear_ingress_for(&client, &pending, &state, &node, key);
+            for (work, key) in services_relist_work(keys, &items) {
+                run_ingress_work(&client, &pending, &state, &node, work, key);
             }
             Ok(())
         }
@@ -1232,35 +1296,107 @@ mod tests {
         // publish lands; a quiet cluster sends no event to trigger another.
         let t0 = Instant::now();
         let mut p = PublishRetry::default();
-        p.record(&svc("a"), false, t0);
+        p.record(&svc("a"), false, false, t0);
         assert!(p.take_due(t0).is_empty(), "backoff not elapsed");
-        assert_eq!(p.take_due(t0 + RETRY_INITIAL), vec![svc("a")]);
+        assert_eq!(p.take_due(t0 + RETRY_INITIAL), vec![(svc("a"), false)]);
         assert!(
             p.take_due(t0 + RETRY_INITIAL).is_empty(),
             "in-flight retry must not be re-issued on the next poll"
         );
-        p.record(&svc("a"), false, t0 + RETRY_INITIAL);
+        p.record(&svc("a"), false, false, t0 + RETRY_INITIAL);
         assert!(
             p.take_due(t0 + RETRY_INITIAL + RETRY_INITIAL).is_empty(),
             "a failed retry backs off further"
         );
         let t2 = t0 + RETRY_INITIAL + RETRY_INITIAL * 2;
-        assert_eq!(p.take_due(t2), vec![svc("a")]);
-        p.record(&svc("a"), true, t2);
+        assert_eq!(p.take_due(t2), vec![(svc("a"), false)]);
+        p.record(&svc("a"), true, false, t2);
         assert!(
             p.take_due(t2 + RETRY_MAX).is_empty(),
             "a successful publish must stop the retries"
         );
     }
 
+    fn svc_event(kind: &str, service_type: &str, ingress: &[&str]) -> Value {
+        let ingress: Vec<Value> = ingress
+            .iter()
+            .map(|ip| serde_json::json!({"ip": ip}))
+            .collect();
+        serde_json::json!({
+            "type": kind,
+            "object": {
+                "metadata": {"namespace": "ns", "name": "a"},
+                "spec": {"type": service_type, "ports": [{"port": 80}]},
+                "status": {"loadBalancer": {"ingress": ingress}},
+            },
+        })
+    }
+
+    #[test]
+    fn retyped_service_event_clears_its_ingress_so_no_dead_address_is_advertised() {
+        let event = svc_event("MODIFIED", "ClusterIP", &["10.0.0.5"]);
+        assert_eq!(
+            service_event_work(None, &event),
+            vec![(IngressWork::Clear, svc("a"))]
+        );
+    }
+
+    #[test]
+    fn changed_load_balancer_event_publishes_and_never_clears() {
+        let event = svc_event("MODIFIED", "LoadBalancer", &["10.0.0.5"]);
+        assert_eq!(
+            service_event_work(Some(svc("a")), &event),
+            vec![(IngressWork::Publish, svc("a"))],
+            "a live LoadBalancer's ingress must not be withdrawn"
+        );
+    }
+
+    #[test]
+    fn deleted_service_event_forgets_pending_retries_so_they_do_not_loop_forever() {
+        let event = svc_event("DELETED", "ClusterIP", &["10.0.0.5"]);
+        assert_eq!(
+            service_event_work(None, &event),
+            vec![(IngressWork::Forget, svc("a"))]
+        );
+    }
+
+    #[test]
+    fn relist_clears_services_retyped_while_the_controller_was_down() {
+        let items = [
+            svc_event("ADDED", "ClusterIP", &["10.0.0.5"])["object"].clone(),
+            svc_event("ADDED", "ClusterIP", &[])["object"].clone(),
+        ];
+        assert_eq!(
+            services_relist_work(vec![svc("lb")], &items),
+            vec![
+                (IngressWork::Publish, svc("lb")),
+                (IngressWork::Clear, svc("a"))
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_clear_is_retried_for_an_untracked_service_until_it_succeeds() {
+        // A retyped Service is untracked and sees few events; dropping the
+        // failed clear would leave a dead ingress advertised indefinitely.
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.record(&svc("a"), false, true, t0);
+        let due = p.take_due(t0 + RETRY_INITIAL);
+        assert_eq!(due, vec![(svc("a"), true)]);
+        assert_eq!(retry_work(false, due[0].1), IngressWork::Clear);
+        assert_eq!(retry_work(false, false), IngressWork::Forget);
+        assert_eq!(retry_work(true, true), IngressWork::Publish);
+    }
+
     #[test]
     fn one_services_success_does_not_cancel_anothers_pending_retry() {
         let t0 = Instant::now();
         let mut p = PublishRetry::default();
-        p.record(&svc("a"), false, t0);
-        p.record(&svc("b"), false, t0);
-        p.record(&svc("a"), true, t0);
-        assert_eq!(p.take_due(t0 + RETRY_INITIAL), vec![svc("b")]);
+        p.record(&svc("a"), false, false, t0);
+        p.record(&svc("b"), false, false, t0);
+        p.record(&svc("a"), true, false, t0);
+        assert_eq!(p.take_due(t0 + RETRY_INITIAL), vec![(svc("b"), false)]);
     }
 
     #[test]

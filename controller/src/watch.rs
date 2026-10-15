@@ -452,6 +452,13 @@ pub fn stale_ingress_key(event: &Value) -> Option<ServiceKey> {
         .flatten()
 }
 
+/// The Service's key when `event` deletes it: nothing is left to clear.
+pub fn deleted_service_key(event: &Value) -> Option<ServiceKey> {
+    matches!(event_kind(event)?, EventKind::Delete)
+        .then(|| service_key(&event["object"]))
+        .flatten()
+}
+
 /// `stale_ingress_key` over a complete Service LIST, catching Services that
 /// changed type while the watch was disconnected.
 pub fn stale_ingress_keys(items: &[Value]) -> Vec<ServiceKey> {
