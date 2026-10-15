@@ -273,7 +273,13 @@ flows pass to the host unbalanced (an absent front is not a front).
     burst of short connections does not pin the 16-slot window until the
     sweep; the new connection overwrites that row. A late packet of the old
     connection (a retransmit within the linger) then meets the new flow's
-    row, the same exposure as TIME_WAIT assassination. The first FIN alone
+    row, the same exposure as TIME_WAIT assassination. beep does not
+    validate TCP sequence numbers, so a stray or out-of-window RST (one the
+    endpoint kernel would ignore) still marks a live flow closed; if that
+    flow then idles past the short sweep, it is reclaimed after 2-4 min and
+    the connection breaks. This is milder than the earlier delete-on-RST
+    behaviour; sequence-number tracking is the deferred fix, pursued only
+    if measured QoS issues appear. The first FIN alone
     never closes, so a half-closed connection keeps working. An RST for a
     flow with no row creates none. (`beep_common::flow_step`.) The flag word
     is updated by whole-value read-modify-write from several paths, not
