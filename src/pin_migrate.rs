@@ -415,7 +415,12 @@ fn apply_plan(plan: &RestorePlan, write: &mut EntryWriter) -> anyhow::Result<()>
 /// Applies `plan` to the freshly created pinned maps under `pin_dir`.
 pub fn apply_restore(pin_dir: &Path, plan: &RestorePlan) -> anyhow::Result<()> {
     let mut maps: HashMap<String, MapData> = HashMap::new();
+    let mut inject =
+        std::env::var_os(crate::FAULT_FAIL_RESTORE_WRITE_ENV).is_some_and(|v| !v.is_empty());
     apply_plan(plan, &mut |name, (key, value), flags| {
+        if std::mem::take(&mut inject) {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
         if !maps.contains_key(name) {
             let path = pin_dir.join(name);
             let map = MapData::from_pin(&path)

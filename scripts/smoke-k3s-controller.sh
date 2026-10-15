@@ -734,6 +734,37 @@ done
 rm -f "$PROBE_OUT" "$FLOW_OUT"
 echo "LEG-H configmap-restart: PASS (pods read the ConfigMap, maps resized, established flow survived)"
 
+# (h2) A restore write failure must reach a real apiserver as MapRestoreFailed Events on the Node
+# (default ns) and the Pod (its ns). The fault hook fails the first restore write with ENOMEM on a
+# resize; removing the hook lets the retry restore from the kept parked pin.
+CFG_FAULT_FRONTS=1500
+echo "==> [13b] injected restore write failure (BEEP_MAX_FRONTS=$CFG_FAULT_FRONTS): MapRestoreFailed Events accepted by the apiserver"
+kube delete events -A --field-selector reason=MapRestoreFailed >/dev/null 2>&1 || true
+kube -n kube-system patch configmap beep-config --type=merge \
+  -p "{\"data\":{\"BEEP_MAX_FRONTS\":\"$CFG_FAULT_FRONTS\"}}" >/dev/null
+kube -n kube-system set env daemonset/servicelb-controller BEEP_FAULT_FAIL_RESTORE_WRITE=1 >/dev/null
+restore_events() { kube get events -A --field-selector reason=MapRestoreFailed -o json; }
+for _ in $(seq 1 45); do
+  [ "$(restore_events | jq '[.items[].involvedObject.kind] | unique | length')" = 2 ] && break
+  sleep 2
+done
+echo "LEG-H2 events:"
+kube get events -A --field-selector reason=MapRestoreFailed
+restore_events | jq -r '.items[0].message' | sed 's/^/LEG-H2 message: /'
+[ "$(restore_events | jq '[.items[] | select(.involvedObject.kind == "Node" and .metadata.namespace == "default")] | length')" -ge 1 ] || \
+  leg_fail "LEG-H2: FAIL (no MapRestoreFailed Event on a Node in default)"
+[ "$(restore_events | jq '[.items[] | select(.involvedObject.kind == "Pod" and .metadata.namespace == "kube-system")] | length')" -ge 1 ] || \
+  leg_fail "LEG-H2: FAIL (no MapRestoreFailed Event on a Pod in kube-system)"
+kube -n kube-system set env daemonset/servicelb-controller BEEP_FAULT_FAIL_RESTORE_WRITE- >/dev/null
+# Dropping the env restores the pre-fault pod template, so a node whose pod never restarted keeps its old sizing.
+kube -n kube-system rollout restart daemonset/servicelb-controller >/dev/null
+kube -n kube-system rollout status daemonset/servicelb-controller --timeout=240s >/dev/null || leg_fail "LEG-H2: FAIL (DaemonSet did not recover once the fault was removed)"
+for vm in "$VM_A" "$VM_B"; do
+  FM="$(map_max_entries "$vm" FRONT_META)"
+  [ "$FM" = "$CFG_FAULT_FRONTS" ] || leg_fail "LEG-H2: FAIL ($vm FRONT_META.max_entries=$FM after the retry, want $CFG_FAULT_FRONTS)"
+done
+echo "LEG-H2 restore-failure-events: PASS (Node and Pod MapRestoreFailed Events accepted; pods recovered after the fault was removed)"
+
 # (g) dead-node pruning: a node whose beep pod is gone must leave status.loadBalancer.ingress
 # (its Lease expires and a live controller prunes it) and return when beep comes back.
 # OnDelete keeps node-a's controller (the pruner) running; a nodeSelector to node-a alone makes the

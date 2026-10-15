@@ -253,7 +253,15 @@ controller posts a `MapRestoreFailed` Warning Event on the node and the pod
 reason=MapRestoreFailed`) naming the map, the errno and the remediation (for
 `ENOMEM`, raise the pod memory limit). The previous programs keep serving on
 the old maps meanwhile. Posting needs the Event `create` Roles in
-`deploy/rbac.yaml`; without them the same text is only in the pod log.
+`deploy/rbac.yaml`; without them the same text is only in the pod log. The
+Pod-event Role and RoleBinding there are written for `kube-system`; if you
+run the DaemonSet in another namespace, change their `namespace` (and the
+ServiceAccount subject) or the Pod event is rejected with 403 and only the
+Node event appears.
+
+Test hook, off by default: setting `BEEP_FAULT_FAIL_RESTORE_WRITE=1` on the
+controller makes the first restore write fail with `ENOMEM`, to exercise this
+path. Never set it in production.
 
 Behaviour changes to expect:
 
