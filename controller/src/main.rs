@@ -31,7 +31,7 @@ use beep_controller::{
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed},
-    status::{ensure_node_ingress, update_ingress},
+    status::{ensure_node_ingress, update_ingress, ServiceGone},
     watch::{
         deleted_service_key, run_list_watch, stale_ingress_key, stale_ingress_keys, ServiceKey,
         WatchState,
@@ -488,8 +488,17 @@ fn publish_ingress(
         pending
             .lock()
             .unwrap()
-            .record(&key, result.is_ok(), clear, Instant::now());
+            .record(&key, attempt_done(clear, &result), clear, Instant::now());
     });
+}
+
+/// Whether a publish/clear attempt needs no retry. A clear of a deleted
+/// Service has nothing left to clear; retrying it would 404 forever.
+fn attempt_done(clear: bool, result: &anyhow::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => clear && e.downcast_ref::<ServiceGone>().is_some(),
+    }
 }
 
 /// Publishes `key`'s ingress from the current state.
@@ -1387,6 +1396,23 @@ mod tests {
         assert_eq!(retry_work(false, due[0].1), IngressWork::Clear);
         assert_eq!(retry_work(false, false), IngressWork::Forget);
         assert_eq!(retry_work(true, true), IngressWork::Publish);
+    }
+
+    #[test]
+    fn clear_of_a_deleted_service_is_done_so_retries_and_log_spam_stop() {
+        let gone = || -> anyhow::Result<()> { Err(ServiceGone("/x".into()).into()) };
+        assert!(
+            attempt_done(true, &gone()),
+            "a retyped Service deleted before its clear landed must not be retried forever"
+        );
+        assert!(
+            !attempt_done(false, &gone()),
+            "only a clear treats 404 as done"
+        );
+        assert!(
+            !attempt_done(true, &Err(anyhow::anyhow!("HTTP 500"))),
+            "a transient error must still be retried"
+        );
     }
 
     #[test]

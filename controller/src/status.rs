@@ -120,6 +120,18 @@ pub async fn ensure_node_ingress(
     .await
 }
 
+/// The Service no longer exists (GET returned 404); the field is the GET path.
+#[derive(Debug)]
+pub struct ServiceGone(pub String);
+
+impl std::fmt::Display for ServiceGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GET {} returned HTTP 404", self.0)
+    }
+}
+
+impl std::error::Error for ServiceGone {}
+
 /// The get-modify-patch loop shared by every writer of the atomic ingress
 /// list: `compute` maps the live list to the corrected one, or `None` to skip
 /// the PATCH.
@@ -137,6 +149,9 @@ pub async fn update_ingress(
             .request(Method::GET, &get_path, None)
             .await
             .with_context(|| format!("GET {get_path}"))?;
+        if status == hyper::StatusCode::NOT_FOUND {
+            anyhow::bail!(ServiceGone(get_path));
+        }
         if !status.is_success() {
             anyhow::bail!("GET {get_path} returned HTTP {status}");
         }
