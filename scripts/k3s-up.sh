@@ -181,6 +181,15 @@ case "$decision" in
     ;;
 esac
 
+# A previous --proxy-mode ipvs run leaves kernel IPVS virtual services (and
+# kube-ipvs0) behind; they have no destinations and blackhole node-IP traffic
+# for a later iptables-mode cluster.
+if [ "$PROXY_MODE" != "ipvs" ]; then
+  for vm in "$VM_A" "$VM_B"; do
+    limactl shell "$vm" -- sudo bash -c 'command -v ipvsadm >/dev/null && ipvsadm -C; ip link del kube-ipvs0 2>/dev/null; true'
+  done
+fi
+
 echo "==> [2/4] installing k3s server on $VM_A (node-ip=$NODE_IP_A, --disable=servicelb,traefik, proxy-mode=$PROXY_MODE, dual-stack=$DUAL_STACK, v6-only=$V6_ONLY)"
 limactl shell "$VM_A" -- sudo bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --disable=servicelb,traefik --node-ip=$NODE_IP_A --write-kubeconfig-mode=644$KUBE_PROXY_ARG$CIDR_ARGS' sh -"
 
