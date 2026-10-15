@@ -440,6 +440,12 @@ FULL_FRAME_BYTES=1588 # 14 outer eth + 20 IP + 8 UDP + 8 Geneve + 24 option + 14
 full_size_leg() {
   local label="$1" ncflag="$2" pod="$3" port="$4" url="$5" pod_hex="$6" port_hex="$7"
   local cap_opt=/tmp/beep-smoke-cap-opt.txt cap_fwd=/tmp/beep-smoke-cap-fwd.txt cap_ret=/tmp/beep-smoke-cap-ret.txt
+  # Captures select this leg's frames by pod IP (option data, udp offset 20) and
+  # inner ethertype (udp offset 52), so a late frame from the previous leg
+  # cannot satisfy them.
+  local ethertype=0x0800
+  [ "$ncflag" = "-6" ] && ethertype=0x86dd
+  local pod_match="udp[20:4] = 0x${pod_hex:0:8} and udp[24:4] = 0x${pod_hex:8:8} and udp[28:4] = 0x${pod_hex:16:8} and udp[32:4] = 0x${pod_hex:24:8}"
   rm -f "$cap_opt" "$cap_fwd" "$cap_ret" "$FULL_REQUEST_SEEN" "$FULL_GOT"
   nohup bash -c "{ sleep 2; printf 'HTTP/1.1 200 OK\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n'; cat ${FULL_REPLY}; } | nc ${ncflag} -l -N ${pod} ${port} >${FULL_REQUEST_SEEN} 2>/dev/null" >/dev/null 2>&1 &
   disown
@@ -447,11 +453,11 @@ full_size_leg() {
   if have_tcpdump "${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames)"; then
     wire=1
     rm -f "$cap_opt.err" "$cap_fwd.err" "$cap_ret.err"
-    timeout 30 tcpdump -nn -l -U -i lo -c 1 -xx 'udp dst port 6081 and udp[14:1] = 100' >"$cap_opt" 2>"$cap_opt.err" &
+    timeout 30 tcpdump -nn -l -U -i lo -c 1 -xx "udp dst port 6081 and udp[14:1] = 100 and ${pod_match}" >"$cap_opt" 2>"$cap_opt.err" &
     local opt_pid=$!
-    timeout 30 tcpdump -nn -l -U -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>"$cap_fwd.err" &
+    timeout 30 tcpdump -nn -l -U -i lo -c 1 "udp dst port 6081 and udp[14:1] = 100 and udp[52:2] = ${ethertype} and len = ${FULL_FRAME_BYTES}" >"$cap_fwd" 2>"$cap_fwd.err" &
     local fwd_pid=$!
-    timeout 30 tcpdump -nn -l -U -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>"$cap_ret.err" &
+    timeout 30 tcpdump -nn -l -U -i lo -c 1 "udp dst port 6081 and udp[14:1] = 200 and udp[52:2] = ${ethertype} and len = ${FULL_FRAME_BYTES}" >"$cap_ret" 2>"$cap_ret.err" &
     local ret_pid=$!
     wait_tcpdump_listening "$cap_opt.err" "$cap_fwd.err" "$cap_ret.err"
   fi
