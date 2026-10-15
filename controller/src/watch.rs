@@ -434,6 +434,40 @@ fn pick_underlay_ip(peer_ips: &[IpAddr], local_node_ip: IpAddr) -> Option<Underl
     })
 }
 
+/// The Service's key when an ADDED/MODIFIED event shows a non-`LoadBalancer`
+/// Service still carrying `status.loadBalancer.ingress`: beep no longer
+/// forwards for it, so the entries this node published must be withdrawn.
+/// Reading the ingress off the event itself avoids a GET per non-LB Service.
+pub fn stale_ingress_key(event: &Value) -> Option<ServiceKey> {
+    if !matches!(event_kind(event)?, EventKind::Upsert) {
+        return None;
+    }
+    let obj = &event["object"];
+    let service_type = obj["spec"]["type"].as_str()?;
+    let has_ingress = obj["status"]["loadBalancer"]["ingress"]
+        .as_array()
+        .is_some_and(|ingress| !ingress.is_empty());
+    (service_type != "LoadBalancer" && has_ingress)
+        .then(|| service_key(obj))
+        .flatten()
+}
+
+/// The Service's key when `event` deletes it: nothing is left to clear.
+pub fn deleted_service_key(event: &Value) -> Option<ServiceKey> {
+    matches!(event_kind(event)?, EventKind::Delete)
+        .then(|| service_key(&event["object"]))
+        .flatten()
+}
+
+/// `stale_ingress_key` over a complete Service LIST, catching Services that
+/// changed type while the watch was disconnected.
+pub fn stale_ingress_keys(items: &[Value]) -> Vec<ServiceKey> {
+    items
+        .iter()
+        .filter_map(|item| stale_ingress_key(&added(item)))
+        .collect()
+}
+
 impl WatchState {
     /// Returns the event's `ServiceKey` when it left the Service tracked as
     /// `type=LoadBalancer` (a fresh ADDED/MODIFIED), or `None` for a delete,
@@ -4037,5 +4071,86 @@ mod tests {
             "trafficDistribution is read from the Service spec"
         );
         assert_eq!(front.local_count(), 2);
+    }
+
+    fn svc_with_type_and_ingress(service_type: &str, ingress: &[&str]) -> Value {
+        let ingress: Vec<Value> = ingress
+            .iter()
+            .map(|ip| serde_json::json!({"ip": ip}))
+            .collect();
+        serde_json::json!({
+            "metadata": {"namespace": "default", "name": "web"},
+            "spec": {"type": service_type, "ports": [{"port": 80}], "ipFamilies": ["IPv4"]},
+            "status": {"loadBalancer": {"ingress": ingress}},
+        })
+    }
+
+    // A Service edited LoadBalancer -> ClusterIP stops forwarding; if beep
+    // doesn't withdraw its ingress, the Service keeps advertising an address
+    // that no longer answers.
+    #[test]
+    fn service_that_left_load_balancer_with_ingress_is_flagged_for_clearing() {
+        let key = ServiceKey {
+            namespace: "default".into(),
+            name: "web".into(),
+        };
+        for service_type in ["ClusterIP", "NodePort", "ExternalName"] {
+            let event = serde_json::json!({
+                "type": "MODIFIED",
+                "object": svc_with_type_and_ingress(service_type, &["10.0.0.5"]),
+            });
+            assert_eq!(
+                stale_ingress_key(&event),
+                Some(key.clone()),
+                "a {service_type} Service still carrying a beep ingress must be cleared"
+            );
+        }
+    }
+
+    // Clearing a Service that never had an ingress, still is a LoadBalancer,
+    // or was deleted would be a pointless (or wrong) API write per event.
+    #[test]
+    fn services_with_nothing_stale_are_not_flagged_for_clearing() {
+        let modified = |obj: Value| serde_json::json!({"type": "MODIFIED", "object": obj});
+        assert_eq!(
+            stale_ingress_key(&modified(svc_with_type_and_ingress("ClusterIP", &[]))),
+            None,
+            "a ClusterIP Service with no ingress has nothing to clear"
+        );
+        assert_eq!(
+            stale_ingress_key(&modified(svc_with_type_and_ingress(
+                "LoadBalancer",
+                &["10.0.0.5"]
+            ))),
+            None,
+            "a LoadBalancer Service's ingress is live and must be kept"
+        );
+        assert_eq!(
+            stale_ingress_key(&serde_json::json!({
+                "type": "DELETED",
+                "object": svc_with_type_and_ingress("ClusterIP", &["10.0.0.5"]),
+            })),
+            None,
+            "a deleted Service has no status left to patch"
+        );
+    }
+
+    // A Service retyped while the controller was down only shows up in the
+    // relist; without this the stale ingress would survive every restart.
+    #[test]
+    fn relist_flags_services_that_changed_type_while_controller_was_down() {
+        let mut stale = svc_with_type_and_ingress("ClusterIP", &["10.0.0.5"]);
+        stale["metadata"]["name"] = "old".into();
+        let items = [
+            stale,
+            svc_with_type_and_ingress("LoadBalancer", &["10.0.0.5"]),
+        ];
+        assert_eq!(
+            stale_ingress_keys(&items),
+            vec![ServiceKey {
+                namespace: "default".into(),
+                name: "old".into()
+            }]
+        );
     }
 }
