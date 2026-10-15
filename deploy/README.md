@@ -107,6 +107,10 @@ the first time, then confirm with "Verify your deployment" below.
    they are exposed through their own `LoadBalancer` Service, which beep
    serves.
 
+7. **Kubernetes version.** beep supports the latest two Kubernetes minor
+   versions (currently 1.36 and 1.37), rolling forward with upstream. Older
+   versions are unsupported.
+
 ## Files
 
 - `daemonset.yaml` — one controller pod per node (`hostNetwork: true`),

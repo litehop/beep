@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-15
+
 ### Upgrade notes / operator action required
+
+- **beep must be the cluster's only L4 load balancer.** Disable k3s `servicelb`
+  and do not run MetalLB, kube-vip or a cloud LB controller alongside; two
+  controllers would write `status.loadBalancer.ingress` on the same Services.
+  kube-proxy must run in iptables or nftables mode. See `deploy/README.md`
+  ("Required per-cluster configuration & gotchas").
+
+- **The loader refuses to start on kernels older than 6.6** (TCX attach).
+  Upgrade nodes to Linux 6.6 or newer before rolling out 0.5.0.
 
 - **New `beep-config` ConfigMap (`deploy/configmap.yaml`) holds the sizing
   caps.** Apply it before `deploy/daemonset.yaml`, which now loads it with
@@ -52,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Service that leaves `type: LoadBalancer` (e.g. patched to `ClusterIP`) now
+  has beep's entries removed from `status.loadBalancer.ingress` and its fronts
+  removed from the dataplane; previously the stale ingress stayed.
+- The controller's `MapRestoreFailed` Warning Event (a failed map restore at
+  upgrade) is verified live on k3s, and posting has an overall deadline so a
+  slow apiserver cannot stall the controller. `BEEP_FAULT_FAIL_RESTORE_WRITE=1`
+  makes the first restore write fail with `ENOMEM` to exercise it; test hook,
+  never set it in production.
 - New connections were refused (dropped at the backend node) once 16 closed
   connections had left stale remap state behind: two Services sharing a pod
   and a client reusing one source port across both remap the second flow's
@@ -128,6 +147,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The memory-smoke tripwire is 1.15x of the expected usage (bucket floors +
   entries x per-entry + the preallocated maps) instead of a flat 6 MiB, which
   stays as the gross ceiling.
+- The controller reads its kubeconfig through the `politeia` crate (git
+  dependency pinned to v0.1.1); the in-tree `beep-kubeconfig` crate is gone.
+  It parses only an X.509 client-cert kubeconfig file; see `deploy/README.md`
+  ("Kubeconfig").
+
+### Known limitations
+
+- kube-proxy IPVS mode is unsupported: kube-proxy binds the published ingress
+  addresses (including node addresses) to `kube-ipvs0`, which breaks node
+  connectivity. Use iptables or nftables mode.
+- Minimum kernel is Linux 6.6; the loader fails fast on older kernels.
+- Supported Kubernetes: the latest two minor versions (currently 1.36 and
+  1.37), rolling forward with upstream. Older versions are unsupported.
 
 ## [0.4.0] - 2026-10-09
 
