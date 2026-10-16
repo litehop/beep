@@ -1574,7 +1574,16 @@ grep -q "is severed" "$GENEVE_RECREATE_LOG" || {
 pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
 nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESPONSE_FILE" >"$BACKEND_LOG" 2>&1 &
 disown
-sleep 0.5
+# A missed bind would otherwise surface as a curl failure indistinguishable
+# from a datapath break.
+for _ in $(seq 1 50); do
+  ss -ltnH "sport = :${TARGET_PORT}" | grep -q . && break
+  sleep 0.1
+done
+ss -ltnH "sport = :${TARGET_PORT}" | grep -q . || {
+  echo "FAIL: listener did not bind on ${TARGET_PORT} within 5s after the backend nc relaunch -- test harness problem, not a datapath failure" >&2
+  exit 1
+}
 recreate_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_PORT}/") || recreate_body=""
 [ "$recreate_body" = "OK" ] || {
   echo "FAIL: expected response body 'OK' through front ${FRONT_IP}:${FRONT_PORT} after geneve0 was re-created, got: '$recreate_body' -- the loader logged a re-attach but traffic does not flow through the re-pinned links" >&2
