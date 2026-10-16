@@ -98,18 +98,16 @@ bd show <id>
 # 4. Implement — surgical, minimal changes
 
 # 5. Sync with main, then run quality gates ONCE, before commit
-# (CWD is already the worktree root). Do this before every push, not just
-# fix rounds — the branch drifts behind main during a long dispatch.
+# (CWD is the worktree root). Do this before every push — the branch drifts
+# behind main during a long dispatch.
 git fetch origin main
 git rev-list --count HEAD..origin/main   # nonzero → merge and resolve now
 cargo fmt --check
 cargo test -p beep-common 2>&1 | tail -30
-# `0 failed` in cargo test's summary line is authoritative — don't re-run
-# piped to grep to double-check a green pass; use `cargo test -p beep-common
-# -- --nocapture <testname>` if you need one failing test's stacktrace. A
-# cold worktree's first-ever cargo invocation compiles test binaries from
-# scratch — set a longer Bash timeout up front rather than let a default
-# fire mid-build.
+# `0 failed` in the summary line is authoritative — don't re-run to
+# double-check; use `-- --nocapture <testname>` for one failing test's
+# stacktrace. A cold worktree's first cargo run compiles from scratch — set a
+# longer Bash timeout up front.
 # clippy(loader), clippy(ebpf), and `cargo build --release` are Linux-only
 # (aya cross-build to bpfel-unknown-none) — do not run them on this macOS
 # host. CI's fmt/lint-matrix/test-matrix/memory-smoke jobs enforce the full
@@ -121,22 +119,23 @@ bash scripts/smoke.sh --vm <ASSIGNED_VM>   # front -> Geneve -> backend round tr
 
 # 6. Commit — pre-commit re-checks `cargo fmt --check` plus the bead/
 # findings-ref guards (not just fmt). Draft the message from your own diff,
-# not from memory of what you wrote. For a non-trivial diff, ground the
-# message with Agent(subagent_type="diff-summarizer", prompt="<your `git
-# diff` output>") instead of re-reading the whole diff yourself; use its
-# summary/breaking_change fields when drafting the commit message and PR
-# body.
+# not from memory. For a non-trivial diff, ground the message with
+# Agent(subagent_type="diff-summarizer", prompt="<your `git diff` output>")
+# and use its summary/breaking_change fields for the commit and PR body.
 git add <files>
 git commit -m "feat(<area>): <what and why>"
 
 # 7. Push and open PR — pre-push re-runs the OS-gated beep gate (fmt +
 # test -p beep-common on this host, not test+clippy --workspace); don't
-# manually re-run it yourself right before this, the hook already will.
+# re-run it yourself first.
+# Harness false positive: inline free text with dollar signs, backticks or
+# escaped quotes is refused ("cannot be shown not to be git").
+# Write the PR body to .pr-body-<topic>.md in the worktree root (never
+# committed), pass --body-file, delete it after. bd free text: --body-file
+# where it exists, else avoid those characters (name variables in words).
+# If refused anyway, STOP and report; the mayor opens the PR.
 git push
-gh pr create --title "..." --body "..."
-
-# Note for mayor: merge PRs with --merge (regular merge commit) by default.
-# Use --squash only for branches with many noisy debug/CI-fixup commits. Never --rebase.
+gh pr create --title "..." --body-file .pr-body-<topic>.md
 
 # 8. Close the bead
 bd close <id> --reason="PR #N opened"
