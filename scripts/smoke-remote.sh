@@ -371,6 +371,48 @@ wait_for_attach() {
   }
 }
 
+# Polls until a TCP or UDP listener is bound on <port> (optionally on local
+# <addr>, optionally inside <netns>). A missed bind would otherwise surface as a
+# client failure indistinguishable from a datapath break.
+wait_for_listener() { # <port> [timeout_s] [addr] [netns]
+  local port="$1" timeout_s="${2:-5}" addr="${3:-}" netns="${4:-}"
+  local i
+  for ((i = 0; i < timeout_s * 10; i++)); do
+    listener_bound "$port" "$addr" "$netns" && return 0
+    sleep 0.1
+  done
+  echo "FAIL: listener did not bind on ${addr:+${addr}:}${port}${netns:+ (netns ${netns})} within ${timeout_s}s -- test harness problem, not a datapath failure" >&2
+  exit 1
+}
+
+# Polls until NO TCP/UDP listener remains on <port>. A `pkill` returns before
+# the old nc has exited, so a relaunch (or wait_for_listener, which would pass
+# against the dying socket) straight after it races the old listener's
+# teardown and can hit EADDRINUSE.
+wait_for_port_free() { # <port> [timeout_s] [addr] [netns]
+  local port="$1" timeout_s="${2:-5}" addr="${3:-}" netns="${4:-}"
+  local i
+  for ((i = 0; i < timeout_s * 10; i++)); do
+    listener_bound "$port" "$addr" "$netns" || return 0
+    sleep 0.1
+  done
+  echo "FAIL: port ${addr:+${addr}:}${port}${netns:+ (netns ${netns})} still bound ${timeout_s}s after its listener was killed -- test harness problem, not a datapath failure" >&2
+  exit 1
+}
+
+listener_bound() { # <port> [addr] [netns]
+  local port="$1" addr="${2:-}" netns="${3:-}"
+  local -a ss_cmd=(ss -lntuH) filter=()
+  [ -z "$netns" ] || ss_cmd=(ip netns exec "$netns" "${ss_cmd[@]}")
+  case "$addr" in
+    "") ;;
+    *:*) filter=(src "[${addr}]") ;;
+    *) filter=(src "$addr") ;;
+  esac
+  filter+=(sport = ":${port}")
+  "${ss_cmd[@]}" "${filter[@]}" | grep -q .
+}
+
 # Stops the running loader and waits for it to actually exit before a
 # restart starts a second instance against the same --pin-dir -- two
 # concurrent instances would both attach_to_link-swap the same pinned links,
@@ -425,7 +467,8 @@ nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESPONSE_FILE" >"$BACKEND_LOG" 2>&1 
 disown
 nohup nc -l -N "$POD_IP" "$TARGET_PORT2" < "$RESPONSE_FILE2" >"$BACKEND_LOG2" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$TARGET_PORT" 5 "$POD_IP"
+wait_for_listener "$TARGET_PORT2" 5 "$POD_IP"
 
 echo "==> driving one client -> front -> backend round trip"
 body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_PORT}/")
@@ -454,7 +497,8 @@ for ((i = 0; i < AFF_CONNECTIONS; i++)); do
   disown
   nohup nc -l -N "$AFF_POD_B" "$AFF_TARGET_PORT" < "$RESPONSE_FILE" >/tmp/beep-smoke-affinity-b 2>&1 &
   disown
-  sleep 0.2
+  wait_for_listener "$AFF_TARGET_PORT" 5 "$AFF_POD_A"
+  wait_for_listener "$AFF_TARGET_PORT" 5 "$AFF_POD_B"
   aff_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${AFF_FRONT_PORT}/") || aff_body=""
   [ "$aff_body" = "OK" ] || {
     echo "FAIL: affinity connection $i got '$aff_body', expected 'OK'" >&2
@@ -470,6 +514,8 @@ for ((i = 0; i < AFF_CONNECTIONS; i++)); do
   fi
   pkill -f "nc -l -N ${AFF_POD_A} ${AFF_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${AFF_POD_B} ${AFF_TARGET_PORT}" 2>/dev/null || true
+  wait_for_port_free "$AFF_TARGET_PORT" 5 "$AFF_POD_A"
+  wait_for_port_free "$AFF_TARGET_PORT" 5 "$AFF_POD_B"
 done
 if [ "$aff_hits_a" -ne 0 ] && [ "$aff_hits_b" -ne 0 ]; then
   echo "FAIL: ClientIP affinity front spread ${AFF_CONNECTIONS} connections from one client IP over both pods (${AFF_POD_A}=${aff_hits_a}, ${AFF_POD_B}=${aff_hits_b}); sticky sessions would break" >&2
@@ -501,6 +547,7 @@ full_size_leg() {
   rm -f "$cap_opt" "$cap_fwd" "$cap_ret" "$FULL_REQUEST_SEEN" "$FULL_GOT"
   nohup bash -c "{ sleep 2; printf 'HTTP/1.1 200 OK\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n'; cat ${FULL_REPLY}; } | nc ${ncflag} -l -N ${pod} ${port} >${FULL_REQUEST_SEEN} 2>/dev/null" >/dev/null 2>&1 &
   disown
+  wait_for_listener "$port" 5 "$pod"
   local wire=0
   if have_tcpdump "${label} wire assertions (option bytes, ${FULL_FRAME_BYTES}-byte frames)"; then
     wire=1
@@ -567,7 +614,7 @@ echo "==> starting a backend responder for the second uplink's front on ${POD_IP
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK3' > "$UPLINK2_RESPONSE_FILE"
 nohup nc -l -N "$POD_IP" "$UPLINK2_TARGET_PORT" < "$UPLINK2_RESPONSE_FILE" >"$UPLINK2_BACKEND_LOG" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$UPLINK2_TARGET_PORT" 5 "$POD_IP"
 
 echo "==> driving a round trip through the SECOND configured uplink ($UPLINK2_IFACE)"
 # The whole point of this check: if try_geneve_decap_return's redirect used
@@ -613,7 +660,7 @@ ip netns exec smoke-client ip link set smoke-veth1 arp off
 nohup nc -l -N "$POD_IP" "$COLD_TARGET_PORT" < "$COLD_RESPONSE_FILE" >"$COLD_BACKEND_LOG" 2>&1 &
 cold_nc_pid=$!
 disown
-sleep 0.5
+wait_for_listener "$COLD_TARGET_PORT" 5 "$POD_IP"
 flush_host_neigh_and_assert_absent
 if control_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${FRONT_IP}:${COLD_FRONT_PORT}/" 2>&1); then
   echo "FAIL: cold-neighbor control succeeded ('$control_body') although the client could never answer ARP -- the return leg is NOT depending on neighbour resolution, so the variant below proves nothing" >&2
@@ -627,13 +674,14 @@ case "$control_entry" in
 esac
 echo "COLD-NEIGHBOR CONTROL: PASS (unresolvable client => round trip failed and host neighbour is '${control_entry:-absent}' -- success below can only come from real resolution)"
 kill "$cold_nc_pid" 2>/dev/null || true
+wait_for_port_free "$COLD_TARGET_PORT" 5 "$POD_IP"
 ip netns exec smoke-client ip link set smoke-veth1 arp on
 
 echo "==> cold-cache round trip: flush the host's entry for ${CLIENT_IP}, then drive the flow"
 nohup nc -l -N "$POD_IP" "$COLD_TARGET_PORT" < "$COLD_RESPONSE_FILE" >"$COLD_BACKEND_LOG" 2>&1 &
 cold_nc_pid=$!
 disown
-sleep 0.5
+wait_for_listener "$COLD_TARGET_PORT" 5 "$POD_IP"
 flush_host_neigh_and_assert_absent
 cold_body=$(ip netns exec smoke-client curl -sS -m 8 "http://${FRONT_IP}:${COLD_FRONT_PORT}/") || {
   echo "FAIL: round trip with a cold host neighbour cache did not complete -- bpf_redirect_neigh failed to resolve ${CLIENT_IP} on the return leg" >&2
@@ -737,7 +785,7 @@ remap_started=$SECONDS
 nohup nc -l -d "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
 remap_srv_a=$!
 disown
-sleep 0.5
+wait_for_listener "$REMAP_TARGET_PORT"
 { printf 'GET / HTTP/1.0\r\nHost: beep\r\n\r\n'; sleep 10; } \
   | timeout 3 ip netns exec smoke-client nc -p "$REMAP_CLIENT_PORT" "$FRONT_IP" "$REMAP_FRONT_PORT_A" >/dev/null 2>&1 &
 remap_cli_a=$!
@@ -758,7 +806,7 @@ done
 { printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n'; sleep 8; printf 'REMAPB'; } \
   | nohup nc -l "$POD_IP" "$REMAP_TARGET_PORT" >/dev/null 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$REMAP_TARGET_PORT" 5 "$POD_IP"
 remap_rc_file=/tmp/beep-smoke-remap-rc-B
 rm -f "$remap_rc_file"
 ( rc=0; ip netns exec smoke-client curl -sS -m 30 --local-port "$REMAP_CLIENT_PORT" \
@@ -824,7 +872,7 @@ for hold in "${POD_IP}:${TARGET_PORT}:smoke-client:${FRONT_IP}:${FRONT_PORT}" \
   IFS=: read -r hold_pod hold_target hold_ns hold_front hold_front_port <<<"$hold"
   nohup bash -c "sleep 40 | nc -l -N ${hold_pod} ${hold_target} >/dev/null 2>&1" >/dev/null 2>&1 &
   disown
-  sleep 0.5
+  wait_for_listener "$hold_target" 5 "$hold_pod"
   nohup ip netns exec "$hold_ns" bash -c "{ printf 'hold'; sleep 40; } | nc ${hold_front} ${hold_front_port} >/dev/null 2>&1" >/dev/null 2>&1 &
   disown
 done
@@ -864,6 +912,7 @@ pkill -f "nc ${UPLINK2_FRONT_IP} ${UPLINK2_FRONT_PORT}" 2>/dev/null || true
 pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
 pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT2}" 2>/dev/null || true
 pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
+wait_for_port_free "$TARGET_PORT" 5 "$POD_IP"
 sleep 1
 
 echo "==> establishing a flow to hold open across a loader restart (a DaemonSet rollout/eviction/OOM kill must not silently drop an established connection)"
@@ -898,6 +947,7 @@ nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESTART_FIFO" >"$RESTART_BACKEND_LOG
 disown
 ( printf '%s' "$RESTART_CHUNK1"; read -r _ < "$RESTART_SIGNAL_FIFO"; printf '%s' "$RESTART_CHUNK2" ) > "$RESTART_FIFO" &
 disown
+wait_for_listener "$TARGET_PORT" 5 "$POD_IP"
 
 ip netns exec smoke-client bash -c "timeout 30 nc ${FRONT_IP} ${FRONT_PORT} > ${RESTART_CLIENT_OUT}" &
 # Not disowned: `wait` on a disowned pid returns 0 immediately without
@@ -967,10 +1017,7 @@ rm -f "$CAPCHG_CLIENT_FIFO" "$CAPCHG_BACKEND_LOG"
 mkfifo "$CAPCHG_CLIENT_FIFO"
 nohup nc -l -N "$POD_IP" "$TARGET_PORT" < <(sleep 40) >"$CAPCHG_BACKEND_LOG" 2>&1 &
 disown
-for _ in $(seq 1 30); do
-  ss -ltnH "sport = :${TARGET_PORT}" | grep -q . && break
-  sleep 0.1
-done
+wait_for_listener "$TARGET_PORT" 5 "$POD_IP"
 ( printf '%s' "$CAPCHG_PING_BEFORE"; read -r _ < "$RESTART_SIGNAL_FIFO"; printf '%s' "$CAPCHG_PING_AFTER"; sleep 10 ) > "$CAPCHG_CLIENT_FIFO" &
 disown
 ip netns exec smoke-client bash -c "timeout 35 nc ${FRONT_IP} ${FRONT_PORT} < ${CAPCHG_CLIENT_FIFO} > /dev/null" &
@@ -1081,7 +1128,7 @@ echo "==> selective conntrack eviction: establishing a flow on a DEDICATED front
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nEVICT1' > "$EVICT_RESPONSE_FILE"
 nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" < "$EVICT_RESPONSE_FILE" >"$EVICT_BACKEND_LOG" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$EVICT_TARGET_PORT" 5 "$POD_IP"
 evict_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
 [ "$evict_body" = "EVICT1" ] || {
   echo "FAIL: expected response body 'EVICT1' from the dedicated eviction-test front, got: $evict_body" >&2
@@ -1119,7 +1166,7 @@ wait_for_attach "$EVICT_LOADER_LOG_REPLACEMENT"
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nREPLACEMENT' > "$REPLACEMENT_RESPONSE_FILE"
 nohup nc -l -N "$REPLACEMENT_POD_IP" "$EVICT_TARGET_PORT" < "$REPLACEMENT_RESPONSE_FILE" >"$REPLACEMENT_BACKEND_LOG" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$EVICT_TARGET_PORT" 5 "$REPLACEMENT_POD_IP"
 replacement_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
 [ "$replacement_body" = "REPLACEMENT" ] || {
   echo "FAIL: expected response body 'REPLACEMENT' after re-pointing the front at a new backend pod, got: $replacement_body -- the eviction sweep must not wedge the front against a replacement endpoint" >&2
@@ -1137,7 +1184,7 @@ wait_for_attach "$EVICT_LOADER_LOG_REUSE"
 { printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n'; sleep 4; printf 'REUSE'; } \
   | nohup nc -l -N "$POD_IP" "$EVICT_TARGET_PORT" >"$REUSE_BACKEND_LOG" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$EVICT_TARGET_PORT" 5 "$POD_IP"
 ip netns exec smoke-client curl -sS -m 15 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/" > "$REUSE_RESPONSE_FILE" 2>&1 &
 reuse_pid=$!
 sleep 2
@@ -1166,7 +1213,7 @@ mkfifo "$PIN_STEER_FIFO" "$PIN_DRAIN_FIFO" "$PIN_DRAIN2_FIFO"
 pin_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 nohup bash -c "sleep 60 | nc -l -N ${POD_IP} ${EVICT_TARGET_PORT} >${PIN_STEER_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$EVICT_TARGET_PORT" 5 "$POD_IP"
 nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN_STEER_FIFO}; printf '%s' ${PIN_STEER_MSG}; read -r _ < ${PIN_DRAIN_FIFO}; printf '%s' ${PIN_DRAIN_MSG}; read -r _ < ${PIN_DRAIN2_FIFO}; printf '%s' ${PIN_DRAIN2_MSG} ) | timeout 60 nc ${FRONT_IP} ${EVICT_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
 disown
 for _ in $(seq 1 30); do
@@ -1191,7 +1238,7 @@ mkfifo "$PIN6_FIFO"
 pin6_flows_before=$(map_entry_count "$PIN_DIR/FLOW_TABLE")
 nohup bash -c "sleep 60 | nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT} >${PIN6_BACKEND_IN} 2>&1" >/dev/null 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$PIN6_TARGET_PORT" 5 "$POD6_A"
 nohup ip netns exec smoke-client bash -c "( read -r _ < ${PIN6_FIFO}; printf '%s' ${PIN6_MSG} ) | timeout 60 nc -6 ${FRONT_IP6} ${PIN6_FRONT_PORT} >/dev/null 2>&1" >/dev/null 2>&1 &
 disown
 for _ in $(seq 1 30); do
@@ -1250,7 +1297,7 @@ echo "PIN-STEERING (established): PASS (flow kept pod ${POD_IP} after its front 
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nREPLACEMENT' > "$REPLACEMENT_RESPONSE_FILE"
 nohup nc -l -N "$REPLACEMENT_POD_IP" "$EVICT_TARGET_PORT" < "$REPLACEMENT_RESPONSE_FILE" >"$REPLACEMENT_BACKEND_LOG" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$EVICT_TARGET_PORT" 5 "$REPLACEMENT_POD_IP"
 pin_new_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${EVICT_FRONT_PORT}/")
 [ "$pin_new_body" = "REPLACEMENT" ] || {
   echo "FAIL: a NEW flow after the re-point must reach ${REPLACEMENT_POD_IP}, got: $pin_new_body" >&2
@@ -1274,7 +1321,7 @@ pkill -f "timeout 60 nc -6 ${FRONT_IP6} ${PIN6_FRONT_PORT}" 2>/dev/null || true
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nREPLACEMENT6' > /tmp/beep-smoke-response-pin6.http
 nohup nc -6 -l -N "$POD6_B" "$PIN6_TARGET_PORT" < /tmp/beep-smoke-response-pin6.http >/dev/null 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$PIN6_TARGET_PORT" 5 "$POD6_B"
 pin6_new_body=$(ip netns exec smoke-client curl -sS -g -m 5 "http://[${FRONT_IP6}]:${PIN6_FRONT_PORT}/")
 [ "$pin6_new_body" = "REPLACEMENT6" ] || {
   echo "FAIL: a NEW v6 flow after the re-point must reach ${POD6_B}, got: $pin6_new_body -- without this the v6 pin check above could pass because the front was never re-pointed" >&2
@@ -1284,7 +1331,7 @@ echo "PIN-STEERING (v6 new flow): PASS (a fresh v6 flow followed the new endpoin
 
 nohup nc -u -l "$POD_IP" "$PEND_TARGET_PORT" >"$PEND_BACKEND_OUT" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$PEND_TARGET_PORT" 5 "$POD_IP"
 printf 'PENDPKT2' | ip netns exec smoke-client nc -u -q0 -p "$PEND_CLIENT_PORT" "$FRONT_IP" "$PEND_FRONT_PORT" 2>/dev/null || true
 sleep 1
 ! grep -q PENDPKT2 "$PEND_BACKEND_OUT" || {
@@ -1371,7 +1418,7 @@ bpftool map update pinned "$PIN_DIR/POD_TARGETS" key $NODE_EGRESS_KEY value 1 ||
 rm -f "$NODE_EGRESS_OUT"
 nohup ip netns exec smoke-client timeout 6 nc -l -N "$CLIENT_IP" "$NODE_EGRESS_PORT" >"$NODE_EGRESS_OUT" 2>&1 &
 disown
-sleep 0.5
+wait_for_listener "$NODE_EGRESS_PORT" 5 "$CLIENT_IP" smoke-client
 echo "node-egress-payload" | nc -s "$FRONT_IP" -w 3 "$CLIENT_IP" "$NODE_EGRESS_PORT" >/dev/null 2>&1 || true
 sleep 0.5
 bpftool map delete pinned "$PIN_DIR/POD_TARGETS" key $NODE_EGRESS_KEY || true
@@ -1422,6 +1469,7 @@ host_listener() { # <tcp|udp> <4|6> <addr> <port> [rx-file]
     nohup timeout 40 nc -$2 -u -l "$3" "$4" >"$5" 2>/dev/null &
   fi
   disown
+  wait_for_listener "$4" 5 "$3"
 }
 : >"$DROP_UDP4_RX"
 : >"$DROP_UDP6_RX"
@@ -1435,7 +1483,6 @@ host_listener tcp 6 "$FRONT_IP6" "$DROP_TCP6_PORT"
 host_listener udp 6 "$FRONT_IP6" "$DROP_UDP6_PORT" "$DROP_UDP6_RX"
 host_listener tcp 4 "$FRONT_IP" "$CONTROL_TCP4_PORT"
 host_listener tcp 6 "$FRONT_IP6" "$CONTROL_TCP6_PORT"
-sleep 1
 
 DROP_CAPTURE_PID=""
 if have_tcpdump "on-the-wire silence capture (client-side behaviour is still asserted)"; then
@@ -1559,6 +1606,9 @@ stop_loader
 ip link del geneve0
 ip link add geneve0 type geneve external
 ip link set geneve0 up
+# udev's per-interface sysctl rule re-applies the distro default rp_filter to a
+# new device asynchronously and would clobber the 0 set below.
+udevadm settle
 sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
 GENEVE_RECREATE_LOG=/tmp/beep-smoke-loader-geneve-recreate.log
 start_loader "$GENEVE_RECREATE_LOG"
@@ -1568,7 +1618,17 @@ grep -q "is severed" "$GENEVE_RECREATE_LOG" || {
   cat "$GENEVE_RECREATE_LOG" >&2
   exit 1
 }
-echo "GENEVE-RECREATE: PASS (loader re-attached and re-pinned links after geneve0 was deleted and re-created)"
+pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
+wait_for_port_free "$TARGET_PORT" 5 "$POD_IP"
+nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESPONSE_FILE" >"$BACKEND_LOG" 2>&1 &
+disown
+wait_for_listener "$TARGET_PORT" 5 "$POD_IP"
+recreate_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_PORT}/") || recreate_body=""
+[ "$recreate_body" = "OK" ] || {
+  echo "FAIL: expected response body 'OK' through front ${FRONT_IP}:${FRONT_PORT} after geneve0 was re-created, got: '$recreate_body' -- the loader logged a re-attach but traffic does not flow through the re-pinned links" >&2
+  exit 1
+}
+echo "GENEVE-RECREATE: PASS (loader re-attached and re-pinned links after geneve0 was deleted and re-created; round trip through front ${FRONT_IP}:${FRONT_PORT} -> 'OK')"
 
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
