@@ -121,7 +121,7 @@ bash scripts/smoke.sh --vm <ASSIGNED_VM>   # front -> Geneve -> backend round tr
 # findings-ref guards (not just fmt). Draft the message from your own diff,
 # not from memory.
 # Free text never goes inline (harness refuses text it can't prove isn't
-# git). Write it to .tmp-<topic>.md in YOUR WORKTREE ROOT (never the session
+# git). Write it to .tmp-commit.md/.tmp-pr.md in YOUR WORKTREE ROOT (never the session
 # scratchpad: the boundary hook blocks it); delete after use, never commit
 # (.gitignore covers .tmp-*). A short one-line -m without special characters is fine.
 git add <files>
