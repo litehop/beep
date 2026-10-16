@@ -26,7 +26,7 @@ jobs:
           # - beep-ebpf
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy;
           # explicit here because this action's `components:` input pins
@@ -70,7 +70,7 @@ jobs:
           - beep-ebpf
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy;
           # explicit here because this action's `components:` input pins
@@ -130,7 +130,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: clippy, rustfmt, rust-src
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -194,7 +194,7 @@ jobs:
       # which needs nightly + rust-src regardless of the host build's own
       # target; aarch64-unknown-linux-gnu is beep-controller's own target.
       # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: rust-src, llvm-tools
           targets: aarch64-unknown-linux-gnu
@@ -235,7 +235,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -415,7 +415,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -469,12 +469,16 @@ jobs:
           set -euo pipefail
           GENEVE=smoke-geneve0
 
+          # Docker turns a missing -v file source into a directory, while the
+          # manifest's FileOrCreate creates an empty file; mirror the latter.
+          sudo touch /etc/sysctl.d/60-beep.conf
+
           echo "==> starting beep-node-prep-smoke"
           docker run -d --name beep-node-prep-smoke \
             --network host \
             --cap-drop=ALL --cap-add=NET_ADMIN --cap-add=BPF --cap-add=PERFMON \
             --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
-            -v /sys/fs/bpf:/sys/fs/bpf \
+            -v /sys/fs/bpf:/sys/fs/bpf -v /etc/sysctl.d/60-beep.conf:/etc/sysctl.d/60-beep.conf \
             beep-controller:ci-smoke \
             --geneve-iface "$GENEVE" --node-prep
 
@@ -488,6 +492,18 @@ jobs:
           echo "rp_filter: all=$all_rpf $GENEVE=$geneve_rpf"
           [ "$all_rpf" = "0" ] || { echo "FAIL: conf.all.rp_filter=$all_rpf, want 0" >&2; exit 1; }
           [ "$geneve_rpf" = "0" ] || { echo "FAIL: conf.$GENEVE.rp_filter=$geneve_rpf, want 0" >&2; exit 1; }
+
+          # systemd-sysctl re-applies sysctl.d (50-default.conf's
+          # rp_filter=2) to every new netdev; only the persisted drop-in
+          # keeps the value across device re-creation.
+          sudo ip link del "$GENEVE"
+          sudo ip link add "$GENEVE" type geneve external
+          sudo ip link set "$GENEVE" up
+          sudo udevadm settle
+          sudo /usr/lib/systemd/systemd-sysctl --prefix="/net/ipv4/conf/$GENEVE"
+          geneve_rpf=$(cat "/proc/sys/net/ipv4/conf/$GENEVE/rp_filter")
+          echo "after re-creation + systemd-sysctl: $GENEVE=$geneve_rpf"
+          [ "$geneve_rpf" = "0" ] || { echo "FAIL: conf.$GENEVE.rp_filter=$geneve_rpf after re-creation, want 0 (sysctl.d drop-in missing?)" >&2; exit 1; }
           echo "CONTAINER NODE-PREP SMOKE: PASS"
 
       - name: Cleanup
@@ -495,3 +511,4 @@ jobs:
         run: |
           docker rm -f beep-node-prep-smoke >/dev/null 2>&1 || true
           sudo ip link del smoke-geneve0 >/dev/null 2>&1 || true
+          sudo rm -f /etc/sysctl.d/60-beep.conf

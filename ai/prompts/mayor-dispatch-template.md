@@ -254,7 +254,9 @@ Commit and push:
 git add <files>
 git commit -m "..."
 git push
-gh pr create --title "..." --body "..."
+# write the PR body to .pr-body-<topic>.md in the worktree root (never committed)
+gh pr create --title "..." --body-file .pr-body-<topic>.md
+rm .pr-body-<topic>.md
 ```
 
 ---
@@ -531,6 +533,10 @@ a genuine, passing dual-stack cross-node round trip built on it.
   hook intercepts `gh pr create` and `gh pr edit` the same way it intercepts
   `git push`. Dispatch prompt must also mandate running quality gates before
   pushing so workers see failures with context, not as a hook rejection.
+- **The harness refuses a worker's `gh pr create` (isolation false positive).**
+  The mayor opens the PR from the mayor checkout (operator authorization
+  2026-10-16; `bd recall mayor-opens-blocked-worker-prs-2026-10-16`). Workers
+  stop and report rather than route around it.
 - **Workers pass the host quality gate but skip `scripts/smoke.sh`
   verification.** Unit/clippy gates cannot prove the verifier accepts the
   program or that the encap/decap round trip actually works. Inject the
