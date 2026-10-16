@@ -112,6 +112,9 @@ pub struct Fixture {
     pub backend_node_ip: IpAddr,
     pub pod_ip: IpAddr,
     pub target_port: u16,
+    /// Optional trailing `affinity` field: the front hashes new flows on the
+    /// client IP alone (`FRONT_FLAG_CLIENT_IP_AFFINITY`).
+    pub client_ip_affinity: bool,
 }
 
 /// Widens a *wire-token* address field (`Fixture::front_ip`/`pod_ip`) into
@@ -174,21 +177,26 @@ fn split_fixture_fields(s: &str) -> Vec<&str> {
 
 pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
     let parts = split_fixture_fields(s);
-    let [front_ip, front_port, proto, backend_node_ip, pod_ip, target_port] = parts.as_slice()
-    else {
-        return Err(format!(
-            "expected front_ip:front_port:proto:backend_node_ip:pod_ip:target_port (bracket an IPv6 \
-             address, e.g. `[2001:db8::1]`), got `{s}`"
-        ));
-    };
+    let ([front_ip, front_port, proto, backend_node_ip, pod_ip, target_port], client_ip_affinity) =
+        match parts.as_slice() {
+            [a, b, c, d, e, f] => ([*a, *b, *c, *d, *e, *f], false),
+            [a, b, c, d, e, f, "affinity"] => ([*a, *b, *c, *d, *e, *f], true),
+            _ => {
+                return Err(format!(
+                "expected front_ip:front_port:proto:backend_node_ip:pod_ip:target_port[:affinity] \
+                     (bracket an IPv6 address, e.g. `[2001:db8::1]`), got `{s}`"
+            ))
+            }
+        };
     Ok(Fixture {
+        client_ip_affinity,
         front_ip: front_ip
             .parse()
             .map_err(|e| format!("front_ip `{front_ip}`: {e}"))?,
         front_port: front_port
             .parse()
             .map_err(|e| format!("front_port `{front_port}`: {e}"))?,
-        proto: match *proto {
+        proto: match proto {
             "tcp" => Proto::Tcp,
             "udp" => Proto::Udp,
             other => return Err(format!("proto: expected `tcp` or `udp`, got `{other}`")),

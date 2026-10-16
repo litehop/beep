@@ -301,6 +301,23 @@ Switching policy does not evict pinned flows; they drain naturally. Pins are
 swept only when their backend pod leaves every EndpointSlice or its IP is
 reused.
 
+### Session affinity
+
+`spec.sessionAffinity: ClientIP` makes new connections from one client IP to a
+front pick the same endpoint: the backend hash leaves out the client port.
+There is no affinity table, so the semantics are weaker than kube-proxy's:
+
+- Stickiness holds while the front's endpoint set is stable. Scaling or a
+  rollout changes the endpoint list and can move clients to another pod.
+  Established connections stay pinned as always.
+- With node-local preference (`externalTrafficPolicy: Local`, or
+  `trafficDistribution` set) each ingress node hashes over its own local
+  endpoints, so a client reaching different nodes can land on different pods.
+  kube-proxy's affinity is likewise per node.
+- `spec.sessionAffinityConfig.clientIP.timeoutSeconds` is not honoured; a
+  client is not released after an idle period. No
+  Event or Service condition reports this.
+
 ## Security & underlay assumptions
 
 **The Geneve underlay MUST prevent IP spoofing.** UDP 6081 is open on every

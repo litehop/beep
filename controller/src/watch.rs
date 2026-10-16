@@ -71,6 +71,7 @@ struct RawService {
     // never constructed with no families to front.
     ip_families: Vec<Family>,
     policy: EndpointPolicy,
+    client_ip_affinity: bool,
 }
 
 impl RawService {
@@ -273,6 +274,7 @@ fn parse_service(obj: &Value) -> Option<RawService> {
         ports,
         ip_families,
         policy,
+        client_ip_affinity: reconcile::client_ip_affinity(obj["spec"]["sessionAffinity"].as_str()),
     })
 }
 
@@ -1054,6 +1056,7 @@ impl WatchState {
                 let view = ServiceView {
                     front_ip: *front_ip,
                     policy: svc.policy,
+                    client_ip_affinity: svc.client_ip_affinity,
                     ports: ports.clone(),
                 };
                 let desired = reconcile::reconcile_service(&view, &endpoint_slices, node);
@@ -4071,6 +4074,34 @@ mod tests {
             "trafficDistribution is read from the Service spec"
         );
         assert_eq!(front.local_count(), 2);
+    }
+
+    #[test]
+    fn service_spec_session_affinity_reaches_the_published_front() {
+        let mut state = WatchState::default();
+        state.apply_service_event(&policy_service(
+            "sticky",
+            serde_json::json!({"sessionAffinity": "ClientIP"}),
+        ));
+        state.apply_node_event(&serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "node-a"},
+                "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+            },
+        }));
+        state.mark_fully_listed();
+        state.apply_endpoint_slice_event(&policy_slice(
+            "sticky",
+            &[("10.244.0.9", "node-a", true, true)],
+        ));
+        let desired = state.desired(&node(Ipv4Addr::new(10, 0, 0, 5)));
+        let front = desired.fronts.values().next().expect("one front");
+        assert_eq!(
+            front.flags,
+            beep_common::FRONT_FLAG_CLIENT_IP_AFFINITY,
+            "sessionAffinity is read from the Service spec; ignoring it breaks sticky sessions"
+        );
     }
 
     fn svc_with_type_and_ingress(service_type: &str, ingress: &[&str]) -> Value {

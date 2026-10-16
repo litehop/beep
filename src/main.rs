@@ -44,7 +44,7 @@ use beep::{
 };
 use beep_common::{
     wire_port, FlowKey, FlowValue, ForwardFlowValue, FrontEndpoint, FrontEndpointKey, FrontMeta,
-    LbFrontBackend, LbFrontKey, TcpFlowKey,
+    LbFrontBackend, LbFrontKey, TcpFlowKey, FRONT_FLAG_CLIENT_IP_AFFINITY,
 };
 use clap::Parser;
 
@@ -594,8 +594,9 @@ fn fixture_key(fixture: &Fixture) -> LbFrontKey {
     }
 }
 
-/// One front per `--fixture`, slot 0 only. A repeated front tuple keeps the
-/// last fixture, as the pre-consolidation maps did.
+/// One front per distinct front tuple; each repeated `--fixture` for it adds
+/// the next endpoint slot, in argument order. The front is affinity-flagged if
+/// any of its fixtures is.
 fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
     fixtures
         .iter()
@@ -621,12 +622,24 @@ fn fixture_fronts(fixtures: &[Fixture]) -> HashMap<LbFrontKey, DesiredFront> {
                 fixture_key(fixture),
                 DesiredFront {
                     prefer_local: true,
-                    flags: 0,
+                    flags: if fixture.client_ip_affinity {
+                        FRONT_FLAG_CLIENT_IP_AFFINITY
+                    } else {
+                        0
+                    },
                     endpoints: vec![endpoint],
                 },
             )
         })
-        .collect()
+        .fold(HashMap::new(), |mut fronts, (key, next)| {
+            let front = fronts.entry(key).or_insert_with(|| DesiredFront {
+                endpoints: Vec::new(),
+                ..next.clone()
+            });
+            front.flags |= next.flags;
+            front.endpoints.extend(next.endpoints);
+            fronts
+        })
 }
 
 /// The fixture loader is the sole writer of the front maps (POD_TARGETS and
@@ -999,6 +1012,25 @@ mod tests {
             let arg = cmd.get_arguments().find(|a| a.get_id() == flag).unwrap();
             assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env));
         }
+    }
+
+    #[test]
+    fn affinity_fixtures_become_one_flagged_multi_endpoint_front() {
+        let fixtures = [
+            parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080:affinity").unwrap(),
+            parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.8:8080:affinity").unwrap(),
+            parse_fixture("10.0.0.5:81:tcp:10.0.0.6:10.244.1.7:8081").unwrap(),
+        ];
+        let fronts = fixture_fronts(&fixtures);
+        assert_eq!(fronts.len(), 2);
+        let sticky = &fronts[&fixture_key(&fixtures[0])];
+        assert_eq!(
+            sticky.endpoints.len(),
+            2,
+            "affinity needs more than one backend to be observable"
+        );
+        assert_eq!(sticky.flags, FRONT_FLAG_CLIENT_IP_AFFINITY);
+        assert_eq!(fronts[&fixture_key(&fixtures[2])].flags, 0);
     }
 
     #[test]
