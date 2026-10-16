@@ -165,8 +165,21 @@ expect_eq "a dual-stack unit with both addresses held is not stale" \
   "" "$(k3s_unit_missing_node_ip "$UNIT_DUAL" "$HOST_ADDRS fd00:beef:98::3")"
 expect_eq "a unit pinning no node-ip is never judged stale" "" "$(k3s_unit_missing_node_ip "$UNIT_NOIP" "$HOST_ADDRS")"
 expect_eq "an empty unit (not installed) is never judged stale" "" "$(k3s_unit_missing_node_ip "" "$HOST_ADDRS")"
+expect_eq "an upper-case unit address matches the lower-case address the host reports" \
+  "" "$(k3s_unit_missing_node_ip "${UNIT_V6/fd00:beef:98::3/FD00:BEEF:98::3}" "$HOST_ADDRS fd00:beef:98::3")"
+expect_eq "an uncompressed unit address matches the host's compressed spelling" \
+  "" "$(k3s_unit_missing_node_ip "${UNIT_V6/fd00:beef:98::3/fd00:beef:0098:0:0:0:0:3}" "$HOST_ADDRS fd00:beef:98::3")"
+expect_eq "a compressed unit address matches the host's fully expanded spelling" \
+  "" "$(k3s_unit_missing_node_ip "$UNIT_V6" "$HOST_ADDRS fd00:beef:0098:0000:0000:0000:0000:0003")"
+expect_eq "a different v6 that only shares a prefix is still stale after canonicalising" \
+  "fd00:beef:98::3" "$(k3s_unit_missing_node_ip "$UNIT_V6" "$HOST_ADDRS fd00:beef:98::4")"
 limactl() { return 1; }
 expect_eq "an unreachable VM probe is unknown, not stale, so it can never trigger a reset" "" "$(k3s_stale_node_ip vm k3s)"
+limactl() { case "$*" in *"-- cat "*) printf '%s\n' "$UNIT_V6" ;; *) return 0 ;; esac; }
+expect_eq "an empty address probe is unknown, not stale, so it can never trigger a reset" "" "$(k3s_stale_node_ip vm k3s)"
+limactl() { case "$*" in *"-- cat "*) printf '%s\n' "$UNIT_V6" ;; *) echo "$HOST_ADDRS" ;; esac; }
+expect_eq "a readable probe lacking the pinned address is stale (guards the empty-probe case above)" \
+  "fd00:beef:98::3" "$(k3s_stale_node_ip vm k3s)"
 limactl() { echo "stub-limactl $*"; }
 
 rc=0

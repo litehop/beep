@@ -131,12 +131,33 @@ k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 
   fi
 }
 
+k3s_canon_ip() { # k3s_canon_ip <address> -- prints the address lower-cased with an IPv6 "::" expanded to eight 4-digit groups, so "FD00:BEEF:98::3" and "fd00:beef:0098:0:0:0:0:3" compare equal. IPv4 and v4-embedded v6 are only lower-cased. bash 3.2 safe (no ${var,,}).
+  local ip head tail n g out="" IFS=:
+  local -a hg tg
+  ip="$(printf '%s' "$1" | tr 'A-F' 'a-f')"
+  case "$ip" in *:*.*|*.*) echo "$ip"; return 0 ;; *:*) ;; *) echo "$ip"; return 0 ;; esac
+  case "$ip" in
+    *::*) head="${ip%%::*}" tail="${ip#*::}" ;;
+    *) head="$ip" tail="" ;;
+  esac
+  read -ra hg <<<"$head"
+  read -ra tg <<<"$tail"
+  n=0
+  case "$ip" in *::*) n=$((8 - ${#hg[@]} - ${#tg[@]})) ;; esac
+  for g in ${hg[@]+"${hg[@]}"}; do out="$out$(printf '%04x' "0x$g"):"; done
+  while [ "$n" -gt 0 ]; do out="${out}0000:"; n=$((n - 1)); done
+  for g in ${tg[@]+"${tg[@]}"}; do out="$out$(printf '%04x' "0x$g"):"; done
+  echo "${out%:}"
+}
+
 k3s_unit_missing_node_ip() { # k3s_unit_missing_node_ip <systemd-unit-text> <local-addresses> -- prints the first --node-ip address in the unit that is not among the whitespace-separated local addresses, nothing if all are present or the unit pins none. k3s cannot start with a node-ip the host does not own, so a hit is positive proof of a stale install (unlike an unreadable node, which may just be starting).
-  local unit="$1" locals=" $(echo $2) " arg ip
+  local unit="$1" locals="" arg ip
+  for ip in $2; do locals="$locals $(k3s_canon_ip "$ip")"; done
+  locals="$locals "
   for arg in $(printf '%s\n' "$unit" | grep -o -- '--node-ip=[0-9A-Fa-f:.,]*' || true); do
     for ip in $(echo "${arg#--node-ip=}" | tr ',' ' '); do
       case "$locals" in
-        *" $ip "*) ;;
+        *" $(k3s_canon_ip "$ip") "*) ;;
         *) echo "$ip"; return 0 ;;
       esac
     done

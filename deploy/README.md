@@ -235,7 +235,8 @@ started, whichever is later (up to 70 s right after a rolling restart). A node
 that dies without a word (power loss, SIGKILL) is dropped within 85 s of its
 last renewal: its last renewal can be one pass old, then the 40 s Lease
 duration, then two passes. A survivor that started after the death needs the
-same 85 s counted from its own start. When that node's controller returns it
+same 85 s counted from its own start (its first pass, up to 15 s in, starts
+the 40 s expiry clock); the warm-up adds nothing. When that node's controller returns it
 renews its Lease and re-adds its own entry.
 
 SIGTERM cannot tell pod removal from a DaemonSet rolling restart, so a

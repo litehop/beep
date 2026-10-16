@@ -56,8 +56,10 @@ pub const PRUNE_INTERVAL_MAX: Duration =
 /// after the withdraw, i.e. no later than `LEASE_DURATION + 2 * pass` after
 /// its own start. A silently dead node is pruned within the non-graceful
 /// figure of its last write, or of the pruning controller's start if later:
-/// the dead Lease only reads as expired `LEASE_DURATION` after the controller
-/// first observed it, which already outlasts the warm-up.
+/// a controller that started after the death stamps the dead Lease at its first
+/// pass (up to one pass after its start), so the expiry clock and both passes
+/// follow from there. That figure is tight, and the warm-up never adds to it
+/// because the expiry already outlasts it.
 pub const fn max_prune_latency(graceful: bool) -> Duration {
     let pass = PRUNE_INTERVAL_MAX.as_secs();
     if graceful {
@@ -830,6 +832,110 @@ mod tests {
              confirming pass is no longer required, so a Lease annotation lagging its \
              published address by one renew would prune a live node"
         );
+    }
+
+    // A node that last wrote its Lease at t=100 s and then goes silent, seen by
+    // a peer whose prune loop started `start_offset` s after that write
+    // (negative: before it). The first pass is 10..=14 s after the start and
+    // consecutive passes are 10, 13 or 14 s apart in every order (13 x 3 = 39 s
+    // is the longest run that stays under the 40 s expiry; the live
+    // peer "c" renews throughout and must never lose its entry). Returns the
+    // worst time from `max(write, start)` to the dead address leaving ingress.
+    fn worst_silent_death_latency(start_offset: i64) -> u64 {
+        const LAST_WRITE: u64 = 100;
+        const PASSES: u32 = 7;
+        let pass = PRUNE_INTERVAL_MAX.as_secs();
+        let gaps = [LEASE_RENEW.as_secs(), pass - 2, pass - 1];
+        let start = LAST_WRITE.checked_add_signed(start_offset).unwrap();
+        let reference = LAST_WRITE.max(start);
+        let base = Instant::now();
+        let expected_ingress = ingress(&["10.0.0.2", "10.0.0.3"]);
+        let mut worst = 0;
+        for first in LEASE_RENEW.as_secs()..pass {
+            for sequence in 0..gaps.len().pow(PASSES) {
+                let mut tracker = LeaseTracker::new(base + Duration::from_secs(start));
+                let mut suspects = PruneSuspects::default();
+                let mut at = start + first;
+                let mut digits = sequence;
+                let mut pruned_at = None;
+                for _ in 0..=PASSES {
+                    let renewing = at / LEASE_RENEW.as_secs() * LEASE_RENEW.as_secs();
+                    let now = base + Duration::from_secs(at);
+                    tracker.observe(
+                        vec![
+                            listed(
+                                "beep-node-a",
+                                &format!("r{}", renewing.min(LAST_WRITE)),
+                                &["10.0.0.1"],
+                            ),
+                            listed("beep-node-b", &format!("own{renewing}"), &["10.0.0.2"]),
+                            listed("beep-node-c", &format!("c{renewing}"), &["10.0.0.3"]),
+                        ],
+                        now,
+                    );
+                    if may_prune(&tracker, "beep-node-b", now) {
+                        let pruned = confirmed_pruned_ingress(
+                            &ingress(&["10.0.0.1", "10.0.0.2", "10.0.0.3"]),
+                            tracker.leases(),
+                            now,
+                            &mut suspects,
+                        );
+                        suspects.end_pass();
+                        if let Some(kept) = pruned {
+                            assert_eq!(
+                                kept, expected_ingress,
+                                "a pass pruned something other than the dead node's address"
+                            );
+                            pruned_at = Some(at);
+                            break;
+                        }
+                    } else {
+                        suspects.reset();
+                    }
+                    at += gaps[digits % gaps.len()];
+                    digits /= gaps.len();
+                }
+                let pruned_at = pruned_at.expect("dead address was never pruned");
+                worst = worst.max(pruned_at - reference);
+            }
+        }
+        worst
+    }
+
+    // Clients keep hitting a dead node until a peer prunes it, whenever that
+    // peer started. The pass that stamps the dead Lease's last `renewTime` (its
+    // first pass for a peer that started after the death) is at most one pass
+    // late, the Lease then needs `LEASE_DURATION`, a pass at most one interval
+    // after that notices, and the next confirms. Times are whole seconds, so
+    // each of the three pass-length terms is one second below its supremum and
+    // so is the expiry term; the documented bound is the supremum.
+    #[test]
+    fn silent_death_prune_worst_case_is_exact_whenever_the_survivor_started() {
+        let pass = PRUNE_INTERVAL_MAX.as_secs();
+        let exact = LEASE_DURATION.as_secs() + 3 * pass - 4;
+        assert_eq!(
+            exact + 4,
+            max_prune_latency(false).as_secs(),
+            "documented silent-death bound is not the supremum of the simulated worst case"
+        );
+        for start_offset in -10..=15 {
+            let worst = worst_silent_death_latency(start_offset);
+            if start_offset >= 0 {
+                assert_eq!(
+                    worst, exact,
+                    "survivor started {start_offset} s after the node died: worst prune latency \
+                     from its own start is not LEASE_DURATION + 3 * pass: the Lease expiry rule, \
+                     the confirming pass or the warm-up gate changed"
+                );
+            } else {
+                assert!(
+                    worst <= exact,
+                    "survivor up {} s when the node died: dead address lingered {worst} s past \
+                     the last renewal, longer than the documented bound",
+                    -start_offset
+                );
+            }
+        }
     }
 
     // A node told to stop withdraws its addresses; if peers still waited for
