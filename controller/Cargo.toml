@@ -21,7 +21,7 @@ dhat = { version = "0.3", optional = true }
 hyper = "1"
 libc = "0.2"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "signal"] }
 
 # Heap-profiling build for attributing idle RSS to allocation sites -- off
 # by default, so the shipped binary never links dhat's allocator wrapper.

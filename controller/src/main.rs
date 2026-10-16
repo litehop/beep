@@ -26,8 +26,8 @@ use beep_controller::{
     apply::PinnedMaps,
     event::{report_restore_failure, PodRef},
     lease::{
-        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, LeaseTracker,
-        PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
+        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, withdraw_lease,
+        LeaseTracker, PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed, read_config_parity, write_config_parity},
@@ -1110,6 +1110,24 @@ async fn main() -> anyhow::Result<()> {
             ),
         );
         watches.and(seed).and(lease).and(prune).and(sweep)
+    };
+
+    // As the container's PID 1 this process ignores SIGTERM without a handler,
+    // so the kubelet would wait out the whole grace period while the Lease kept
+    // renewing and the node stayed advertised.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+    let controller = async {
+        tokio::select! {
+            result = controller => result,
+            _ = sigterm.recv() => {
+                eprintln!("controller: SIGTERM received; withdrawing node Lease addresses");
+                if let Err(e) = withdraw_lease(&client, &args.lease_namespace, &node_name).await {
+                    eprintln!("controller: WARN withdrawing node Lease failed: {e:#}");
+                }
+                Ok(())
+            }
+        }
     };
 
     #[cfg(feature = "dhat-heap")]
