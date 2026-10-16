@@ -391,7 +391,9 @@ it, patch the DaemonSet (kustomize) to add the `--kubeconfig=...` arg and a
 Secret volume. The parser only reads four fields -- `server:`,
 `certificate-authority-data:`, `client-certificate-data:`,
 `client-key-data:` -- so any kubeconfig containing those four works,
-however it was minted.
+however it was minted. `scripts/smoke-k3s-controller.sh --client-cert-auth`
+runs the flow below on a k3s rig and checks the patched controller still
+works with the ServiceAccount token unmounted.
 
 **Minting one via the Kubernetes CSR API**, scoped to exactly the RBAC
 `deploy/rbac.yaml` grants (run as a cluster admin who can approve CSRs):
