@@ -727,6 +727,83 @@ CLOSED_FWD="$(closed_rows "$VM_A" 00)"
 [ "$CLOSED_FWD" -ge "$((N_COLLIDE / 2))" ] || leg_fail "LEG-I: FAIL (only $CLOSED_FWD of $N_COLLIDE closed connections through $VM_A have their forward row marked closed)"
 echo "LEG-I colliding-source-ports: PASS ($((N_COLLIDE * 2)) connections over $N_COLLIDE colliding pairs all answered although closed rows linger; $CLOSED_FWD ingress forward rows marked closed)"
 
+# (j) SIGTERM withdraw: a node whose beep pod is removed gracefully publishes an empty address set in
+# its Lease on SIGTERM, so its Lease annotation empties within seconds and peers drop its address from
+# ingress within the documented ~30s (deploy/README.md, "Node liveness Leases") -- not after the 40s
+# Lease expiry plus prune passes a controller that dies silently needs. Without the withdraw the
+# annotation keeps the node's address until expiry, so the 30s annotation bound fails.
+# A nodeSelector to node-a alone makes the DaemonSet controller delete node-b's pod (graceful, SIGTERM)
+# and not recreate it, which keeps the empty-annotation window open long enough to observe; removing
+# it brings the replacement. OnDelete for the duration: the template change would otherwise also roll
+# node-a's pod, restarting the surviving pruner at SIGTERM and putting the leg inside its warm-up.
+# The 30s ingress bound only holds once the surviving controller (node-a) has run for the 40s Lease
+# duration: a controller that started T s before the withdraw takes up to max(30, 70-T) s. The leg
+# waits out that warm-up first, then budgets 30s plus slack for the 1s polling and kubectl round trips.
+SURVIVOR_WARM_SECS=45
+WITHDRAW_LEASE_BUDGET=30
+WITHDRAW_INGRESS_BUDGET=35
+RETURN_BUDGET=90
+LEASE_B="beep-node-$NODE_B_K8S"
+SIGTERM_BOTH_IPS="$(printf '%s\n%s' "$IP_A" "$IP_B" | sort | tr '\n' ' ' | sed 's/ $//')"
+lease_ips() { # lease_ips <lease> -- the node-ips annotation; fails if the Lease cannot be read, so an unreadable Lease is never mistaken for an empty one
+  kube -n beep-leases get lease "$1" -o json | jq -r '.metadata.annotations["beep.litehop.io/node-ips"] // ""'
+}
+lease_ips_empty() { local v; v="$(lease_ips "$1")" || return 1; [ -z "$v" ]; }
+lease_ips_has() { local v; v="$(lease_ips "$1")" || return 1; case ",$v," in *",$2,"*) ;; *) return 1 ;; esac; }
+ingress_is() { [ "$(ingress_of "$1")" = "$2" ]; }
+node_b_controller_ready() {
+  [ "$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" --field-selector "spec.nodeName=$NODE_B_K8S" \
+    -o jsonpath='{.items[*].status.containerStatuses[0].ready}')" = true ]
+}
+poll_until() { # poll_until <budget-secs> <cmd...> -- reruns cmd until it succeeds; echoes the elapsed seconds, or "" once the budget is spent
+  local t0 now
+  t0="$(date +%s)"
+  while :; do
+    if "${@:2}"; then echo "$(( $(date +%s) - t0 ))"; return; fi
+    now="$(date +%s)"
+    [ "$((now - t0))" -lt "$1" ] || { echo ""; return; }
+    sleep 1
+  done
+}
+vm_epoch() { limactl shell "$VM_A" -- date +%s; } # one clock (node-a's) for every timestamp the leg logs
+survivor_start_epoch() { # node-a's controller container start, the moment its prune tracker begins
+  local ts
+  ts="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" --field-selector "spec.nodeName=$NODE_A_K8S" \
+    -o jsonpath='{.items[0].status.containerStatuses[0].state.running.startedAt}')"
+  [ -n "$ts" ] || return 1
+  limactl shell "$VM_A" -- date -d "$ts" +%s
+}
+echo "==> [12j] SIGTERM withdraw: gracefully stopping $NODE_B_K8S's beep pod; its Lease must empty within ${WITHDRAW_LEASE_BUDGET}s"
+J_FAILS_BEFORE="$LEG_FAILURES"
+T_SURVIVOR_START="$(survivor_start_epoch)" || leg_fail "LEG-J: FAIL (cannot read the start time of $NODE_A_K8S's controller container)"
+SURVIVOR_AGE=$(( $(vm_epoch) - T_SURVIVOR_START ))
+if [ "$SURVIVOR_AGE" -lt "$SURVIVOR_WARM_SECS" ]; then
+  echo "LEG-J: surviving controller on $NODE_A_K8S is only ${SURVIVOR_AGE}s old; waiting $((SURVIVOR_WARM_SECS - SURVIVOR_AGE))s so it may prune (warm-up is 40s)"
+  sleep "$((SURVIVOR_WARM_SECS - SURVIVOR_AGE))"
+fi
+lease_ips_has "$LEASE_B" "$IP_B" || leg_fail "LEG-J: FAIL (precondition: $LEASE_B should advertise $IP_B before its pod is stopped, got '$(lease_ips "$LEASE_B" || echo unreadable)')"
+ingress_is whoami "$SIGTERM_BOTH_IPS" || leg_fail "LEG-J: FAIL (precondition: whoami ingress should list both nodes, got '$(ingress_of whoami)')"
+T_SIGTERM="$(vm_epoch)"
+kube -n kube-system patch daemonset servicelb-controller --type=merge \
+  -p "{\"spec\":{\"updateStrategy\":{\"type\":\"OnDelete\",\"rollingUpdate\":null},\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$NODE_A_K8S\"}}}}}" >/dev/null
+LEASE_EMPTY_AFTER="$(poll_until "$WITHDRAW_LEASE_BUDGET" lease_ips_empty "$LEASE_B")"
+T_LEASE_EMPTY="$(vm_epoch)"
+[ -n "$LEASE_EMPTY_AFTER" ] || leg_fail "LEG-J: FAIL ($LEASE_B still advertises '$(lease_ips "$LEASE_B" || echo unreadable)' ${WITHDRAW_LEASE_BUDGET}s after its pod was stopped; the SIGTERM withdraw did not publish an empty address set)"
+INGRESS_GONE_AFTER="$(poll_until "$WITHDRAW_INGRESS_BUDGET" ingress_is whoami "$IP_A")"
+T_INGRESS="$(vm_epoch)"
+[ "$(survivor_start_epoch)" = "$T_SURVIVOR_START" ] || leg_fail "LEG-J: FAIL ($NODE_A_K8S's controller restarted during the leg, so the 30s bound does not apply; the survivor must stay up)"
+[ -n "$INGRESS_GONE_AFTER" ] || leg_fail "LEG-J: FAIL ($IP_B still in whoami ingress '$(ingress_of whoami)' ${WITHDRAW_INGRESS_BUDGET}s after the withdraw; peers did not prune the withdrawn address; survivor was $((T_SIGTERM - T_SURVIVOR_START))s old at SIGTERM)"
+echo "LEG-J withdraw: ${LEASE_EMPTY_AFTER:-n/a}s to an empty Lease annotation, ${INGRESS_GONE_AFTER:-n/a}s to $IP_B leaving ingress (bounds ${WITHDRAW_LEASE_BUDGET}s/${WITHDRAW_INGRESS_BUDGET}s)"
+echo "LEG-J timestamps (epoch, $VM_A clock): survivor_start=$T_SURVIVOR_START sigterm=$T_SIGTERM (+$((T_SIGTERM - T_SURVIVOR_START))s) lease_empty=$T_LEASE_EMPTY (+$((T_LEASE_EMPTY - T_SIGTERM))s) ingress_pruned=$T_INGRESS (+$((T_INGRESS - T_LEASE_EMPTY))s after lease_empty)"
+kube -n kube-system patch daemonset servicelb-controller --type=merge \
+  -p '{"spec":{"updateStrategy":{"type":"RollingUpdate"},"template":{"spec":{"nodeSelector":null}}}}' >/dev/null
+[ -n "$(poll_until "$RETURN_BUDGET" node_b_controller_ready)" ] || leg_fail "LEG-J: FAIL (no Ready replacement beep pod on $NODE_B_K8S ${RETURN_BUDGET}s after the nodeSelector was removed)"
+LEASE_BACK_AFTER="$(poll_until "$RETURN_BUDGET" lease_ips_has "$LEASE_B" "$IP_B")"
+[ -n "$LEASE_BACK_AFTER" ] || leg_fail "LEG-J: FAIL ($LEASE_B did not re-advertise $IP_B ${RETURN_BUDGET}s after the replacement pod was Ready; got '$(lease_ips "$LEASE_B" || echo unreadable)')"
+INGRESS_BACK_AFTER="$(poll_until "$RETURN_BUDGET" ingress_is whoami "$SIGTERM_BOTH_IPS")"
+[ -n "$INGRESS_BACK_AFTER" ] || leg_fail "LEG-J: FAIL ($IP_B did not return to whoami ingress ${RETURN_BUDGET}s after the replacement pod was Ready: '$(ingress_of whoami)')"
+[ "$LEG_FAILURES" = "$J_FAILS_BEFORE" ] && echo "LEG-J sigterm-withdraw: PASS (Lease emptied in ${LEASE_EMPTY_AFTER}s, $IP_B left ingress in ${INGRESS_GONE_AFTER}s; replacement re-advertised it in ${LEASE_BACK_AFTER}s and ingress listed it again after ${INGRESS_BACK_AFTER}s)"
+
 # (h) ConfigMap sizing change: editing beep-config and restarting the DaemonSet resizes the front
 # maps on both nodes (the pods read the new value; bpftool shows the new max_entries) while an
 # established flow keeps running (FLOW_TABLE is a separate, unchanged map). Fresh connections are
