@@ -1559,6 +1559,9 @@ stop_loader
 ip link del geneve0
 ip link add geneve0 type geneve external
 ip link set geneve0 up
+# udev's per-interface sysctl rule re-applies the distro default rp_filter to a
+# new device asynchronously and would clobber the 0 set below.
+udevadm settle
 sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
 GENEVE_RECREATE_LOG=/tmp/beep-smoke-loader-geneve-recreate.log
 start_loader "$GENEVE_RECREATE_LOG"
@@ -1568,7 +1571,16 @@ grep -q "is severed" "$GENEVE_RECREATE_LOG" || {
   cat "$GENEVE_RECREATE_LOG" >&2
   exit 1
 }
-echo "GENEVE-RECREATE: PASS (loader re-attached and re-pinned links after geneve0 was deleted and re-created)"
+pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
+nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESPONSE_FILE" >"$BACKEND_LOG" 2>&1 &
+disown
+sleep 0.5
+recreate_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_PORT}/") || recreate_body=""
+[ "$recreate_body" = "OK" ] || {
+  echo "FAIL: expected response body 'OK' through front ${FRONT_IP}:${FRONT_PORT} after geneve0 was re-created, got: '$recreate_body' -- the loader logged a re-attach but traffic does not flow through the re-pinned links" >&2
+  exit 1
+}
+echo "GENEVE-RECREATE: PASS (loader re-attached and re-pinned links after geneve0 was deleted and re-created; round trip through front ${FRONT_IP}:${FRONT_PORT} -> 'OK')"
 
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2

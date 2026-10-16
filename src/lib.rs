@@ -2462,9 +2462,8 @@ mod tests {
         assert_eq!(doomed, expected);
     }
 
-    // A restart that reset the parity to 0 would, with the sweep clock also
-    // reset, never let a node restarted more often than the TCP interval run
-    // the backstop; the flip state must survive the restart.
+    // These only classify the errno; that attach_and_pin acts on it is
+    // guarded by the GENEVE-RECREATE step in scripts/smoke-remote.sh.
     #[test]
     fn enolink_from_link_update_means_severed_so_the_pod_reattaches_not_crash_loops_after_geneve0_recreation(
     ) {
@@ -2481,6 +2480,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn affinity_seventh_field_flags_the_fixture_so_clientip_affinity_is_not_silently_off() {
+        let plain = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080").unwrap();
+        let flagged = parse_fixture("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080:affinity").unwrap();
+        assert!(!plain.client_ip_affinity);
+        assert!(flagged.client_ip_affinity);
+    }
+
+    #[test]
+    fn any_other_seventh_field_is_rejected_so_a_typo_cannot_drop_affinity_unnoticed() {
+        for suffix in ["Affinity", "sticky", "affinity:extra"] {
+            let s = format!("10.0.0.5:80:tcp:10.0.0.6:10.244.1.7:8080:{suffix}");
+            assert!(parse_fixture(&s).is_err(), "`{s}` must be rejected");
+        }
+    }
+
+    // A restart that reset the parity to 0 would, with the sweep clock also
+    // reset, never let a node restarted more often than the TCP interval run
+    // the backstop; the flip state must survive the restart.
     #[test]
     fn restart_keeps_the_pinned_idle_gc_parity() {
         let pinned = Config {
