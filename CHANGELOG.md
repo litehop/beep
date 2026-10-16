@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0] - 2026-10-16
 
-### BREAKING / upgrade notes
+### Upgrade notes / operator action required
 
 - **Manifests moved to `deploy/base`.** Install with
   `kubectl apply -k deploy/base`; the client-cert opt-in is
@@ -60,8 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A removed node's address leaves Service `status.loadBalancer.ingress`
   promptly, and the controller handles SIGTERM by withdrawing its Lease
   addresses.
-- The k3s rig resets a k3s left pinned to an address the VM no longer holds
-  instead of refusing to reinstall.
 
 ## [0.5.0] - 2026-10-15
 
