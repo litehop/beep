@@ -9,10 +9,14 @@
 //! monotonic clock. Wall-clock skew between nodes therefore cannot expire a
 //! healthy node or keep a dead one.
 //!
-//! Timing mirrors Kubernetes node leases: 40 s duration, 10 s renew. A dead
-//! node leaves ingress after at most `LEASE_DURATION` plus one prune interval
-//! (`LEASE_RENEW` plus jitter); four missed renewals are tolerated before a
-//! healthy node is dropped.
+//! Timing mirrors Kubernetes node leases: 40 s duration, 10 s renew; four
+//! missed renewals are tolerated before a healthy node is dropped. The
+//! worst-case time for a lost node to leave ingress is `max_prune_latency`:
+//! a controller that is told to stop (SIGTERM) first publishes an empty
+//! address set in its Lease, so peers prune it within two prune passes; one
+//! that dies silently is pruned after its Lease expires plus the same two
+//! passes, because an address is only pruned once it is unmatched on two
+//! consecutive passes (`PruneSuspects`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -30,6 +34,29 @@ pub const LEASE_RENEW: Duration = Duration::from_secs(10);
 /// Upper bound of the random delay added to each prune interval so
 /// controllers started together do not all prune at the same instant.
 pub const PRUNE_JITTER_MAX: Duration = Duration::from_secs(5);
+
+/// Longest the SIGTERM withdraw may run; well under the pod's
+/// `terminationGracePeriodSeconds`.
+const WITHDRAW_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest gap between two prune passes of one controller.
+pub const PRUNE_INTERVAL_MAX: Duration =
+    Duration::from_secs(LEASE_RENEW.as_secs() + PRUNE_JITTER_MAX.as_secs());
+
+/// Upper bound on how long a lost node's address stays in
+/// `status.loadBalancer.ingress`, measured from its last Lease write.
+/// `graceful`: the node's controller withdrew its addresses on shutdown (one
+/// pass sees them unmatched, the next prunes). Otherwise: the last
+/// observed renewal can be one pass old, the Lease then needs `LEASE_DURATION`
+/// to expire, a pass must notice, and a second must confirm.
+pub const fn max_prune_latency(graceful: bool) -> Duration {
+    let pass = PRUNE_INTERVAL_MAX.as_secs();
+    if graceful {
+        Duration::from_secs(2 * pass)
+    } else {
+        Duration::from_secs(LEASE_DURATION.as_secs() + 3 * pass)
+    }
+}
 
 const NAME_PREFIX: &str = "beep-node-";
 const LABEL_SELECTOR: &str = "app.kubernetes.io%2Fcomponent%3Dnode-lease";
@@ -117,6 +144,21 @@ pub async fn renew_lease(
         bail!("PUT {item} returned HTTP {status}");
     }
     Ok(())
+}
+
+/// Publishes an empty address set in this node's Lease so peers drop the
+/// node's addresses from ingress without waiting for the Lease to expire.
+/// For a controller that is about to stop; a restarted one re-publishes.
+/// Bounded by `WITHDRAW_TIMEOUT` so a hung apiserver cannot hold up exit until
+/// the kubelet's SIGKILL.
+pub async fn withdraw_lease(
+    client: &HyperApiClient,
+    namespace: &str,
+    node: &str,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(WITHDRAW_TIMEOUT, renew_lease(client, namespace, node, &[]))
+        .await
+        .context("withdrawing node Lease timed out")?
 }
 
 /// One node Lease as listed from the apiserver.
@@ -631,5 +673,100 @@ mod tests {
             parse_lease_list(&body).unwrap(),
             vec![listed("beep-node-a", "t0", &["10.0.0.1", "fd00::1"])]
         );
+    }
+
+    // Simulates a peer pruning every `PRUNE_INTERVAL_MAX` (its slowest) at
+    // every phase against a node whose last Lease write is at t=100 s, and
+    // returns the worst time from that write to the entry leaving ingress.
+    fn worst_prune_latency(graceful: bool) -> Duration {
+        const LAST_WRITE: u64 = 100;
+        let base = Instant::now();
+        let mut worst = Duration::ZERO;
+        for phase in 0..PRUNE_INTERVAL_MAX.as_secs() {
+            let mut tracker = LeaseTracker::new(base);
+            let mut suspects = PruneSuspects::default();
+            let mut at = LAST_WRITE - 60 + phase;
+            loop {
+                let renewed = (at / LEASE_RENEW.as_secs() * LEASE_RENEW.as_secs()).min(LAST_WRITE);
+                let ips: &[&str] = if graceful && renewed == LAST_WRITE {
+                    &[]
+                } else {
+                    &["10.0.0.1"]
+                };
+                let now = base + Duration::from_secs(at);
+                tracker.observe(
+                    vec![listed("beep-node-a", &format!("r{renewed}"), ips)],
+                    now,
+                );
+                let pruned = confirmed_pruned_ingress(
+                    &ingress(&["10.0.0.1"]),
+                    tracker.leases(),
+                    now,
+                    &mut suspects,
+                );
+                suspects.end_pass();
+                if pruned.is_some() {
+                    worst = worst.max(Duration::from_secs(at - LAST_WRITE));
+                    break;
+                }
+                at += PRUNE_INTERVAL_MAX.as_secs();
+                assert!(at < LAST_WRITE + 600, "entry was never pruned");
+            }
+        }
+        worst
+    }
+
+    // Clients keep being sent to a dead node's address until its entry
+    // leaves ingress; the documented bound must hold for a node that dies
+    // without a word, at the slowest peer prune cadence.
+    #[test]
+    fn silently_dead_node_leaves_ingress_within_the_documented_bound() {
+        let worst = worst_prune_latency(false);
+        assert!(
+            worst <= max_prune_latency(false),
+            "dead node's address lingered {worst:?}, past the documented bound"
+        );
+        // The last write is first observed up to one pass late, the Lease is
+        // noticed expired on the pass after `LEASE_DURATION` elapses, and the
+        // confirming pass follows: at least that many whole passes in the
+        // worst phase. Without confirmation the worst phase is one pass less.
+        let pass = PRUNE_INTERVAL_MAX.as_secs();
+        let expiry_passes = LEASE_DURATION.as_secs().div_ceil(pass);
+        let floor = Duration::from_secs((expiry_passes + 1) * pass);
+        assert!(
+            worst >= floor,
+            "dead node's address left ingress after {worst:?}, before {floor:?}: the second \
+             confirming pass is no longer required, so a Lease annotation lagging its \
+             published address by one renew would prune a live node"
+        );
+    }
+
+    // A node told to stop withdraws its addresses; if peers still waited for
+    // Lease expiry, a removed beep pod would stay advertised for ~40 s more.
+    #[test]
+    fn gracefully_stopped_node_leaves_ingress_without_waiting_for_lease_expiry() {
+        let worst = worst_prune_latency(true);
+        assert!(
+            worst <= max_prune_latency(true),
+            "withdrawn node's address lingered {worst:?}, past the documented bound"
+        );
+        assert!(
+            worst < LEASE_DURATION,
+            "a withdrawn address must not wait out the Lease duration"
+        );
+        assert!(
+            worst >= PRUNE_INTERVAL_MAX,
+            "withdrawn address left ingress after {worst:?}, within one pass: the second \
+             confirming pass is no longer required"
+        );
+    }
+
+    // The shutdown withdrawal is only effective if an empty address set
+    // survives the Lease wire format and parses as "no addresses".
+    #[test]
+    fn withdrawn_lease_body_parses_back_to_no_addresses() {
+        let body = json!({"items": [lease_body("ns", "a", &[], "t1")]}).to_string();
+        let parsed = parse_lease_list(&body).unwrap();
+        assert_eq!(parsed, vec![listed("beep-node-a", "t1", &[])]);
     }
 }

@@ -63,8 +63,8 @@ use aya_ebpf::{
 use beep_common::{
     address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
     decode_pod_id_option, egress_return_admission, egress_return_outcome, encode_flow_key,
-    encode_pod_id_option, encode_tcp_flow_key, flow_hash, flow_step, flow_step_flags,
-    forward_admission, fwd_pending_affinity_pin, ingress_steer, ipv4_mapped_v6,
+    encode_pod_id_option, encode_tcp_flow_key, flow_step, flow_step_flags, forward_admission,
+    front_flow_hash, fwd_pending_affinity_pin, ingress_steer, ipv4_mapped_v6,
     is_redirected_return_mark, occupant_conflicts, peer_node_admission, resolve_backend_src_port,
     return_authorization, reverse_occupant, tunnel_remote_addr, unmap_ipv4,
     AddressRewriteChecksums, BackendPortDecision, BackendPortResolution, Config,
@@ -509,7 +509,7 @@ fn ingress_backend(
         meta,
         established,
         pending,
-        flow_hash(seed, client_ip, client_port, &front),
+        front_flow_hash(seed, client_ip, client_port, &front, &meta),
         front,
         front_endpoints_get,
     );

@@ -24,7 +24,7 @@ use aya::{
     programs::{
         links::{FdLink, LinkError, PinnedLink},
         tc::{SchedClassifierLink, TcAttachOptions},
-        LinkOrder, SchedClassifier, TcAttachType,
+        LinkOrder, ProgramError, SchedClassifier, TcAttachType,
     },
     sys::SyscallError,
     Ebpf, EbpfLoader,
@@ -112,6 +112,9 @@ pub struct Fixture {
     pub backend_node_ip: IpAddr,
     pub pod_ip: IpAddr,
     pub target_port: u16,
+    /// Optional trailing `affinity` field: the front hashes new flows on the
+    /// client IP alone (`FRONT_FLAG_CLIENT_IP_AFFINITY`).
+    pub client_ip_affinity: bool,
 }
 
 /// Widens a *wire-token* address field (`Fixture::front_ip`/`pod_ip`) into
@@ -174,21 +177,26 @@ fn split_fixture_fields(s: &str) -> Vec<&str> {
 
 pub fn parse_fixture(s: &str) -> Result<Fixture, String> {
     let parts = split_fixture_fields(s);
-    let [front_ip, front_port, proto, backend_node_ip, pod_ip, target_port] = parts.as_slice()
-    else {
-        return Err(format!(
-            "expected front_ip:front_port:proto:backend_node_ip:pod_ip:target_port (bracket an IPv6 \
-             address, e.g. `[2001:db8::1]`), got `{s}`"
-        ));
-    };
+    let ([front_ip, front_port, proto, backend_node_ip, pod_ip, target_port], client_ip_affinity) =
+        match parts.as_slice() {
+            [a, b, c, d, e, f] => ([*a, *b, *c, *d, *e, *f], false),
+            [a, b, c, d, e, f, "affinity"] => ([*a, *b, *c, *d, *e, *f], true),
+            _ => {
+                return Err(format!(
+                "expected front_ip:front_port:proto:backend_node_ip:pod_ip:target_port[:affinity] \
+                     (bracket an IPv6 address, e.g. `[2001:db8::1]`), got `{s}`"
+            ))
+            }
+        };
     Ok(Fixture {
+        client_ip_affinity,
         front_ip: front_ip
             .parse()
             .map_err(|e| format!("front_ip `{front_ip}`: {e}"))?,
         front_port: front_port
             .parse()
             .map_err(|e| format!("front_port `{front_port}`: {e}"))?,
-        proto: match *proto {
+        proto: match proto {
             "tcp" => Proto::Tcp,
             "udp" => Proto::Udp,
             other => return Err(format!("proto: expected `tcp` or `udp`, got `{other}`")),
@@ -1334,27 +1342,47 @@ pub fn attach_and_pin(
         // verifier or aya bug. Suffixed by iface so N links for the same
         // program (one per configured uplink) each get their own pin file.
         let link_pin_path = pin_dir.join(format!("{name}-{iface}-link"));
+        let mut fresh = false;
         match PinnedLink::from_pin(&link_pin_path) {
             Ok(existing) => {
                 // bpf_link_update swaps the target program on the *same*
                 // kernel link object referenced by the existing pin file, so
                 // the pin file itself needs no changes.
                 let link: SchedClassifierLink = FdLink::from(existing).try_into()?;
-                program.attach_to_link(link)?;
+                match program.attach_to_link(link) {
+                    Ok(_) => {}
+                    Err(ProgramError::SyscallError(SyscallError { io_error, .. }))
+                        if is_severed_link(&io_error) =>
+                    {
+                        eprintln!(
+                            "beep: pinned link {} for {iface} is severed ({io_error}); \
+                             its device was deleted. Unpinning and re-attaching",
+                            link_pin_path.display()
+                        );
+                        std::fs::remove_file(&link_pin_path).with_context(|| {
+                            format!("removing severed link pin {}", link_pin_path.display())
+                        })?;
+                        fresh = true;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             Err(LinkError::SyscallError(SyscallError { io_error, .. }))
                 if io_error.kind() == std::io::ErrorKind::NotFound =>
             {
-                let link_id = program.attach_with_options(
-                    iface,
-                    attach_type,
-                    TcAttachOptions::TcxOrder(LinkOrder::default()),
-                )?;
-                let link = program.take_link(link_id)?;
-                let fd_link: FdLink = link.try_into()?;
-                fd_link.pin(&link_pin_path)?;
+                fresh = true;
             }
             Err(e) => return Err(e.into()),
+        }
+        if fresh {
+            let link_id = program.attach_with_options(
+                iface,
+                attach_type,
+                TcAttachOptions::TcxOrder(LinkOrder::default()),
+            )?;
+            let link = program.take_link(link_id)?;
+            let fd_link: FdLink = link.try_into()?;
+            fd_link.pin(&link_pin_path)?;
         }
     }
 
@@ -1366,6 +1394,12 @@ pub fn attach_and_pin(
     program.pin(&prog_pin_path)?;
 
     Ok(())
+}
+
+/// `bpf_link_update` fails with ENOLINK once the link's target device has been
+/// deleted; the pinned link can never be revived and must be replaced.
+pub fn is_severed_link(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(67)
 }
 
 /// Attach goes through TCX only (no netlink fallback), which needs Linux 6.6.
@@ -2431,6 +2465,22 @@ mod tests {
     // A restart that reset the parity to 0 would, with the sweep clock also
     // reset, never let a node restarted more often than the TCP interval run
     // the backstop; the flip state must survive the restart.
+    #[test]
+    fn enolink_from_link_update_means_severed_so_the_pod_reattaches_not_crash_loops_after_geneve0_recreation(
+    ) {
+        assert!(is_severed_link(&std::io::Error::from_raw_os_error(67)));
+    }
+
+    #[test]
+    fn other_link_update_errors_stay_fatal_so_real_failures_are_not_masked_by_a_reattach() {
+        for errno in [1, 2, 13, 22] {
+            assert!(
+                !is_severed_link(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} must not trigger unpin+reattach"
+            );
+        }
+    }
+
     #[test]
     fn restart_keeps_the_pinned_idle_gc_parity() {
         let pinned = Config {

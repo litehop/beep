@@ -168,6 +168,15 @@ REUSE_BACKEND_LOG="/tmp/beep-smoke-backend-reuse.log"
 EVICT_LOADER_LOG_REPLACEMENT="/tmp/beep-smoke-loader-evict-replacement.log"
 EVICT_LOADER_LOG_REUSE="/tmp/beep-smoke-loader-evict-reuse.log"
 
+# ClientIP session-affinity fixture: one front over two pods, flagged
+# `affinity`. Many new connections from one client IP (distinct ephemeral
+# source ports) must all reach the same pod.
+AFF_FRONT_PORT="19111"
+AFF_TARGET_PORT="18089"
+AFF_POD_A="198.51.100.70"
+AFF_POD_B="198.51.100.71"
+AFF_CONNECTIONS=24
+
 cmd="${1:-}"
 
 # Releases the backend's blocking read on the signal fifo (the
@@ -200,6 +209,11 @@ cleanup() {
   pkill -f "nc -l -N ${POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${REPLACEMENT_POD_IP} ${EVICT_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${POD_IP} ${COLD_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${AFF_POD_A} ${AFF_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${AFF_POD_B} ${AFF_TARGET_PORT}" 2>/dev/null || true
+  rm -f /tmp/beep-smoke-affinity-a /tmp/beep-smoke-affinity-b
+  ip addr del "${AFF_POD_A}/32" dev lo 2>/dev/null || true
+  ip addr del "${AFF_POD_B}/32" dev lo 2>/dev/null || true
   pkill -9 -f "nc -l .*${REMAP_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -6 -l -N ${POD6_A} ${PIN6_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -6 -l -N ${POD6_B} ${PIN6_TARGET_PORT}" 2>/dev/null || true
@@ -269,6 +283,8 @@ ip addr add "${POD_IP}/32" dev lo
 # this address -- added up front alongside POD_IP so both aliases exist for
 # the whole run, not just from the point they're first used.
 ip addr add "${REPLACEMENT_POD_IP}/32" dev lo
+ip addr add "${AFF_POD_A}/32" dev lo
+ip addr add "${AFF_POD_B}/32" dev lo
 ip -6 addr add "${POD6_A}/128" dev lo nodad
 ip -6 addr add "${POD6_B}/128" dev lo nodad
 ip addr add "${FRONT_IP6}/64" dev smoke-veth0 nodad
@@ -320,6 +336,8 @@ start_loader() {
     --fixture "[${FRONT_IP6}]:${PIN6_FRONT_PORT}:tcp:${FRONT_IP}:[${PIN6_FRONT_POD_IP}]:${PIN6_TARGET_PORT}" \
     --fixture "[${FRONT_IP6}]:${PIN6_KEEP_FRONT_PORT}:tcp:${FRONT_IP}:[${POD6_A}]:${PIN6_TARGET_PORT}" \
     --fixture "${FRONT_IP}:${PEND_FRONT_PORT}:udp:${PEND_BACKEND_NODE_IP}:${POD_IP}:${PEND_TARGET_PORT}" \
+    --fixture "${FRONT_IP}:${AFF_FRONT_PORT}:tcp:${FRONT_IP}:${AFF_POD_A}:${AFF_TARGET_PORT}:affinity" \
+    --fixture "${FRONT_IP}:${AFF_FRONT_PORT}:tcp:${FRONT_IP}:${AFF_POD_B}:${AFF_TARGET_PORT}:affinity" \
     >"$log" 2>&1 &
   # Not `local`: wait_for_attach (called right after, every time) reads
   # this. `kill -0 "$loader_pid"`, not `pgrep -f "$BIN"`: pgrep matches on
@@ -424,6 +442,40 @@ body2=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${FRONT_POR
   exit 1
 }
 echo "MULTI-PORT ROUND-TRIP: PASS (client ${CLIENT_IP} -> front ${FRONT_IP}:${FRONT_PORT2} -> backend ${POD_IP}:${TARGET_PORT2} -> response 'OK2', distinct from the first Service port's target)"
+
+echo "==> ClientIP affinity: ${AFF_CONNECTIONS} new connections from one client IP to a two-pod front must all reach one pod"
+# Each iteration listens on both pods, makes ONE new connection from the
+# client netns (fresh ephemeral source port), and reads which pod got it.
+aff_hits_a=0
+aff_hits_b=0
+for ((i = 0; i < AFF_CONNECTIONS; i++)); do
+  rm -f /tmp/beep-smoke-affinity-a /tmp/beep-smoke-affinity-b
+  nohup nc -l -N "$AFF_POD_A" "$AFF_TARGET_PORT" < "$RESPONSE_FILE" >/tmp/beep-smoke-affinity-a 2>&1 &
+  disown
+  nohup nc -l -N "$AFF_POD_B" "$AFF_TARGET_PORT" < "$RESPONSE_FILE" >/tmp/beep-smoke-affinity-b 2>&1 &
+  disown
+  sleep 0.2
+  aff_body=$(ip netns exec smoke-client curl -sS -m 5 "http://${FRONT_IP}:${AFF_FRONT_PORT}/") || aff_body=""
+  [ "$aff_body" = "OK" ] || {
+    echo "FAIL: affinity connection $i got '$aff_body', expected 'OK'" >&2
+    exit 1
+  }
+  if [ -s /tmp/beep-smoke-affinity-a ]; then
+    aff_hits_a=$((aff_hits_a + 1))
+  elif [ -s /tmp/beep-smoke-affinity-b ]; then
+    aff_hits_b=$((aff_hits_b + 1))
+  else
+    echo "FAIL: affinity connection $i reached neither pod's listener" >&2
+    exit 1
+  fi
+  pkill -f "nc -l -N ${AFF_POD_A} ${AFF_TARGET_PORT}" 2>/dev/null || true
+  pkill -f "nc -l -N ${AFF_POD_B} ${AFF_TARGET_PORT}" 2>/dev/null || true
+done
+if [ "$aff_hits_a" -ne 0 ] && [ "$aff_hits_b" -ne 0 ]; then
+  echo "FAIL: ClientIP affinity front spread ${AFF_CONNECTIONS} connections from one client IP over both pods (${AFF_POD_A}=${aff_hits_a}, ${AFF_POD_B}=${aff_hits_b}); sticky sessions would break" >&2
+  exit 1
+fi
+echo "CLIENT-IP-AFFINITY: PASS (${AFF_CONNECTIONS} new connections from ${CLIENT_IP} all reached one pod: ${AFF_POD_A}=${aff_hits_a}, ${AFF_POD_B}=${aff_hits_b})"
 
 # Drives one POST with a 256 KiB body and a 256 KiB reply through a front and
 # checks, on the wire at the Geneve underlay (`lo`, since the backend node is
@@ -1501,6 +1553,22 @@ spoof_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${FRONT_IP}:${FRON
   exit 1
 }
 echo "ANTI-SPOOF: PASS (round trip through front ${FRONT_IP}:${FRONT_PORT} correctly dropped once its own NODE_ALLOW entry was removed -- curl rc=$spoof_rc)"
+
+echo "==> geneve0 re-creation: a loader restart must replace the severed pinned links, not crash-loop"
+stop_loader
+ip link del geneve0
+ip link add geneve0 type geneve external
+ip link set geneve0 up
+sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
+GENEVE_RECREATE_LOG=/tmp/beep-smoke-loader-geneve-recreate.log
+start_loader "$GENEVE_RECREATE_LOG"
+wait_for_attach "$GENEVE_RECREATE_LOG"
+grep -q "is severed" "$GENEVE_RECREATE_LOG" || {
+  echo "FAIL: loader attached after geneve0 re-creation without reporting a severed pinned link -- the stale-pin path was not exercised" >&2
+  cat "$GENEVE_RECREATE_LOG" >&2
+  exit 1
+}
+echo "GENEVE-RECREATE: PASS (loader re-attached and re-pinned links after geneve0 was deleted and re-created)"
 
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2

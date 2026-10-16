@@ -214,10 +214,24 @@ supplies the node name) every 10 s, with a 40 s duration -- the same timing Kube
 uses for node leases. The Lease carries the node's addresses in the
 `beep.litehop.io/node-ips` annotation. Every controller lists these Leases
 every ~10-15 s (10 s plus up to 5 s of jitter) and removes any
-`status.loadBalancer.ingress` entry whose address has no live Lease, so a
-node whose beep pod stopped is dropped from every Service within about
-40 s + one prune interval. When that node's controller returns it renews
-its Lease and re-adds its own entry.
+`status.loadBalancer.ingress` entry whose address has no live Lease for two
+consecutive passes (a Lease annotation can lag a newly published address by
+one renew). On SIGTERM a controller first publishes an empty address set in
+its Lease, so a node whose beep pod is removed is dropped from every Service
+within 30 s (two prune passes of at most 15 s). A node that dies without
+a word (power loss, SIGKILL) is dropped within 85 s: its last renewal can be
+one pass old, then the 40 s Lease duration, then two passes. When that node's
+controller returns it renews its Lease and re-adds its own entry.
+
+SIGTERM cannot tell pod removal from a DaemonSet rolling restart, so a
+restart withdraws the node too (the pinned dataplane keeps serving
+meanwhile). The replacement controller publishes no Lease addresses until its
+initial Node LIST completes, then renews with the full address set and
+re-publishes its ingress entries after its Service/EndpointSlice LISTs. If that
+happens before peers' second prune pass (under 30 s after SIGTERM) the entry is
+never pruned; otherwise the node is absent from ingress from the prune until
+the replacement re-publishes, with no operator action.
+The withdraw itself is bounded to 5 s so a hung apiserver cannot delay exit.
 
 Liveness is judged by observation: a Lease is live while its `renewTime`
 keeps changing as seen by the pruning controller's own monotonic clock, so
@@ -232,7 +246,9 @@ Apply the new objects before the DaemonSet rolls:
 
 1. `deploy/rbac.yaml` creates the `beep-leases` Namespace and the Lease Role
    (with a CSR-minted kubeconfig, also bind it in `beep-leases`; see
-   "Kubeconfig").
+   "Authentication"). The DaemonSet no longer mounts the
+   `beep-controller-kubeconfig` Secret or passes `--kubeconfig`; it uses its
+   ServiceAccount token.
 2. `deploy/configmap.yaml` creates `beep-config`. The DaemonSet's `envFrom`
    is required, so pods stay in `CreateContainerConfigError` without it.
 3. `deploy/daemonset.yaml` last. It sets `NODE_NAME`; the controller requires
@@ -301,6 +317,23 @@ Switching policy does not evict pinned flows; they drain naturally. Pins are
 swept only when their backend pod leaves every EndpointSlice or its IP is
 reused.
 
+### Session affinity
+
+`spec.sessionAffinity: ClientIP` makes new connections from one client IP to a
+front pick the same endpoint: the backend hash leaves out the client port.
+There is no affinity table, so the semantics are weaker than kube-proxy's:
+
+- Stickiness holds while the front's endpoint set is stable. Scaling or a
+  rollout changes the endpoint list and can move clients to another pod.
+  Established connections stay pinned as always.
+- With node-local preference (`externalTrafficPolicy: Local`, or
+  `trafficDistribution` set) each ingress node hashes over its own local
+  endpoints, so a client reaching different nodes can land on different pods.
+  kube-proxy's affinity is likewise per node.
+- `spec.sessionAffinityConfig.clientIP.timeoutSeconds` is not honoured; a
+  client is not released after an idle period. No
+  Event or Service condition reports this.
+
 ## Security & underlay assumptions
 
 **The Geneve underlay MUST prevent IP spoofing.** UDP 6081 is open on every
@@ -347,16 +380,25 @@ This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the
 revisit trigger.
 
-## Kubeconfig
+## Authentication
 
-`politeia` only parses an X.509 client-cert kubeconfig file (no
-in-cluster ServiceAccount token support yet), so `--kubeconfig` points at a
-Secret-mounted kubeconfig, not the ServiceAccount's own projected token.
-Provisioning that Secret (`beep-controller-kubeconfig` in `kube-system`) is
-left to the cluster operator/deploy tooling -- not this manifest. The
-parser only reads four fields -- `server:`, `certificate-authority-data:`,
-`client-certificate-data:`, `client-key-data:` -- so any kubeconfig
-containing those four works, however it was minted.
+By default the controller authenticates as its own ServiceAccount
+(`servicelb-controller`, bound by `deploy/rbac.yaml`) using the projected
+token at `/var/run/secrets/kubernetes.io/serviceaccount/token` and the
+cluster CA beside it, reaching the API server at
+`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`. The token is re-read
+from disk every 60 s, so kubelet rotation needs no restart. TLS
+verification against that CA is always on. If the token, CA or those env vars
+are missing (e.g. `automountServiceAccountToken: false`) and no
+`--kubeconfig` is given, the controller exits naming what is missing.
+
+`--kubeconfig` is the alternative, and always wins when given: an X.509
+client-cert kubeconfig. `deploy/daemonset.yaml` no longer mounts one; to use
+it, patch the DaemonSet (kustomize) to add the `--kubeconfig=...` arg and a
+Secret volume. The parser only reads four fields -- `server:`,
+`certificate-authority-data:`, `client-certificate-data:`,
+`client-key-data:` -- so any kubeconfig containing those four works,
+however it was minted.
 
 **Minting one via the Kubernetes CSR API**, scoped to exactly the RBAC
 `deploy/rbac.yaml` grants (run as a cluster admin who can approve CSRs):
@@ -404,8 +446,8 @@ kubectl config set-context beep-controller \
   --cluster=beep --user=beep-controller --kubeconfig=beep-controller.kubeconfig
 kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig
 
-# 5. Ship it as the Secret the DaemonSet mounts -- the key name must be
-#    `kubeconfig` to land at /etc/beep-controller/kubeconfig
+# 5. Ship it as a Secret and mount it via your DaemonSet patch (e.g. at
+#    /etc/beep-controller, with --kubeconfig=/etc/beep-controller/kubeconfig)
 kubectl create secret generic beep-controller-kubeconfig -n kube-system \
   --from-file=kubeconfig=beep-controller.kubeconfig
 ```

@@ -11,7 +11,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use beep::front_swap::DesiredFront;
 use beep::{tunnel_remote_v6, wire_ip_v6};
-use beep_common::{wire_port, FrontEndpoint, LbFrontBackend, LbFrontKey, ENDPOINT_FLAG_IS_LOCAL};
+use beep_common::{
+    wire_port, FrontEndpoint, LbFrontBackend, LbFrontKey, ENDPOINT_FLAG_IS_LOCAL,
+    FRONT_FLAG_CLIENT_IP_AFFINITY,
+};
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -194,7 +197,17 @@ pub struct ServicePort {
 pub struct ServiceView {
     pub front_ip: IpAddr,
     pub policy: EndpointPolicy,
+    /// `spec.sessionAffinity == ClientIP` (see `client_ip_affinity`).
+    pub client_ip_affinity: bool,
     pub ports: Vec<ServicePort>,
+}
+
+/// Whether `spec.sessionAffinity` asks for client-IP stickiness. The
+/// dataplane pins a client IP to one endpoint while the endpoint set is
+/// stable; `spec.sessionAffinityConfig.clientIP.timeoutSeconds` is
+/// deliberately not read.
+pub fn client_ip_affinity(session_affinity: Option<&str>) -> bool {
+    session_affinity == Some("ClientIP")
 }
 
 /// One `EndpointSlice` endpoint. `node_ip` is the IP of the node hosting
@@ -606,7 +619,11 @@ pub fn reconcile_service(
         desired.fronts.insert(
             front_key(svc.front_ip, port),
             DesiredFront {
-                flags: 0,
+                flags: if svc.client_ip_affinity {
+                    FRONT_FLAG_CLIENT_IP_AFFINITY
+                } else {
+                    0
+                },
                 prefer_local: svc.policy != EndpointPolicy::Uniform,
                 endpoints,
             },
@@ -667,6 +684,7 @@ mod tests {
         ServiceView {
             front_ip: IpAddr::V4(front_ip),
             policy: EndpointPolicy::PreferLocal,
+            client_ip_affinity: false,
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -679,6 +697,7 @@ mod tests {
         ServiceView {
             front_ip: IpAddr::V6(front_ip),
             policy: EndpointPolicy::PreferLocal,
+            client_ip_affinity: false,
             ports: vec![ServicePort {
                 port,
                 protocol: Protocol::Tcp,
@@ -951,6 +970,7 @@ mod tests {
         let svc = ServiceView {
             front_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             policy: EndpointPolicy::PreferLocal,
+            client_ip_affinity: false,
             ports: vec![
                 ServicePort {
                     port: 80,
@@ -1885,6 +1905,30 @@ mod tests {
         let mut svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
         svc.policy = policy;
         svc
+    }
+
+    #[test]
+    fn client_ip_session_affinity_sets_the_front_flag_so_sticky_sessions_survive() {
+        assert!(client_ip_affinity(Some("ClientIP")));
+        assert!(!client_ip_affinity(Some("None")));
+        assert!(!client_ip_affinity(None));
+
+        let slices = [EndpointSliceView {
+            endpoints: vec![ep_on(THIS, 9)],
+        }];
+        let node = node(THIS);
+        let mut svc = with_policy(EndpointPolicy::Uniform);
+        let flags_of = |svc: &ServiceView| {
+            reconcile_service(svc, &slices, &node)
+                .fronts
+                .values()
+                .next()
+                .unwrap()
+                .flags
+        };
+        assert_eq!(flags_of(&svc), 0);
+        svc.client_ip_affinity = true;
+        assert_eq!(flags_of(&svc), FRONT_FLAG_CLIENT_IP_AFFINITY);
     }
 
     fn ep_on(node_ip: Ipv4Addr, octet: u8) -> Endpoint {

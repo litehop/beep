@@ -10,7 +10,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -26,8 +26,8 @@ use beep_controller::{
     apply::PinnedMaps,
     event::{report_restore_failure, PodRef},
     lease::{
-        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, LeaseTracker,
-        PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
+        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, withdraw_lease,
+        LeaseTracker, PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed, read_config_parity, write_config_parity},
@@ -38,7 +38,10 @@ use beep_controller::{
     },
 };
 use clap::Parser;
-use politeia::{build_tls_connector, parse_kubeconfig, HyperApiClient};
+use politeia::{
+    build_tls_connector, in_cluster_client, parse_kubeconfig, HyperApiClient, IN_CLUSTER_CA_PATH,
+    IN_CLUSTER_TOKEN_PATH,
+};
 use serde_json::Value;
 
 // Heap-profiling build only: routes every allocation through dhat so a
@@ -104,8 +107,10 @@ struct Args {
     #[arg(long = "node-ip", required_unless_present = "node_prep")]
     node_ip: Option<IpAddr>,
 
-    /// Path to a kubeconfig with credentials for this DaemonSet's watch.
-    #[arg(long, required_unless_present = "node_prep")]
+    /// Path to an X.509 client-cert kubeconfig for this DaemonSet's watch.
+    /// Omit to authenticate with the pod's own ServiceAccount token and
+    /// cluster CA (`select_client_source`).
+    #[arg(long)]
     kubeconfig: Option<String>,
 
     /// Namespace holding the `servicelb-flow-hash-seed` Secret: the cluster-wide
@@ -462,8 +467,9 @@ async fn run_idle_sweep_loop(
     }
 }
 
-/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs
-/// immediately so the Lease exists before peers' warm-up ends.
+/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs as soon
+/// as the initial Node LIST completes, so the Lease exists before peers'
+/// warm-up ends and never carries a partial address set.
 async fn run_lease_loop(
     client: Arc<HyperApiClient>,
     state: Arc<Mutex<WatchState>>,
@@ -472,7 +478,11 @@ async fn run_lease_loop(
     node_ip: IpAddr,
 ) -> anyhow::Result<()> {
     loop {
-        let ips = state.lock().unwrap().own_node_ips(node_ip);
+        let ips = state.lock().unwrap().lease_ips(node_ip);
+        let Some(ips) = ips else {
+            tokio::time::sleep(RETRY_POLL).await;
+            continue;
+        };
         if let Err(e) = renew_lease(&client, &namespace, &node_name, &ips).await {
             eprintln!("controller: WARN renewing node Lease failed (will retry): {e:#}");
         }
@@ -926,6 +936,44 @@ async fn run_controller_loop(
         .and(publish_retrier)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClientSource<'a> {
+    Kubeconfig(&'a str),
+    InCluster,
+}
+
+/// An explicit `--kubeconfig` always wins; otherwise the pod's own
+/// ServiceAccount is used, and only if every piece of it is present.
+fn select_client_source(
+    kubeconfig: Option<&str>,
+    token_exists: bool,
+    ca_exists: bool,
+    service_env_set: bool,
+) -> anyhow::Result<ClientSource<'_>> {
+    if let Some(path) = kubeconfig {
+        return Ok(ClientSource::Kubeconfig(path));
+    }
+    let mut missing = Vec::new();
+    if !token_exists {
+        missing.push(IN_CLUSTER_TOKEN_PATH);
+    }
+    if !ca_exists {
+        missing.push(IN_CLUSTER_CA_PATH);
+    }
+    if !service_env_set {
+        missing.push("KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT");
+    }
+    if missing.is_empty() {
+        Ok(ClientSource::InCluster)
+    } else {
+        anyhow::bail!(
+            "no --kubeconfig given and in-cluster ServiceAccount credentials are unusable (missing: {}); \
+             pass --kubeconfig or run in a pod with automountServiceAccountToken",
+            missing.join(", ")
+        )
+    }
+}
+
 // current_thread, not the default multi-thread runtime: this process's
 // concurrency is 3 cooperatively-interleaved list-watches (`tokio::join!`
 // in `run_controller_loop`), never CPU-parallel work -- a DaemonSet's own
@@ -956,17 +1004,27 @@ async fn main() -> anyhow::Result<()> {
 
     let (front_meta_max_entries, front_endpoints_max_entries) =
         front_map_max_entries(args.max_fronts, args.endpoints_per_front)?;
-    let kubeconfig = args
-        .kubeconfig
-        .as_deref()
-        .expect("clap requires --kubeconfig unless --node-prep, which already returned above");
-    let creds = parse_kubeconfig(kubeconfig).context("parsing kubeconfig")?;
-    let connector =
-        build_tls_connector(&creds).context("building TLS connector from kubeconfig")?;
-    let client = Arc::new(HyperApiClient {
-        server: creds.server,
-        connector,
-        bearer: None,
+    let source = select_client_source(
+        args.kubeconfig.as_deref(),
+        Path::new(IN_CLUSTER_TOKEN_PATH).is_file(),
+        Path::new(IN_CLUSTER_CA_PATH).is_file(),
+        std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+            && std::env::var_os("KUBERNETES_SERVICE_PORT").is_some(),
+    )?;
+    let client = Arc::new(match source {
+        ClientSource::Kubeconfig(path) => {
+            let creds = parse_kubeconfig(path).context("parsing kubeconfig")?;
+            let connector =
+                build_tls_connector(&creds).context("building TLS connector from kubeconfig")?;
+            HyperApiClient {
+                server: creds.server,
+                connector,
+                bearer: None,
+            }
+        }
+        ClientSource::InCluster => {
+            in_cluster_client().context("building in-cluster ServiceAccount client")?
+        }
     });
 
     let mut ebpf =
@@ -1112,6 +1170,24 @@ async fn main() -> anyhow::Result<()> {
         watches.and(seed).and(lease).and(prune).and(sweep)
     };
 
+    // As the container's PID 1 this process ignores SIGTERM without a handler,
+    // so the kubelet would wait out the whole grace period while the Lease kept
+    // renewing and the node stayed advertised.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+    let controller = async {
+        tokio::select! {
+            result = controller => result,
+            _ = sigterm.recv() => {
+                eprintln!("controller: SIGTERM received; withdrawing node Lease addresses");
+                if let Err(e) = withdraw_lease(&client, &args.lease_namespace, &node_name).await {
+                    eprintln!("controller: WARN withdrawing node Lease failed: {e:#}");
+                }
+                Ok(())
+            }
+        }
+    };
+
     #[cfg(feature = "dhat-heap")]
     {
         tokio::select! {
@@ -1144,14 +1220,58 @@ mod tests {
     }
 
     // The other side of the same guarantee: outside --node-prep mode, the
-    // three watch/reconcile args are still mandatory. If `required_unless_present`
+    // watch/reconcile args are still mandatory. If `required_unless_present`
     // were ever loosened into unconditional non-required, this would start
     // the real controller with a garbage default pod_cidr/node_ip instead of
     // failing fast at argument parsing.
     #[test]
-    fn watch_mode_still_requires_pod_cidr_node_ip_and_kubeconfig() {
-        Args::try_parse_from(["beep-controller"]).expect_err(
-            "pod-cidr/node-ip/kubeconfig must stay required when --node-prep is absent",
+    fn watch_mode_still_requires_pod_cidr_and_node_ip() {
+        Args::try_parse_from(["beep-controller"])
+            .expect_err("pod-cidr/node-ip must stay required when --node-prep is absent");
+    }
+
+    // A DaemonSet with no kubeconfig Secret must still parse: if --kubeconfig
+    // became required again, the in-cluster deploy would crash-loop at clap.
+    #[test]
+    fn kubeconfig_flag_is_optional_so_a_serviceaccount_only_pod_can_start() {
+        let mut argv = REQUIRED.to_vec();
+        argv.drain(7..9);
+        let args = Args::try_parse_from(argv).expect("--kubeconfig must be optional");
+        assert!(args.kubeconfig.is_none());
+    }
+
+    #[test]
+    fn explicit_kubeconfig_wins_even_when_serviceaccount_files_exist() {
+        assert_eq!(
+            select_client_source(Some("/k"), true, true, true).unwrap(),
+            ClientSource::Kubeconfig("/k"),
+            "an operator-supplied kubeconfig must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn serviceaccount_only_daemonset_reaches_the_apiserver_in_cluster() {
+        assert_eq!(
+            select_client_source(None, true, true, true).unwrap(),
+            ClientSource::InCluster,
+            "a pod with no kubeconfig Secret can't reach the API server otherwise"
+        );
+    }
+
+    #[test]
+    fn missing_serviceaccount_pieces_fail_loud_naming_each() {
+        let msg = select_client_source(None, false, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(IN_CLUSTER_TOKEN_PATH), "{msg}");
+        assert!(msg.contains(IN_CLUSTER_CA_PATH), "{msg}");
+        assert!(msg.contains("KUBERNETES_SERVICE_HOST"), "{msg}");
+        let msg = select_client_source(None, true, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(IN_CLUSTER_CA_PATH) && !msg.contains(IN_CLUSTER_TOKEN_PATH),
+            "operator with automount off must be told exactly what is missing: {msg}"
         );
     }
 

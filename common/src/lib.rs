@@ -276,6 +276,11 @@ pub struct FrontMeta {
     pub _pad: u16,
 }
 
+/// `FrontMeta::flags`: the Service asked for `sessionAffinity: ClientIP`. New
+/// flows of the front hash on the client IP alone (`front_flow_hash`), so every
+/// connection from one client lands on the same endpoint slot.
+pub const FRONT_FLAG_CLIENT_IP_AFFINITY: u16 = 1;
+
 /// `FRONT_ENDPOINTS` key: one endpoint slot of one generation of a front.
 /// `_pad` keeps the struct free of compiler-inserted bytes: the kernel
 /// hashes the raw key bytes, so every byte must be deterministic.
@@ -1140,6 +1145,24 @@ pub fn flow_hash(seed: u64, client_ip: [u8; 16], client_port: u16, front: &LbFro
     h ^= h >> 13;
     h = h.wrapping_mul(0xC2B2_AE35);
     h ^ (h >> 16)
+}
+
+/// `flow_hash` for a new flow of the front described by `meta`: the client
+/// port is left out when the front has `FRONT_FLAG_CLIENT_IP_AFFINITY`, so
+/// sticky-session clients keep their backend across new connections.
+pub fn front_flow_hash(
+    seed: u64,
+    client_ip: [u8; 16],
+    client_port: u16,
+    front: &LbFrontKey,
+    meta: &FrontMeta,
+) -> u32 {
+    let port = if meta.flags & FRONT_FLAG_CLIENT_IP_AFFINITY != 0 {
+        0
+    } else {
+        client_port
+    };
+    flow_hash(seed, client_ip, port, front)
 }
 
 /// Maps `hash` uniformly onto `[0, n)` via multiply-shift (no division, so
@@ -3015,6 +3038,41 @@ mod tests {
                 Some(0)
             );
         }
+    }
+
+    #[test]
+    fn client_ip_affinity_pins_one_client_to_one_slot_across_source_ports() {
+        let front = test_front();
+        let mut sticky = meta(1, 8);
+        sticky.flags = FRONT_FLAG_CLIENT_IP_AFFINITY;
+        let plain = meta(1, 8);
+        let slot_of = |m: &FrontMeta, port: u16| {
+            let h = front_flow_hash(SEED, v4_client(7), port, &front, m);
+            select_endpoint_slot(h, m.count, m.local_count).unwrap()
+        };
+        let sticky_slots: std::collections::HashSet<u16> =
+            (32768..33768).map(|p| slot_of(&sticky, p)).collect();
+        assert_eq!(
+            sticky_slots.len(),
+            1,
+            "new connections from one client IP must reuse one backend or sticky sessions break"
+        );
+        let plain_slots: std::collections::HashSet<u16> =
+            (32768..33768).map(|p| slot_of(&plain, p)).collect();
+        assert!(
+            plain_slots.len() > 1,
+            "without affinity ports must still spread load across backends"
+        );
+        let other_clients: std::collections::HashSet<u16> = (0..200)
+            .map(|c| {
+                let h = front_flow_hash(SEED, v4_client(c), 4000, &front, &sticky);
+                select_endpoint_slot(h, 8, 0).unwrap()
+            })
+            .collect();
+        assert!(
+            other_clients.len() > 1,
+            "affinity must still spread distinct clients across backends"
+        );
     }
 
     #[test]
