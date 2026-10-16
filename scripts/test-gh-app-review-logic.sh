@@ -178,6 +178,20 @@ else
     "$([ -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
 fi
 
+# ---------------------------------------------------------------------------
+# 8. Repo override.
+# ---------------------------------------------------------------------------
+assert "default repo is litehop/beep -- existing beep callers keep working without a second argument" \
+  "$(rm -f "$CURL_ARGV_CAPTURE"; run_wrapper 482; grep -qF 'https://api.github.com/repos/litehop/beep/pulls/482/reviews' "$CURL_ARGV_CAPTURE" && echo 1 || echo 0)"
+
+rm -f "$CURL_ARGV_CAPTURE"
+RUN_OUT=$(printf '%s' "$PAYLOAD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 11 litehop/politeia 2>/dev/null) \
+  && RUN_RC=0 || RUN_RC=$?
+assert "a repo argument retargets the POST -- otherwise a cross-repo review hits the same-numbered beep PR (422) and the reviewer falls back to the operator token" \
+  "$(grep -qF 'https://api.github.com/repos/litehop/politeia/pulls/11/reviews' "$CURL_ARGV_CAPTURE" && ! grep -qF 'repos/litehop/beep' "$CURL_ARGV_CAPTURE" && echo 1 || echo 0)"
+assert "...and the cross-repo review is still posted under the minted App token, not an ambient one" \
+  "$(grep -qF "Authorization: token $STUB_TOKEN" "$CURL_STDIN_CAPTURE" && echo 1 || echo 0)"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
