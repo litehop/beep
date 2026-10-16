@@ -367,7 +367,17 @@ external-mode Geneve device) is created if it doesn't already exist, and the
 reverse-path filter is disabled on `all` and `geneve0`
 (`net.ipv4.conf.{all,geneve0}.rp_filter=0`). The `rp_filter` write runs in
 the privileged `node-prep` initContainer, not the main container — see
-`docs/decisions/servicelb-rp-filter-init-container.md` for why.
+`docs/decisions/servicelb-rp-filter-init-container.md` for why. That
+initContainer also writes `/etc/sysctl.d/60-beep.conf` (via a single-file
+`hostPath` mount of that one file, type `FileOrCreate`; the rest of
+`/etc/sysctl.d` is not exposed), because on systemd hosts udev re-applies the
+distro default `rp_filter=2` to each new device after creation and would
+otherwise override the `/proc` write. The file name is fixed; its content
+follows `--geneve-iface`. `/etc/sysctl.d` must already exist on the node
+(true on every supported distro; see "Supported platforms" in the top-level
+README). Without it the pod stays in Init with a `hostPath` mount error. The
+file persists on the host after uninstall; remove it manually if beep is
+decommissioned.
 
 This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the
