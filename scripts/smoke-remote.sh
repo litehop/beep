@@ -1502,6 +1502,22 @@ spoof_body=$(ip netns exec smoke-client curl -sS -m 3 "http://${FRONT_IP}:${FRON
 }
 echo "ANTI-SPOOF: PASS (round trip through front ${FRONT_IP}:${FRONT_PORT} correctly dropped once its own NODE_ALLOW entry was removed -- curl rc=$spoof_rc)"
 
+echo "==> geneve0 re-creation: a loader restart must replace the severed pinned links, not crash-loop"
+stop_loader
+ip link del geneve0
+ip link add geneve0 type geneve external
+ip link set geneve0 up
+sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
+GENEVE_RECREATE_LOG=/tmp/beep-smoke-loader-geneve-recreate.log
+start_loader "$GENEVE_RECREATE_LOG"
+wait_for_attach "$GENEVE_RECREATE_LOG"
+grep -q "is severed" "$GENEVE_RECREATE_LOG" || {
+  echo "FAIL: loader attached after geneve0 re-creation without reporting a severed pinned link -- the stale-pin path was not exercised" >&2
+  cat "$GENEVE_RECREATE_LOG" >&2
+  exit 1
+}
+echo "GENEVE-RECREATE: PASS (loader re-attached and re-pinned links after geneve0 was deleted and re-created)"
+
 echo "==> sampling eBPF map memory + loader RSS (after round trip, before cleanup)"
 bash "$MEMORY_SCRIPT" once --pin-dir "$PIN_DIR" --out-dir "$MEMORY_OUT_DIR" || echo "WARN: eBPF memory sampling failed -- continuing (monitoring gap, not a smoke-test failure)" >&2
 
