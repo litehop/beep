@@ -148,6 +148,27 @@ expect_eq "two agreeing keep reads stay keep" keep "$(k3s_confirm_reinstall keep
 expect_eq "two agreeing unreadable reads stay unreadable (fail loud)" unreadable "$(k3s_confirm_reinstall unreadable unreadable)"
 expect_eq "keep then reinstall (cluster changing under us) does not wipe" unreadable "$(k3s_confirm_reinstall keep reinstall)"
 
+UNIT_V6="ExecStart=/usr/local/bin/k3s \\
+    server \\
+    '--node-ip=fd00:beef:98::3' \\
+    '--write-kubeconfig-mode=644'"
+UNIT_DUAL="ExecStart=/usr/local/bin/k3s server '--node-ip=192.168.5.15,fd00:beef:98::3'"
+UNIT_NOIP="ExecStart=/usr/local/bin/k3s server '--disable=traefik'"
+HOST_ADDRS="127.0.0.1 192.168.5.15 ::1 fe80::1"
+expect_eq "a v6-only unit whose ULA vanished on VM restart is stale, the crash-loop that blocked the next rig run" \
+  "fd00:beef:98::3" "$(k3s_unit_missing_node_ip "$UNIT_V6" "$HOST_ADDRS")"
+expect_eq "a v6-only unit whose ULA is still assigned is not stale, so a healthy cluster is never wiped" \
+  "" "$(k3s_unit_missing_node_ip "$UNIT_V6" "$HOST_ADDRS"$'\n'"fd00:beef:98::3")"
+expect_eq "a dual-stack unit missing only its v6 half is stale" \
+  "fd00:beef:98::3" "$(k3s_unit_missing_node_ip "$UNIT_DUAL" "$HOST_ADDRS")"
+expect_eq "a dual-stack unit with both addresses held is not stale" \
+  "" "$(k3s_unit_missing_node_ip "$UNIT_DUAL" "$HOST_ADDRS fd00:beef:98::3")"
+expect_eq "a unit pinning no node-ip is never judged stale" "" "$(k3s_unit_missing_node_ip "$UNIT_NOIP" "$HOST_ADDRS")"
+expect_eq "an empty unit (not installed) is never judged stale" "" "$(k3s_unit_missing_node_ip "" "$HOST_ADDRS")"
+limactl() { return 1; }
+expect_eq "an unreachable VM probe is unknown, not stale, so it can never trigger a reset" "" "$(k3s_stale_node_ip vm k3s)"
+limactl() { echo "stub-limactl $*"; }
+
 rc=0
 msg="$(k3s_bring_up_cluster a b c iptables 1 1 2>&1)" || rc=$?
 expect_eq "dual-stack + v6-only together is rejected instead of v6-only silently winning" 1 "$rc"
