@@ -9,7 +9,7 @@
 # "Mayor checkout" = the main (non-linked) checkout of the project repo: the
 # effective repo's --absolute-git-dir equals its --git-common-dir (same
 # detection as assert-worktree-boundary.sh) AND that common dir is the one of
-# $CLAUDE_PROJECT_DIR (default: this script's repo). Linked worktrees
+# this script's repo or of $CLAUDE_PROJECT_DIR. Linked worktrees
 # (ai/worktrees/*, scratch worktrees) and unrelated clones (e.g. a scratch
 # clone of another repo) are therefore allowed.
 #
@@ -57,10 +57,17 @@ common_dir() { # $1 dir -> its repo's physical common git dir
   (cd "$common" 2>/dev/null && pwd -P)
 }
 
-# The repo this hook protects: the session's project dir (a linked worktree
-# of it resolves to the same common dir). Empty if undeterminable, in which
-# case every repo's main checkout is guarded (fail closed).
-MAYOR_COMMON=$(common_dir "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/..}" || true)
+# The repos this hook protects: the one containing this script, plus the
+# session's project dir when set (a linked worktree of either resolves to the
+# same common dir), so an unset or unrelated CLAUDE_PROJECT_DIR cannot unguard
+# this script's own repo. If CLAUDE_PROJECT_DIR is set but unresolvable, or
+# neither repo is determinable, every main checkout is guarded (fail closed).
+OWN_COMMON=$(common_dir "$(dirname "$0")/.." || true)
+PROJECT_COMMON=""
+PROJECT_UNKNOWN=0
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  PROJECT_COMMON=$(common_dir "$CLAUDE_PROJECT_DIR") || PROJECT_UNKNOWN=1
+fi
 
 is_main_checkout() {
   local dir="$1" abs common
@@ -68,7 +75,9 @@ is_main_checkout() {
   abs=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 1
   abs=$(cd "$abs" 2>/dev/null && pwd -P) || return 1
   [ "$abs" = "$common" ] || return 1
-  [ -z "$MAYOR_COMMON" ] || [ "$common" = "$MAYOR_COMMON" ]
+  [ "$PROJECT_UNKNOWN" -eq 1 ] && return 0
+  [ -z "$OWN_COMMON$PROJECT_COMMON" ] && return 0
+  [ "$common" = "$OWN_COMMON" ] || [ "$common" = "$PROJECT_COMMON" ]
 }
 
 UNKNOWN_DIR="?"

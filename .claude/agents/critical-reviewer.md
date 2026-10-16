@@ -212,8 +212,7 @@ Then post it yourself, per deliverable type:
   or not at all. If `scripts/gh-app-review.sh` exits non-zero, do NOT post via
   `gh api`, `gh pr review`, or any other path under the operator's own token.
   Return the full findings text and the script's exact error to the mayor
-  instead; only an explicit mayor instruction may authorize a different
-  identity.
+  instead.
 
   Partition your findings before building the JSON payload:
   - Each **Confirmed findings** / **Suspicions** bullet whose Evidence cites

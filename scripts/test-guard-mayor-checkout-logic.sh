@@ -30,7 +30,11 @@ run_hook() {
   input=$(jq -n --arg id "$1" --arg cwd "$2" --arg cmd "$3" \
     '{cwd:$cwd, tool_input:{command:$cmd}} + (if $id == "" then {} else {agent_id:$id, agent_type:"critical-reviewer"} end)')
   RC=0
-  ERR=$(CLAUDE_PROJECT_DIR="${PROJECT_DIR:-$MAYOR}" bash "$HOOK" <<< "$input" 2>&1 >/dev/null) || RC=$?
+  if [ -n "${UNSET_PROJECT_DIR:-}" ]; then
+    ERR=$(env -u CLAUDE_PROJECT_DIR bash "${HOOK_UNDER_TEST:-$HOOK}" <<< "$input" 2>&1 >/dev/null) || RC=$?
+  else
+    ERR=$(CLAUDE_PROJECT_DIR="${PROJECT_DIR:-$MAYOR}" bash "${HOOK_UNDER_TEST:-$HOOK}" <<< "$input" 2>&1 >/dev/null) || RC=$?
+  fi
 }
 
 expect() { # $1 label, $2 expected rc (0 allow / 2 block)
@@ -336,6 +340,26 @@ expect "a session rooted in a linked worktree still allows unrelated scratch clo
 
 PROJECT_DIR="$SANDBOX/nonexistent" run_hook agent-1 "$SCRATCH_CLONE" "git checkout -b review"
 expect "undeterminable project dir fails closed: every main checkout stays guarded" 2
+
+# The hook installed inside the mayor repo, as in production: its own repo is
+# the mayor checkout regardless of what CLAUDE_PROJECT_DIR says.
+mkdir -p "$MAYOR/scripts"
+cp "$HOOK" "$MAYOR/scripts/guard-mayor-checkout.sh"
+HOOK_UNDER_TEST="$MAYOR/scripts/guard-mayor-checkout.sh"
+
+UNSET_PROJECT_DIR=1 run_hook agent-1 "$MAYOR" "git checkout main"
+expect "CLAUDE_PROJECT_DIR unset still guards the mayor checkout (falls back to the script's own repo, not fail-open)" 2
+
+UNSET_PROJECT_DIR=1 run_hook agent-1 "$SCRATCH_CLONE" "git checkout -b review"
+expect "CLAUDE_PROJECT_DIR unset still allows unrelated scratch clones" 0
+
+PROJECT_DIR="$SCRATCH_CLONE" run_hook agent-1 "$MAYOR" "git checkout main"
+expect "CLAUDE_PROJECT_DIR pointing at an unrelated clone must not unguard the mayor checkout" 2
+
+PROJECT_DIR="$SCRATCH_CLONE" run_hook agent-1 "$WT" "git checkout -b review2"
+expect "CLAUDE_PROJECT_DIR at an unrelated clone still allows the mayor's linked worktrees" 0
+
+unset HOOK_UNDER_TEST
 
 run_hook "" "$MAYOR" "git checkout main"
 expect "mayor session (no agent_id) can still move its own HEAD" 0
