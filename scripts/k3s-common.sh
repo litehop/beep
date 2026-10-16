@@ -131,6 +131,26 @@ k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 
   fi
 }
 
+k3s_unit_missing_node_ip() { # k3s_unit_missing_node_ip <systemd-unit-text> <local-addresses> -- prints the first --node-ip address in the unit that is not among the whitespace-separated local addresses, nothing if all are present or the unit pins none. k3s cannot start with a node-ip the host does not own, so a hit is positive proof of a stale install (unlike an unreadable node, which may just be starting).
+  local unit="$1" locals=" $(echo $2) " arg ip
+  for arg in $(printf '%s\n' "$unit" | grep -o -- '--node-ip=[0-9A-Fa-f:.,]*' || true); do
+    for ip in $(echo "${arg#--node-ip=}" | tr ',' ' '); do
+      case "$locals" in
+        *" $ip "*) ;;
+        *) echo "$ip"; return 0 ;;
+      esac
+    done
+  done
+}
+
+k3s_stale_node_ip() { # k3s_stale_node_ip <vm> <k3s|k3s-agent> -- prints "<ip>" when that VM's installed k3s unit is pinned to a node-ip the VM does not hold (see k3s_unit_missing_node_ip); nothing otherwise, including when the unit or the probe is unavailable, so an unknown never triggers a reset.
+  local unit locals
+  unit="$(limactl shell "$1" -- cat "/etc/systemd/system/$2.service" 2>/dev/null)" || return 0
+  locals="$(limactl shell "$1" -- bash -c "ip -o addr show | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null)" || return 0
+  [ -n "$locals" ] || return 0
+  k3s_unit_missing_node_ip "$unit" "$locals"
+}
+
 k3s_sa_token_scope() { # k3s_sa_token_scope <default|client-cert> <pod-json> -- prints "scoped" when the ServiceAccount token reaches exactly the right containers, else "init=<names> containers=<names>" naming who holds it. A holder is any container mounting a volume with a serviceAccountToken source, so the kubelet's auto-injected kube-api-access volume counts. default: only servicelb-controller (never the privileged node-prep initContainer); client-cert: nobody.
   local mode="$1" pod_json="$2"
   jq -r --arg mode "$mode" '

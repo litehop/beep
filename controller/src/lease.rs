@@ -49,6 +49,15 @@ pub const PRUNE_INTERVAL_MAX: Duration =
 /// pass sees them unmatched, the next prunes). Otherwise: the last
 /// observed renewal can be one pass old, the Lease then needs `LEASE_DURATION`
 /// to expire, a pass must notice, and a second must confirm.
+///
+/// Both figures assume the pruning controller has run for at least
+/// `LEASE_DURATION` (`warmed_up`). A controller that started `T` seconds
+/// before a node's graceful withdraw prunes it at most `max(30, 70 - T)` s
+/// after the withdraw, i.e. no later than `LEASE_DURATION + 2 * pass` after
+/// its own start. A silently dead node is pruned within the non-graceful
+/// figure of its last write, or of the pruning controller's start if later:
+/// the dead Lease only reads as expired `LEASE_DURATION` after the controller
+/// first observed it, which already outlasts the warm-up.
 pub const fn max_prune_latency(graceful: bool) -> Duration {
     let pass = PRUNE_INTERVAL_MAX.as_secs();
     if graceful {
@@ -720,6 +729,82 @@ mod tests {
             }
         }
         worst
+    }
+
+    // Like `worst_prune_latency(true)` for a pruning controller that started
+    // `uptime` s before the peer's Lease was emptied at t=100 s, observed by
+    // `may_prune` exactly as the prune loop does. Passes run every
+    // `PRUNE_INTERVAL_MAX`; sweeping the first pass over a full interval covers
+    // every phase of that cadence against the empty write and the warm-up gate.
+    fn worst_restarted_graceful_latency(uptime: u64) -> Duration {
+        const LAST_WRITE: u64 = 100;
+        let pass = PRUNE_INTERVAL_MAX.as_secs();
+        let base = Instant::now();
+        let start = LAST_WRITE - uptime;
+        let mut worst = Duration::ZERO;
+        for first in LEASE_RENEW.as_secs()..LEASE_RENEW.as_secs() + pass {
+            let mut tracker = LeaseTracker::new(base + Duration::from_secs(start));
+            let mut suspects = PruneSuspects::default();
+            let mut at = start + first;
+            loop {
+                let renewed = (at / LEASE_RENEW.as_secs() * LEASE_RENEW.as_secs()).min(LAST_WRITE);
+                let ips: &[&str] = if renewed == LAST_WRITE {
+                    &[]
+                } else {
+                    &["10.0.0.1"]
+                };
+                let now = base + Duration::from_secs(at);
+                tracker.observe(
+                    vec![
+                        listed("beep-node-a", &format!("r{renewed}"), ips),
+                        listed("beep-node-b", &format!("own{at}"), &["10.0.0.2"]),
+                    ],
+                    now,
+                );
+                if may_prune(&tracker, "beep-node-b", now) {
+                    let pruned = confirmed_pruned_ingress(
+                        &ingress(&["10.0.0.1", "10.0.0.2"]),
+                        tracker.leases(),
+                        now,
+                        &mut suspects,
+                    );
+                    suspects.end_pass();
+                    if at >= LAST_WRITE && pruned.is_some() {
+                        worst = worst.max(Duration::from_secs(at - LAST_WRITE));
+                        break;
+                    }
+                } else {
+                    suspects.reset();
+                }
+                at += pass;
+                assert!(at < LAST_WRITE + 600, "entry was never pruned");
+            }
+        }
+        worst
+    }
+
+    // A controller restarted shortly before a peer is removed cannot prune
+    // until it has watched leases for `LEASE_DURATION`; if the documented
+    // 30 s were promised unconditionally, a rolling restart followed by a node
+    // removal would keep the dead address advertised for up to 70 s. Times are
+    // whole seconds, so the true supremum is one second above the worst case
+    // measured here.
+    #[test]
+    fn graceful_prune_after_a_controller_restart_waits_out_the_warm_up() {
+        let pass = PRUNE_INTERVAL_MAX.as_secs();
+        for uptime in 0..=LEASE_DURATION.as_secs() + 5 {
+            let bound = max_prune_latency(true)
+                .as_secs()
+                .max(LEASE_DURATION.as_secs() + 2 * pass - uptime);
+            let worst = worst_restarted_graceful_latency(uptime);
+            assert_eq!(
+                worst,
+                Duration::from_secs(bound - 1),
+                "controller up {uptime} s when the peer withdrew: worst prune latency is not \
+                 max(30, 70 - uptime): the warm-up gate no longer holds restarted controllers \
+                 back, or holds them longer than LEASE_DURATION"
+            );
+        }
     }
 
     // Clients keep being sent to a dead node's address until its entry
