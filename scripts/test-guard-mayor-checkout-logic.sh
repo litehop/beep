@@ -18,13 +18,19 @@ mkdir -p "$MAYOR/ai/worktrees"
 WT="$MAYOR/ai/worktrees/w1"
 git -C "$MAYOR" worktree add -q "$WT" -b w1
 
+# An unrelated repo's main checkout, like a scratch clone of another project.
+SCRATCH_CLONE=$(cd "$SANDBOX" && mkdir scratch-clone && cd scratch-clone && pwd -P)
+git -C "$SCRATCH_CLONE" init -q -b main
+git -C "$SCRATCH_CLONE" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+
 # run_hook <agent_id|""> <cwd> <command> -> sets RC
+# PROJECT_DIR defaults to the mayor checkout, as the harness sets it for hooks.
 run_hook() {
   local input
   input=$(jq -n --arg id "$1" --arg cwd "$2" --arg cmd "$3" \
     '{cwd:$cwd, tool_input:{command:$cmd}} + (if $id == "" then {} else {agent_id:$id, agent_type:"critical-reviewer"} end)')
   RC=0
-  ERR=$(bash "$HOOK" <<< "$input" 2>&1 >/dev/null) || RC=$?
+  ERR=$(CLAUDE_PROJECT_DIR="${PROJECT_DIR:-$MAYOR}" bash "$HOOK" <<< "$input" 2>&1 >/dev/null) || RC=$?
 }
 
 expect() { # $1 label, $2 expected rc (0 allow / 2 block)
@@ -298,6 +304,38 @@ expect "gh pr create --body \"\$(cat file)\" stays allowed" 0
 
 run_hook agent-1 "$MAYOR" "if true; then git status; fi"
 expect "read-only git inside if/then stays allowed" 0
+
+run_hook agent-1 "$SCRATCH_CLONE" "git checkout -b review"
+expect "checkout in an unrelated scratch clone is allowed (else cross-repo workers get blocked and route around the guard)" 0
+
+for mv in "git switch main" "git reset --hard HEAD" "git stash" "git pull --ff-only"; do
+  run_hook agent-1 "$SCRATCH_CLONE" "$mv"
+  expect "'$mv' in an unrelated scratch clone is allowed (the clone is not the mayor's tree)" 0
+done
+
+run_hook agent-1 "$WT" "git -C $SCRATCH_CLONE checkout -b review"
+expect "git -C <scratch clone> from a worktree is allowed" 0
+
+run_hook agent-1 "$WT" "cd $SCRATCH_CLONE && git checkout -b review"
+expect "cd <scratch clone> && checkout is allowed" 0
+
+run_hook agent-1 "$SCRATCH_CLONE" "git -C $MAYOR checkout main"
+expect "git -C <mayor> from inside a scratch clone is still blocked (cwd must not decide)" 2
+
+run_hook agent-1 "$SCRATCH_CLONE" "cd $MAYOR && git checkout main"
+expect "cd <mayor> from a scratch clone is still blocked" 2
+
+run_hook agent-1 "$SCRATCH_CLONE" "git --git-dir=$MAYOR/.git checkout main"
+expect "--git-dir redirect keeps failing closed even from a scratch clone" 2
+
+PROJECT_DIR="$WT" run_hook agent-1 "$MAYOR" "git checkout main"
+expect "a session rooted in a linked worktree still protects the mayor checkout it belongs to" 2
+
+PROJECT_DIR="$WT" run_hook agent-1 "$SCRATCH_CLONE" "git checkout -b review"
+expect "a session rooted in a linked worktree still allows unrelated scratch clones" 0
+
+PROJECT_DIR="$SANDBOX/nonexistent" run_hook agent-1 "$SCRATCH_CLONE" "git checkout -b review"
+expect "undeterminable project dir fails closed: every main checkout stays guarded" 2
 
 run_hook "" "$MAYOR" "git checkout main"
 expect "mayor session (no agent_id) can still move its own HEAD" 0

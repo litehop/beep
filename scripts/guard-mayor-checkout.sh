@@ -6,9 +6,12 @@
 # tool call comes from a subagent; the mayor's own session has none and is
 # never blocked here.
 #
-# "Main checkout" = the effective repo's --absolute-git-dir equals its
-# --git-common-dir (same detection as assert-worktree-boundary.sh). Linked
-# worktrees (ai/worktrees/*, scratch worktrees) are therefore always allowed.
+# "Mayor checkout" = the main (non-linked) checkout of the project repo: the
+# effective repo's --absolute-git-dir equals its --git-common-dir (same
+# detection as assert-worktree-boundary.sh) AND that common dir is the one of
+# $CLAUDE_PROJECT_DIR (default: this script's repo). Linked worktrees
+# (ai/worktrees/*, scratch worktrees) and unrelated clones (e.g. a scratch
+# clone of another repo) are therefore allowed.
 #
 # Effective directory: the hook's cwd, updated by `cd`/`pushd <dir>` segments
 # (flags and `builtin cd` handled; `popd` and `pushd` without a dir make it
@@ -46,15 +49,26 @@ CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
 
 BLOCKED_SUBCMDS=" checkout switch reset pull merge rebase stash restore cherry-pick revert "
 
-is_main_checkout() {
-  local dir="$1" abs common
+common_dir() { # $1 dir -> its repo's physical common git dir
+  local dir="$1" common
   [ -d "$dir" ] || return 1
-  abs=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 1
   common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 1
   [[ "$common" == /* ]] || common="$dir/$common"
-  common=$(cd "$common" 2>/dev/null && pwd -P) || return 1
+  (cd "$common" 2>/dev/null && pwd -P)
+}
+
+# The repo this hook protects: the session's project dir (a linked worktree
+# of it resolves to the same common dir). Empty if undeterminable, in which
+# case every repo's main checkout is guarded (fail closed).
+MAYOR_COMMON=$(common_dir "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/..}" || true)
+
+is_main_checkout() {
+  local dir="$1" abs common
+  common=$(common_dir "$dir") || return 1
+  abs=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 1
   abs=$(cd "$abs" 2>/dev/null && pwd -P) || return 1
-  [ "$abs" = "$common" ]
+  [ "$abs" = "$common" ] || return 1
+  [ -z "$MAYOR_COMMON" ] || [ "$common" = "$MAYOR_COMMON" ]
 }
 
 UNKNOWN_DIR="?"
