@@ -54,22 +54,41 @@ awk '/^        - name: bpffs$/ {print "        - name: extra0"; print "         
 mv "$TMP/ds.yaml" "$TMP/deploy/base/daemonset.yaml"
 check_render "volume inserted before bpffs (indices shifted)" "$TMP/deploy/overlays/client-cert"
 
-# The move into deploy/base must not change what gets applied: render it and
-# the pre-move flat manifests through the same kustomize and compare.
-mkdir "$TMP/flat"
-flat_ok=1
-for f in rbac configmap daemonset; do
-  git -C "$REPO" show "8626385a322c7e0ed7abf543ae498855093d4f40:deploy/$f.yaml" >"$TMP/flat/$f.yaml" 2>/dev/null || flat_ok=0
-done
-if [ "$flat_ok" = 1 ]; then
-  printf 'resources:\n  - rbac.yaml\n  - configmap.yaml\n  - daemonset.yaml\n' >"$TMP/flat/kustomization.yaml"
-  if diff <(kubectl kustomize "$TMP/flat") <(kubectl kustomize "$REPO/deploy/base") >/dev/null; then
-    ok "deploy/base renders the same objects as the pre-move flat manifests"
+# A manifest accidentally dropped from or added to the base would silently
+# change what users apply (e.g. losing the RBAC the controller needs), and the
+# overlay must ship exactly the same objects.
+EXPECTED='ClusterRole/servicelb-controller
+ClusterRoleBinding/servicelb-controller
+ConfigMap/kube-system/beep-config
+DaemonSet/kube-system/servicelb-controller
+Namespace/beep-leases
+Role/beep-leases/servicelb-controller-node-lease
+Role/default/servicelb-controller-events
+Role/kube-system/servicelb-controller-events
+Role/kube-system/servicelb-controller-flow-hash-seed
+RoleBinding/beep-leases/servicelb-controller-node-lease
+RoleBinding/default/servicelb-controller-events
+RoleBinding/kube-system/servicelb-controller-events
+RoleBinding/kube-system/servicelb-controller-flow-hash-seed
+ServiceAccount/kube-system/servicelb-controller'
+
+objects() { # <kustomize-dir> -> sorted kind/[namespace/]name lines
+  kubectl kustomize "$1" | awk '
+    function flush() { if (kind != "") print kind "/" (ns != "" ? ns "/" : "") name; kind = ""; ns = ""; name = ""; m = 0 }
+    /^---$/ { flush(); next }
+    /^kind:/ { kind = $2 }
+    /^[^ ]/ { m = ($0 == "metadata:") }
+    m && /^  name:/ { name = $2 }
+    m && /^  namespace:/ { ns = $2 }
+    END { flush() }' | LC_ALL=C sort
+}
+
+for d in base overlays/client-cert; do
+  if [ "$(objects "$REPO/deploy/$d")" = "$(printf '%s\n' "$EXPECTED" | LC_ALL=C sort)" ]; then
+    ok "deploy/$d renders exactly the expected objects"
   else
-    bad "deploy/base renders differently from the pre-move flat manifests, so the move changed what users apply"
+    bad "deploy/$d renders a different object set than expected, so users would apply more or fewer manifests than intended"
   fi
-else
-  echo "SKIP: the pre-move commit with flat deploy/*.yaml is not in this clone; render equivalence was NOT checked" >&2
-fi
+done
 
 exit "$fail"
