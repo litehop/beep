@@ -178,8 +178,8 @@ spec:
             type: Directory
         # What the kubelet would auto-mount (token, cluster CA, namespace),
         # declared by hand so it can be mounted into one container.
-        # deploy/patches/client-cert-kubeconfig.yaml removes this volume and
-        # its mount by index: keep it the last volume and mount.
+        # deploy-overlays/client-cert removes this volume and its mount by
+        # name and mountPath: keep both names.
         - name: serviceaccount
           projected:
             sources:

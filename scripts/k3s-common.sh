@@ -153,7 +153,7 @@ k3s_export_admin_kubeconfig() { # k3s_export_admin_kubeconfig <vm-a> <ip-a> -- w
 
 CLIENT_CERT_KUBECONFIG_SECRET="beep-controller-kubeconfig"
 
-k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> <repo-root> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then applies deploy/patches/client-cert-kubeconfig.yaml verbatim (the file users apply). That patch also turns the ServiceAccount token off so it cannot mask a broken cert path. The patch hardcodes the Secret name CLIENT_CERT_KUBECONFIG_SECRET.
+k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> <repo-root> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then applies the deploy-overlays/client-cert kustomize overlay (what users apply, rendered with the host's kubectl and the DaemonSet's live image kept). That overlay also turns the ServiceAccount token off so it cannot mask a broken cert path. The overlay hardcodes the Secret name CLIENT_CERT_KUBECONFIG_SECRET.
   local vm_a="$1" ip_a="$2" repo_root="$3"
   limactl shell "$vm_a" -- sudo bash -c "
   set -euo pipefail
@@ -190,8 +190,12 @@ CSR
   k3s kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig >/dev/null
   k3s kubectl create secret generic $CLIENT_CERT_KUBECONFIG_SECRET -n kube-system --from-file=kubeconfig=beep-controller.kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -
 "
-  kube -n kube-system patch daemonset servicelb-controller --type=json --patch-file /dev/stdin \
-    < "$repo_root/deploy/patches/client-cert-kubeconfig.yaml" >/dev/null
+  local live_image
+  live_image=$(kube -n kube-system get daemonset servicelb-controller \
+    -o jsonpath='{.spec.template.spec.containers[0].image}')
+  kubectl kustomize "$repo_root/deploy-overlays/client-cert" \
+    | sed "s#docker.io/valerauko/beep-lb:latest#${live_image}#" \
+    | kube apply -f - >/dev/null
   kube -n kube-system rollout status daemonset/servicelb-controller --timeout=120s
 }
 

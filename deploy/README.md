@@ -405,8 +405,8 @@ are missing (e.g. the volume was removed) and no
 
 `--kubeconfig` is the alternative, and always wins when given: an X.509
 client-cert kubeconfig. `deploy/daemonset.yaml` does not mount one; step 5
-below applies `deploy/patches/client-cert-kubeconfig.yaml`, which adds the
-`--kubeconfig=...` arg and a Secret volume and unmounts the ServiceAccount
+below applies the `deploy-overlays/client-cert` kustomize overlay, which adds
+the `--kubeconfig=...` arg and a Secret volume and unmounts the ServiceAccount
 token. The parser only reads four fields -- `server:`,
 `certificate-authority-data:`, `client-certificate-data:`,
 `client-key-data:` -- so any kubeconfig containing those four works,
@@ -460,12 +460,12 @@ kubectl config set-context beep-controller \
   --cluster=beep --user=beep-controller --kubeconfig=beep-controller.kubeconfig
 kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig
 
-# 5. Ship it as a Secret and patch the DaemonSet to mount it (the patch
-#    expects this exact Secret name, key "kubeconfig")
+# 5. Ship it as a Secret and apply the overlay (it re-applies rbac.yaml,
+#    configmap.yaml and daemonset.yaml with the token swapped for the Secret;
+#    it expects this exact Secret name, key "kubeconfig")
 kubectl create secret generic beep-controller-kubeconfig -n kube-system \
   --from-file=kubeconfig=beep-controller.kubeconfig
-kubectl -n kube-system patch daemonset servicelb-controller \
-  --type=json --patch-file deploy/patches/client-cert-kubeconfig.yaml
+kubectl apply -k deploy-overlays/client-cert
 ```
 
 ## Verify your deployment
