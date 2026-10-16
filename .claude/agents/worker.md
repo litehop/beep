@@ -105,9 +105,9 @@ git rev-list --count HEAD..origin/main   # nonzero → merge and resolve now
 cargo fmt --check
 cargo test -p beep-common 2>&1 | tail -30
 # `0 failed` in the summary line is authoritative — don't re-run to
-# double-check; use `-- --nocapture <testname>` for one failing test's
-# stacktrace. A cold worktree's first cargo run compiles from scratch — set a
-# longer Bash timeout up front.
+# double-check; use `cargo test -p beep-common -- --nocapture <testname>` for
+# one failing test's stacktrace. A cold worktree's first cargo run compiles
+# from scratch — set a longer Bash timeout.
 # clippy(loader), clippy(ebpf), and `cargo build --release` are Linux-only
 # (aya cross-build to bpfel-unknown-none) — do not run them on this macOS
 # host. CI's fmt/lint-matrix/test-matrix/memory-smoke jobs enforce the full
@@ -136,6 +136,7 @@ git commit -m "feat(<area>): <what and why>"
 # If refused anyway, STOP and report; the mayor opens the PR.
 git push
 gh pr create --title "..." --body-file .pr-body-<topic>.md
+rm .pr-body-<topic>.md
 
 # 8. Close the bead
 bd close <id> --reason="PR #N opened"

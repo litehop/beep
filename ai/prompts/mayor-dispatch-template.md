@@ -254,7 +254,9 @@ Commit and push:
 git add <files>
 git commit -m "..."
 git push
-gh pr create --title "..." --body-file .pr-body-<topic>.md   # file inside worktree root, uncommitted, deleted after
+# write the PR body to .pr-body-<topic>.md in the worktree root (never committed)
+gh pr create --title "..." --body-file .pr-body-<topic>.md
+rm .pr-body-<topic>.md
 ```
 
 ---
