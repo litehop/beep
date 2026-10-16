@@ -376,21 +376,41 @@ wait_for_attach() {
 # client failure indistinguishable from a datapath break.
 wait_for_listener() { # <port> [timeout_s] [addr] [netns]
   local port="$1" timeout_s="${2:-5}" addr="${3:-}" netns="${4:-}"
-  local -a ss_cmd=(ss -lntuH) filter=()
-  [ -z "$netns" ] || ss_cmd=(ip netns exec "$netns" "${ss_cmd[@]}")
-  case "$addr" in
-    "") ;;
-    *:*) addr="[${addr}]"; filter=(src "$addr") ;;
-    *) filter=(src "$addr") ;;
-  esac
-  filter+=(sport = ":${port}")
   local i
   for ((i = 0; i < timeout_s * 10; i++)); do
-    "${ss_cmd[@]}" "${filter[@]}" | grep -q . && return 0
+    listener_bound "$port" "$addr" "$netns" && return 0
     sleep 0.1
   done
   echo "FAIL: listener did not bind on ${addr:+${addr}:}${port}${netns:+ (netns ${netns})} within ${timeout_s}s -- test harness problem, not a datapath failure" >&2
   exit 1
+}
+
+# Polls until NO TCP/UDP listener remains on <port>. A `pkill` returns before
+# the old nc has exited, so a relaunch (or wait_for_listener, which would pass
+# against the dying socket) straight after it races the old listener's
+# teardown and can hit EADDRINUSE.
+wait_for_port_free() { # <port> [timeout_s] [addr] [netns]
+  local port="$1" timeout_s="${2:-5}" addr="${3:-}" netns="${4:-}"
+  local i
+  for ((i = 0; i < timeout_s * 10; i++)); do
+    listener_bound "$port" "$addr" "$netns" || return 0
+    sleep 0.1
+  done
+  echo "FAIL: port ${addr:+${addr}:}${port}${netns:+ (netns ${netns})} still bound ${timeout_s}s after its listener was killed -- test harness problem, not a datapath failure" >&2
+  exit 1
+}
+
+listener_bound() { # <port> [addr] [netns]
+  local port="$1" addr="${2:-}" netns="${3:-}"
+  local -a ss_cmd=(ss -lntuH) filter=()
+  [ -z "$netns" ] || ss_cmd=(ip netns exec "$netns" "${ss_cmd[@]}")
+  case "$addr" in
+    "") ;;
+    *:*) filter=(src "[${addr}]") ;;
+    *) filter=(src "$addr") ;;
+  esac
+  filter+=(sport = ":${port}")
+  "${ss_cmd[@]}" "${filter[@]}" | grep -q .
 }
 
 # Stops the running loader and waits for it to actually exit before a
@@ -494,6 +514,8 @@ for ((i = 0; i < AFF_CONNECTIONS; i++)); do
   fi
   pkill -f "nc -l -N ${AFF_POD_A} ${AFF_TARGET_PORT}" 2>/dev/null || true
   pkill -f "nc -l -N ${AFF_POD_B} ${AFF_TARGET_PORT}" 2>/dev/null || true
+  wait_for_port_free "$AFF_TARGET_PORT" 5 "$AFF_POD_A"
+  wait_for_port_free "$AFF_TARGET_PORT" 5 "$AFF_POD_B"
 done
 if [ "$aff_hits_a" -ne 0 ] && [ "$aff_hits_b" -ne 0 ]; then
   echo "FAIL: ClientIP affinity front spread ${AFF_CONNECTIONS} connections from one client IP over both pods (${AFF_POD_A}=${aff_hits_a}, ${AFF_POD_B}=${aff_hits_b}); sticky sessions would break" >&2
@@ -652,6 +674,7 @@ case "$control_entry" in
 esac
 echo "COLD-NEIGHBOR CONTROL: PASS (unresolvable client => round trip failed and host neighbour is '${control_entry:-absent}' -- success below can only come from real resolution)"
 kill "$cold_nc_pid" 2>/dev/null || true
+wait_for_port_free "$COLD_TARGET_PORT" 5 "$POD_IP"
 ip netns exec smoke-client ip link set smoke-veth1 arp on
 
 echo "==> cold-cache round trip: flush the host's entry for ${CLIENT_IP}, then drive the flow"
@@ -889,6 +912,7 @@ pkill -f "nc ${UPLINK2_FRONT_IP} ${UPLINK2_FRONT_PORT}" 2>/dev/null || true
 pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
 pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT2}" 2>/dev/null || true
 pkill -f "nc -l -N ${POD_IP} ${UPLINK2_TARGET_PORT}" 2>/dev/null || true
+wait_for_port_free "$TARGET_PORT" 5 "$POD_IP"
 sleep 1
 
 echo "==> establishing a flow to hold open across a loader restart (a DaemonSet rollout/eviction/OOM kill must not silently drop an established connection)"
@@ -1595,6 +1619,7 @@ grep -q "is severed" "$GENEVE_RECREATE_LOG" || {
   exit 1
 }
 pkill -f "nc -l -N ${POD_IP} ${TARGET_PORT}" 2>/dev/null || true
+wait_for_port_free "$TARGET_PORT" 5 "$POD_IP"
 nohup nc -l -N "$POD_IP" "$TARGET_PORT" < "$RESPONSE_FILE" >"$BACKEND_LOG" 2>&1 &
 disown
 wait_for_listener "$TARGET_PORT" 5 "$POD_IP"
