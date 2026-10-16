@@ -26,8 +26,8 @@ use beep_controller::{
     apply::PinnedMaps,
     event::{report_restore_failure, PodRef},
     lease::{
-        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, LeaseTracker,
-        PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
+        confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, withdraw_lease,
+        LeaseTracker, PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
     reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
     seed::{converge_seed, load_or_create_seed, read_config_parity, write_config_parity},
@@ -462,8 +462,9 @@ async fn run_idle_sweep_loop(
     }
 }
 
-/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs
-/// immediately so the Lease exists before peers' warm-up ends.
+/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs as soon
+/// as the initial Node LIST completes, so the Lease exists before peers'
+/// warm-up ends and never carries a partial address set.
 async fn run_lease_loop(
     client: Arc<HyperApiClient>,
     state: Arc<Mutex<WatchState>>,
@@ -472,7 +473,11 @@ async fn run_lease_loop(
     node_ip: IpAddr,
 ) -> anyhow::Result<()> {
     loop {
-        let ips = state.lock().unwrap().own_node_ips(node_ip);
+        let ips = state.lock().unwrap().lease_ips(node_ip);
+        let Some(ips) = ips else {
+            tokio::time::sleep(RETRY_POLL).await;
+            continue;
+        };
         if let Err(e) = renew_lease(&client, &namespace, &node_name, &ips).await {
             eprintln!("controller: WARN renewing node Lease failed (will retry): {e:#}");
         }
@@ -1110,6 +1115,24 @@ async fn main() -> anyhow::Result<()> {
             ),
         );
         watches.and(seed).and(lease).and(prune).and(sweep)
+    };
+
+    // As the container's PID 1 this process ignores SIGTERM without a handler,
+    // so the kubelet would wait out the whole grace period while the Lease kept
+    // renewing and the node stayed advertised.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+    let controller = async {
+        tokio::select! {
+            result = controller => result,
+            _ = sigterm.recv() => {
+                eprintln!("controller: SIGTERM received; withdrawing node Lease addresses");
+                if let Err(e) = withdraw_lease(&client, &args.lease_namespace, &node_name).await {
+                    eprintln!("controller: WARN withdrawing node Lease failed: {e:#}");
+                }
+                Ok(())
+            }
+        }
     };
 
     #[cfg(feature = "dhat-heap")]

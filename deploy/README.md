@@ -214,10 +214,24 @@ supplies the node name) every 10 s, with a 40 s duration -- the same timing Kube
 uses for node leases. The Lease carries the node's addresses in the
 `beep.litehop.io/node-ips` annotation. Every controller lists these Leases
 every ~10-15 s (10 s plus up to 5 s of jitter) and removes any
-`status.loadBalancer.ingress` entry whose address has no live Lease, so a
-node whose beep pod stopped is dropped from every Service within about
-40 s + one prune interval. When that node's controller returns it renews
-its Lease and re-adds its own entry.
+`status.loadBalancer.ingress` entry whose address has no live Lease for two
+consecutive passes (a Lease annotation can lag a newly published address by
+one renew). On SIGTERM a controller first publishes an empty address set in
+its Lease, so a node whose beep pod is removed is dropped from every Service
+within 30 s (two prune passes of at most 15 s). A node that dies without
+a word (power loss, SIGKILL) is dropped within 85 s: its last renewal can be
+one pass old, then the 40 s Lease duration, then two passes. When that node's
+controller returns it renews its Lease and re-adds its own entry.
+
+SIGTERM cannot tell pod removal from a DaemonSet rolling restart, so a
+restart withdraws the node too (the pinned dataplane keeps serving
+meanwhile). The replacement controller publishes no Lease addresses until its
+initial Node LIST completes, then renews with the full address set and
+re-publishes its ingress entries after its Service/EndpointSlice LISTs. If that
+happens before peers' second prune pass (under 30 s after SIGTERM) the entry is
+never pruned; otherwise the node is absent from ingress from the prune until
+the replacement re-publishes, with no operator action.
+The withdraw itself is bounded to 5 s so a hung apiserver cannot delay exit.
 
 Liveness is judged by observation: a Lease is live while its `renewTime`
 keeps changing as seen by the pruning controller's own monotonic clock, so
