@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-16
+
+### BREAKING / upgrade notes
+
+- **Manifests moved to `deploy/base`.** Install with
+  `kubectl apply -k deploy/base`; the client-cert opt-in is
+  `kubectl apply -k deploy/overlays/client-cert`. `kubectl apply -f deploy/`
+  no longer works.
+
+- **The stock DaemonSet authenticates with its in-cluster ServiceAccount.** It
+  no longer mounts the `beep-controller-kubeconfig` Secret or passes
+  `--kubeconfig`. Operators who rely on a client-cert kubeconfig must apply the
+  `deploy/overlays/client-cert` overlay.
+
+- **The ServiceAccount token is mounted into the controller container only.**
+  `deploy/base/daemonset.yaml` sets `automountServiceAccountToken: false` and
+  mounts a projected `serviceaccount` volume into the controller container, not
+  the privileged node-prep initContainer. Re-check any custom DaemonSet patches.
+
+- **Supported platforms: systemd-based Linux only** (kernel 6.6+, little-endian
+  x86-64/AArch64, latest two Kubernetes minors).
+
+- **Nodes need `/etc/sysctl.d`.** node-prep writes `/etc/sysctl.d/60-beep.conf`
+  to persist `geneve0` `rp_filter=0`.
+
+- **Lost-node prune bounds.** A removed node leaves Service
+  `status.loadBalancer.ingress` within 30 s of a graceful stop once the
+  surviving controllers have run for 40 s, and up to 70 s right after a
+  controller restart; a silently lost node within 85 s.
+
+### Added
+
+- Service `sessionAffinity: ClientIP` is honoured: a client stays pinned to one
+  endpoint while the endpoint set is stable (`timeoutSeconds` is not honoured).
+
+### Changed
+
+- Loader `--fixture` repeated for one front now adds endpoints instead of
+  keeping the last; an optional `:affinity` suffix requests ClientIP affinity.
+- `FRONT_META.flags` bit 0 now means ClientIP affinity (no byte-layout change).
+
+### Fixed
+
+- `geneve0` `rp_filter` no longer reverts to the distro default after the
+  device is re-created on systemd hosts.
+- The loader re-attaches pinned links severed by deleting the geneve device
+  instead of crash-looping until `/sys/fs/bpf/beep` is cleaned by hand.
+- The controller no longer logs WARN for idle watch timeouts or the startup
+  initial-LIST wait; its watches request bookmarks.
+- A removed node's address leaves Service `status.loadBalancer.ingress`
+  promptly, and the controller handles SIGTERM by withdrawing its Lease
+  addresses.
+
 ## [0.5.0] - 2026-10-15
 
 ### Upgrade notes / operator action required
