@@ -227,10 +227,16 @@ every ~10-15 s (10 s plus up to 5 s of jitter) and removes any
 consecutive passes (a Lease annotation can lag a newly published address by
 one renew). On SIGTERM a controller first publishes an empty address set in
 its Lease, so a node whose beep pod is removed is dropped from every Service
-within 30 s (two prune passes of at most 15 s). A node that dies without
-a word (power loss, SIGKILL) is dropped within 85 s: its last renewal can be
-one pass old, then the 40 s Lease duration, then two passes. When that node's
-controller returns it renews its Lease and re-adds its own entry.
+within 30 s (two prune passes of at most 15 s), provided the surviving
+controllers have run for at least 40 s. A controller that started T s (T under
+40) before the removal cannot prune until 40 s after its own start, so it
+takes up to 70 - T s: 30 s after the Lease empties or 70 s after the survivor
+started, whichever is later (up to 70 s right after a rolling restart). A node
+that dies without a word (power loss, SIGKILL) is dropped within 85 s of its
+last renewal: its last renewal can be one pass old, then the 40 s Lease
+duration, then two passes. A survivor that started after the death needs the
+same 85 s counted from its own start. When that node's controller returns it
+renews its Lease and re-adds its own entry.
 
 SIGTERM cannot tell pod removal from a DaemonSet rolling restart, so a
 restart withdraws the node too (the pinned dataplane keeps serving
