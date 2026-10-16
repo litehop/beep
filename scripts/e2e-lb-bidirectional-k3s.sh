@@ -115,7 +115,8 @@ for vm in "$VM_A" "$VM_B"; do
 done
 
 echo "==> [4/8] deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
-if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
+k3s_build_load_image "$REPO_ROOT" "$VM_A" "$VM_B" || exit 1
+if ! k3s_deploy_controller_daemonset "$REPO_ROOT" "$IMAGE"; then
   echo "CONTROLLER-DEPLOY: FAIL" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
   dump_evidence
