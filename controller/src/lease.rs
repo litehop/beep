@@ -156,7 +156,13 @@ pub async fn withdraw_lease(
     namespace: &str,
     node: &str,
 ) -> anyhow::Result<()> {
-    tokio::time::timeout(WITHDRAW_TIMEOUT, renew_lease(client, namespace, node, &[]))
+    bounded_withdraw(renew_lease(client, namespace, node, &[])).await
+}
+
+async fn bounded_withdraw(
+    write: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(WITHDRAW_TIMEOUT, write)
         .await
         .context("withdrawing node Lease timed out")?
 }
@@ -759,6 +765,24 @@ mod tests {
             "withdrawn address left ingress after {worst:?}, within one pass: the second \
              confirming pass is no longer required"
         );
+    }
+
+    // A hung apiserver must not hold the controller past the kubelet's
+    // SIGKILL: the withdraw is abandoned after WITHDRAW_TIMEOUT so exit is
+    // bounded. The outer timeout turns "no inner bound" into an assertion
+    // failure instead of a hung test.
+    #[tokio::test(start_paused = true)]
+    async fn hung_withdraw_is_abandoned_after_the_timeout_so_shutdown_is_bounded() {
+        let start = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            WITHDRAW_TIMEOUT * 4,
+            bounded_withdraw(std::future::pending()),
+        )
+        .await;
+        let result = outcome.expect("withdraw is unbounded: a hung apiserver would block exit");
+        let err = result.expect_err("a hung withdraw must fail, not succeed");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert_eq!(start.elapsed(), WITHDRAW_TIMEOUT);
     }
 
     // The shutdown withdrawal is only effective if an empty address set

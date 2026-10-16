@@ -233,6 +233,11 @@ never pruned; otherwise the node is absent from ingress from the prune until
 the replacement re-publishes, with no operator action.
 The withdraw itself is bounded to 5 s so a hung apiserver cannot delay exit.
 
+The under-30 s restart case assumes the initial Node LIST is quick. If it
+takes longer than the 40 s Lease duration, or keeps failing, the node's Lease
+expires and peers prune it while its pinned dataplane still serves traffic.
+Its address returns once the LIST completes and the Lease renews.
+
 Liveness is judged by observation: a Lease is live while its `renewTime`
 keeps changing as seen by the pruning controller's own monotonic clock, so
 wall-clock skew between nodes is irrelevant. A freshly started controller
