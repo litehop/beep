@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy-overlays/client-cert must swap the ServiceAccount token for the
+# deploy/overlays/client-cert must swap the ServiceAccount token for the
 # client-cert kubeconfig by NAME, never by position: if a base edit reordered
 # or appended volumes and the overlay then dropped the wrong one, the
 # dataplane would lose its bpffs mount or keep the token that masks a broken
@@ -42,16 +42,34 @@ check_render() { # <label> <overlay-dir>
   fi
 }
 
-check_render "stock base" "$REPO/deploy-overlays/client-cert"
+check_render "stock base" "$REPO/deploy/overlays/client-cert"
 
 # Same manifests in a scratch tree, base volumes/mounts perturbed.
-cp -R "$REPO/deploy" "$REPO/deploy-overlays" "$TMP/"
-printf '        - name: extra\n          emptyDir: {}\n' >>"$TMP/deploy/daemonset.yaml"
-check_render "volume appended to base" "$TMP/deploy-overlays/client-cert"
+cp -R "$REPO/deploy" "$TMP/"
+printf '        - name: extra\n          emptyDir: {}\n' >>"$TMP/deploy/base/daemonset.yaml"
+check_render "volume appended to base" "$TMP/deploy/overlays/client-cert"
 
 awk '/^        - name: bpffs$/ {print "        - name: extra0"; print "          emptyDir: {}"} {print}' \
-  "$TMP/deploy/daemonset.yaml" >"$TMP/ds.yaml"
-mv "$TMP/ds.yaml" "$TMP/deploy/daemonset.yaml"
-check_render "volume inserted before bpffs (indices shifted)" "$TMP/deploy-overlays/client-cert"
+  "$TMP/deploy/base/daemonset.yaml" >"$TMP/ds.yaml"
+mv "$TMP/ds.yaml" "$TMP/deploy/base/daemonset.yaml"
+check_render "volume inserted before bpffs (indices shifted)" "$TMP/deploy/overlays/client-cert"
+
+# The move into deploy/base must not change what gets applied: render it and
+# the pre-move flat manifests through the same kustomize and compare.
+mkdir "$TMP/flat"
+flat_ok=1
+for f in rbac configmap daemonset; do
+  git -C "$REPO" show "8626385a322c7e0ed7abf543ae498855093d4f40:deploy/$f.yaml" >"$TMP/flat/$f.yaml" 2>/dev/null || flat_ok=0
+done
+if [ "$flat_ok" = 1 ]; then
+  printf 'resources:\n  - rbac.yaml\n  - configmap.yaml\n  - daemonset.yaml\n' >"$TMP/flat/kustomization.yaml"
+  if diff <(kubectl kustomize "$TMP/flat") <(kubectl kustomize "$REPO/deploy/base") >/dev/null; then
+    ok "deploy/base renders the same objects as the pre-move flat manifests"
+  else
+    bad "deploy/base renders differently from the pre-move flat manifests, so the move changed what users apply"
+  fi
+else
+  echo "SKIP: the pre-move commit with flat deploy/*.yaml is not in this clone; render equivalence was NOT checked" >&2
+fi
 
 exit "$fail"

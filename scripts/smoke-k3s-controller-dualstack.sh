@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Dual-stack sibling of scripts/smoke-k3s-controller.sh: proves the REAL
-# controller (Node/Service/EndpointSlice watch, deploy/daemonset.yaml -- not
+# controller (Node/Service/EndpointSlice watch, deploy/base/daemonset.yaml -- not
 # a hand-rolled --fixture) correctly fronts THREE real Service objects on a
 # genuinely dual-stack k3s cluster (scripts/k3s-up.sh --dual-stack):
 #
@@ -70,7 +70,7 @@ PORT_V4="8081"
 PORT_V6="8082"
 TARGET_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
-# deploy/daemonset.yaml hardcodes this exact secret name (not
+# deploy/base/daemonset.yaml hardcodes this exact secret name (not
 # parameterizable) -- must match, not a free choice.
 IMAGE_TMPDIR=""
 IMAGE=""

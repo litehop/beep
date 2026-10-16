@@ -2,12 +2,12 @@
 # Tier-2 controller-driven integration gate: a real type=LoadBalancer
 # Service + backend Deployment/Pod + resulting EndpointSlice on the
 # k3s-on-Lima cluster (scripts/k3s-up.sh), with the beep servicelb
-# controller (deploy/daemonset.yaml) watching Service/EndpointSlice/Node and
+# controller (deploy/base/daemonset.yaml) watching Service/EndpointSlice/Node and
 # programming the dataplane maps from LIVE watch events -- not hand-rolled
 # fixture args like scripts/smoke.sh / smoke-wg-2node.sh /
 # smoke-eth-ingress-2node.sh.
 #
-# IMAGE: deploy/daemonset.yaml hardcodes docker.io/valerauko/beep-lb:latest,
+# IMAGE: deploy/base/daemonset.yaml hardcodes docker.io/valerauko/beep-lb:latest,
 # which resolves to the newest RELEASE (.github/workflows/delivery.yaml's
 # `v*` tag push), not this checkout -- a main-branch commit only ever gets a
 # `:sha` tag (github.sha, the full 40-char commit sha), and that tag never
@@ -19,7 +19,7 @@
 #
 # STATUS: the AppArmor/bpffs-pin blocker, the BPF_PROG_LOAD
 # verifier/CAP_PERFMON blocker, and the cross-node return-path dataplane
-# bug this gate originally surfaced are all fixed (`deploy/daemonset.yaml`'s
+# bug this gate originally surfaced are all fixed (`deploy/base/daemonset.yaml`'s
 # `appArmorProfile: Unconfined` + `add: ["BPF", "NET_ADMIN", "PERFMON"]`;
 # see docs/decisions/servicelb-controller-apparmor-unconfined.md). Every
 # step -- cluster bring-up, geneve0, the
@@ -46,8 +46,8 @@
 # run that needs no Lima rig. See scripts/controller-rss.sh's header for the
 # measured baseline the shared ceilings are set against.
 #
-# AUTH: the stock deploy/daemonset.yaml is applied unmodified, so the
-# controller authenticates as its own ServiceAccount (deploy/rbac.yaml's
+# AUTH: the stock deploy/base/daemonset.yaml is applied unmodified, so the
+# controller authenticates as its own ServiceAccount (deploy/base/rbac.yaml's
 # scoped ClusterRole) via the projected token -- no kubeconfig anywhere. The
 # gate asserts the DaemonSet carries no --kubeconfig, that only the
 # controller container (never the privileged node-prep initContainer) mounts
@@ -202,7 +202,7 @@ done
 
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 IMAGE="docker.io/valerauko/beep-lb:${SHA}"
-echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
+echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
 
 node_arch="$(limactl shell "$VM_A" -- uname -m)"
 [ "$(limactl shell "$VM_B" -- uname -m)" = "$node_arch" ] || {

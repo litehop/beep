@@ -153,7 +153,7 @@ k3s_export_admin_kubeconfig() { # k3s_export_admin_kubeconfig <vm-a> <ip-a> -- w
 
 CLIENT_CERT_KUBECONFIG_SECRET="beep-controller-kubeconfig"
 
-k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> <repo-root> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then applies the deploy-overlays/client-cert kustomize overlay (what users apply, rendered with the host's kubectl and the DaemonSet's live image kept). That overlay also turns the ServiceAccount token off so it cannot mask a broken cert path. The overlay hardcodes the Secret name CLIENT_CERT_KUBECONFIG_SECRET.
+k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> <repo-root> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then applies the deploy/overlays/client-cert kustomize overlay (what users apply, rendered with the host's kubectl and the DaemonSet's live image kept). That overlay also turns the ServiceAccount token off so it cannot mask a broken cert path. The overlay hardcodes the Secret name CLIENT_CERT_KUBECONFIG_SECRET.
   local vm_a="$1" ip_a="$2" repo_root="$3"
   limactl shell "$vm_a" -- sudo bash -c "
   set -euo pipefail
@@ -193,7 +193,7 @@ CSR
   local live_image
   live_image=$(kube -n kube-system get daemonset servicelb-controller \
     -o jsonpath='{.spec.template.spec.containers[0].image}')
-  kubectl kustomize "$repo_root/deploy-overlays/client-cert" \
+  kubectl kustomize "$repo_root/deploy/overlays/client-cert" \
     | sed "s#docker.io/valerauko/beep-lb:latest#${live_image}#" \
     | kube apply -f - >/dev/null
   kube -n kube-system rollout status daemonset/servicelb-controller --timeout=120s
@@ -207,14 +207,14 @@ k3s_teardown_client_cert_auth() { # k3s_teardown_client_cert_auth -- removes wha
   kube -n kube-system delete secret "$CLIENT_CERT_KUBECONFIG_SECRET" --ignore-not-found >/dev/null 2>&1 || true
 }
 
-k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
+k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/base/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/base/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
   local repo_root="$1" image="${2:-}"
-  kube apply -f - < "$repo_root/deploy/rbac.yaml"
-  kube apply -f - < "$repo_root/deploy/configmap.yaml"
+  kube apply -f - < "$repo_root/deploy/base/rbac.yaml"
+  kube apply -f - < "$repo_root/deploy/base/configmap.yaml"
   controller_deploy_failed=0
   if [ -n "$image" ]; then
-    sed "s#docker.io/valerauko/beep-lb:latest#${image}#" "$repo_root/deploy/daemonset.yaml" | kube apply -f -
-    # If deploy/daemonset.yaml's hardcoded image line ever drifts from this
+    sed "s#docker.io/valerauko/beep-lb:latest#${image}#" "$repo_root/deploy/base/daemonset.yaml" | kube apply -f -
+    # If deploy/base/daemonset.yaml's hardcoded image line ever drifts from this
     # sed's match pattern, the sed silently no-ops and the rig deploys
     # whatever :latest resolves to -- recreating the exact stale-image
     # regression this image override exists to prevent. Read the deployed
@@ -226,17 +226,17 @@ k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root
     deployed_image=$(kube -n kube-system get daemonset servicelb-controller \
       -o jsonpath='{.spec.template.spec.containers[0].image}')
     if [ "$deployed_image" != "$image" ]; then
-      echo "FAIL: image override did not apply -- deployed image is '$deployed_image', expected '$image' (deploy/daemonset.yaml's hardcoded image line may have drifted from k3s_deploy_controller_daemonset's sed pattern)" >&2
+      echo "FAIL: image override did not apply -- deployed image is '$deployed_image', expected '$image' (deploy/base/daemonset.yaml's hardcoded image line may have drifted from k3s_deploy_controller_daemonset's sed pattern)" >&2
       controller_deploy_failed=1
     fi
   else
-    kube apply -f - < "$repo_root/deploy/daemonset.yaml"
+    kube apply -f - < "$repo_root/deploy/base/daemonset.yaml"
   fi
   if ! kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s; then
     controller_deploy_failed=1
   fi
   # Read the pod selector back from the DaemonSet itself, rather than
-  # hardcoding a copy of `deploy/daemonset.yaml`'s labels here: a hardcoded
+  # hardcoding a copy of `deploy/base/daemonset.yaml`'s labels here: a hardcoded
   # literal that drifts from the manifest matches zero pods, leaving
   # `controller_deploy_failed` unchanged instead of failing -- a silent
   # no-op, not a caught error.
@@ -260,9 +260,9 @@ k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root
 
 k3s_teardown_controller() { # k3s_teardown_controller <repo-root> -- deletes the controller DaemonSet/RBAC/ConfigMap via the caller's kube(); `-f -` (stdin), not a host path -- kube() runs kubectl on a remote VM with no access to this process's own $REPO_ROOT
   local repo_root="$1"
-  kube delete -f - --ignore-not-found < "$repo_root/deploy/daemonset.yaml" >/dev/null 2>&1 || true
-  kube delete -f - --ignore-not-found < "$repo_root/deploy/rbac.yaml" >/dev/null 2>&1 || true
-  kube delete -f - --ignore-not-found < "$repo_root/deploy/configmap.yaml" >/dev/null 2>&1 || true
+  kube delete -f - --ignore-not-found < "$repo_root/deploy/base/daemonset.yaml" >/dev/null 2>&1 || true
+  kube delete -f - --ignore-not-found < "$repo_root/deploy/base/rbac.yaml" >/dev/null 2>&1 || true
+  kube delete -f - --ignore-not-found < "$repo_root/deploy/base/configmap.yaml" >/dev/null 2>&1 || true
 }
 
 kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)

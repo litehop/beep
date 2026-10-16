@@ -2,14 +2,14 @@
 # client-cert kubeconfig stored in the Secret beep-controller-kubeconfig (key
 # "kubeconfig"). Apply with:
 #
-#   kubectl apply -k deploy-overlays/client-cert
+#   kubectl apply -k deploy/overlays/client-cert
 #
 # See deploy/README.md, "Authentication", for minting the Secret. The patch
 # deletes the `serviceaccount` volume and mount by name and mountPath, so the
 # token is gone and only the cert can authenticate, whatever the order of the
 # base's volumes and mounts.
 resources:
-  - ../../deploy
+  - ../../base
 patches:
   - path: client-cert.yaml
   # Args are an unkeyed list, so appending is the only position-independent

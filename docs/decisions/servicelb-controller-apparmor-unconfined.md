@@ -5,7 +5,7 @@
 
 ## Context
 
-`deploy/daemonset.yaml`'s controller pods crashlooped on every
+`deploy/base/daemonset.yaml`'s controller pods crashlooped on every
 AppArmor-enabled containerd node with `Error: creating pin dir
 /sys/fs/bpf/beep: Permission denied (os error 13)`, before loading a
 single eBPF program (`bd show beep-26s`). Root cause, confirmed with a

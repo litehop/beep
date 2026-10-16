@@ -115,7 +115,7 @@ struct Args {
 
     /// Namespace holding the `servicelb-flow-hash-seed` Secret: the cluster-wide
     /// key for backend selection, created by the first controller to start
-    /// and read by the rest. Must be the namespace `deploy/rbac.yaml` grants
+    /// and read by the rest. Must be the namespace `deploy/base/rbac.yaml` grants
     /// Secret access in.
     #[arg(long, default_value = "kube-system")]
     seed_namespace: String,
@@ -138,7 +138,7 @@ struct Args {
     pod_uid: Option<String>,
 
     /// Namespace for the per-node Leases; must be the namespace
-    /// `deploy/rbac.yaml` grants Lease access in.
+    /// `deploy/base/rbac.yaml` grants Lease access in.
     #[arg(long, default_value = "beep-leases")]
     lease_namespace: String,
 
