@@ -68,7 +68,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 JUNIT_DIR="${JUNIT_DIR:-$REPO_ROOT/temp/e2e-lb-k3s-junit}"
 
 PIN_DIR="/sys/fs/bpf/beep"
-KUBECONFIG_SECRET="beep-controller-kubeconfig"
 CLIENT_KUBECONFIG="/tmp/e2e-lb-k3s-kubeconfig"
 CLIENT_JUNIT="/tmp/e2e-lb-k3s-junit.xml"
 # The ETP=Local spec derives a /16 from the node InternalIP (192.168.0.0/16
@@ -89,7 +88,7 @@ cleanup() {
   # so their generated Namespaces are named loadbalancers-<random>/esipp-<random>.
   kube get ns -o name 2>/dev/null | grep -E '^namespace/(loadbalancers|esipp)-' | sed 's#^namespace/##' \
     | while read -r ns; do kube delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true; done || true
-  k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
+  k3s_teardown_controller "$REPO_ROOT"
   limactl shell "$VM_CLIENT" -- rm -f "$CLIENT_KUBECONFIG" "$CLIENT_JUNIT" >/dev/null 2>&1 || true
   limactl shell "$VM_CLIENT" -- sudo bash -c "ip route del ${IP_A:-}/32 dev eth0; ip route del ${IP_B:-}/32 dev eth0; ip addr del $CLIENT_ALT_IP/32 dev eth0" >/dev/null 2>&1 || true
   for vm in "$VM_A" "$VM_B"; do
@@ -135,11 +134,11 @@ for vm in "$VM_A" "$VM_B"; do
   limactl shell "$vm" -- sudo ip route replace "$CLIENT_ALT_IP/32" dev eth0
 done
 
-echo "==> [3/7] provisioning kubeconfigs (controller Secret on $VM_A, e2e client copy on $VM_CLIENT)"
-k3s_provision_kubeconfig_secret "$VM_A" "$IP_A" "$KUBECONFIG_SECRET" 0
-limactl shell "$VM_A" -- sudo cat /tmp/beep-controller-kubeconfig \
+echo "==> [3/7] provisioning the e2e client's kubeconfig copy on $VM_CLIENT"
+k3s_export_admin_kubeconfig "$VM_A" "$IP_A"
+limactl shell "$VM_A" -- sudo cat /tmp/beep-admin-kubeconfig \
   | limactl shell "$VM_CLIENT" -- tee "$CLIENT_KUBECONFIG" >/dev/null
-limactl shell "$VM_A" -- sudo rm -f /tmp/beep-controller-kubeconfig
+limactl shell "$VM_A" -- sudo rm -f /tmp/beep-admin-kubeconfig
 
 echo "==> [4/7] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
 if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then

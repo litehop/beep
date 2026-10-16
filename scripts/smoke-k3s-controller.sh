@@ -22,7 +22,7 @@
 # bug this gate originally surfaced are all fixed (`deploy/daemonset.yaml`'s
 # `appArmorProfile: Unconfined` + `add: ["BPF", "NET_ADMIN", "PERFMON"]`;
 # see docs/decisions/servicelb-controller-apparmor-unconfined.md). Every
-# step -- cluster bring-up, geneve0, the kubeconfig Secret, the
+# step -- cluster bring-up, geneve0, the
 # DaemonSet/RBAC apply, the controller loading and pinning its eBPF
 # programs, map programming, the cross-node round trip, and FLOW_TABLE
 # promotion -- is a genuine, asserted PASS.
@@ -46,18 +46,18 @@
 # run that needs no Lima rig. See scripts/controller-rss.sh's header for the
 # measured baseline the shared ceilings are set against.
 #
-# KUBECONFIG: politeia (controller/src/main.rs's --kubeconfig) only
-# parses an X.509 client-cert kubeconfig -- no in-cluster ServiceAccount
-# token support yet. This gate extracts k3s's own admin kubeconfig
-# (/etc/rancher/k3s/k3s.yaml) from node-a, rewrites its `server:` from
-# 127.0.0.1 to node-a's real address (node-b has no local apiserver to
-# reach at 127.0.0.1), and ships it to both controller pods as a Secret.
-# That grants the controller cluster-admin rather than deploy/rbac.yaml's
-# scoped ClusterRole -- acceptable for this gate (RBAC's own intent is
-# still verified by inspection, not exercised end-to-end); tracked as a
-# known gap, not a bug this bead fixes.
+# AUTH: the stock deploy/daemonset.yaml is applied unmodified, so the
+# controller authenticates as its own ServiceAccount (deploy/rbac.yaml's
+# scoped ClusterRole) via the projected token -- no kubeconfig anywhere. The
+# gate asserts the DaemonSet carries no --kubeconfig and that every node's
+# Lease keeps renewing; Service status, map programming and the round trip
+# below prove the watches and patches work under that scoped RBAC.
+# --client-cert-auth instead exercises deploy/README.md's documented
+# client-cert opt-in (k3s_provision_client_cert_auth), with the
+# ServiceAccount token unmounted so only the cert can authenticate, and stops
+# after the first round trip and conntrack steps.
 #
-# Usage: scripts/smoke-k3s-controller.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>] [--proxy-mode <iptables|ipvs>]
+# Usage: scripts/smoke-k3s-controller.sh [--vm-a <ingress-vm>] [--vm-b <backend-vm>] [--vm-client <client-vm>] [--proxy-mode <iptables|ipvs>] [--client-cert-auth]
 # Defaults: beep-node-a (ingress, k3s server), beep-node-b (backend Pod,
 # k3s agent), beep-client (client). All three must be on the same Lima
 # network (scripts/k3s-up.sh's beep-k3s.yaml profile for the first two).
@@ -75,6 +75,7 @@ VM_CLIENT="beep-client"
 PROXY_MODE="iptables"
 KEEP_GOING=0
 LEG_FAILURES=0
+CLIENT_CERT_AUTH=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm-a) VM_A="$2"; shift 2 ;;
@@ -82,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --vm-client) VM_CLIENT="$2"; shift 2 ;;
     --proxy-mode) PROXY_MODE="$2"; shift 2 ;;
     --keep-going) KEEP_GOING=1; shift ;;
+    --client-cert-auth) CLIENT_CERT_AUTH=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -98,7 +100,6 @@ SERVICE_NAME="whoami"
 DEPLOY_NAME="whoami"
 FRONT_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
-KUBECONFIG_SECRET="beep-controller-kubeconfig"
 IMAGE_TMPDIR=""
 IMAGE=""
 
@@ -129,7 +130,8 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s >/dev/null 2>&1 || \
     echo "WARN: namespace $NAMESPACE was not deleted within 120s; it may still be terminating and can leak into the next run" >&2
-  k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
+  k3s_teardown_controller "$REPO_ROOT"
+  k3s_teardown_client_cert_auth
   kube -n beep-leases delete lease -l app.kubernetes.io/component=node-lease --ignore-not-found >/dev/null 2>&1 || true
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   # The tarball above is trap-cleaned, but the locally built+tagged image
@@ -197,9 +199,6 @@ for vm in "$VM_A" "$VM_B"; do
   '
 done
 
-echo "==> [3/11] provisioning the controller's kubeconfig Secret from $VM_A's own admin kubeconfig (see this script's header)"
-k3s_provision_kubeconfig_secret "$VM_A" "$IP_A" "$KUBECONFIG_SECRET" 1
-
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 IMAGE="docker.io/valerauko/beep-lb:${SHA}"
 echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
@@ -244,6 +243,42 @@ if ! k3s_deploy_controller_daemonset "$REPO_ROOT" "$IMAGE"; then
   exit 1
 fi
 echo "CONTROLLER-DEPLOY: PASS (servicelb-controller Running on both nodes, zero restarts after a 10s settle)"
+
+lease_renewals() { # lease_renewals -- "<lease> <renewTime>" per node Lease
+  kube -n beep-leases get lease -l app.kubernetes.io/component=node-lease \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.spec.renewTime}{"\n"}{end}'
+}
+
+if [ "$CLIENT_CERT_AUTH" = 1 ]; then
+  echo "==> [4a/11] switching the controller to the documented client-cert kubeconfig (deploy/README.md Authentication)"
+  k3s_provision_client_cert_auth "$VM_A" "$IP_A" || {
+    echo "CLIENT-CERT-AUTH: FAIL (provisioning or rollout failed)" >&2
+    dump_evidence
+    exit 1
+  }
+  sleep 10
+  AUTH_ARGS="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.containers[0].args}')"
+  AUTH_AUTOMOUNT="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.automountServiceAccountToken}')"
+  AUTH_LABEL="client-cert kubeconfig, ServiceAccount token unmounted"
+  case "$AUTH_ARGS" in *--kubeconfig=*) ;; *) echo "CLIENT-CERT-AUTH: FAIL (pods carry no --kubeconfig arg: $AUTH_ARGS)" >&2; dump_evidence; exit 1 ;; esac
+  case "$AUTH_AUTOMOUNT" in *true*) echo "CLIENT-CERT-AUTH: FAIL (ServiceAccount token still mounted: $AUTH_AUTOMOUNT)" >&2; dump_evidence; exit 1 ;; esac
+else
+  AUTH_ARGS="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.containers[0].args}')"
+  AUTH_LABEL="in-cluster ServiceAccount, no kubeconfig"
+  case "$AUTH_ARGS" in *--kubeconfig*) echo "AUTH: FAIL (the stock DaemonSet must not pass --kubeconfig: $AUTH_ARGS)" >&2; dump_evidence; exit 1 ;; esac
+fi
+LEASES_BEFORE="$(lease_renewals)"
+sleep 25
+LEASES_AFTER="$(lease_renewals)"
+if [ "$(wc -l <<<"$LEASES_AFTER" | tr -d ' ')" -lt 2 ] || \
+   awk 'NR==FNR{b[$1]=$2;next} b[$1]==$2{bad=1} END{exit !bad}' <(printf '%s\n' "$LEASES_BEFORE") <(printf '%s\n' "$LEASES_AFTER"); then
+  echo "AUTH: FAIL (a node Lease did not renew in 25s, so the controller is not talking to the API under $AUTH_LABEL)" >&2
+  echo "before: $LEASES_BEFORE" >&2
+  echo "after: $LEASES_AFTER" >&2
+  dump_evidence
+  exit 1
+fi
+echo "AUTH: PASS ($AUTH_LABEL; $(wc -l <<<"$LEASES_AFTER" | tr -d ' ') node Leases renewed within 25s)"
 
 echo "==> [5/11] sampling beep-controller RSS baseline (post-deploy, before any Service/EndpointSlice reconcile load)"
 rss_a_baseline=$(controller_rss limactl shell "$VM_A" --)
@@ -376,6 +411,12 @@ wait "$HOLD_PID" || true
   exit 1
 }
 echo "CONNTRACK: PASS ($VM_A FLOW_TABLE=$flow_a entries)"
+
+if [ "$CLIENT_CERT_AUTH" = 1 ]; then
+  echo ""
+  echo "GATE CLIENT-CERT AUTH: PASS"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Multi-endpoint legs. Every Service gets its own front port (a front is keyed

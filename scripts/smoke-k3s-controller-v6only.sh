@@ -58,7 +58,6 @@ PORT_V6="8082"
 TARGET_PORT="80"
 BACKEND_IMAGE="docker.io/traefik/whoami:latest"
 PIN_DIR="/sys/fs/bpf/beep"
-KUBECONFIG_SECRET="beep-controller-kubeconfig"
 V4_GENEVE_BLOCK_TAG="beep-v6only-no-v4-geneve"
 CAPTURE_UNIT="beep-v6only-capture"
 CAPTURE_FILE="/tmp/beep-v6only-capture.pcap"
@@ -106,7 +105,7 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
+  k3s_teardown_controller "$REPO_ROOT"
   [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
   [ -n "$IMAGE" ] && docker rmi "$IMAGE" >/dev/null 2>&1 || true
   for vm in "$VM_A" "$VM_B"; do
@@ -167,9 +166,6 @@ for vm in "$VM_A" "$VM_B"; do
     sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   '
 done
-
-echo "==> [3/12] provisioning the controller's kubeconfig Secret (apiserver over v6: [$ULA_A]:6443)"
-k3s_provision_kubeconfig_secret "$VM_A" "[$ULA_A]" "$KUBECONFIG_SECRET" 1
 
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 IMAGE="docker.io/valerauko/beep-lb:${SHA}-v6only"

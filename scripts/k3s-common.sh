@@ -131,16 +131,68 @@ k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 
   fi
 }
 
-k3s_provision_kubeconfig_secret() { # k3s_provision_kubeconfig_secret <vm-a> <ip-a> <secret-name> <rm-after: 0|1> -- extracts vm-a's own admin kubeconfig, rewrites its 127.0.0.1 server to vm-a's real address, and applies it as a Secret; rm-after=0 leaves /tmp/beep-controller-kubeconfig on vm-a for the caller to copy elsewhere (e.g. to a client VM) before removing it itself
-  local vm_a="$1" ip_a="$2" secret_name="$3" rm_after="$4" rm_cmd=""
-  [ "$rm_after" = "1" ] && rm_cmd='
-  rm -f /tmp/beep-controller-kubeconfig'
+k3s_export_admin_kubeconfig() { # k3s_export_admin_kubeconfig <vm-a> <ip-a> -- writes vm-a's own admin kubeconfig, its 127.0.0.1 server rewritten to vm-a's real address, to /tmp/beep-admin-kubeconfig on vm-a for the caller to copy to a client VM and then remove. Test clients only: the controller authenticates as its own ServiceAccount.
+  local vm_a="$1" ip_a="$2"
   limactl shell "$vm_a" -- sudo bash -c "
-  sed 's#server: https://\(127.0.0.1\|\[::1\]\):6443#server: https://${ip_a}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-controller-kubeconfig
-  grep -qF 'server: https://${ip_a}:6443' /tmp/beep-controller-kubeconfig || { echo 'FAIL: kubeconfig server was not rewritten to ${ip_a}' >&2; exit 1; }
-  k3s kubectl create secret generic $secret_name -n kube-system \
-    --from-file=kubeconfig=/tmp/beep-controller-kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -$rm_cmd
+  sed 's#server: https://\(127.0.0.1\|\[::1\]\):6443#server: https://${ip_a}:6443#' /etc/rancher/k3s/k3s.yaml > /tmp/beep-admin-kubeconfig
+  grep -qF 'server: https://${ip_a}:6443' /tmp/beep-admin-kubeconfig || { echo 'FAIL: kubeconfig server was not rewritten to ${ip_a}' >&2; exit 1; }
 "
+}
+
+CLIENT_CERT_KUBECONFIG_SECRET="beep-controller-kubeconfig"
+
+k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then the documented DaemonSet patch (arg, Secret volume, mount). automountServiceAccountToken is also turned off so the ServiceAccount path cannot mask a broken cert path.
+  local vm_a="$1" ip_a="$2"
+  limactl shell "$vm_a" -- sudo bash -c "
+  set -euo pipefail
+  d=\$(mktemp -d)
+  trap 'rm -rf \$d' EXIT
+  cd \$d
+  openssl req -new -newkey rsa:2048 -nodes -keyout beep-controller.key -out beep-controller.csr -subj '/CN=beep-controller' 2>/dev/null
+  k3s kubectl delete csr beep-controller --ignore-not-found >/dev/null
+  k3s kubectl apply -f - <<CSR
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: beep-controller
+spec:
+  request: \$(base64 < beep-controller.csr | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  usages: [\"client auth\"]
+CSR
+  k3s kubectl certificate approve beep-controller
+  crt=''
+  for _ in \$(seq 1 30); do
+    crt=\$(k3s kubectl get csr beep-controller -o jsonpath='{.status.certificate}')
+    [ -n \"\$crt\" ] && break
+    sleep 1
+  done
+  [ -n \"\$crt\" ] || { echo 'FAIL: CSR beep-controller was never issued' >&2; exit 1; }
+  base64 -d <<<\"\$crt\" > beep-controller.crt
+  k3s kubectl create clusterrolebinding beep-controller-csr --clusterrole=servicelb-controller --user=beep-controller
+  k3s kubectl create rolebinding beep-controller-csr-flow-hash-seed -n kube-system --role=servicelb-controller-flow-hash-seed --user=beep-controller
+  k3s kubectl create rolebinding beep-controller-csr-node-lease -n beep-leases --role=servicelb-controller-node-lease --user=beep-controller
+  k3s kubectl config set-cluster beep --server=https://${ip_a}:6443 --certificate-authority=/var/lib/rancher/k3s/server/tls/server-ca.crt --embed-certs --kubeconfig=beep-controller.kubeconfig >/dev/null
+  k3s kubectl config set-credentials beep-controller --client-certificate=beep-controller.crt --client-key=beep-controller.key --embed-certs --kubeconfig=beep-controller.kubeconfig >/dev/null
+  k3s kubectl config set-context beep-controller --cluster=beep --user=beep-controller --kubeconfig=beep-controller.kubeconfig >/dev/null
+  k3s kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig >/dev/null
+  k3s kubectl create secret generic $CLIENT_CERT_KUBECONFIG_SECRET -n kube-system --from-file=kubeconfig=beep-controller.kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -
+"
+  kube -n kube-system patch daemonset servicelb-controller --type=json -p '[
+    {"op":"replace","path":"/spec/template/spec/automountServiceAccountToken","value":false},
+    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubeconfig=/etc/beep-controller/kubeconfig"},
+    {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"kubeconfig","mountPath":"/etc/beep-controller","readOnly":true}},
+    {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"kubeconfig","secret":{"secretName":"'"$CLIENT_CERT_KUBECONFIG_SECRET"'"}}}
+  ]' >/dev/null
+  kube -n kube-system rollout status daemonset/servicelb-controller --timeout=120s
+}
+
+k3s_teardown_client_cert_auth() { # k3s_teardown_client_cert_auth -- removes what k3s_provision_client_cert_auth created, via the caller's kube()
+  kube delete csr beep-controller --ignore-not-found >/dev/null 2>&1 || true
+  kube delete clusterrolebinding beep-controller-csr --ignore-not-found >/dev/null 2>&1 || true
+  kube -n kube-system delete rolebinding beep-controller-csr-flow-hash-seed --ignore-not-found >/dev/null 2>&1 || true
+  kube -n beep-leases delete rolebinding beep-controller-csr-node-lease --ignore-not-found >/dev/null 2>&1 || true
+  kube -n kube-system delete secret "$CLIENT_CERT_KUBECONFIG_SECRET" --ignore-not-found >/dev/null 2>&1 || true
 }
 
 k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
@@ -194,12 +246,11 @@ k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root
   return "$controller_deploy_failed"
 }
 
-k3s_teardown_controller() { # k3s_teardown_controller <repo-root> <secret-name> -- deletes the controller DaemonSet/RBAC/kubeconfig Secret via the caller's kube(); `-f -` (stdin), not a host path -- kube() runs kubectl on a remote VM with no access to this process's own $REPO_ROOT
-  local repo_root="$1" secret_name="$2"
+k3s_teardown_controller() { # k3s_teardown_controller <repo-root> -- deletes the controller DaemonSet/RBAC/ConfigMap via the caller's kube(); `-f -` (stdin), not a host path -- kube() runs kubectl on a remote VM with no access to this process's own $REPO_ROOT
+  local repo_root="$1"
   kube delete -f - --ignore-not-found < "$repo_root/deploy/daemonset.yaml" >/dev/null 2>&1 || true
   kube delete -f - --ignore-not-found < "$repo_root/deploy/rbac.yaml" >/dev/null 2>&1 || true
   kube delete -f - --ignore-not-found < "$repo_root/deploy/configmap.yaml" >/dev/null 2>&1 || true
-  kube delete secret "$secret_name" -n kube-system --ignore-not-found >/dev/null 2>&1 || true
 }
 
 kill_tree() { # kill_tree <pid> -- SIGKILL a process and all its descendants (killing only the subshell would orphan the wedged limactl/ssh child)

@@ -49,7 +49,6 @@ NAMESPACE="beep-bidirectional-e2e"
 PORT_SVC_A="80"   # svc-on-node-a, dialed via node-b
 PORT_SVC_B="8081" # svc-on-node-b, dialed via node-a
 PIN_DIR="/sys/fs/bpf/beep"
-KUBECONFIG_SECRET="beep-controller-kubeconfig"
 RPFILTER_SAVE="/tmp/beep-k3s-bidirectional-rpfilter-all.saved"
 
 for tool in limactl jq; do
@@ -60,7 +59,7 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  k3s_teardown_controller "$REPO_ROOT" "$KUBECONFIG_SECRET"
+  k3s_teardown_controller "$REPO_ROOT"
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
@@ -114,9 +113,6 @@ for vm in "$VM_A" "$VM_B"; do
     sysctl -w net.ipv4.conf.geneve0.rp_filter=0 >/dev/null
   "
 done
-
-echo "==> [3/8] provisioning the controller's kubeconfig Secret from $VM_A's own admin kubeconfig"
-k3s_provision_kubeconfig_secret "$VM_A" "$IP_A" "$KUBECONFIG_SECRET" 1
 
 echo "==> [4/8] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
 if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
