@@ -335,10 +335,13 @@ reverse-path filter is disabled on `all` and `geneve0`
 (`net.ipv4.conf.{all,geneve0}.rp_filter=0`). The `rp_filter` write runs in
 the privileged `node-prep` initContainer, not the main container — see
 `docs/decisions/servicelb-rp-filter-init-container.md` for why. That
-initContainer also writes `/etc/sysctl.d/60-beep-geneve0.conf` (via a
-`hostPath` mount of the host's `/etc/sysctl.d`), because on systemd hosts
-udev re-applies the distro default `rp_filter=2` to each new device after
-creation and would otherwise override the `/proc` write.
+initContainer also writes `/etc/sysctl.d/60-beep.conf` (via a single-file
+`hostPath` mount of that one file, type `FileOrCreate`; the rest of
+`/etc/sysctl.d` is not exposed), because on systemd hosts udev re-applies the
+distro default `rp_filter=2` to each new device after creation and would
+otherwise override the `/proc` write. The file name is fixed; its content
+follows `--geneve-iface`. The file persists on the host after uninstall;
+remove it manually if beep is decommissioned.
 
 This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the

@@ -51,12 +51,14 @@ spec:
             privileged: true
           args:
             - --node-prep
-          # Persists geneve0's rp_filter=0 as /etc/sysctl.d/60-beep-geneve0.conf:
-          # systemd re-applies sysctl.d to each new netdev after creation and
-          # would otherwise reset it to 2.
+          # Persists the Geneve device's rp_filter=0 in the single host file
+          # /etc/sysctl.d/60-beep.conf: systemd re-applies sysctl.d to each
+          # new netdev after creation and would otherwise reset it to 2. The
+          # file is bind-mounted, so beep rewrites it in place (no rename).
+          # The name is fixed; its content follows --geneve-iface.
           volumeMounts:
             - name: host-sysctl-d
-              mountPath: /etc/sysctl.d
+              mountPath: /etc/sysctl.d/60-beep.conf
       containers:
         - name: servicelb-controller
           image: docker.io/valerauko/beep-lb:latest
@@ -159,8 +161,8 @@ spec:
         # Mounted by the node-prep initContainer only.
         - name: host-sysctl-d
           hostPath:
-            path: /etc/sysctl.d
-            type: DirectoryOrCreate
+            path: /etc/sysctl.d/60-beep.conf
+            type: FileOrCreate
         # bpffs must already be mounted at this path on the host (it is on
         # any kernel new enough to run this dataplane); pins under it survive
         # container restarts so a rollout doesn't drop established flows.

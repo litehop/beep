@@ -1102,16 +1102,17 @@ pub fn ensure_geneve_iface(iface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-const SYSCTL_D_DIR: &str = "/etc/sysctl.d";
+/// Fixed drop-in path, independent of the iface name: the DaemonSet bind-mounts
+/// exactly this one file from the host, so the name cannot vary with
+/// `--geneve-iface`.
+const RP_FILTER_DROPIN: &str = "/etc/sysctl.d/60-beep.conf";
 
-/// File name and content of the sysctl.d drop-in pinning `iface`'s
-/// `rp_filter` to 0. The `60-` prefix sorts after systemd's `50-default.conf`
-/// so this wins when `systemd-sysctl` applies both to a new netdev.
-fn rp_filter_dropin(iface: &str) -> (String, String) {
-    (
-        format!("60-beep-{iface}.conf"),
-        format!("net.ipv4.conf.{iface}.rp_filter = 0\n"),
-    )
+/// Content of the sysctl.d drop-in pinning `iface`'s `rp_filter` to 0. The
+/// `60-` prefix of [`RP_FILTER_DROPIN`] sorts after systemd's
+/// `50-default.conf` so this wins when `systemd-sysctl` applies both to a new
+/// netdev.
+fn rp_filter_dropin_body(iface: &str) -> String {
+    format!("net.ipv4.conf.{iface}.rp_filter = 0\n")
 }
 
 /// Disables the kernel reverse-path filter on `all` and on `iface` (the
@@ -1130,17 +1131,17 @@ fn rp_filter_dropin(iface: &str) -> (String, String) {
 /// alternative that preserves symmetric RPF at a real datapath cost.
 ///
 /// Also persists `iface`'s `rp_filter=0` as a sysctl.d drop-in under
-/// `/etc/sysctl.d` (the node-prep container must mount the host's). On
+/// [`RP_FILTER_DROPIN`] (the node-prep container bind-mounts that one host
+/// file, so it is rewritten in place -- truncate + write, never
+/// write-temp-then-rename, which fails with EBUSY on a bind mount). On
 /// systemd hosts udev re-runs `systemd-sysctl` for every netdev `add` event
 /// and re-applies `/usr/lib/sysctl.d/50-default.conf`'s
 /// `net.ipv4.conf.*.rp_filter = 2` AFTER the `/proc` write below, so the
 /// write alone loses the race and decapped packets are dropped. `all` is
 /// not per-netdev: it is applied once at boot, so it needs no drop-in.
 pub fn disable_rp_filter(iface: &str) -> anyhow::Result<()> {
-    let (name, body) = rp_filter_dropin(iface);
-    let dropin = std::path::Path::new(SYSCTL_D_DIR).join(name);
-    std::fs::create_dir_all(SYSCTL_D_DIR).with_context(|| format!("creating {SYSCTL_D_DIR}"))?;
-    std::fs::write(&dropin, body).with_context(|| format!("writing {}", dropin.display()))?;
+    std::fs::write(RP_FILTER_DROPIN, rp_filter_dropin_body(iface))
+        .with_context(|| format!("writing {RP_FILTER_DROPIN}"))?;
     for dev in ["all", iface] {
         let path = format!("/proc/sys/net/ipv4/conf/{dev}/rp_filter");
         std::fs::write(&path, b"0").with_context(|| format!("writing 0 to {path}"))?;
@@ -1408,9 +1409,10 @@ mod tests {
 
     #[test]
     fn rp_filter_dropin_sorts_after_systemd_default_and_zeroes_iface() {
-        let (name, body) = rp_filter_dropin("geneve0");
+        let body = rp_filter_dropin_body("geneve0");
+        let name = RP_FILTER_DROPIN.rsplit('/').next().unwrap();
         assert!(
-            name.as_str() > "50-default.conf",
+            name > "50-default.conf",
             "systemd-sysctl applies drop-ins in lexical order; sorting before 50-default.conf lets its rp_filter=2 win and black-holes decapped packets"
         );
         assert!(
