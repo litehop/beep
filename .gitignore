@@ -24,4 +24,4 @@ temp/*
 .beads.gate.lock
 
 # PR body files for gh pr create --body-file; never commit.
-.pr-body-*.md
+.tmp-*
