@@ -394,10 +394,13 @@ By default the controller authenticates as its own ServiceAccount
 (`servicelb-controller`, bound by `deploy/rbac.yaml`) using the projected
 token at `/var/run/secrets/kubernetes.io/serviceaccount/token` and the
 cluster CA beside it, reaching the API server at
-`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`. The token is re-read
+`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`. The DaemonSet sets
+`automountServiceAccountToken: false` and declares that projected volume
+itself, mounted into the controller container only: the privileged
+`node-prep` initContainer never receives a token. The token is re-read
 from disk every 60 s, so kubelet rotation needs no restart. TLS
 verification against that CA is always on. If the token, CA or those env vars
-are missing (e.g. `automountServiceAccountToken: false`) and no
+are missing (e.g. the volume was removed) and no
 `--kubeconfig` is given, the controller exits naming what is missing.
 
 `--kubeconfig` is the alternative, and always wins when given: an X.509

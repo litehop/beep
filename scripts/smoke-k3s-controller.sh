@@ -49,8 +49,9 @@
 # AUTH: the stock deploy/daemonset.yaml is applied unmodified, so the
 # controller authenticates as its own ServiceAccount (deploy/rbac.yaml's
 # scoped ClusterRole) via the projected token -- no kubeconfig anywhere. The
-# gate asserts the DaemonSet carries no --kubeconfig and that every node's
-# Lease keeps renewing; Service status, map programming and the round trip
+# gate asserts the DaemonSet carries no --kubeconfig, that only the
+# controller container (never the privileged node-prep initContainer) mounts
+# the token, and that every node's Lease keeps renewing; Service status, map programming and the round trip
 # below prove the watches and patches work under that scoped RBAC.
 # --client-cert-auth instead exercises deploy/README.md's documented
 # client-cert opt-in (k3s_provision_client_cert_auth), with the
@@ -258,15 +259,25 @@ if [ "$CLIENT_CERT_AUTH" = 1 ]; then
   }
   sleep 10
   AUTH_ARGS="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.containers[0].args}')"
-  AUTH_AUTOMOUNT="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.automountServiceAccountToken}')"
   AUTH_LABEL="client-cert kubeconfig, ServiceAccount token unmounted"
+  SCOPE_MODE=client-cert
   case "$AUTH_ARGS" in *--kubeconfig=*) ;; *) echo "CLIENT-CERT-AUTH: FAIL (pods carry no --kubeconfig arg: $AUTH_ARGS)" >&2; dump_evidence; exit 1 ;; esac
-  case "$AUTH_AUTOMOUNT" in *true*) echo "CLIENT-CERT-AUTH: FAIL (ServiceAccount token still mounted: $AUTH_AUTOMOUNT)" >&2; dump_evidence; exit 1 ;; esac
 else
   AUTH_ARGS="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.containers[0].args}')"
   AUTH_LABEL="in-cluster ServiceAccount, no kubeconfig"
+  SCOPE_MODE=default
   case "$AUTH_ARGS" in *--kubeconfig*) echo "AUTH: FAIL (the stock DaemonSet must not pass --kubeconfig: $AUTH_ARGS)" >&2; dump_evidence; exit 1 ;; esac
 fi
+CONTROLLER_PODS_JSON="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o json)"
+for i in $(seq 0 $(( $(jq '.items | length' <<<"$CONTROLLER_PODS_JSON") - 1 ))); do
+  SCOPE="$(k3s_sa_token_scope "$SCOPE_MODE" "$(jq ".items[$i]" <<<"$CONTROLLER_PODS_JSON")")"
+  [ "$SCOPE" = scoped ] || {
+    echo "AUTH: FAIL (ServiceAccount token reaches the wrong containers in $(jq -r ".items[$i].metadata.name" <<<"$CONTROLLER_PODS_JSON") under $SCOPE_MODE: $SCOPE; the privileged node-prep initContainer must never hold it)" >&2
+    dump_evidence
+    exit 1
+  }
+done
+[ "$(jq '.items | length' <<<"$CONTROLLER_PODS_JSON")" -ge 2 ] || { echo "AUTH: FAIL (expected a controller pod on both nodes)" >&2; dump_evidence; exit 1; }
 LEASES_BEFORE="$(lease_renewals)"
 sleep 25
 LEASES_AFTER="$(lease_renewals)"
@@ -278,7 +289,7 @@ if [ "$(wc -l <<<"$LEASES_AFTER" | tr -d ' ')" -lt 2 ] || \
   dump_evidence
   exit 1
 fi
-echo "AUTH: PASS ($AUTH_LABEL; $(wc -l <<<"$LEASES_AFTER" | tr -d ' ') node Leases renewed within 25s)"
+echo "AUTH: PASS ($AUTH_LABEL; token scope ok; $(wc -l <<<"$LEASES_AFTER" | tr -d ' ') node Leases renewed within 25s)"
 
 echo "==> [5/11] sampling beep-controller RSS baseline (post-deploy, before any Service/EndpointSlice reconcile load)"
 rss_a_baseline=$(controller_rss limactl shell "$VM_A" --)

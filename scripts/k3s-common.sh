@@ -131,6 +131,18 @@ k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 
   fi
 }
 
+k3s_sa_token_scope() { # k3s_sa_token_scope <default|client-cert> <pod-json> -- prints "scoped" when the ServiceAccount token reaches exactly the right containers, else "init=<names> containers=<names>" naming who holds it. A holder is any container mounting a volume with a serviceAccountToken source, so the kubelet's auto-injected kube-api-access volume counts. default: only servicelb-controller (never the privileged node-prep initContainer); client-cert: nobody.
+  local mode="$1" pod_json="$2"
+  jq -r --arg mode "$mode" '
+    [.spec.volumes[]? | select(any(.projected.sources[]?; has("serviceAccountToken"))) | .name] as $tv
+    | def holders(cs): [cs[]? | select(any(.volumeMounts[]?; .name as $n | ($tv | index($n)) != null)) | .name] | join(",");
+    holders(.spec.initContainers) as $init
+    | holders(.spec.containers) as $ctr
+    | (if $mode == "client-cert" then "" else "servicelb-controller" end) as $want
+    | if $init == "" and $ctr == $want then "scoped" else "init=\($init) containers=\($ctr)" end
+  ' <<<"$pod_json"
+}
+
 k3s_export_admin_kubeconfig() { # k3s_export_admin_kubeconfig <vm-a> <ip-a> -- writes vm-a's own admin kubeconfig, its 127.0.0.1 server rewritten to vm-a's real address, to /tmp/beep-admin-kubeconfig on vm-a for the caller to copy to a client VM and then remove. Test clients only: the controller authenticates as its own ServiceAccount.
   local vm_a="$1" ip_a="$2"
   limactl shell "$vm_a" -- sudo bash -c "

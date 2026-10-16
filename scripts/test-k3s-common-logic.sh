@@ -154,6 +154,29 @@ expect_eq "dual-stack + v6-only together is rejected instead of v6-only silently
 case "$msg" in *"mutually exclusive"*) said=yes ;; *) said=no ;; esac
 expect_eq "the rejection says why" yes "$said"
 
+SA_VOL='{"name":"serviceaccount","projected":{"sources":[{"serviceAccountToken":{"path":"token"}},{"configMap":{"name":"kube-root-ca.crt"}}]}}'
+AUTO_VOL='{"name":"kube-api-access-x7k2q","projected":{"sources":[{"serviceAccountToken":{"path":"token"}}]}}'
+HOST_VOL='{"name":"bpffs","hostPath":{"path":"/sys/fs/bpf"}}'
+pod() { # pod <volumes-json> <node-prep mounts> <controller mounts>
+  echo "{\"spec\":{\"volumes\":$1,\"initContainers\":[{\"name\":\"node-prep\",\"volumeMounts\":$2}],\"containers\":[{\"name\":\"servicelb-controller\",\"volumeMounts\":$3}]}}"
+}
+M_SA='{"name":"serviceaccount","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount"}'
+M_AUTO='{"name":"kube-api-access-x7k2q","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount"}'
+M_HOST='{"name":"bpffs","mountPath":"/sys/fs/bpf"}'
+expect_eq "stock pod: token only in the controller container is scoped" scoped \
+  "$(k3s_sa_token_scope default "$(pod "[$HOST_VOL,$SA_VOL]" "[$M_HOST]" "[$M_HOST,$M_SA]")")"
+expect_eq "kubelet automount hands the privileged node-prep the token, which the scoping exists to prevent" \
+  "init=node-prep containers=servicelb-controller" \
+  "$(k3s_sa_token_scope default "$(pod "[$HOST_VOL,$AUTO_VOL]" "[$M_AUTO]" "[$M_AUTO]")")"
+expect_eq "a controller with no token mount would crash at startup, so default mode rejects it" \
+  "init= containers=" \
+  "$(k3s_sa_token_scope default "$(pod "[$HOST_VOL,$SA_VOL]" "[$M_HOST]" "[$M_HOST]")")"
+expect_eq "client-cert mode with no token anywhere is scoped, so only the cert can authenticate" scoped \
+  "$(k3s_sa_token_scope client-cert "$(pod "[$HOST_VOL]" "[$M_HOST]" "[$M_HOST]")")"
+expect_eq "client-cert mode with the token still mounted could mask a broken cert path" \
+  "init= containers=servicelb-controller" \
+  "$(k3s_sa_token_scope client-cert "$(pod "[$HOST_VOL,$SA_VOL]" "[$M_HOST]" "[$M_HOST,$M_SA]")")"
+
 echo "---"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

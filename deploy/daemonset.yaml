@@ -17,7 +17,11 @@ spec:
       serviceAccountName: servicelb-controller
       # The controller authenticates with this ServiceAccount's projected
       # token (rotated by the kubelet) and the cluster CA; no --kubeconfig.
-      automountServiceAccountToken: true
+      # Pod-level automount is off so the privileged node-prep initContainer,
+      # which never calls the API, gets no token; the `serviceaccount` volume
+      # below is mounted into the controller container only, at the standard
+      # path the controller reads.
+      automountServiceAccountToken: false
       hostNetwork: true
       # hostNetwork pods need this to resolve in-cluster DNS names correctly;
       # the default dnsPolicy breaks under hostNetwork.
@@ -156,6 +160,9 @@ spec:
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
+            - name: serviceaccount
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
       volumes:
         # Mounted by the node-prep initContainer only.
         - name: host-sysctl-d
@@ -169,3 +176,24 @@ spec:
           hostPath:
             path: /sys/fs/bpf
             type: Directory
+        # What the kubelet would auto-mount (token, cluster CA, namespace),
+        # declared by hand so it can be mounted into one container.
+        # deploy/patches/client-cert-kubeconfig.yaml removes this volume and
+        # its mount by index: keep it the last volume and mount.
+        - name: serviceaccount
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
