@@ -80,11 +80,11 @@ regression test — it is documentation. Extract untestable async handler logic
 into a pure function and test that. A fix without a failing-on-revert test is
 not complete.
 
-### Rule 15 — Prefer Merge Commits for PRs
-Use `gh pr merge --merge` by default. Use `--squash` only for branches with
-many noisy fixup commits — and say why in the merge message. Never `--rebase`
-(rewrites SHAs, breaks history). Resolve merge conflicts by merging `main`
-into the branch; do not force-push.
+### Rule 15 — Merge Through the Merge Queue
+Merge with a bare `gh pr merge <N>`; the queue (ruleset 22605658) creates the
+merge commit and rejects `--merge` and `--delete-branch`. Never `--rebase` or
+`--admin`. Resolve merge conflicts by merging `main` into the branch; never
+force-push.
 
 ### Rule 16 — Prose Is Code
 Rule 2 applies to sentences. Cut every clause that restates a doc you linked,
