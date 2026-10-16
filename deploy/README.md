@@ -246,7 +246,9 @@ Apply the new objects before the DaemonSet rolls:
 
 1. `deploy/rbac.yaml` creates the `beep-leases` Namespace and the Lease Role
    (with a CSR-minted kubeconfig, also bind it in `beep-leases`; see
-   "Kubeconfig").
+   "Authentication"). The DaemonSet no longer mounts the
+   `beep-controller-kubeconfig` Secret or passes `--kubeconfig`; it uses its
+   ServiceAccount token.
 2. `deploy/configmap.yaml` creates `beep-config`. The DaemonSet's `envFrom`
    is required, so pods stay in `CreateContainerConfigError` without it.
 3. `deploy/daemonset.yaml` last. It sets `NODE_NAME`; the controller requires
@@ -371,16 +373,25 @@ This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the
 revisit trigger.
 
-## Kubeconfig
+## Authentication
 
-`politeia` only parses an X.509 client-cert kubeconfig file (no
-in-cluster ServiceAccount token support yet), so `--kubeconfig` points at a
-Secret-mounted kubeconfig, not the ServiceAccount's own projected token.
-Provisioning that Secret (`beep-controller-kubeconfig` in `kube-system`) is
-left to the cluster operator/deploy tooling -- not this manifest. The
-parser only reads four fields -- `server:`, `certificate-authority-data:`,
-`client-certificate-data:`, `client-key-data:` -- so any kubeconfig
-containing those four works, however it was minted.
+By default the controller authenticates as its own ServiceAccount
+(`servicelb-controller`, bound by `deploy/rbac.yaml`) using the projected
+token at `/var/run/secrets/kubernetes.io/serviceaccount/token` and the
+cluster CA beside it, reaching the API server at
+`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`. The token is re-read
+from disk every 60 s, so kubelet rotation needs no restart. TLS
+verification against that CA is always on. If the token, CA or those env vars
+are missing (e.g. `automountServiceAccountToken: false`) and no
+`--kubeconfig` is given, the controller exits naming what is missing.
+
+`--kubeconfig` is the alternative, and always wins when given: an X.509
+client-cert kubeconfig. `deploy/daemonset.yaml` no longer mounts one; to use
+it, patch the DaemonSet (kustomize) to add the `--kubeconfig=...` arg and a
+Secret volume. The parser only reads four fields -- `server:`,
+`certificate-authority-data:`, `client-certificate-data:`,
+`client-key-data:` -- so any kubeconfig containing those four works,
+however it was minted.
 
 **Minting one via the Kubernetes CSR API**, scoped to exactly the RBAC
 `deploy/rbac.yaml` grants (run as a cluster admin who can approve CSRs):
@@ -428,8 +439,8 @@ kubectl config set-context beep-controller \
   --cluster=beep --user=beep-controller --kubeconfig=beep-controller.kubeconfig
 kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig
 
-# 5. Ship it as the Secret the DaemonSet mounts -- the key name must be
-#    `kubeconfig` to land at /etc/beep-controller/kubeconfig
+# 5. Ship it as a Secret and mount it via your DaemonSet patch (e.g. at
+#    /etc/beep-controller, with --kubeconfig=/etc/beep-controller/kubeconfig)
 kubectl create secret generic beep-controller-kubeconfig -n kube-system \
   --from-file=kubeconfig=beep-controller.kubeconfig
 ```

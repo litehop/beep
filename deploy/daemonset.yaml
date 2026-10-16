@@ -15,6 +15,9 @@ spec:
         app.kubernetes.io/name: servicelb-controller
     spec:
       serviceAccountName: servicelb-controller
+      # The controller authenticates with this ServiceAccount's projected
+      # token (rotated by the kubelet) and the cluster CA; no --kubeconfig.
+      automountServiceAccountToken: true
       hostNetwork: true
       # hostNetwork pods need this to resolve in-cluster DNS names correctly;
       # the default dnsPolicy breaks under hostNetwork.
@@ -138,7 +141,6 @@ spec:
             # on absence of that log.
             - --pod-cidr=10.42.0.0/16
             - --node-ip=$(NODE_IP)
-            - --kubeconfig=/etc/beep-controller/kubeconfig
             # Repeatable (docs/decisions/servicelb-multi-symmetric-uplink.md)
             # -- add a second --uplink-iface=... entry per additional
             # client-facing NIC this node admits traffic on.
@@ -146,9 +148,6 @@ spec:
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
-            - name: kubeconfig
-              mountPath: /etc/beep-controller
-              readOnly: true
       volumes:
         # bpffs must already be mounted at this path on the host (it is on
         # any kernel new enough to run this dataplane); pins under it survive
@@ -157,11 +156,3 @@ spec:
           hostPath:
             path: /sys/fs/bpf
             type: Directory
-        # politeia only parses an X.509 client-cert kubeconfig (no
-        # in-cluster ServiceAccount token support yet) -- this Secret must
-        # hold one with (at least) the RBAC this DaemonSet's ClusterRole
-        # grants (rbac.yaml). Provisioning it is left to the cluster
-        # operator/deploy tooling, not this manifest.
-        - name: kubeconfig
-          secret:
-            secretName: beep-controller-kubeconfig
