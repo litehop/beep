@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Lost-node prune bounds.** A removed node leaves Service
   `status.loadBalancer.ingress` within 30 s of a graceful stop once the
   surviving controllers have run for 40 s, and up to 70 s right after a
-  controller restart; a silently lost node within 85 s.
+  restart; a silently lost node within 85 s of the later of its last renewal
+  and the survivor's start.
 
 ### Added
 
@@ -59,6 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A removed node's address leaves Service `status.loadBalancer.ingress`
   promptly, and the controller handles SIGTERM by withdrawing its Lease
   addresses.
+- The k3s rig resets a k3s left pinned to an address the VM no longer holds
+  instead of refusing to reinstall.
 
 ## [0.5.0] - 2026-10-15
 
