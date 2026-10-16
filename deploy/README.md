@@ -373,8 +373,11 @@ initContainer also writes `/etc/sysctl.d/60-beep.conf` (via a single-file
 `/etc/sysctl.d` is not exposed), because on systemd hosts udev re-applies the
 distro default `rp_filter=2` to each new device after creation and would
 otherwise override the `/proc` write. The file name is fixed; its content
-follows `--geneve-iface`. The file persists on the host after uninstall;
-remove it manually if beep is decommissioned.
+follows `--geneve-iface`. `/etc/sysctl.d` must already exist on the node
+(true on every supported distro; see "Supported platforms" in the top-level
+README). Without it the pod stays in Init with a `hostPath` mount error. The
+file persists on the host after uninstall; remove it manually if beep is
+decommissioned.
 
 This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the

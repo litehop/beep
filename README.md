@@ -16,7 +16,17 @@ For now, you supply the loader with static FRONT_IP:PORT -> backend-node/PodIP:T
 
 ## Deploying to Kubernetes
 
-To run beep on a real Kubernetes cluster as a DaemonSet, rather than standalone with `--fixture`, see the setup guide in `deploy/README.md`. Read its "Required per-cluster configuration & gotchas" section before deploying to any cluster other than the dev rig, and use "Verify your deployment" to confirm the install worked. beep must be the cluster's only L4 load balancer (on k3s, install with `--disable=servicelb`). Supported Kubernetes: the latest two minor versions (currently 1.36 and 1.37).
+To run beep on a real Kubernetes cluster as a DaemonSet, rather than standalone with `--fixture`, see the setup guide in `deploy/README.md`. Read its "Required per-cluster configuration & gotchas" section before deploying to any cluster other than the dev rig, and use "Verify your deployment" to confirm the install worked. beep must be the cluster's only L4 load balancer (on k3s, install with `--disable=servicelb`).
+## Supported platforms
+
+Until 1.0, beep supports:
+
+- systemd-based Linux distros (for example Debian, Ubuntu, the Fedora/RHEL family, Flatcar)
+- Linux kernel 6.6 or newer
+- little-endian x86-64 and AArch64 only
+- the latest two Kubernetes minor versions (currently 1.36 and 1.37)
+
+Non-systemd distros and immutable OSes (Talos, Bottlerocket) are unsupported for now. The node must have `/etc/sysctl.d`, where the `node-prep` initContainer persists the `geneve0` `rp_filter` setting.
 
 ## Building
 
