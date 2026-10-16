@@ -401,9 +401,10 @@ are missing (e.g. `automountServiceAccountToken: false`) and no
 `--kubeconfig` is given, the controller exits naming what is missing.
 
 `--kubeconfig` is the alternative, and always wins when given: an X.509
-client-cert kubeconfig. `deploy/daemonset.yaml` no longer mounts one; to use
-it, patch the DaemonSet (kustomize) to add the `--kubeconfig=...` arg and a
-Secret volume. The parser only reads four fields -- `server:`,
+client-cert kubeconfig. `deploy/daemonset.yaml` does not mount one; step 5
+below applies `deploy/patches/client-cert-kubeconfig.yaml`, which adds the
+`--kubeconfig=...` arg and a Secret volume and unmounts the ServiceAccount
+token. The parser only reads four fields -- `server:`,
 `certificate-authority-data:`, `client-certificate-data:`,
 `client-key-data:` -- so any kubeconfig containing those four works,
 however it was minted. `scripts/smoke-k3s-controller.sh --client-cert-auth`
@@ -456,10 +457,12 @@ kubectl config set-context beep-controller \
   --cluster=beep --user=beep-controller --kubeconfig=beep-controller.kubeconfig
 kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig
 
-# 5. Ship it as a Secret and mount it via your DaemonSet patch (e.g. at
-#    /etc/beep-controller, with --kubeconfig=/etc/beep-controller/kubeconfig)
+# 5. Ship it as a Secret and patch the DaemonSet to mount it (the patch
+#    expects this exact Secret name, key "kubeconfig")
 kubectl create secret generic beep-controller-kubeconfig -n kube-system \
   --from-file=kubeconfig=beep-controller.kubeconfig
+kubectl -n kube-system patch daemonset servicelb-controller \
+  --type=json --patch-file deploy/patches/client-cert-kubeconfig.yaml
 ```
 
 ## Verify your deployment

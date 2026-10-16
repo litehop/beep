@@ -251,7 +251,7 @@ lease_renewals() { # lease_renewals -- "<lease> <renewTime>" per node Lease
 
 if [ "$CLIENT_CERT_AUTH" = 1 ]; then
   echo "==> [4a/11] switching the controller to the documented client-cert kubeconfig (deploy/README.md Authentication)"
-  k3s_provision_client_cert_auth "$VM_A" "$IP_A" || {
+  k3s_provision_client_cert_auth "$VM_A" "$IP_A" "$REPO_ROOT" || {
     echo "CLIENT-CERT-AUTH: FAIL (provisioning or rollout failed)" >&2
     dump_evidence
     exit 1

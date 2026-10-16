@@ -141,8 +141,8 @@ k3s_export_admin_kubeconfig() { # k3s_export_admin_kubeconfig <vm-a> <ip-a> -- w
 
 CLIENT_CERT_KUBECONFIG_SECRET="beep-controller-kubeconfig"
 
-k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then the documented DaemonSet patch (arg, Secret volume, mount). automountServiceAccountToken is also turned off so the ServiceAccount path cannot mask a broken cert path.
-  local vm_a="$1" ip_a="$2"
+k3s_provision_client_cert_auth() { # k3s_provision_client_cert_auth <vm-a> <ip-a> <repo-root> -- follows deploy/README.md's Authentication section end to end: a CSR-minted client cert for CN=beep-controller, bound to the rbac.yaml roles, a 4-field kubeconfig shipped as a Secret, then applies deploy/patches/client-cert-kubeconfig.yaml verbatim (the file users apply). That patch also turns the ServiceAccount token off so it cannot mask a broken cert path. The patch hardcodes the Secret name CLIENT_CERT_KUBECONFIG_SECRET.
+  local vm_a="$1" ip_a="$2" repo_root="$3"
   limactl shell "$vm_a" -- sudo bash -c "
   set -euo pipefail
   d=\$(mktemp -d)
@@ -178,12 +178,8 @@ CSR
   k3s kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig >/dev/null
   k3s kubectl create secret generic $CLIENT_CERT_KUBECONFIG_SECRET -n kube-system --from-file=kubeconfig=beep-controller.kubeconfig --dry-run=client -o yaml | k3s kubectl apply -f -
 "
-  kube -n kube-system patch daemonset servicelb-controller --type=json -p '[
-    {"op":"replace","path":"/spec/template/spec/automountServiceAccountToken","value":false},
-    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubeconfig=/etc/beep-controller/kubeconfig"},
-    {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"kubeconfig","mountPath":"/etc/beep-controller","readOnly":true}},
-    {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"kubeconfig","secret":{"secretName":"'"$CLIENT_CERT_KUBECONFIG_SECRET"'"}}}
-  ]' >/dev/null
+  kube -n kube-system patch daemonset servicelb-controller --type=json --patch-file /dev/stdin \
+    < "$repo_root/deploy/patches/client-cert-kubeconfig.yaml" >/dev/null
   kube -n kube-system rollout status daemonset/servicelb-controller --timeout=120s
 }
 
