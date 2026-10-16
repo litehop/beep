@@ -5,7 +5,7 @@
 
 ## Context
 
-`deploy/daemonset.yaml`'s controller crash-looped on every real
+`deploy/base/daemonset.yaml`'s controller crash-looped on every real
 containerd-CRI node: `disable_rp_filter()` (`src/lib.rs`) failed writing
 `/proc/sys/net/ipv4/conf/*/rp_filter` with `EROFS` (`bd show beep-1vf`).
 Containerd's default OCI spec marks `/proc/sys` read-only

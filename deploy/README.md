@@ -2,6 +2,12 @@
 
 Manifest skeleton for the beep servicelb controller.
 
+Install with `kubectl apply -k deploy/base` (the controller authenticates as
+its ServiceAccount). To authenticate with a client-cert kubeconfig instead,
+see "Authentication" and apply `kubectl apply -k deploy/overlays/client-cert`
+in place of the base. `kubectl apply -f deploy/` no longer works: the
+manifests live in `deploy/base/`.
+
 - `daemonset.yaml` points at `docker.io/valerauko/beep-lb:latest`, a
   dual-arch (linux/amd64 + linux/arm64) image built by the root
   `Dockerfile` and published by `.github/workflows/delivery.yaml`'s
@@ -13,7 +19,7 @@ Manifest skeleton for the beep servicelb controller.
   ```yaml
   # kustomization.yaml
   resources:
-    - github.com/<org>/beep/deploy?ref=v0.1.0
+    - github.com/<org>/beep/deploy/base?ref=v0.1.0
   images:
     - name: docker.io/valerauko/beep-lb
       newTag: v0.1.0
@@ -41,7 +47,7 @@ the first time, then confirm with "Verify your deployment" below.
 
 1. **`--pod-cidr` MUST match your cluster's real pod CIDR — this is the
    day-one gotcha.** `daemonset.yaml` defaults to k3s's own flannel CIDR,
-   `10.42.0.0/16` (`deploy/daemonset.yaml:96`). If your cluster's actual pod
+   `10.42.0.0/16` (`deploy/base/daemonset.yaml:96`). If your cluster's actual pod
    network differs (e.g. Calico's `10.244.0.0/16`), every backend Pod is
    rejected by the controller's admission gate: an `EndpointSlice` endpoint
    is only admitted if its `pod_ip` falls inside `--pod-cidr`, or equals its
@@ -90,7 +96,7 @@ the first time, then confirm with "Verify your deployment" below.
 5. **Only one uplink, `eth0`, is configured by default — add a second
    `--uplink-iface` per additional client-facing interface a node admits
    traffic on.** `daemonset.yaml` ships `--uplink-iface=eth0`
-   (`deploy/daemonset.yaml:119`); the flag is repeatable and required —
+   (`deploy/base/daemonset.yaml:119`); the flag is repeatable and required —
    the loader refuses to start with none — so a node that also takes
    client traffic over e.g. a WireGuard mesh interface needs a second
    `--uplink-iface=wg0` entry alongside it, added via a local kustomize
@@ -112,6 +118,9 @@ the first time, then confirm with "Verify your deployment" below.
    versions are unsupported.
 
 ## Files
+
+All under `deploy/base/`, listed by its `kustomization.yaml`;
+`deploy/overlays/client-cert/` patches them for client-cert auth.
 
 - `daemonset.yaml` — one controller pod per node (`hostNetwork: true`),
   tolerates all taints so it runs on every node including control-plane
@@ -249,14 +258,14 @@ ingress. Timings are constants (`controller/src/lease.rs`), not flags.
 
 Apply the new objects before the DaemonSet rolls:
 
-1. `deploy/rbac.yaml` creates the `beep-leases` Namespace and the Lease Role
+1. `deploy/base/rbac.yaml` creates the `beep-leases` Namespace and the Lease Role
    (with a CSR-minted kubeconfig, also bind it in `beep-leases`; see
    "Authentication"). The DaemonSet no longer mounts the
    `beep-controller-kubeconfig` Secret or passes `--kubeconfig`; it uses its
    ServiceAccount token.
-2. `deploy/configmap.yaml` creates `beep-config`. The DaemonSet's `envFrom`
+2. `deploy/base/configmap.yaml` creates `beep-config`. The DaemonSet's `envFrom`
    is required, so pods stay in `CreateContainerConfigError` without it.
-3. `deploy/daemonset.yaml` last. It sets `NODE_NAME`; the controller requires
+3. `deploy/base/daemonset.yaml` last. It sets `NODE_NAME`; the controller requires
    `--node-name` (env `NODE_NAME`) and exits without it.
 
 Two different things reset or keep flows, so do not confuse them:
@@ -278,7 +287,7 @@ controller posts a `MapRestoreFailed` Warning Event on the node and the pod
 reason=MapRestoreFailed`) naming the map, the errno and the remediation (for
 `ENOMEM`, raise the pod memory limit). The previous programs keep serving on
 the old maps meanwhile. Posting needs the Event `create` Roles in
-`deploy/rbac.yaml`; without them the same text is only in the pod log. The
+`deploy/base/rbac.yaml`; without them the same text is only in the pod log. The
 Pod-event Role and RoleBinding there are written for `kube-system`; if you
 run the DaemonSet in another namespace, change their `namespace` (and the
 ServiceAccount subject) or the Pod event is rejected with 403 and only the
@@ -391,19 +400,23 @@ revisit trigger.
 ## Authentication
 
 By default the controller authenticates as its own ServiceAccount
-(`servicelb-controller`, bound by `deploy/rbac.yaml`) using the projected
+(`servicelb-controller`, bound by `deploy/base/rbac.yaml`) using the projected
 token at `/var/run/secrets/kubernetes.io/serviceaccount/token` and the
 cluster CA beside it, reaching the API server at
-`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`. The token is re-read
+`KUBERNETES_SERVICE_HOST:KUBERNETES_SERVICE_PORT`. The DaemonSet sets
+`automountServiceAccountToken: false` and declares that projected volume
+itself, mounted into the controller container only: the privileged
+`node-prep` initContainer never receives a token. The token is re-read
 from disk every 60 s, so kubelet rotation needs no restart. TLS
 verification against that CA is always on. If the token, CA or those env vars
-are missing (e.g. `automountServiceAccountToken: false`) and no
+are missing (e.g. the volume was removed) and no
 `--kubeconfig` is given, the controller exits naming what is missing.
 
 `--kubeconfig` is the alternative, and always wins when given: an X.509
-client-cert kubeconfig. `deploy/daemonset.yaml` no longer mounts one; to use
-it, patch the DaemonSet (kustomize) to add the `--kubeconfig=...` arg and a
-Secret volume. The parser only reads four fields -- `server:`,
+client-cert kubeconfig. `deploy/base/daemonset.yaml` does not mount one; step 5
+below applies the `deploy/overlays/client-cert` kustomize overlay, which adds
+the `--kubeconfig=...` arg and a Secret volume and unmounts the ServiceAccount
+token. The parser only reads four fields -- `server:`,
 `certificate-authority-data:`, `client-certificate-data:`,
 `client-key-data:` -- so any kubeconfig containing those four works,
 however it was minted. `scripts/smoke-k3s-controller.sh --client-cert-auth`
@@ -411,7 +424,7 @@ runs the flow below on a k3s rig and checks the patched controller still
 works with the ServiceAccount token unmounted.
 
 **Minting one via the Kubernetes CSR API**, scoped to exactly the RBAC
-`deploy/rbac.yaml` grants (run as a cluster admin who can approve CSRs):
+`deploy/base/rbac.yaml` grants (run as a cluster admin who can approve CSRs):
 
 ```bash
 # 1. Keypair + CSR for CN=beep-controller (the identity the cert authenticates as)
@@ -434,7 +447,7 @@ kubectl certificate approve beep-controller
 kubectl get csr beep-controller -o jsonpath='{.status.certificate}' \
   | base64 -d > beep-controller.crt
 
-# 3. Bind that identity to the SAME ClusterRole deploy/rbac.yaml defines --
+# 3. Bind that identity to the SAME ClusterRole deploy/base/rbac.yaml defines --
 #    a User, not the ServiceAccount rbac.yaml's own binding targets: X.509
 #    client-cert auth authenticates as a distinct Kubernetes User (the
 #    cert's CN), never as the DaemonSet's own ServiceAccount.
@@ -456,15 +469,17 @@ kubectl config set-context beep-controller \
   --cluster=beep --user=beep-controller --kubeconfig=beep-controller.kubeconfig
 kubectl config use-context beep-controller --kubeconfig=beep-controller.kubeconfig
 
-# 5. Ship it as a Secret and mount it via your DaemonSet patch (e.g. at
-#    /etc/beep-controller, with --kubeconfig=/etc/beep-controller/kubeconfig)
+# 5. Ship it as a Secret and apply the overlay (it re-applies rbac.yaml,
+#    configmap.yaml and daemonset.yaml with the token swapped for the Secret;
+#    it expects this exact Secret name, key "kubeconfig")
 kubectl create secret generic beep-controller-kubeconfig -n kube-system \
   --from-file=kubeconfig=beep-controller.kubeconfig
+kubectl apply -k deploy/overlays/client-cert
 ```
 
 ## Verify your deployment
 
-Applying `deploy/rbac.yaml`, `deploy/configmap.yaml` and `deploy/daemonset.yaml` (with your own
+Applying `deploy/base/rbac.yaml`, `deploy/base/configmap.yaml` and `deploy/base/daemonset.yaml` (with your own
 `--pod-cidr` override) leaves every controller Pod `Running` even when
 gotcha #1 above is misconfigured -- a healthy Pod status proves nothing
 about actual delivery, and the WARN log is easy to miss across a fleet of

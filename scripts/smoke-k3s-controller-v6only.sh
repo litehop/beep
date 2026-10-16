@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # IPv6-only sibling of scripts/smoke-k3s-controller-dualstack.sh: proves the
-# REAL controller (deploy/daemonset.yaml -- not a hand-rolled --fixture)
+# REAL controller (deploy/base/daemonset.yaml -- not a hand-rolled --fixture)
 # serves a v6 front end to end on a genuinely IPv6-only k3s cluster
 # (scripts/k3s-up.sh --v6-only): neither Node object carries a v4 InternalIP,
 # neither k3s --node-ip is v4, and v4 Geneve egress is dropped on both nodes,
@@ -217,7 +217,7 @@ for pair in "$NODE_A_K8S:$ULA_A" "$NODE_B_K8S:$ULA_B"; do
   want="${pair#*:}"
   host_ip="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" --field-selector "spec.nodeName=$node" -o jsonpath='{.items[0].status.hostIP}')"
   [ "$host_ip" = "$want" ] || {
-    echo "FAIL: controller pod on $node has status.hostIP='$host_ip', wanted $want -- deploy/daemonset.yaml's --node-ip=\$(NODE_IP) would not be this node's v6 address" >&2
+    echo "FAIL: controller pod on $node has status.hostIP='$host_ip', wanted $want -- deploy/base/daemonset.yaml's --node-ip=\$(NODE_IP) would not be this node's v6 address" >&2
     dump_evidence
     exit 1
   }

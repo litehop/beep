@@ -55,7 +55,7 @@ before and after this testing; only IPVS mode exhibits the conflict.
 
 - kube-proxy MUST run in **iptables or nftables** mode. Do not deploy
   beep onto a cluster with `--proxy-mode ipvs` set.
-- beep MUST run as a **DaemonSet on every node** (`deploy/daemonset.yaml`)
+- beep MUST run as a **DaemonSet on every node** (`deploy/base/daemonset.yaml`)
   so each node's tc-ingress intercepts its own front traffic locally. This
   is also *why* IPVS breaks: every node ends up publishing its own address
   into the same shared ingress list.
@@ -123,5 +123,5 @@ Before deploying beep onto an existing cluster:
    will refuse to start otherwise) or its Service CIDR (checked manually
    today — `kubectl cluster-info dump | grep -i cidr` or the CNI/cluster
    config).
-3. Deploy `deploy/daemonset.yaml` on every node, not a subset — a partial
+3. Deploy `deploy/base/daemonset.yaml` on every node, not a subset — a partial
    rollout leaves nodes without local front interception.

@@ -1,0 +1,26 @@
+# Switches the controller from its ServiceAccount token to an X.509
+# client-cert kubeconfig stored in the Secret beep-controller-kubeconfig (key
+# "kubeconfig"). Apply with:
+#
+#   kubectl apply -k deploy/overlays/client-cert
+#
+# See deploy/README.md, "Authentication", for minting the Secret. The patch
+# deletes the `serviceaccount` volume and mount by name and mountPath, so the
+# token is gone and only the cert can authenticate, whatever the order of the
+# base's volumes and mounts.
+resources:
+  - ../../base
+patches:
+  - path: client-cert.yaml
+  # Args are an unkeyed list, so appending is the only position-independent
+  # edit. The container is addressed by index, guarded by a test on its name.
+  - target:
+      kind: DaemonSet
+      name: servicelb-controller
+    patch: |-
+      - op: test
+        path: /spec/template/spec/containers/0/name
+        value: servicelb-controller
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --kubeconfig=/etc/beep-controller/kubeconfig

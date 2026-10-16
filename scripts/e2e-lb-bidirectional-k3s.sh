@@ -11,7 +11,7 @@
 # orientation, since node-a (k3s server, apiserver-hosting) and node-b (k3s
 # agent) are not guaranteed symmetric just because the same eBPF program is
 # loaded on both. Reuses scripts/k3s-up.sh's bring-up and
-# deploy/{rbac,daemonset}.yaml, same as smoke-k3s-controller.sh -- does not
+# deploy/base/{rbac,daemonset}.yaml, same as smoke-k3s-controller.sh -- does not
 # re-assert RSS/FLOW_TABLE/FRONT_META population already covered there.
 #
 # Each direction uses a distinct front port (80 vs 8081): a type=LoadBalancer
@@ -114,7 +114,7 @@ for vm in "$VM_A" "$VM_B"; do
   "
 done
 
-echo "==> [4/8] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
+echo "==> [4/8] deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
 if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
   echo "CONTROLLER-DEPLOY: FAIL" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true

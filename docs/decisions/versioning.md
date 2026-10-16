@@ -37,7 +37,7 @@ eventual repo split for an independent release cadence (`mayor-aie31.4`).
 `docker.io/valerauko/beep-lb:v0.1.0` (plus `:latest`, if it's the highest
 `v*` tag) and auto-creates the GitHub release.
 
-**`deploy/daemonset.yaml` stays on `:latest`**: a release-tag pin is
+**`deploy/base/daemonset.yaml` stays on `:latest`**: a release-tag pin is
 temporally impossible — the pin commit lands after the immutable tag, so
 the tagged commit never carries its own pin. `:latest` now equals the
 newest release; override to a version or sha via a local kustomize patch

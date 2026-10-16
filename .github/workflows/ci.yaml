@@ -405,7 +405,7 @@ jobs:
   # amd64, no cross-build needed since this runner IS that platform), then
   # `docker run`s it to assert `ip` is present and that beep-controller
   # creates `geneve0` and disables its reverse-path filter end-to-end --
-  # exactly the two node-prep steps deploy/daemonset.yaml's hostNetwork pod
+  # exactly the two node-prep steps deploy/base/daemonset.yaml's hostNetwork pod
   # relies on this image providing.
   container-smoke:
     runs-on: ubuntu-latest
@@ -440,16 +440,16 @@ jobs:
       - name: Assert `ip` (iproute2) is present on PATH inside the built image
         run: docker run --rm --entrypoint sh beep-controller:ci-smoke -c 'command -v ip && ip -V'
 
-      # --network host: matches deploy/daemonset.yaml's hostNetwork: true,
+      # --network host: matches deploy/base/daemonset.yaml's hostNetwork: true,
       # and (practically) means geneve0/rp_filter land in the runner's own
       # netns/procfs, so they're inspectable after the container exits
       # instead of being torn down with its private netns. `--node-prep`
       # (docs/decisions/servicelb-rp-filter-init-container.md) is exactly
-      # what deploy/daemonset.yaml's privileged initContainer runs -- it
+      # what deploy/base/daemonset.yaml's privileged initContainer runs -- it
       # exits on its own once done, so this job only asserts on its side
       # effects, not a full k8s watch.
       #
-      # Capabilities + AppArmor mirror deploy/daemonset.yaml's main
+      # Capabilities + AppArmor mirror deploy/base/daemonset.yaml's main
       # container securityContext (docs/decisions/servicelb-controller-
       # apparmor-unconfined.md), not the real initContainer's `privileged:
       # true` -- this job's point is confirming the SHIPPED IMAGE's

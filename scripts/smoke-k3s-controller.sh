@@ -2,12 +2,12 @@
 # Tier-2 controller-driven integration gate: a real type=LoadBalancer
 # Service + backend Deployment/Pod + resulting EndpointSlice on the
 # k3s-on-Lima cluster (scripts/k3s-up.sh), with the beep servicelb
-# controller (deploy/daemonset.yaml) watching Service/EndpointSlice/Node and
+# controller (deploy/base/daemonset.yaml) watching Service/EndpointSlice/Node and
 # programming the dataplane maps from LIVE watch events -- not hand-rolled
 # fixture args like scripts/smoke.sh / smoke-wg-2node.sh /
 # smoke-eth-ingress-2node.sh.
 #
-# IMAGE: deploy/daemonset.yaml hardcodes docker.io/valerauko/beep-lb:latest,
+# IMAGE: deploy/base/daemonset.yaml hardcodes docker.io/valerauko/beep-lb:latest,
 # which resolves to the newest RELEASE (.github/workflows/delivery.yaml's
 # `v*` tag push), not this checkout -- a main-branch commit only ever gets a
 # `:sha` tag (github.sha, the full 40-char commit sha), and that tag never
@@ -19,7 +19,7 @@
 #
 # STATUS: the AppArmor/bpffs-pin blocker, the BPF_PROG_LOAD
 # verifier/CAP_PERFMON blocker, and the cross-node return-path dataplane
-# bug this gate originally surfaced are all fixed (`deploy/daemonset.yaml`'s
+# bug this gate originally surfaced are all fixed (`deploy/base/daemonset.yaml`'s
 # `appArmorProfile: Unconfined` + `add: ["BPF", "NET_ADMIN", "PERFMON"]`;
 # see docs/decisions/servicelb-controller-apparmor-unconfined.md). Every
 # step -- cluster bring-up, geneve0, the
@@ -46,11 +46,12 @@
 # run that needs no Lima rig. See scripts/controller-rss.sh's header for the
 # measured baseline the shared ceilings are set against.
 #
-# AUTH: the stock deploy/daemonset.yaml is applied unmodified, so the
-# controller authenticates as its own ServiceAccount (deploy/rbac.yaml's
+# AUTH: the stock deploy/base/daemonset.yaml is applied unmodified, so the
+# controller authenticates as its own ServiceAccount (deploy/base/rbac.yaml's
 # scoped ClusterRole) via the projected token -- no kubeconfig anywhere. The
-# gate asserts the DaemonSet carries no --kubeconfig and that every node's
-# Lease keeps renewing; Service status, map programming and the round trip
+# gate asserts the DaemonSet carries no --kubeconfig, that only the
+# controller container (never the privileged node-prep initContainer) mounts
+# the token, and that every node's Lease keeps renewing; Service status, map programming and the round trip
 # below prove the watches and patches work under that scoped RBAC.
 # --client-cert-auth instead exercises deploy/README.md's documented
 # client-cert opt-in (k3s_provision_client_cert_auth), with the
@@ -201,7 +202,7 @@ done
 
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 IMAGE="docker.io/valerauko/beep-lb:${SHA}"
-echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
+echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
 
 node_arch="$(limactl shell "$VM_A" -- uname -m)"
 [ "$(limactl shell "$VM_B" -- uname -m)" = "$node_arch" ] || {
@@ -251,22 +252,32 @@ lease_renewals() { # lease_renewals -- "<lease> <renewTime>" per node Lease
 
 if [ "$CLIENT_CERT_AUTH" = 1 ]; then
   echo "==> [4a/11] switching the controller to the documented client-cert kubeconfig (deploy/README.md Authentication)"
-  k3s_provision_client_cert_auth "$VM_A" "$IP_A" || {
+  k3s_provision_client_cert_auth "$VM_A" "$IP_A" "$REPO_ROOT" || {
     echo "CLIENT-CERT-AUTH: FAIL (provisioning or rollout failed)" >&2
     dump_evidence
     exit 1
   }
   sleep 10
   AUTH_ARGS="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.containers[0].args}')"
-  AUTH_AUTOMOUNT="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.automountServiceAccountToken}')"
   AUTH_LABEL="client-cert kubeconfig, ServiceAccount token unmounted"
+  SCOPE_MODE=client-cert
   case "$AUTH_ARGS" in *--kubeconfig=*) ;; *) echo "CLIENT-CERT-AUTH: FAIL (pods carry no --kubeconfig arg: $AUTH_ARGS)" >&2; dump_evidence; exit 1 ;; esac
-  case "$AUTH_AUTOMOUNT" in *true*) echo "CLIENT-CERT-AUTH: FAIL (ServiceAccount token still mounted: $AUTH_AUTOMOUNT)" >&2; dump_evidence; exit 1 ;; esac
 else
   AUTH_ARGS="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o jsonpath='{.items[*].spec.containers[0].args}')"
   AUTH_LABEL="in-cluster ServiceAccount, no kubeconfig"
+  SCOPE_MODE=default
   case "$AUTH_ARGS" in *--kubeconfig*) echo "AUTH: FAIL (the stock DaemonSet must not pass --kubeconfig: $AUTH_ARGS)" >&2; dump_evidence; exit 1 ;; esac
 fi
+CONTROLLER_PODS_JSON="$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o json)"
+for i in $(seq 0 $(( $(jq '.items | length' <<<"$CONTROLLER_PODS_JSON") - 1 ))); do
+  SCOPE="$(k3s_sa_token_scope "$SCOPE_MODE" "$(jq ".items[$i]" <<<"$CONTROLLER_PODS_JSON")")"
+  [ "$SCOPE" = scoped ] || {
+    echo "AUTH: FAIL (ServiceAccount token reaches the wrong containers in $(jq -r ".items[$i].metadata.name" <<<"$CONTROLLER_PODS_JSON") under $SCOPE_MODE: $SCOPE; the privileged node-prep initContainer must never hold it)" >&2
+    dump_evidence
+    exit 1
+  }
+done
+[ "$(jq '.items | length' <<<"$CONTROLLER_PODS_JSON")" -ge 2 ] || { echo "AUTH: FAIL (expected a controller pod on both nodes)" >&2; dump_evidence; exit 1; }
 LEASES_BEFORE="$(lease_renewals)"
 sleep 25
 LEASES_AFTER="$(lease_renewals)"
@@ -278,7 +289,7 @@ if [ "$(wc -l <<<"$LEASES_AFTER" | tr -d ' ')" -lt 2 ] || \
   dump_evidence
   exit 1
 fi
-echo "AUTH: PASS ($AUTH_LABEL; $(wc -l <<<"$LEASES_AFTER" | tr -d ' ') node Leases renewed within 25s)"
+echo "AUTH: PASS ($AUTH_LABEL; token scope ok; $(wc -l <<<"$LEASES_AFTER" | tr -d ' ') node Leases renewed within 25s)"
 
 echo "==> [5/11] sampling beep-controller RSS baseline (post-deploy, before any Service/EndpointSlice reconcile load)"
 rss_a_baseline=$(controller_rss limactl shell "$VM_A" --)

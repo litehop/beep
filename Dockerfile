@@ -13,7 +13,7 @@
 # ca-certificates package is needed: politeia builds its TLS root
 # store from the CA cert embedded in the mounted kubeconfig/ServiceAccount
 # token, not the OS trust store. The DaemonSet grants CAP_BPF/CAP_NET_ADMIN
-# at the pod level (deploy/daemonset.yaml).
+# at the pod level (deploy/base/daemonset.yaml).
 #
 # iproute2 provides `ip`, which `beep::ensure_geneve_iface` shells out to at
 # startup to create the node's `geneve0` device -- the workspace has no

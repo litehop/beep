@@ -140,7 +140,7 @@ limactl shell "$VM_A" -- sudo cat /tmp/beep-admin-kubeconfig \
   | limactl shell "$VM_CLIENT" -- tee "$CLIENT_KUBECONFIG" >/dev/null
 limactl shell "$VM_A" -- sudo rm -f /tmp/beep-admin-kubeconfig
 
-echo "==> [4/7] deploying the controller DaemonSet (deploy/rbac.yaml + deploy/daemonset.yaml)"
+echo "==> [4/7] deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
 if ! k3s_deploy_controller_daemonset "$REPO_ROOT"; then
   echo "CONTROLLER-DEPLOY: FAIL" >&2
   kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
