@@ -853,7 +853,7 @@ impl WatchState {
             .map(|(name, _)| name)
             .collect();
             warnings.insert(format!(
-                "controller: WARN initial LIST of {} has not completed; leaving FRONT_META, \
+                "controller: INFO initial LIST of {} has not completed; leaving FRONT_META, \
                  FRONT_ENDPOINTS and POD_TARGETS as the previous process left them",
                 missing.join(", ")
             ));
@@ -1097,6 +1097,22 @@ pub fn is_resource_expired(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("410")
 }
 
+/// Whether a watch ended only because no frame arrived within the client's
+/// idle window -- routine on a quiet cluster, not a fault.
+fn is_idle_timeout(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("watch stream idle timeout")
+}
+
+/// The `resourceVersion` a BOOKMARK event carries. A bookmark is a progress
+/// marker with no object change, so it must only advance the resume point and
+/// never reach the state handlers.
+fn bookmark_resource_version(event: &Value) -> Option<&str> {
+    if event["type"].as_str()? != "BOOKMARK" {
+        return None;
+    }
+    event["object"]["metadata"]["resourceVersion"].as_str()
+}
+
 /// Exponential backoff for the list-watch loop, capped so a persistently
 /// unreachable apiserver doesn't get hammered, but this node's dataplane
 /// maps also don't go stale forever waiting on a slow backoff. A successful
@@ -1190,8 +1206,24 @@ pub async fn run_list_watch(
         }
 
         let rv = resource_version.clone().expect("set above");
-        let path = format!("{resource_path}?watch=true&resourceVersion={rv}");
-        match client.watch_stream(&path, &mut on_event).await {
+        let path =
+            format!("{resource_path}?watch=true&allowWatchBookmarks=true&resourceVersion={rv}");
+        let mut latest_rv: Option<String> = None;
+        let result = client
+            .watch_stream(&path, &mut |event: Value| {
+                if let Some(bookmark_rv) = bookmark_resource_version(&event) {
+                    latest_rv = Some(bookmark_rv.to_owned());
+                } else {
+                    on_event(event);
+                }
+            })
+            .await;
+        // A bookmark proves nothing changed up to its resourceVersion, so the
+        // reconnect resumes there rather than at the (possibly compacted) LIST one.
+        if let Some(bookmark_rv) = latest_rv {
+            resource_version = Some(bookmark_rv);
+        }
+        match result {
             Ok(()) => {
                 // Clean EOF (apiserver closed the connection, e.g. its own
                 // watch timeout) -- resume at the same resourceVersion, no
@@ -1199,7 +1231,11 @@ pub async fn run_list_watch(
                 backoff = INITIAL_BACKOFF;
             }
             Err(e) => {
-                eprintln!("controller: watch {path} failed: {e:#}");
+                if is_idle_timeout(&e) {
+                    eprintln!("controller: INFO watch {path} idle; reconnecting: {e:#}");
+                } else {
+                    eprintln!("controller: WARN watch {path} failed: {e:#}");
+                }
                 if is_resource_expired(&e) {
                     resource_version = None;
                 }
@@ -2387,6 +2423,39 @@ mod tests {
             "a transient idle-timeout disconnect must resume at the same resourceVersion, not \
              pay for a full relist"
         );
+    }
+
+    // A BOOKMARK must advance the resume point and never be handed to the
+    // state handlers; if a real change were mistaken for one, that change would be
+    // swallowed and the dataplane would miss an update.
+    #[test]
+    fn bookmark_advances_resume_point_and_real_events_do_not() {
+        let bookmark = serde_json::json!({
+            "type": "BOOKMARK",
+            "object": {"metadata": {"resourceVersion": "42"}}
+        });
+        assert_eq!(bookmark_resource_version(&bookmark), Some("42"));
+        let modified = serde_json::json!({
+            "type": "MODIFIED",
+            "object": {"metadata": {"resourceVersion": "43"}}
+        });
+        assert_eq!(
+            bookmark_resource_version(&modified),
+            None,
+            "a real change must flow to the handlers, not be consumed as a bookmark"
+        );
+    }
+
+    // An idle-timeout reconnect is routine; reporting it as a failure makes
+    // operators ignore the WARNs that matter.
+    #[test]
+    fn idle_timeout_is_benign_but_other_watch_errors_are_not() {
+        assert!(is_idle_timeout(&anyhow::anyhow!(
+            "watch stream idle timeout after 300s"
+        )));
+        assert!(!is_idle_timeout(&anyhow::anyhow!(
+            "watch returned HTTP 500"
+        )));
     }
 
     // The backoff must grow on repeated failure (so a down apiserver isn't
