@@ -195,7 +195,7 @@ assert "...and the cross-repo review is still posted under the minted App token,
 # ---------------------------------------------------------------------------
 # 9. Repo argument validation.
 # ---------------------------------------------------------------------------
-for bad in 'litehop/beep/../../x' 'litehop' 'litehop/beep?x=1' 'a/b/c' '/beep' 'litehop/'; do
+for bad in 'litehop/beep/../../x' 'litehop' 'litehop/beep?x=1' 'a/b/c' '/beep' 'litehop/' 'a/..' '../..' './b' 'a/.'; do
   rm -f "$CURL_CALLED_MARKER"
   RUN_OUT=$(printf '%s' "$PAYLOAD" | PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" 11 "$bad" 2>"$WORK/stderr") \
     && RUN_RC=0 || RUN_RC=$?

@@ -22,7 +22,7 @@ set -euo pipefail
 
 PR_NUMBER="${1:?usage: gh-app-review.sh <pr-number> [owner/repo] < review-payload.json}"
 REPO="${2:-litehop/beep}"
-if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "$REPO" =~ (^|/)\.+(/|$) ]]; then
   echo "gh-app-review.sh: invalid repo '$REPO' (expected owner/repo)" >&2
   exit 2
 fi
