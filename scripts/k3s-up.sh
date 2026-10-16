@@ -151,11 +151,20 @@ read_node_addrs() { # sets addrs/read_ok; a node that is not Ready is not a posi
     read_ok=1
   fi
 }
+stale_ip=""
 if [ "$installed" = "1" ]; then
   read_node_addrs
+  # A k3s unit pinned to a node-ip this VM no longer owns (the static LAN ULA
+  # is not persistent across a VM restart) can never become Ready, so an
+  # unreadable node there is a positive finding, not an unknown.
+  stale_ip="$(k3s_stale_node_ip "$VM_A" k3s)"
+  [ -n "$stale_ip" ] || stale_ip="$(k3s_stale_node_ip "$VM_B" k3s-agent)"
 fi
 decision="$(k3s_reinstall_decision "$DUAL_STACK" "$V6_ONLY" "$installed" "$read_ok" "$addrs")"
-if [ "$decision" = "reinstall" ]; then
+if [ -n "$stale_ip" ]; then
+  echo "==> WARNING: stale k3s: its unit is pinned to node-ip $stale_ip, which is not on any interface of that VM, so it can never become Ready -- resetting k3s on $VM_A/$VM_B"
+  decision=reinstall
+elif [ "$decision" = "reinstall" ]; then
   first_addrs="$addrs"
   sleep 10
   read_node_addrs
