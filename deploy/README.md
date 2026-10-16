@@ -223,6 +223,16 @@ a word (power loss, SIGKILL) is dropped within 85 s: its last renewal can be
 one pass old, then the 40 s Lease duration, then two passes. When that node's
 controller returns it renews its Lease and re-adds its own entry.
 
+SIGTERM cannot tell pod removal from a DaemonSet rolling restart, so a
+restart withdraws the node too (the pinned dataplane keeps serving
+meanwhile). The replacement controller publishes no Lease addresses until its
+initial Node LIST completes, then renews with the full address set and
+re-publishes its ingress entries after its Service/EndpointSlice LISTs. If that
+happens before peers' second prune pass (under 30 s after SIGTERM) the entry is
+never pruned; otherwise the node is absent from ingress from the prune until
+the replacement re-publishes, with no operator action.
+The withdraw itself is bounded to 5 s so a hung apiserver cannot delay exit.
+
 Liveness is judged by observation: a Lease is live while its `renewTime`
 keeps changing as seen by the pruning controller's own monotonic clock, so
 wall-clock skew between nodes is irrelevant. A freshly started controller

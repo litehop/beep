@@ -35,6 +35,10 @@ pub const LEASE_RENEW: Duration = Duration::from_secs(10);
 /// controllers started together do not all prune at the same instant.
 pub const PRUNE_JITTER_MAX: Duration = Duration::from_secs(5);
 
+/// Longest the SIGTERM withdraw may run; well under the pod's
+/// `terminationGracePeriodSeconds`.
+const WITHDRAW_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Longest gap between two prune passes of one controller.
 pub const PRUNE_INTERVAL_MAX: Duration =
     Duration::from_secs(LEASE_RENEW.as_secs() + PRUNE_JITTER_MAX.as_secs());
@@ -145,12 +149,16 @@ pub async fn renew_lease(
 /// Publishes an empty address set in this node's Lease so peers drop the
 /// node's addresses from ingress without waiting for the Lease to expire.
 /// For a controller that is about to stop; a restarted one re-publishes.
+/// Bounded by `WITHDRAW_TIMEOUT` so a hung apiserver cannot hold up exit until
+/// the kubelet's SIGKILL.
 pub async fn withdraw_lease(
     client: &HyperApiClient,
     namespace: &str,
     node: &str,
 ) -> anyhow::Result<()> {
-    renew_lease(client, namespace, node, &[]).await
+    tokio::time::timeout(WITHDRAW_TIMEOUT, renew_lease(client, namespace, node, &[]))
+        .await
+        .context("withdrawing node Lease timed out")?
 }
 
 /// One node Lease as listed from the apiserver.
@@ -718,10 +726,18 @@ mod tests {
             worst <= max_prune_latency(false),
             "dead node's address lingered {worst:?}, past the documented bound"
         );
+        // The last write is first observed up to one pass late, the Lease is
+        // noticed expired on the pass after `LEASE_DURATION` elapses, and the
+        // confirming pass follows: at least that many whole passes in the
+        // worst phase. Without confirmation the worst phase is one pass less.
+        let pass = PRUNE_INTERVAL_MAX.as_secs();
+        let expiry_passes = LEASE_DURATION.as_secs().div_ceil(pass);
+        let floor = Duration::from_secs((expiry_passes + 1) * pass);
         assert!(
-            worst > LEASE_DURATION + PRUNE_INTERVAL_MAX,
-            "a one-pass bound (the old documentation) is unreachable here because the \
-             second confirming pass is required; the bound must account for it"
+            worst >= floor,
+            "dead node's address left ingress after {worst:?}, before {floor:?}: the second \
+             confirming pass is no longer required, so a Lease annotation lagging its \
+             published address by one renew would prune a live node"
         );
     }
 
@@ -737,6 +753,11 @@ mod tests {
         assert!(
             worst < LEASE_DURATION,
             "a withdrawn address must not wait out the Lease duration"
+        );
+        assert!(
+            worst >= PRUNE_INTERVAL_MAX,
+            "withdrawn address left ingress after {worst:?}, within one pass: the second \
+             confirming pass is no longer required"
         );
     }
 

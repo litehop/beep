@@ -462,8 +462,9 @@ async fn run_idle_sweep_loop(
     }
 }
 
-/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs
-/// immediately so the Lease exists before peers' warm-up ends.
+/// Renews this node's Lease every `LEASE_RENEW`. The first renew runs as soon
+/// as the initial Node LIST completes, so the Lease exists before peers'
+/// warm-up ends and never carries a partial address set.
 async fn run_lease_loop(
     client: Arc<HyperApiClient>,
     state: Arc<Mutex<WatchState>>,
@@ -472,7 +473,11 @@ async fn run_lease_loop(
     node_ip: IpAddr,
 ) -> anyhow::Result<()> {
     loop {
-        let ips = state.lock().unwrap().own_node_ips(node_ip);
+        let ips = state.lock().unwrap().lease_ips(node_ip);
+        let Some(ips) = ips else {
+            tokio::time::sleep(RETRY_POLL).await;
+            continue;
+        };
         if let Err(e) = renew_lease(&client, &namespace, &node_name, &ips).await {
             eprintln!("controller: WARN renewing node Lease failed (will retry): {e:#}");
         }

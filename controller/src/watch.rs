@@ -537,6 +537,14 @@ impl WatchState {
             .unwrap_or_else(|| vec![local_node_ip])
     }
 
+    /// `own_node_ips`, or `None` until the initial Node LIST has completed.
+    /// The Lease address set must not be published from the pre-LIST
+    /// fallback: it lacks the front addresses, so peers would prune them from
+    /// ingress after a restart.
+    pub fn lease_ips(&self, local_node_ip: IpAddr) -> Option<Vec<IpAddr>> {
+        self.nodes_listed.then(|| self.own_node_ips(local_node_ip))
+    }
+
     /// This node's FRONT addresses that should be published to `key`'s
     /// `status.loadBalancer.ingress` right now -- narrowed to `key`'s own
     /// `spec.ipFamilies`, the same way `desired`'s front_ip loop narrows
@@ -3406,6 +3414,28 @@ mod tests {
             vec![local],
             "before this node's own Node object has resolved, own_node_ips must still return \
              its CLI-configured --node-ip alone"
+        );
+    }
+
+    // A restarted controller publishes its Lease address set on its first
+    // renew; from the pre-LIST fallback that set lacks the front addresses, so
+    // peers would prune the node from ingress while its dataplane still serves.
+    #[test]
+    fn lease_ips_are_withheld_until_the_initial_node_list_completes() {
+        let mut state = WatchState::default();
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(
+            state.lease_ips(local),
+            None,
+            "the Lease must not publish the pre-LIST fallback address set"
+        );
+        state
+            .replace_nodes(&[node_obj("node-a", "10.0.0.5")], local)
+            .unwrap();
+        assert_eq!(
+            state.lease_ips(local),
+            Some(state.own_node_ips(local)),
+            "once the Node LIST completes the Lease publishes this node's resolved addresses"
         );
     }
 
