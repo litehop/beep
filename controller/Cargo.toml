@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 beep-common = { path = "../common", features = ["user"] }
 beep = { path = ".." }
-politeia = { git = "https://github.com/litehop/politeia", tag = "v0.1.1" }
+politeia = { git = "https://github.com/litehop/politeia", tag = "v0.2.0" }
 aya = { version = "0.14", default-features = false }
 anyhow = "1"
 base64 = "0.23"
