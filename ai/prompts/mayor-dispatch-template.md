@@ -252,12 +252,14 @@ with context, not as a hook rejection that gives you no stacktrace.
 Commit and push:
 ```bash
 git add <files>
-git commit -m "..."
+git commit -F .tmp-commit.md
 git push
-# write the PR body to .pr-body-<topic>.md in the worktree root (never committed)
-gh pr create --title "..." --body-file .pr-body-<topic>.md
-rm .pr-body-<topic>.md
+gh pr create --title "..." --body-file .tmp-pr.md
+rm .tmp-commit.md .tmp-pr.md
 ```
+Free text goes in `.tmp-*` files in the worktree root (never committed). bd
+has no file option for notes: workers return note text in their report and
+the mayor records it.
 
 ---
 

@@ -119,24 +119,24 @@ bash scripts/smoke.sh --vm <ASSIGNED_VM>   # front -> Geneve -> backend round tr
 
 # 6. Commit — pre-commit re-checks `cargo fmt --check` plus the bead/
 # findings-ref guards (not just fmt). Draft the message from your own diff,
-# not from memory. For a non-trivial diff, ground the message with
-# Agent(subagent_type="diff-summarizer", prompt="<your `git diff` output>")
-# and use its summary/breaking_change fields for the commit and PR body.
+# not from memory.
+# Free text never goes inline (harness refuses text it can't prove isn't
+# git). Write it to .tmp-commit.md/.tmp-pr.md in YOUR WORKTREE ROOT (never the session
+# scratchpad: the boundary hook blocks it); delete after use, never commit
+# (.gitignore covers .tmp-*). A short one-line -m without special characters is fine.
 git add <files>
-git commit -m "feat(<area>): <what and why>"
+git commit -F .tmp-commit.md   # feat(<area>): <what and why>
 
 # 7. Push and open PR — pre-push re-runs the OS-gated beep gate (fmt +
 # test -p beep-common on this host, not test+clippy --workspace); don't
 # re-run it yourself first.
-# Harness false positive: inline free text with dollar signs, backticks or
-# escaped quotes is refused ("cannot be shown not to be git").
-# Write the PR body to .pr-body-<topic>.md in the worktree root (never
-# committed), pass --body-file, delete it after. bd free text: --body-file
-# where it exists, else avoid those characters (name variables in words).
-# If refused anyway, STOP and report; the mayor opens the PR.
+# Beads: bd create/update --body-file / --design-file. Never pass long text
+# to --notes/--append-notes (no file option): put it in your final report;
+# the mayor records it.
+# On any harness or hook refusal, STOP and report; the mayor opens the PR.
 git push
-gh pr create --title "..." --body-file .pr-body-<topic>.md
-rm .pr-body-<topic>.md
+gh pr create --title "..." --body-file .tmp-pr.md
+rm .tmp-pr.md .tmp-commit.md
 
 # 8. Close the bead
 bd close <id> --reason="PR #N opened"

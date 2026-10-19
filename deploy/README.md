@@ -235,7 +235,8 @@ started, whichever is later (up to 70 s right after a rolling restart). A node
 that dies without a word (power loss, SIGKILL) is dropped within 85 s of its
 last renewal: its last renewal can be one pass old, then the 40 s Lease
 duration, then two passes. A survivor that started after the death needs the
-same 85 s counted from its own start. When that node's controller returns it
+same 85 s counted from its own start (its first pass, up to 15 s in, starts
+the 40 s expiry clock); the warm-up adds nothing. When that node's controller returns it
 renews its Lease and re-adds its own entry.
 
 SIGTERM cannot tell pod removal from a DaemonSet rolling restart, so a
@@ -306,9 +307,9 @@ path. Never set it in production.
 Behaviour changes to expect:
 
 - A front with no usable endpoint (count 0: `externalTrafficPolicy: Local`
-  with no usable local pod, or a Service with no ready endpoints) now
-  silently drops new connections. 0.4 answered with a TCP RST or ICMP
-  port-unreachable. Established flows keep forwarding.
+  with no usable local pod and no ready pod anywhere, or a Service with no
+  ready endpoints) now silently drops new connections. 0.4 answered with a TCP
+  RST or ICMP port-unreachable. Established flows keep forwarding.
 - Services may now spread over every ready endpoint and honour
   `externalTrafficPolicy` and `spec.trafficDistribution`; see "Service
   policy".
@@ -322,11 +323,19 @@ Full list: `CHANGELOG.md`.
 Each node's controller derives a front's endpoints from the Service spec
 (`controller/src/reconcile.rs`):
 
-- `externalTrafficPolicy: Local` uses only endpoints on the ingress node:
-  ready ones, else serving-but-terminating ones, else none (count 0, silent
-  drop). It ignores `spec.trafficDistribution`. A node with no usable local
-  pod removes its own address from `status.loadBalancer.ingress`, so clients
-  are only sent to nodes that can serve them.
+- `externalTrafficPolicy: Local` uses the ingress node's own endpoints: ready
+  ones, else serving-but-terminating ones. **This deliberately deviates from
+  upstream Local semantics:** a node without a usable local pod forwards to
+  every ready, non-terminating endpoint cluster-wide over Geneve (client IP
+  preserved) instead of dropping, so a client still holding a node's address
+  after the pod moved is served. The front is count 0 (silent drop) only when
+  no pod is ready anywhere; a remote serving-but-terminating pod keeps the
+  Service published but is not a fallback target. It ignores
+  `spec.trafficDistribution`. Once any node has a usable pod, a node without
+  one removes its own address from `status.loadBalancer.ingress`. While no
+  node has a usable pod (per address family), every node stays listed
+  (fail-open, like a cloud LB with no healthy target), so a Service created
+  before its pods still gets an ingress.
 - Otherwise `spec.trafficDistribution` of `PreferSameNode`, `PreferClose` or
   `PreferSameZone` prefers local endpoints and falls back to all ready ones.
   beep has no zone model, so the latter two behave as `PreferSameNode`.

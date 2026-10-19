@@ -131,12 +131,33 @@ k3s_reinstall_decision() { # k3s_reinstall_decision <dual-stack: 0|1> <v6-only: 
   fi
 }
 
+k3s_canon_ip() { # k3s_canon_ip <address> -- prints the address lower-cased with an IPv6 "::" expanded to eight 4-digit groups, so "FD00:BEEF:98::3" and "fd00:beef:0098:0:0:0:0:3" compare equal. IPv4 and v4-embedded v6 are only lower-cased. bash 3.2 safe (no ${var,,}).
+  local ip head tail n g out="" IFS=:
+  local -a hg tg
+  ip="$(printf '%s' "$1" | tr 'A-F' 'a-f')"
+  case "$ip" in *:*.*|*.*) echo "$ip"; return 0 ;; *:*) ;; *) echo "$ip"; return 0 ;; esac
+  case "$ip" in
+    *::*) head="${ip%%::*}" tail="${ip#*::}" ;;
+    *) head="$ip" tail="" ;;
+  esac
+  read -ra hg <<<"$head"
+  read -ra tg <<<"$tail"
+  n=0
+  case "$ip" in *::*) n=$((8 - ${#hg[@]} - ${#tg[@]})) ;; esac
+  for g in ${hg[@]+"${hg[@]}"}; do out="$out$(printf '%04x' "0x$g"):"; done
+  while [ "$n" -gt 0 ]; do out="${out}0000:"; n=$((n - 1)); done
+  for g in ${tg[@]+"${tg[@]}"}; do out="$out$(printf '%04x' "0x$g"):"; done
+  echo "${out%:}"
+}
+
 k3s_unit_missing_node_ip() { # k3s_unit_missing_node_ip <systemd-unit-text> <local-addresses> -- prints the first --node-ip address in the unit that is not among the whitespace-separated local addresses, nothing if all are present or the unit pins none. k3s cannot start with a node-ip the host does not own, so a hit is positive proof of a stale install (unlike an unreadable node, which may just be starting).
-  local unit="$1" locals=" $(echo $2) " arg ip
+  local unit="$1" locals="" arg ip
+  for ip in $2; do locals="$locals $(k3s_canon_ip "$ip")"; done
+  locals="$locals "
   for arg in $(printf '%s\n' "$unit" | grep -o -- '--node-ip=[0-9A-Fa-f:.,]*' || true); do
     for ip in $(echo "${arg#--node-ip=}" | tr ',' ' '); do
       case "$locals" in
-        *" $ip "*) ;;
+        *" $(k3s_canon_ip "$ip") "*) ;;
         *) echo "$ip"; return 0 ;;
       esac
     done
@@ -225,6 +246,31 @@ k3s_teardown_client_cert_auth() { # k3s_teardown_client_cert_auth -- removes wha
   kube -n kube-system delete rolebinding beep-controller-csr-flow-hash-seed --ignore-not-found >/dev/null 2>&1 || true
   kube -n beep-leases delete rolebinding beep-controller-csr-node-lease --ignore-not-found >/dev/null 2>&1 || true
   kube -n kube-system delete secret "$CLIENT_CERT_KUBECONFIG_SECRET" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+k3s_build_load_image() { # k3s_build_load_image <repo-root> <vm-a> <vm-b> -- cross-builds beep-controller, builds docker.io/valerauko/beep-lb:<HEAD sha> and imports it into both nodes' containerd (never pulled: the registry's :latest may predate the commit under test); sets IMAGE as a side effect, so pass it to k3s_deploy_controller_daemonset
+  local repo_root="$1" vm_a="$2" vm_b="$3" sha node_arch rust_target goarch tmpdir vm
+  sha="$(git -C "$repo_root" rev-parse HEAD)"
+  IMAGE="docker.io/valerauko/beep-lb:${sha}"
+  node_arch="$(limactl shell "$vm_a" -- uname -m)"
+  [ "$(limactl shell "$vm_b" -- uname -m)" = "$node_arch" ] || { echo "FAIL: $vm_a and $vm_b report different architectures" >&2; return 1; }
+  case "$node_arch" in
+    aarch64) rust_target="aarch64-unknown-linux-gnu.2.36"; goarch="arm64" ;;
+    x86_64) rust_target="x86_64-unknown-linux-gnu.2.36"; goarch="amd64" ;;
+    *) echo "FAIL: unsupported node architecture '$node_arch' (want aarch64 or x86_64)" >&2; return 1 ;;
+  esac
+  ( cd "$repo_root" && cargo +nightly zigbuild --release -p beep-controller --target "$rust_target" ) || return 1
+  mkdir -p "$repo_root/dist/linux/$goarch"
+  cp "$repo_root/target/${rust_target%%.*}/release/beep-controller" "$repo_root/dist/linux/$goarch/beep-controller"
+  docker buildx build --platform "linux/$goarch" -t "$IMAGE" --load "$repo_root" >/dev/null || return 1
+  tmpdir="$(mktemp -d)"
+  docker save "$IMAGE" -o "$tmpdir/beep-lb.tar" || { rm -rf "$tmpdir"; return 1; }
+  for vm in "$vm_a" "$vm_b"; do
+    limactl copy "$tmpdir/beep-lb.tar" "$vm":/tmp/beep-lb.tar
+    limactl shell "$vm" -- sudo k3s ctr images import /tmp/beep-lb.tar >/dev/null
+    limactl shell "$vm" -- rm -f /tmp/beep-lb.tar
+  done
+  rm -rf "$tmpdir"
 }
 
 k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/base/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/base/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.

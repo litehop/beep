@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart; a silently lost node within 85 s of the later of its last renewal
   and the survivor's start.
 
+- **Published ingress for existing `externalTrafficPolicy: Local` Services
+  changes.** While no node has a usable endpoint (per address family), every
+  node is listed in `status.loadBalancer.ingress` (fail-open), so a Service
+  created before its pods gets an ingress; new connections are dropped until a
+  pod is usable. Once one is, only nodes with a usable local pod stay listed.
+
 ### Added
 
 - Service `sessionAffinity: ClientIP` is honoured: a client stays pinned to one
@@ -48,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loader `--fixture` repeated for one front now adds endpoints instead of
   keeping the last; an optional `:affinity` suffix requests ClientIP affinity.
 - `FRONT_META.flags` bit 0 now means ClientIP affinity (no byte-layout change).
+- **`externalTrafficPolicy: Local` now deviates from upstream semantics.** A
+  node with no usable local pod forwards to the ready, non-terminating
+  endpoints cluster-wide (client IP preserved) instead of dropping. The front
+  is count 0 (drop) only when no pod is ready anywhere; a remote
+  serving-but-terminating pod keeps the Service published but is not a
+  fallback target.
+- Dependency and CI-action bumps (Renovate).
 
 ### Fixed
 

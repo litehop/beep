@@ -18,6 +18,24 @@ disk: "10GiB"
 networks:
   - lima: user-v2
 
+# Never auto-forward guest listeners onto host loopback: the shared host runs
+# other projects on ports a guest can listen on (k3s 6443/6444, kubelet
+# 10248-10259). Rigs reach guests over user-v2 or `limactl shell`, never a
+# forwarded host port. SSH is forwarded separately from portForwards.
+portForwards:
+  - guestIP: 0.0.0.0
+    guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+  - guestIP: "::"
+    guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+  - guestIP: 127.0.0.1
+    guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+
 # Pinned to a dated release + digest; never a floating `latest`/`trixie` path.
 images:
   - location: https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2
