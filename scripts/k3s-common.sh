@@ -248,6 +248,31 @@ k3s_teardown_client_cert_auth() { # k3s_teardown_client_cert_auth -- removes wha
   kube -n kube-system delete secret "$CLIENT_CERT_KUBECONFIG_SECRET" --ignore-not-found >/dev/null 2>&1 || true
 }
 
+k3s_build_load_image() { # k3s_build_load_image <repo-root> <vm-a> <vm-b> -- cross-builds beep-controller, builds docker.io/valerauko/beep-lb:<HEAD sha> and imports it into both nodes' containerd (never pulled: the registry's :latest may predate the commit under test); sets IMAGE as a side effect, so pass it to k3s_deploy_controller_daemonset
+  local repo_root="$1" vm_a="$2" vm_b="$3" sha node_arch rust_target goarch tmpdir vm
+  sha="$(git -C "$repo_root" rev-parse HEAD)"
+  IMAGE="docker.io/valerauko/beep-lb:${sha}"
+  node_arch="$(limactl shell "$vm_a" -- uname -m)"
+  [ "$(limactl shell "$vm_b" -- uname -m)" = "$node_arch" ] || { echo "FAIL: $vm_a and $vm_b report different architectures" >&2; return 1; }
+  case "$node_arch" in
+    aarch64) rust_target="aarch64-unknown-linux-gnu.2.36"; goarch="arm64" ;;
+    x86_64) rust_target="x86_64-unknown-linux-gnu.2.36"; goarch="amd64" ;;
+    *) echo "FAIL: unsupported node architecture '$node_arch' (want aarch64 or x86_64)" >&2; return 1 ;;
+  esac
+  ( cd "$repo_root" && cargo +nightly zigbuild --release -p beep-controller --target "$rust_target" ) || return 1
+  mkdir -p "$repo_root/dist/linux/$goarch"
+  cp "$repo_root/target/${rust_target%%.*}/release/beep-controller" "$repo_root/dist/linux/$goarch/beep-controller"
+  docker buildx build --platform "linux/$goarch" -t "$IMAGE" --load "$repo_root" >/dev/null || return 1
+  tmpdir="$(mktemp -d)"
+  docker save "$IMAGE" -o "$tmpdir/beep-lb.tar" || { rm -rf "$tmpdir"; return 1; }
+  for vm in "$vm_a" "$vm_b"; do
+    limactl copy "$tmpdir/beep-lb.tar" "$vm":/tmp/beep-lb.tar
+    limactl shell "$vm" -- sudo k3s ctr images import /tmp/beep-lb.tar >/dev/null
+    limactl shell "$vm" -- rm -f /tmp/beep-lb.tar
+  done
+  rm -rf "$tmpdir"
+}
+
 k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/base/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/base/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
   local repo_root="$1" image="${2:-}"
   kube apply -f - < "$repo_root/deploy/base/rbac.yaml"
