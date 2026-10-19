@@ -10,6 +10,27 @@
       ],
       "extractVersion": "^(?<version>v?\\d+\\.\\d+\\.\\d+)$",
       "versioning": "regex:^v?(?<major>\\d+)(\\.(?<minor>\\d+)\\.(?<patch>\\d+))?$"
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "aya",
+        "aya-build",
+        "aya-ebpf"
+      ],
+      "groupName": "aya crates"
+    },
+    {
+      "description": "aya-obj must match the version aya depends on; bump it by hand alongside aya.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "aya-obj"
+      ],
+      "enabled": false
     }
   ]
 }
