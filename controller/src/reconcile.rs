@@ -2236,11 +2236,17 @@ mod tests {
             true
         ));
 
-        let v6_remote = [ep_on(OTHER, 1)];
-        let refs: Vec<&Endpoint> = v6_remote.iter().collect();
+        let v4_remote = [ep_on(OTHER, 1)];
+        let refs: Vec<&Endpoint> = v4_remote.iter().collect();
         assert!(
             publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
             "a v4 pod does not count as usable for the v6 family, which stays fail-open"
+        );
+        let v4_local = [ep_on(THIS, 1)];
+        let refs: Vec<&Endpoint> = v4_local.iter().collect();
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
+            "a local v4 pod serves no v6 front, but no v6 pod is usable anywhere, so the v6 front fails open"
         );
     }
 }

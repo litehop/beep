@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- `externalTrafficPolicy: Local` Services list every node in
-  `status.loadBalancer.ingress` while no node has a usable endpoint
-  (fail-open); once one does, only nodes with a usable local pod stay listed.
+### Changed
+
+- **Published ingress for existing `externalTrafficPolicy: Local` Services
+  changes.** While no node has a usable endpoint (per address family), every
+  node is listed in `status.loadBalancer.ingress` (fail-open), so a Service
+  created before its pods gets an ingress; new connections are dropped until a
+  pod is usable. Once one is, only nodes with a usable local pod stay listed.
 
 ## [0.5.0] - 2026-10-15
 

@@ -563,7 +563,8 @@ impl WatchState {
             None => vec![local_node_ip],
         };
         // Only `externalTrafficPolicy: Local` narrows the set further: this
-        // node is listed only while it hosts a usable local pod. Until this
+        // node is listed only while it hosts a usable local pod or no node
+        // does (fail-open). Until this
         // node's own Node entry resolves, locality is unknowable, so it is not
         // pruned.
         let own_known = self.own_node_addrs(local_node_ip).is_some();
@@ -606,6 +607,15 @@ impl WatchState {
                     )
             })
             .collect()
+    }
+
+    /// Whether `ips_to_publish(key)` is meaningful yet. An
+    /// `externalTrafficPolicy: Local` Service fails open on "no usable pod
+    /// anywhere", which before the first EndpointSlice LIST only means "not
+    /// listed yet"; publishing then would list a podless node until the LIST
+    /// lands. The LIST completion re-publishes every such Service.
+    pub fn ingress_decidable(&self, key: &ServiceKey) -> bool {
+        self.slices_listed || !self.is_local_policy(key)
     }
 
     /// Keys of the Services whose published ingress depends on which pods
@@ -4165,6 +4175,35 @@ mod tests {
             None,
             "eTP=Cluster ingress never depends on slices, so no re-publish"
         );
+    }
+
+    // After a restart the Service LIST lands before the EndpointSlice LIST, so
+    // empty endpoints must not read as "no pod anywhere" and list a podless
+    // node.
+    #[test]
+    fn local_ingress_is_withheld_until_the_endpoint_slice_list_completes() {
+        let key = |n: &str| ServiceKey {
+            namespace: "default".to_owned(),
+            name: n.to_owned(),
+        };
+        let mut state = WatchState::default();
+        state.apply_service_event(&policy_service(
+            "local",
+            serde_json::json!({"externalTrafficPolicy": "Local"}),
+        ));
+        state.apply_service_event(&policy_service("cluster", serde_json::json!({})));
+        assert!(
+            !state.ingress_decidable(&key("local")),
+            "a restarted node must not fail open before it has seen any EndpointSlice"
+        );
+        assert!(
+            state.ingress_decidable(&key("cluster")),
+            "eTP=Cluster ingress does not depend on slices"
+        );
+        state
+            .replace_endpoint_slices(&[policy_slice("local", &[])])
+            .unwrap();
+        assert!(state.ingress_decidable(&key("local")));
     }
 
     #[test]
