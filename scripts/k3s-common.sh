@@ -275,6 +275,11 @@ k3s_build_load_image() { # k3s_build_load_image <repo-root> <vm-a> <vm-b> -- cro
 
 k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root> [image] -- applies deploy/base/{rbac,daemonset}.yaml via the caller's kube(), waits for the rollout, and requires zero container restarts after a 10s settle; sets CONTROLLER_SELECTOR as a side effect, returns 1 on any failure. image, if given, overrides deploy/base/daemonset.yaml's hardcoded docker.io/valerauko/beep-lb:latest -- e.g. scripts/smoke-k3s-controller.sh pins the commit-under-test's :sha so this gate tests that build, not whatever :latest currently resolves to.
   local repo_root="$1" image="${2:-}"
+  # A run aborted mid-leg (or a dead host) leaves the DaemonSet OnDelete with a
+  # leg nodeSelector, and a reused cluster would keep it: `rollout status`
+  # then refuses ("only available for RollingUpdate strategy type"). Start
+  # from no DaemonSet so the apply below always recreates the stock one.
+  kube -n kube-system delete daemonset servicelb-controller --ignore-not-found --timeout=120s || return 1
   kube apply -f - < "$repo_root/deploy/base/rbac.yaml"
   kube apply -f - < "$repo_root/deploy/base/configmap.yaml"
   controller_deploy_failed=0

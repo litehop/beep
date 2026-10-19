@@ -211,6 +211,15 @@ expect_eq "client-cert mode with the token still mounted could mask a broken cer
   "init= containers=servicelb-controller" \
   "$(k3s_sa_token_scope client-cert "$(pod "[$HOST_VOL,$SA_VOL]" "[$M_HOST]" "[$M_HOST,$M_SA]")")"
 
+(
+  kube() { echo "kube $*" >> "$WORK/deploy.calls"; }
+  sleep() { :; }
+  k3s_deploy_controller_daemonset "$REPO" >/dev/null 2>&1 || true
+)
+expect_eq "a DaemonSet left OnDelete by an aborted leg is deleted before the stock one is applied, or rollout status refuses on the reused cluster" \
+  "kube -n kube-system delete daemonset servicelb-controller --ignore-not-found --timeout=120s" \
+  "$(head -n1 "$WORK/deploy.calls")"
+
 echo "---"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
