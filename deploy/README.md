@@ -307,7 +307,7 @@ path. Never set it in production.
 Behaviour changes to expect:
 
 - A front with no usable endpoint (count 0: `externalTrafficPolicy: Local`
-  with no usable pod anywhere, or a Service with no ready endpoints) now
+  with no usable local pod and no ready pod anywhere, or a Service with no ready endpoints) now
   silently drops new connections. 0.4 answered with a TCP RST or ICMP
   port-unreachable. Established flows keep forwarding.
 - Services may now spread over every ready endpoint and honour
@@ -324,10 +324,13 @@ Each node's controller derives a front's endpoints from the Service spec
 (`controller/src/reconcile.rs`):
 
 - `externalTrafficPolicy: Local` uses the ingress node's own endpoints: ready
-  ones, else serving-but-terminating ones. With neither, it forwards to every
-  ready endpoint cluster-wide over Geneve (client IP preserved), so a client
-  still holding a node's address after the pod moved is served; only when no
-  node has a usable pod is the front count 0 (silent drop). It ignores
+  ones, else serving-but-terminating ones. **This deliberately deviates from
+  upstream Local semantics:** a node without a usable local pod forwards to
+  every ready, non-terminating endpoint cluster-wide over Geneve (client IP
+  preserved) instead of dropping, so a client still holding a node's address
+  after the pod moved is served. The front is count 0 (silent drop) only when
+  no pod is ready anywhere; a remote serving-but-terminating pod keeps the
+  Service published but is not a fallback target. It ignores
   `spec.trafficDistribution`. Once any node has a usable pod, a node without
   one removes its own address from `status.loadBalancer.ingress`. While no
   node has a usable pod (per address family), every node stays listed

@@ -2158,6 +2158,8 @@ mod tests {
         assert_eq!(front.local_count(), 0);
     }
 
+    // Guard, not a regression test: passes without the remote fallback; fails
+    // if the fallback is widened to apply alongside local pods.
     #[test]
     fn only_local_with_a_ready_local_pod_never_adds_remote_pods() {
         let desired = reconcile_on(
@@ -2172,7 +2174,8 @@ mod tests {
         );
     }
 
-    // Matches the documented order: serving-terminating local beats remote ready.
+    // Guard, not a regression test: passes without the remote fallback; fails
+    // if remote ready pods outrank a serving-terminating local pod.
     #[test]
     fn only_local_prefers_a_serving_terminating_local_pod_over_remote_ready_pods() {
         let desired = reconcile_on(
@@ -2208,6 +2211,27 @@ mod tests {
             local.pod_targets.contains(&pod_wire(4)),
             "a terminating local pod keeps decap admission for its pinned flows"
         );
+    }
+
+    #[test]
+    fn a_local_pod_turning_ready_narrows_the_fallback_front_to_local_only() {
+        let remote = || vec![ep_on(OTHER, 1), ep_on(OTHER, 3)];
+        let fallback = reconcile_on(EndpointPolicy::OnlyLocal, remote());
+        let mut with_local = remote();
+        with_local.push(ep_on(THIS, 2));
+        let local = reconcile_on(EndpointPolicy::OnlyLocal, with_local);
+
+        assert_eq!(
+            slot_pods(only_front(&fallback)),
+            vec![pod_wire(1), pod_wire(3)]
+        );
+        assert_eq!(only_front(&fallback).local_count(), 0);
+        assert_eq!(
+            slot_pods(only_front(&local)),
+            vec![pod_wire(2)],
+            "new flows go to the local pod once one is ready"
+        );
+        assert_eq!(only_front(&local).local_count(), 1);
     }
 
     #[test]
@@ -2305,11 +2329,17 @@ mod tests {
             true
         ));
 
-        let v6_remote = [ep_on(OTHER, 1)];
-        let refs: Vec<&Endpoint> = v6_remote.iter().collect();
+        let v4_remote = [ep_on(OTHER, 1)];
+        let refs: Vec<&Endpoint> = v4_remote.iter().collect();
         assert!(
             publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
             "a v4 pod does not count as usable for the v6 family, which stays fail-open"
+        );
+        let v4_local = [ep_on(THIS, 1)];
+        let refs: Vec<&Endpoint> = v4_local.iter().collect();
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
+            "a local v4 pod serves no v6 front, but no v6 pod is usable anywhere, so the v6 front fails open"
         );
     }
 }
