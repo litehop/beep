@@ -325,9 +325,13 @@ Each node's controller derives a front's endpoints from the Service spec
 
 - `externalTrafficPolicy: Local` uses only endpoints on the ingress node:
   ready ones, else serving-but-terminating ones, else none (count 0, silent
-  drop). It ignores `spec.trafficDistribution`. A node with no usable local
-  pod removes its own address from `status.loadBalancer.ingress`, so clients
-  are only sent to nodes that can serve them.
+  drop). It ignores `spec.trafficDistribution`. Once any node has a usable
+  pod, a node without one removes its own address from
+  `status.loadBalancer.ingress`, so clients are only sent to nodes that can
+  serve them. While no node has a usable pod (per address family), every node
+  stays listed (fail-open, like a cloud LB with no healthy target), so a
+  Service created before its pods still gets an ingress; connections to it
+  are dropped until a pod is usable.
 - Otherwise `spec.trafficDistribution` of `PreferSameNode`, `PreferClose` or
   `PreferSameZone` prefers local endpoints and falls back to all ready ones.
   beep has no zone model, so the latter two behave as `PreferSameNode`.

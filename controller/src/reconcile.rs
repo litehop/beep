@@ -433,8 +433,10 @@ fn eligible_endpoints<'a>(
 
 /// Whether this node should list its own address in a Service's
 /// `status.loadBalancer.ingress`. Only `OnlyLocal` narrows it: a node with no
-/// usable local pod would silently drop every connection. Every other policy
-/// forwards cross-node, so any node running beep qualifies.
+/// usable local pod would silently drop every connection -- except while no
+/// node anywhere has a usable pod, when every node is listed (fail-open, as a
+/// cloud LB does with no healthy target). Every other policy forwards
+/// cross-node, so any node running beep qualifies.
 pub fn publishes_ingress(
     policy: EndpointPolicy,
     endpoints: &[&Endpoint],
@@ -449,7 +451,10 @@ pub fn publishes_ingress(
         .copied()
         .filter(|e| e.pod_ip.is_ipv4() == family_is_v4)
         .collect();
-    !eligible_endpoints(policy, &same_family, node_ip).is_empty()
+    let usable_anywhere = same_family
+        .iter()
+        .any(|e| (e.ready && !e.terminating) || (e.serving && e.terminating));
+    !usable_anywhere || !eligible_endpoints(policy, &same_family, node_ip).is_empty()
 }
 
 fn front_key(front_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
@@ -2160,10 +2165,6 @@ mod tests {
             this,
             true
         ));
-        assert!(
-            !publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
-            "a v4 local pod gives a v6 front nothing to serve it"
-        );
     }
 
     #[test]
@@ -2177,13 +2178,75 @@ mod tests {
             this,
             true
         ));
-        let dead = [terminating_ep_on(THIS, 4, false)];
+        let remote_ready_local_dead = [ep_on(OTHER, 1), terminating_ep_on(THIS, 4, false)];
+        let refs: Vec<&Endpoint> = remote_ready_local_dead.iter().collect();
+        assert!(
+            !publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, true),
+            "a dead local pod beside a usable remote one must not list this node"
+        );
+    }
+
+    #[test]
+    fn only_local_fails_open_while_no_node_has_a_usable_pod() {
+        let this = IpAddr::V4(THIS);
+        let none: [&Endpoint; 0] = [];
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &none, this, true),
+            "a Service created before its pods must still get an ingress"
+        );
+
+        let dead = [
+            terminating_ep_on(THIS, 4, false),
+            terminating_ep_on(OTHER, 5, false),
+        ];
         let refs: Vec<&Endpoint> = dead.iter().collect();
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, true),
+            "terminating non-serving pods are not usable, so nothing is usable anywhere"
+        );
+
+        let not_ready = [Endpoint {
+            ready: false,
+            ..ep_on(OTHER, 1)
+        }];
+        let refs: Vec<&Endpoint> = not_ready.iter().collect();
+        assert!(publishes_ingress(
+            EndpointPolicy::OnlyLocal,
+            &refs,
+            this,
+            true
+        ));
+    }
+
+    #[test]
+    fn only_local_fail_open_ends_once_any_node_has_a_usable_pod() {
+        let this = IpAddr::V4(THIS);
+        let remote = [ep_on(OTHER, 1)];
+        let refs: Vec<&Endpoint> = remote.iter().collect();
+        assert!(
+            !publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, true),
+            "a remote usable pod makes this node a blackhole again"
+        );
+        let remote_draining = [terminating_ep_on(OTHER, 1, true)];
+        let refs: Vec<&Endpoint> = remote_draining.iter().collect();
         assert!(!publishes_ingress(
             EndpointPolicy::OnlyLocal,
             &refs,
             this,
             true
         ));
+
+        let v4_remote = [ep_on(OTHER, 1)];
+        let refs: Vec<&Endpoint> = v4_remote.iter().collect();
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
+            "a v4 pod does not count as usable for the v6 family, which stays fail-open"
+        );
+        let v4_local = [ep_on(THIS, 1)];
+        let refs: Vec<&Endpoint> = v4_local.iter().collect();
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &refs, this, false),
+            "a local v4 pod serves no v6 front, but no v6 pod is usable anywhere, so the v6 front fails open"
+        );
     }
 }
