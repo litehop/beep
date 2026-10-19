@@ -220,6 +220,17 @@ expect_eq "a DaemonSet left OnDelete by an aborted leg is deleted before the sto
   "kube -n kube-system delete daemonset servicelb-controller --ignore-not-found --timeout=120s" \
   "$(head -n1 "$WORK/deploy.calls")"
 
+expect_eq "arm64 Lima nodes get an aarch64 build and an arm64 image, or the controller binary crashes with exec format error" \
+  "aarch64-unknown-linux-gnu.2.36 arm64" "$(k3s_arch_targets aarch64)"
+expect_eq "amd64 Lima nodes get an x86_64 build and an amd64 image, or the controller binary crashes with exec format error" \
+  "x86_64-unknown-linux-gnu.2.36 amd64" "$(k3s_arch_targets x86_64)"
+rc=0
+k3s_arch_targets riscv64 >/dev/null || rc=$?
+expect_eq "an unsupported node arch fails instead of building a binary the node cannot run" 1 "$rc"
+rc=0
+k3s_arch_targets "" >/dev/null || rc=$?
+expect_eq "an unreadable uname (empty) fails rather than defaulting to a host arch" 1 "$rc"
+
 echo "---"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -101,7 +101,6 @@ SERVICE_NAME="whoami"
 DEPLOY_NAME="whoami"
 FRONT_PORT="80"
 PIN_DIR="/sys/fs/bpf/beep"
-IMAGE_TMPDIR=""
 IMAGE=""
 
 for tool in limactl jq docker cargo-zigbuild; do
@@ -134,11 +133,7 @@ cleanup() {
   k3s_teardown_controller "$REPO_ROOT"
   k3s_teardown_client_cert_auth
   kube -n beep-leases delete lease -l app.kubernetes.io/component=node-lease --ignore-not-found >/dev/null 2>&1 || true
-  [ -n "$IMAGE_TMPDIR" ] && rm -rf "$IMAGE_TMPDIR"
-  # The tarball above is trap-cleaned, but the locally built+tagged image
-  # itself isn't -- without this, every run of a different commit leaves
-  # its sha-tagged image on the host indefinitely.
-  [ -n "$IMAGE" ] && docker rmi "$IMAGE" >/dev/null 2>&1 || true
+  k3s_cleanup_image "$REPO_ROOT"
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true
@@ -200,42 +195,9 @@ for vm in "$VM_A" "$VM_B"; do
   '
 done
 
-SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-IMAGE="docker.io/valerauko/beep-lb:${SHA}"
-echo "==> [4/11] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
-
-node_arch="$(limactl shell "$VM_A" -- uname -m)"
-[ "$(limactl shell "$VM_B" -- uname -m)" = "$node_arch" ] || {
-  echo "FAIL: $VM_A and $VM_B report different architectures -- this rig assumes a homogeneous node pair" >&2
-  exit 1
-}
-case "$node_arch" in
-  aarch64) rust_target="aarch64-unknown-linux-gnu.2.36"; goarch="arm64" ;;
-  x86_64) rust_target="x86_64-unknown-linux-gnu.2.36"; goarch="amd64" ;;
-  *) echo "FAIL: unsupported node architecture '$node_arch' (want aarch64 or x86_64)" >&2; exit 1 ;;
-esac
-
-# Same cross-build technique as scripts/smoke.sh (cargo-zigbuild, no QEMU),
-# glibc-pinned the same way as .github/workflows/delivery.yaml's real
-# release build, just targeting this rig's own node arch instead of both.
-( cd "$REPO_ROOT" && cargo +nightly zigbuild --release -p beep-controller --target "$rust_target" )
-mkdir -p "$REPO_ROOT/dist/linux/$goarch"
-cp "$REPO_ROOT/target/${rust_target%%.*}/release/beep-controller" "$REPO_ROOT/dist/linux/$goarch/beep-controller"
-
-docker buildx build --platform "linux/$goarch" -t "$IMAGE" --load "$REPO_ROOT" >/dev/null
-
-IMAGE_TMPDIR="$(mktemp -d)"
-docker save "$IMAGE" -o "$IMAGE_TMPDIR/beep-lb.tar"
-for vm in "$VM_A" "$VM_B"; do
-  limactl copy "$IMAGE_TMPDIR/beep-lb.tar" "$vm":/tmp/beep-lb.tar
-  # Imported straight into containerd, never pulled from a registry -- the
-  # whole point is testing this exact checkout, not whatever tag currently
-  # resolves on Docker Hub (see this script's IMAGE header note).
-  limactl shell "$vm" -- sudo k3s ctr images import /tmp/beep-lb.tar >/dev/null
-  limactl shell "$vm" -- rm -f /tmp/beep-lb.tar
-done
-rm -rf "$IMAGE_TMPDIR"
-IMAGE_TMPDIR=""
+echo "==> [4/11] building the commit-under-test's image and deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
+k3s_build_load_image "$REPO_ROOT" "$VM_A" "$VM_B" || exit 1
+echo "image: $IMAGE"
 
 if ! k3s_deploy_controller_daemonset "$REPO_ROOT" "$IMAGE"; then
   echo "CONTROLLER-DEPLOY: FAIL (see pod status/logs below -- this step is expected to PASS, see this script's header)" >&2
