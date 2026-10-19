@@ -195,6 +195,13 @@ for vm in "$VM_A" "$VM_B"; do
   '
 done
 
+# A killed run skips cleanup(), leaving the old controller and its pinned maps
+# (with the old run's flow rows) behind; a rerun would inherit both.
+kube -n kube-system delete daemonset servicelb-controller --ignore-not-found --timeout=120s
+for vm in "$VM_A" "$VM_B"; do
+  limactl shell "$vm" -- sudo rm -rf "$PIN_DIR"
+done
+
 echo "==> [4/11] building the commit-under-test's image and deploying the controller DaemonSet (deploy/base/rbac.yaml + deploy/base/daemonset.yaml)"
 k3s_build_load_image "$REPO_ROOT" "$VM_A" "$VM_B" || exit 1
 echo "image: $IMAGE"
