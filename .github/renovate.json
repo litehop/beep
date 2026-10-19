@@ -23,14 +23,14 @@
       "groupName": "aya crates"
     },
     {
-      "description": "aya-obj must match the version aya depends on; bump it by hand alongside aya.",
+      "description": "aya-obj must match the version aya depends on; whoever bumps aya also raises this bound and checks that cargo tree -d shows no duplicate aya-obj.",
       "matchManagers": [
         "cargo"
       ],
       "matchPackageNames": [
         "aya-obj"
       ],
-      "enabled": false
+      "allowedVersions": "<0.4"
     }
   ]
 }
