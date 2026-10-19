@@ -4091,6 +4091,11 @@ mod tests {
                 },
             }));
         }
+        assert_eq!(
+            state.ips_to_publish(&key("local"), this),
+            vec![this],
+            "a Service with no pods anywhere fails open so it still gets an ingress"
+        );
         let remote_only = [("10.244.1.9", "node-b", true, true)];
         for svc in ["local", "cluster"] {
             state.apply_endpoint_slice_event(&policy_slice(svc, &remote_only));
@@ -4131,11 +4136,29 @@ mod tests {
             "a serving-terminating local pod still serves, so the node stays listed"
         );
 
-        state.apply_endpoint_slice_event(&policy_slice(
+        let dead = state.apply_endpoint_slice_event(&policy_slice(
             "local",
             &[("10.244.0.9", "node-a", false, false)],
         ));
-        assert!(state.ips_to_publish(&key("local"), this).is_empty());
+        assert_eq!(dead, Some(key("local")));
+        assert_eq!(
+            state.ips_to_publish(&key("local"), this),
+            vec![this],
+            "only a terminating non-serving pod: nothing usable anywhere, fail open"
+        );
+
+        state.apply_endpoint_slice_event(&policy_slice("local", &remote_only));
+        assert!(
+            state.ips_to_publish(&key("local"), this).is_empty(),
+            "a usable pod reappearing on another node ends the fail-open"
+        );
+        let emptied = state.apply_endpoint_slice_event(&policy_slice("local", &[]));
+        assert_eq!(
+            emptied,
+            Some(key("local")),
+            "dropping to zero usable pods must trigger a re-publish"
+        );
+        assert_eq!(state.ips_to_publish(&key("local"), this), vec![this]);
 
         assert_eq!(
             state.apply_endpoint_slice_event(&policy_slice("cluster", &remote_only)),
