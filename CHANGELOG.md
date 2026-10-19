@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node is listed in `status.loadBalancer.ingress` (fail-open), so a Service
   created before its pods gets an ingress; new connections are dropped until a
   pod is usable. Once one is, only nodes with a usable local pod stay listed.
+- **`externalTrafficPolicy: Local` now deviates from upstream semantics.** A
+  node with no usable local pod forwards to the ready, non-terminating
+  endpoints cluster-wide (client IP preserved) instead of dropping. The front
+  is count 0 (drop) only when no pod is ready anywhere; a remote
+  serving-but-terminating pod keeps the Service published but is not a
+  fallback target.
 
 ## [0.5.0] - 2026-10-15
 

@@ -4206,6 +4206,61 @@ mod tests {
         assert!(state.ingress_decidable(&key("local")));
     }
 
+    // New flows move to the local pod once one is ready, but the remote pods
+    // the fallback was serving stay in cluster_backends (the departed-pod
+    // sweep's input), so conntrack pins to them drain naturally instead of
+    // being evicted.
+    #[test]
+    fn local_pod_turning_ready_after_remote_fallback_does_not_sweep_pinned_remote_pods() {
+        let this = Ipv4Addr::new(10, 0, 0, 5);
+        let mut state = WatchState::default();
+        state.apply_service_event(&policy_service(
+            "local",
+            serde_json::json!({"externalTrafficPolicy": "Local"}),
+        ));
+        for (name, ip) in [("node-a", "10.0.0.5"), ("node-b", "10.0.0.6")] {
+            state.apply_node_event(&serde_json::json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": name},
+                    "status": {"addresses": [{"type": "InternalIP", "address": ip}]},
+                },
+            }));
+        }
+        state.mark_fully_listed();
+        let remote = ("10.244.1.9", "node-b", true, true);
+        state.apply_endpoint_slice_event(&policy_slice("local", &[remote]));
+        let fallback = state.desired(&node(this));
+        let remote_pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 1, 9)));
+        let local_pod = wire_ip_v6(IpAddr::V4(Ipv4Addr::new(10, 244, 0, 9)));
+        assert!(
+            fallback.fronts.values().all(|f| f
+                .endpoints
+                .iter()
+                .map(|e| e.backend.pod_ip)
+                .eq([remote_pod])),
+            "with no local pod the front falls back to the remote one"
+        );
+
+        state.apply_endpoint_slice_event(&policy_slice(
+            "local",
+            &[remote, ("10.244.0.9", "node-a", true, true)],
+        ));
+        let local = state.desired(&node(this));
+        assert!(
+            local.fronts.values().all(|f| f
+                .endpoints
+                .iter()
+                .map(|e| e.backend.pod_ip)
+                .eq([local_pod])),
+            "new flows narrow to the local pod"
+        );
+        assert!(
+            local.cluster_backends.contains_key(&remote_pod),
+            "a flow pinned to the fallback pod must not be swept when a local pod turns ready"
+        );
+    }
+
     #[test]
     fn service_spec_policy_fields_reach_the_published_front() {
         let mut state = WatchState::default();

@@ -359,7 +359,8 @@ pub enum EndpointPolicy {
     Uniform,
     /// Every ready endpoint, local ones preferred while any exist.
     PreferLocal,
-    /// Only endpoints on this node (`externalTrafficPolicy: Local`).
+    /// Endpoints on this node (`externalTrafficPolicy: Local`); every ready
+    /// endpoint cluster-wide when this node has no usable one.
     OnlyLocal,
 }
 
@@ -392,12 +393,15 @@ impl EndpointPolicy {
 /// The endpoints `policy` lets a front use, in slot order. `candidates` must
 /// already match the front's port and address family.
 ///
-/// `OnlyLocal` mirrors kube-proxy's `CategorizeEndpoints`: ready local
+/// `OnlyLocal` follows kube-proxy's `CategorizeEndpoints` order: ready local
 /// endpoints, else serving-but-terminating local ones (so a rolling update of
-/// a single local pod does not black-hole), else none. Other policies use
-/// ready, non-terminating endpoints only. Slot order is local-first only when
-/// the policy prefers local; otherwise by pod IP alone, so every node derives
-/// the same slots and one flow hashes to the same pod on any ingress node.
+/// a single local pod does not black-hole). Unlike kube-proxy, with neither it
+/// falls back to every ready, non-terminating endpoint cluster-wide, since
+/// beep has no health-checking front to steer clients away from a node that
+/// lacks a local pod. Other policies use ready, non-terminating endpoints only.
+/// Slot order is local-first only when the policy prefers local; otherwise by
+/// pod IP alone, so every node derives the same slots and one flow hashes to
+/// the same pod on any ingress node.
 fn eligible_endpoints<'a>(
     policy: EndpointPolicy,
     candidates: &[&'a Endpoint],
@@ -406,19 +410,11 @@ fn eligible_endpoints<'a>(
     let ready = |e: &&Endpoint| e.ready && !e.terminating;
     let mut chosen: Vec<&Endpoint> = match policy {
         EndpointPolicy::OnlyLocal => {
-            let local_ready: Vec<_> = candidates
-                .iter()
-                .copied()
-                .filter(|e| is_local(e, node_ip) && ready(e))
-                .collect();
-            if local_ready.is_empty() {
-                candidates
-                    .iter()
-                    .copied()
-                    .filter(|e| is_local(e, node_ip) && e.serving && e.terminating)
-                    .collect()
+            let local = local_usable_endpoints(candidates, node_ip);
+            if local.is_empty() {
+                candidates.iter().copied().filter(ready).collect()
             } else {
-                local_ready
+                local
             }
         }
         _ => candidates.iter().copied().filter(ready).collect(),
@@ -429,6 +425,24 @@ fn eligible_endpoints<'a>(
         chosen.sort_by_key(|e| e.pod_ip);
     }
     chosen
+}
+
+/// This node's own usable endpoints for `OnlyLocal`: ready ones, else
+/// serving-but-terminating ones.
+fn local_usable_endpoints<'a>(candidates: &[&'a Endpoint], node_ip: IpAddr) -> Vec<&'a Endpoint> {
+    let local_ready: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|e| is_local(e, node_ip) && e.ready && !e.terminating)
+        .collect();
+    if !local_ready.is_empty() {
+        return local_ready;
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|e| is_local(e, node_ip) && e.serving && e.terminating)
+        .collect()
 }
 
 /// Whether this node should list its own address in a Service's
@@ -454,7 +468,7 @@ pub fn publishes_ingress(
     let usable_anywhere = same_family
         .iter()
         .any(|e| (e.ready && !e.terminating) || (e.serving && e.terminating));
-    !usable_anywhere || !eligible_endpoints(policy, &same_family, node_ip).is_empty()
+    !usable_anywhere || !local_usable_endpoints(&same_family, node_ip).is_empty()
 }
 
 fn front_key(front_ip: IpAddr, port: &ServicePort) -> LbFrontKey {
@@ -2107,10 +2121,13 @@ mod tests {
     }
 
     #[test]
-    fn only_local_without_any_usable_local_pod_is_a_count_zero_front() {
+    fn only_local_with_nothing_usable_anywhere_is_a_count_zero_front() {
         let desired = reconcile_on(
             EndpointPolicy::OnlyLocal,
-            vec![ep_on(OTHER, 1), terminating_ep_on(THIS, 5, false)],
+            vec![
+                terminating_ep_on(OTHER, 1, false),
+                terminating_ep_on(THIS, 5, false),
+            ],
         );
 
         let front = only_front(&desired);
@@ -2118,6 +2135,61 @@ mod tests {
             front.endpoints.is_empty(),
             "the front stays owned at count 0 so it drops instead of passing to the host"
         );
+    }
+
+    #[test]
+    fn only_local_with_only_remote_ready_pods_forwards_to_them() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![
+                ep_on(OTHER, 3),
+                ep_on(OTHER, 1),
+                terminating_ep_on(OTHER, 6, true),
+                terminating_ep_on(THIS, 5, false),
+            ],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(1), pod_wire(3)],
+            "a stale ingress node must still serve the client, forwarded to ready pods by pod IP"
+        );
+        assert_eq!(front.local_count(), 0);
+    }
+
+    // Guard, not a regression test: passes without the remote fallback; fails
+    // if the fallback is widened to apply alongside local pods.
+    #[test]
+    fn only_local_with_a_ready_local_pod_never_adds_remote_pods() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![ep_on(OTHER, 1), ep_on(THIS, 2), ep_on(OTHER, 3)],
+        );
+
+        assert_eq!(
+            slot_pods(only_front(&desired)),
+            vec![pod_wire(2)],
+            "remote pods are a fallback only; a local pod keeps traffic on-node"
+        );
+    }
+
+    // Guard, not a regression test: passes without the remote fallback; fails
+    // if remote ready pods outrank a serving-terminating local pod.
+    #[test]
+    fn only_local_prefers_a_serving_terminating_local_pod_over_remote_ready_pods() {
+        let desired = reconcile_on(
+            EndpointPolicy::OnlyLocal,
+            vec![ep_on(OTHER, 1), terminating_ep_on(THIS, 4, true)],
+        );
+
+        let front = only_front(&desired);
+        assert_eq!(
+            slot_pods(front),
+            vec![pod_wire(4)],
+            "a draining local pod keeps serving on-node before any cross-node fallback"
+        );
+        assert_eq!(front.local_count(), 1);
     }
 
     // Eviction and pinned-flow admission read POD_TARGETS, never the policy, so
@@ -2139,6 +2211,27 @@ mod tests {
             local.pod_targets.contains(&pod_wire(4)),
             "a terminating local pod keeps decap admission for its pinned flows"
         );
+    }
+
+    #[test]
+    fn a_local_pod_turning_ready_narrows_the_fallback_front_to_local_only() {
+        let remote = || vec![ep_on(OTHER, 1), ep_on(OTHER, 3)];
+        let fallback = reconcile_on(EndpointPolicy::OnlyLocal, remote());
+        let mut with_local = remote();
+        with_local.push(ep_on(THIS, 2));
+        let local = reconcile_on(EndpointPolicy::OnlyLocal, with_local);
+
+        assert_eq!(
+            slot_pods(only_front(&fallback)),
+            vec![pod_wire(1), pod_wire(3)]
+        );
+        assert_eq!(only_front(&fallback).local_count(), 0);
+        assert_eq!(
+            slot_pods(only_front(&local)),
+            vec![pod_wire(2)],
+            "new flows go to the local pod once one is ready"
+        );
+        assert_eq!(only_front(&local).local_count(), 1);
     }
 
     #[test]
