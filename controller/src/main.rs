@@ -634,6 +634,9 @@ fn publish_ingress_for(
 ) {
     let (own_ips, desired_ips) = {
         let state = state.lock().unwrap();
+        if !state.ingress_decidable(&key) {
+            return;
+        }
         (
             state.own_node_ips(node.node_ip),
             state.ips_to_publish(&key, node.node_ip),
