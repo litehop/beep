@@ -51,7 +51,7 @@ PORT_SVC_B="8081" # svc-on-node-b, dialed via node-a
 PIN_DIR="/sys/fs/bpf/beep"
 RPFILTER_SAVE="/tmp/beep-k3s-bidirectional-rpfilter-all.saved"
 
-for tool in limactl jq; do
+for tool in limactl jq docker cargo-zigbuild; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
 
@@ -60,6 +60,7 @@ dump_evidence() { k3s_dump_evidence "$VM_A" "$VM_B" "$PIN_DIR"; }
 cleanup() {
   kube delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   k3s_teardown_controller "$REPO_ROOT"
+  k3s_cleanup_image "$REPO_ROOT"
   for vm in "$VM_A" "$VM_B"; do
     limactl shell "$vm" -- sudo rm -rf "$PIN_DIR" >/dev/null 2>&1 || true
     limactl shell "$vm" -- sudo ip link del geneve0 >/dev/null 2>&1 || true

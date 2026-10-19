@@ -75,7 +75,7 @@ CLIENT_JUNIT="/tmp/e2e-lb-k3s-junit.xml"
 # client's source toward the nodes must lie outside that range.
 CLIENT_ALT_IP="172.31.104.15"
 
-for tool in limactl jq; do
+for tool in limactl jq docker cargo-zigbuild; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
 
@@ -89,6 +89,7 @@ cleanup() {
   kube get ns -o name 2>/dev/null | grep -E '^namespace/(loadbalancers|esipp)-' | sed 's#^namespace/##' \
     | while read -r ns; do kube delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true; done || true
   k3s_teardown_controller "$REPO_ROOT"
+  k3s_cleanup_image "$REPO_ROOT"
   limactl shell "$VM_CLIENT" -- rm -f "$CLIENT_KUBECONFIG" "$CLIENT_JUNIT" >/dev/null 2>&1 || true
   limactl shell "$VM_CLIENT" -- sudo bash -c "ip route del ${IP_A:-}/32 dev eth0; ip route del ${IP_B:-}/32 dev eth0; ip addr del $CLIENT_ALT_IP/32 dev eth0" >/dev/null 2>&1 || true
   for vm in "$VM_A" "$VM_B"; do
