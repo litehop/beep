@@ -553,9 +553,18 @@ ING="$(wait_ingress mlocal "$IP_B")"
 HITS="$(client_hits "$IP_B" "$P_LOCAL" 40)"
 echo "$HITS"
 [ "$(hits_failed "$HITS")" = 0 ] && [ "$(hits_pods "$HITS")" = 2 ] || leg_fail "LEG-C: FAIL (eTP=Local via the node with pods should spread over its 2 local pods: $HITS)"
-RC_A="$(probe_rc "$IP_A" "$P_LOCAL")"
-[ "$RC_A" != 0 ] || leg_fail "LEG-C: FAIL (a connection via $IP_A, which has no local pod, succeeded)"
-echo "LEG-C eTP=Local: PASS (ingress=$ING; $IP_B served by both local pods; $IP_A has no local pod, connection failed rc=$RC_A)"
+HITS_A="$(client_hits "$IP_A" "$P_LOCAL" 20)"
+echo "$HITS_A"
+[ "$(hits_failed "$HITS_A")" = 0 ] && [ "$(hits_total "$HITS_A")" = 20 ] || \
+  leg_fail "LEG-C: FAIL (eTP=Local via $IP_A, which has no local pod, must forward cross-node instead of dropping clients that reach a non-advertised node: $HITS_A)"
+[ "$(hits_on_node "$LMAP" "$HITS_A" "$NODE_B_K8S")" = 20 ] || \
+  leg_fail "LEG-C: FAIL (every connection via $IP_A must be served by a pod on $NODE_B_K8S, the only node with ready pods: $HITS_A)"
+REMOTE_ADDR="$(limactl shell "$VM_CLIENT" -- curl -sS -m 5 "http://$IP_A:$P_LOCAL/" | sed -n 's/^RemoteAddr: //p')"
+case "$REMOTE_ADDR" in
+  "$IP_CLIENT":*) ;;
+  *) leg_fail "LEG-C: FAIL (cross-node eTP=Local must preserve the real client IP $IP_CLIENT for the pod, got RemoteAddr '$REMOTE_ADDR')" ;;
+esac
+echo "LEG-C eTP=Local: PASS (ingress=$ING; $IP_B served by both local pods; $IP_A is not advertised but forwarded 20/20 to $NODE_B_K8S pods, pod saw client $REMOTE_ADDR)"
 
 # (d) deleting one pod re-homes only its flows: every long-lived flow on a surviving pod continues,
 # and the lost flows are exactly a subset of the victim's. Each flow is one curl connection (two URLs,
