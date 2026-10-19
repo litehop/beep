@@ -307,9 +307,9 @@ path. Never set it in production.
 Behaviour changes to expect:
 
 - A front with no usable endpoint (count 0: `externalTrafficPolicy: Local`
-  with no usable local pod and no ready pod anywhere, or a Service with no ready endpoints) now
-  silently drops new connections. 0.4 answered with a TCP RST or ICMP
-  port-unreachable. Established flows keep forwarding.
+  with no usable local pod and no ready pod anywhere, or a Service with no
+  ready endpoints) now silently drops new connections. 0.4 answered with a TCP
+  RST or ICMP port-unreachable. Established flows keep forwarding.
 - Services may now spread over every ready endpoint and honour
   `externalTrafficPolicy` and `spec.trafficDistribution`; see "Service
   policy".
