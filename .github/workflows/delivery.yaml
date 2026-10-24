@@ -53,7 +53,7 @@ jobs:
 
       # Same hash-verified prebuilt-binary install as ci.yaml's bpf-linker
       # step; cargo-zigbuild is also in taiki-e/install-action's tool set.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: bpf-linker,cargo-zigbuild
         env:
