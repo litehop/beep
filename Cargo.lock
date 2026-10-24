@@ -727,8 +727,8 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "politeia"
-version = "0.2.1"
-source = "git+https://github.com/litehop/politeia?tag=v0.2.1#8005d9a015137d6e2b0d345288f0a7c8fe7c68b5"
+version = "0.3.2"
+source = "git+https://github.com/litehop/politeia?tag=v0.3.2#ad8fecedd0fcd3d5164fff226e838fa027f53278"
 dependencies = [
  "anyhow",
  "base64",
