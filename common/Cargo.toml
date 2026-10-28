@@ -15,7 +15,7 @@ workspace = true
 # side needs `aya::Pod` for the controller-written map types below. Kept
 # out of `beep-ebpf`'s dependency graph (it depends on this crate with
 # default features) so the no_std, bpfel-unknown-none build never sees it.
-aya = { version = "0.14", default-features = false, optional = true }
+aya = { version = "0.16", default-features = false, optional = true }
 
 [features]
 user = ["dep:aya"]
