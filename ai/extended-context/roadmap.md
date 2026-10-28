@@ -6,7 +6,7 @@ description: Progress review of beep against the operator's six-gate v1.0 (produ
 # Roadmap
 
 As of 2026-10-29 (v0.6.0 is the latest release), beep's functional core is
-built and release-verified on Lima rigs, but v1.0 is gated on tests on real
+built and verified on Lima rigs, but v1.0 is gated on tests on real
 hardware, which only the operator can provision, followed by the performance
 and security audits and documentation.
 
@@ -65,8 +65,11 @@ Tags: v0.1.0 (2026-09-14), v0.2.0 (2026-09-19), v0.3.0 (2026-09-21), v0.4.0
 (2026-10-09), v0.5.0 (2026-10-15, multi-endpoint LB), v0.6.0 (2026-10-19,
 deploy hardening, ClientIP affinity, `externalTrafficPolicy: Local`
 fail-open to cluster-wide endpoints). Nothing is unreleased on `main` beyond
-dependency bumps. Releases are verified against the release-candidate image on
-every in-scope rig (all must pass; a red rig blocks until explained). Scheme
+dependency bumps. Since the e2e rigs began deploying the commit under test,
+releases are verified against the release-candidate image on every in-scope
+rig (all must pass; a red rig blocks until explained); v0.6.0 was verified that
+way, while v0.4.0 and v0.5.0 predate it and their e2e runs may have used a
+stale image. Scheme
 and scope: [`versioning`](../../docs/decisions/versioning.md). The image is
 published to `docker.io/valerauko/beep-lb`; IPv6-native pull is unverified.
 
@@ -99,7 +102,9 @@ Operator decisions not in an ADR:
 - The flow-hash seed is cluster-wide via a Secret because external clients
   are untrusted.
 - Decap trusts the target port in the peer's forward Geneve option, so the
-  underlay trust model is load-bearing.
+  underlay trust model is load-bearing: `NODE_ALLOW` source-IP admission is the
+  boundary, assuming the underlay prevents IP spoofing; no decap port bound
+  unless spoofing is observed.
 - Routing (FIB) selects relay egress; asymmetric return egress is not a goal;
   a NATed or unreachable node InternalIP is a cluster misconfiguration.
 
