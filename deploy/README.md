@@ -405,8 +405,7 @@ otherwise override the `/proc` write. The file name is fixed; its content
 follows `--geneve-iface`. `/etc/sysctl.d` must already exist on the node
 (true on every supported distro; see "Supported platforms" in the top-level
 README). Without it the pod stays in Init with a `hostPath` mount error. The
-file persists on the host after uninstall; remove it manually if beep is
-decommissioned.
+file persists on the host after uninstall; see "Uninstall".
 
 This is a deliberate, operator-decided tradeoff, not an oversight — see
 `docs/decisions/geneve-rp-filter-disable.md` for the rationale and the
@@ -491,6 +490,59 @@ kubectl create secret generic beep-controller-kubeconfig -n kube-system \
   --from-file=kubeconfig=beep-controller.kubeconfig
 kubectl apply -k deploy/overlays/client-cert
 ```
+
+## Uninstall
+
+`kubectl delete -k` removes only the cluster objects. The DaemonSet leaves
+state on every node, and that state keeps working (or misbehaving) with no
+controller running, so clean both.
+
+1. Delete the cluster objects (use `deploy/overlays/client-cert` instead if
+   that is what you applied; it re-applies the same base resources):
+
+   ```bash
+   kubectl delete -k deploy/base
+   ```
+
+   This removes the DaemonSet, ConfigMap, RBAC and the `beep-leases`
+   Namespace (`rbac.yaml`), which takes the per-node `beep-node-<node>` Leases
+   with it. It does **not** remove objects that were not applied from the
+   kustomization:
+
+   - the `servicelb-flow-hash-seed` Secret in `kube-system`, created by the
+     first controller at runtime. Delete it (`kubectl -n kube-system delete
+     secret servicelb-flow-hash-seed`) or a later install keeps the old seed.
+   - client-cert overlay only, created by hand under "Authentication": the
+     `beep-controller-kubeconfig` Secret, the `beep-controller`
+     CertificateSigningRequest, and the `beep-controller-csr`,
+     `beep-controller-csr-flow-hash-seed` (`kube-system`) and
+     `beep-controller-csr-node-lease` (`beep-leases`) bindings. The
+     `kubectl delete -k` above already removes the namespaced binding with
+     `beep-leases`.
+
+2. On each node, after its controller pod is gone (a running pod re-adopts
+   the pins and recreates `geneve0`):
+
+   ```bash
+   sudo rm -rf /sys/fs/bpf/beep      # TCX links + maps; the kernel detaches the programs
+   sudo ip link del geneve0          # name follows --geneve-iface
+   sudo rm /etc/sysctl.d/60-beep.conf
+   sudo sysctl --system              # re-read sysctl.d without the beep drop-in
+   ```
+
+   - The pin directory is `--pin-dir` (default `/sys/fs/bpf/beep`), reached
+     through the DaemonSet's `/sys/fs/bpf` `hostPath`. The classifiers are
+     TCX links, so there are no tc filters or qdiscs to remove.
+   - `geneve0` is created by the controller (`ensure_geneve_iface`) and
+     persists across pod restarts.
+   - `/etc/sysctl.d/60-beep.conf` is written by the `node-prep` initContainer
+     (`disable_rp_filter` in `src/lib.rs`) and is never removed by the
+     DaemonSet.
+   - `sysctl --system` does not revert the runtime
+     `net.ipv4.conf.all.rp_filter=0` that `node-prep` also wrote; it is
+     not persisted by beep, so it reverts at the next reboot. To restore it
+     immediately, set it to your distro's prior value with
+     `sysctl -w net.ipv4.conf.all.rp_filter=<value>`.
 
 ## Verify your deployment
 
