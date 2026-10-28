@@ -1021,7 +1021,7 @@ async fn main() -> anyhow::Result<()> {
                 build_tls_connector(&creds).context("building TLS connector from kubeconfig")?;
             HyperApiClient {
                 server: creds.server,
-                connector,
+                connector: connector.into(),
                 bearer: None,
             }
         }
