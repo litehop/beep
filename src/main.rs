@@ -756,7 +756,7 @@ fn populate_fixtures(
         }
         for pod_ip in &local_ips {
             pod_targets
-                .insert(pod_ip, 1u8, 0)
+                .insert(pod_ip, &1u8, 0)
                 .with_context(|| capacity_hint("POD_TARGETS"))?;
         }
     }
@@ -781,7 +781,7 @@ fn populate_fixtures(
             }
         }
         node_allow
-            .insert(node_ip_key, 1u8, 0)
+            .insert(&node_ip_key, &1u8, 0)
             .with_context(|| capacity_hint("NODE_ALLOW"))?;
     }
 

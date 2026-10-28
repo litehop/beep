@@ -30,7 +30,7 @@
       "matchPackageNames": [
         "aya-obj"
       ],
-      "allowedVersions": "<0.4"
+      "allowedVersions": "<0.7"
     }
   ]
 }

@@ -40,8 +40,8 @@ strip = true
 panic = "abort"
 
 [dependencies]
-aya = { version = "0.14", default-features = false }
-aya-obj = "0.3"
+aya = { version = "0.16", default-features = false }
+aya-obj = "0.6"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
