@@ -235,7 +235,7 @@ pub fn write_config_seed(pin_dir: &Path, seed: u64) -> anyhow::Result<()> {
         .context("map `CONFIG` is not a BPF_MAP_TYPE_ARRAY")?;
     let mut value = config.get(&0, 0).context("reading CONFIG[0]")?;
     value.flow_hash_seed = seed;
-    config.set(0, value, 0).context("writing CONFIG[0]")?;
+    config.set(0, &value, 0).context("writing CONFIG[0]")?;
     Ok(())
 }
 
@@ -270,7 +270,7 @@ pub fn write_config_parity(pin_dir: &Path, proto: u8, parity: bool) -> anyhow::R
     } else {
         value.tcp_parity = parity as u8;
     }
-    config.set(0, value, 0).context("writing CONFIG[0]")?;
+    config.set(0, &value, 0).context("writing CONFIG[0]")?;
     Ok(())
 }
 

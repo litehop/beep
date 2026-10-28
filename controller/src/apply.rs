@@ -350,7 +350,7 @@ fn apply_pod_targets(
         }
     }
     for ip in install {
-        if let Err(e) = map.insert(ip, 1u8, 0) {
+        if let Err(e) = map.insert(&ip, &1u8, 0) {
             failed += 1;
             eprintln!(
                 "controller: POD_TARGETS upsert for pod {} failed (pod left undeliverable): \
@@ -589,7 +589,7 @@ fn apply_node_allow(
         }
     }
     for ip in &live {
-        if let Err(e) = map.insert(ip, 1u8, 0) {
+        if let Err(e) = map.insert(&ip, &1u8, 0) {
             failed += 1;
             eprintln!(
                 "controller: NODE_ALLOW upsert for peer {} failed (node left unreachable): \

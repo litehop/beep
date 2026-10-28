@@ -23,7 +23,7 @@ use aya::{
     maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, MapInfo},
     programs::{
         links::{FdLink, LinkError, PinnedLink},
-        tc::{SchedClassifierLink, TcAttachOptions},
+        tc::{SchedClassifierLink, TcAttach},
         LinkOrder, ProgramError, SchedClassifier, TcAttachType,
     },
     sys::SyscallError,
@@ -1177,7 +1177,7 @@ pub fn populate_config(
     let existing = config.get(&0, 0)?;
     config.set(
         0,
-        config_keeping_parity(existing, geneve_ifindex, flow_hash_seed),
+        &config_keeping_parity(existing, geneve_ifindex, flow_hash_seed),
         0,
     )?;
     Ok(())
@@ -1283,7 +1283,7 @@ pub fn populate_uplink_config(ebpf: &mut Ebpf, uplink_ifaces: &[String]) -> anyh
         eprintln!(
             "uplink {uplink_iface}: ifindex {uplink_ifindex}, ARPHRD type {uplink_arphrd}, L2 header skip {l2_hlen} byte(s)"
         );
-        uplink_config.insert(uplink_ifindex, UplinkConfig { l2_hlen }, 0)?;
+        uplink_config.insert(&uplink_ifindex, &UplinkConfig { l2_hlen }, 0)?;
         configured.push(uplink_ifindex);
     }
     // The map is pinned, so rows from a prior run survive a restart. Deleted
@@ -1312,8 +1312,8 @@ pub fn stale_uplink_ifindexes(existing: &[u32], configured: &[u32]) -> Vec<u32> 
 /// `load_program` errors `AlreadyLoaded` on a second call for the same
 /// program, so a multi-uplink `--uplink-iface` attaches the SAME loaded
 /// `SchedClassifier` to each configured uplink via repeated
-/// `attach_with_options`/`attach_to_link` calls on that one handle, never a
-/// second `load()`. Every link returned by `attach_with_options` MUST be
+/// `attach`/`attach_to_link` calls on that one handle, never a
+/// second `load()`. Every link returned by `attach` MUST be
 /// pinned (or otherwise retained) individually -- an un-pinned,
 /// un-retained link auto-detaches silently on drop, with no error surfaced.
 pub fn attach_and_pin(
@@ -1323,7 +1323,7 @@ pub fn attach_and_pin(
     attach_type: TcAttachType,
     pin_dir: &Path,
 ) -> anyhow::Result<()> {
-    // No `tc::qdisc_add_clsact` call: `attach_with_options` below always
+    // No `tc::qdisc_add_clsact` call: `attach` below always
     // requests `TcxOrder`, and aya's TCX branch of `do_attach` calls
     // `bpf_link_create` directly -- it never touches (or needs) a clsact
     // qdisc, that's only for the legacy netlink attach path.
@@ -1375,10 +1375,13 @@ pub fn attach_and_pin(
             Err(e) => return Err(e.into()),
         }
         if fresh {
-            let link_id = program.attach_with_options(
-                iface,
-                attach_type,
-                TcAttachOptions::TcxOrder(LinkOrder::default()),
+            let iface_c = std::ffi::CString::new(*iface)?;
+            let link_id = program.attach(
+                &iface_c,
+                TcAttach::Tcx {
+                    attach_type,
+                    order: LinkOrder::default(),
+                },
             )?;
             let link = program.take_link(link_id)?;
             let fd_link: FdLink = link.try_into()?;
