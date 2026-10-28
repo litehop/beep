@@ -514,11 +514,10 @@ controller running, so clean both.
      secret servicelb-flow-hash-seed`) or a later install keeps the old seed.
    - client-cert overlay only, created by hand under "Authentication": the
      `beep-controller-kubeconfig` Secret, the `beep-controller`
-     CertificateSigningRequest, and the `beep-controller-csr`,
-     `beep-controller-csr-flow-hash-seed` (`kube-system`) and
-     `beep-controller-csr-node-lease` (`beep-leases`) bindings. The
-     `kubectl delete -k` above already removes the namespaced binding with
-     `beep-leases`.
+     CertificateSigningRequest, and the `beep-controller-csr` and
+     `beep-controller-csr-flow-hash-seed` (`kube-system`) bindings. The
+     `beep-controller-csr-node-lease` binding goes with the `beep-leases`
+     Namespace.
 
 2. On each node, after its controller pod is gone (a running pod re-adopts
    the pins and recreates `geneve0`):
@@ -535,13 +534,12 @@ controller running, so clean both.
      TCX links, so there are no tc filters or qdiscs to remove.
    - `geneve0` is created by the controller (`ensure_geneve_iface`) and
      persists across pod restarts.
-   - `/etc/sysctl.d/60-beep.conf` is written by the `node-prep` initContainer
-     (`disable_rp_filter` in `src/lib.rs`) and is never removed by the
-     DaemonSet.
-   - `sysctl --system` does not revert the runtime
-     `net.ipv4.conf.all.rp_filter=0` that `node-prep` also wrote; it is
-     not persisted by beep, so it reverts at the next reboot. To restore it
-     immediately, set it to your distro's prior value with
+   - `/etc/sysctl.d/60-beep.conf` is written by `node-prep` and never
+     removed by the DaemonSet.
+   - `node-prep` also set `net.ipv4.conf.all.rp_filter=0` at runtime only.
+     Where the distro's sysctl.d sets it explicitly (Ubuntu 24.04:
+     `10-network-security.conf`, `=2`), `sysctl --system` restores it;
+     otherwise it stays `0` until reboot or
      `sysctl -w net.ipv4.conf.all.rp_filter=<value>`.
 
 ## Verify your deployment
