@@ -138,9 +138,10 @@ these status checks, enforced: `test-gate`, `lint-gate`, `memory-smoke`,
 tests THAT, so also requiring the PR branch itself to be current would only cost
 a redundant CI cycle per PR.
 
-1. Call `ListAgents`, extract the `worker/agent-*` ids of currently running
-   subagents, and run `scripts/mayor-tick.sh --live-agents <comma-separated
-   ids>` (omit the flag if none are running). This is the only reliable
+1. Call `ListAgents`, extract the bare ids of currently running
+   subagents (`agent-<id>` / `worker/agent-<id>` are also accepted; any
+   non-alphanumeric entry exits 2), and run `scripts/mayor-tick.sh
+   --live-agents <comma-separated ids>` (omit the flag if none are running). This is the only reliable
    liveness signal for an in-process worker sub-agent — a sub-agent cannot
    call `ListAgents` on itself, and `claude agents --json` doesn't
    enumerate in-process subagents. A worker/agent-* branch with no PR yet
@@ -237,8 +238,9 @@ their own subagents.
 **Worktree hygiene loop body.** The mechanical body — `git worktree prune`
 and stale worker/non-worker branch cleanup — lives in
 `scripts/worktree-hygiene.sh`; the cron loop runs that script directly.
-Before running it, call `ListAgents` and extract the `worker/agent-*` ids of
-currently running subagents. If any are running, pass them as
+Before running it, call `ListAgents` and extract the bare ids of
+currently running subagents (`agent-<id>` / `worker/agent-<id>` also
+accepted). If any are running, pass them as
 `--live-agents <comma-separated ids>`; if none are running, pass
 `--no-live-workers` instead — do NOT fake a placeholder id (the old
 `--live-agents __none_live__` convention is deprecated), since that made

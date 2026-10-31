@@ -124,6 +124,26 @@ normalize_live_agents() {
   printf '%s' "$out"
 }
 
+# Canonicalizes a --live-agents value to bare ListAgents ids: each entry may
+# be `<id>`, `agent-<id>` or `worker/agent-<id>`; anything else that is not
+# alphanumeric after stripping is rejected (return 1, message on stderr). The
+# membership checks compare bare ids only, so an unstripped `agent-<id>`
+# would silently classify a live worker as reapable.
+canonical_live_agents() {
+  local out="" tok id
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    id="${tok#worker/agent-}"
+    [ "$id" != "$tok" ] || id="${tok#agent-}"
+    if ! [[ "$id" =~ ^[A-Za-z0-9]+$ ]]; then
+      echo "$(basename "$0"): refusing to run -- invalid --live-agents entry '$tok' (expected a bare ListAgents agent id, optionally prefixed agent- or worker/agent-)" >&2
+      return 1
+    fi
+    out="${out:+${out},}${id}"
+  done <<< "$(normalize_live_agents "$1" | tr ',' '\n')"
+  printf '%s' "$out"
+}
+
 # True (exit 0) iff `agent_id` is present in the comma-separated
 # --live-agents set. Empty `live_agents` (including whitespace-only, once
 # normalized) never matches anything.
@@ -521,6 +541,10 @@ main() {
   if [ "$live_agents_provided" -eq 1 ] && [ "$no_live_workers" -eq 1 ]; then
     echo "worktree-hygiene: refusing to run -- --live-agents and --no-live-workers are mutually exclusive. Pass --live-agents <ids> when ListAgents shows running workers, or --no-live-workers when it shows zero -- never both." >&2
     exit 2
+  fi
+
+  if [ "$live_agents_provided" -eq 1 ]; then
+    LIVE_AGENTS="$(canonical_live_agents "$LIVE_AGENTS")" || exit 2
   fi
 
   if [ "$no_live_workers" -eq 1 ]; then
