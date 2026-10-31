@@ -234,7 +234,12 @@ per-operator and individually revocable, so none is ever shared.
 a different OS user from reading the key, but not a worker subagent running
 as the same OS user — the threat model here is accidental exposure (logs,
 transcripts, env dumps), not process isolation between an operator and
-their own subagents.
+their own subagents. `Bash(scripts/mayor-tick.sh *)` and
+`Bash(scripts/gh-app-review.sh *)` stay in each operator's untracked
+`.claude/settings.local.json`, not tracked `settings.json`: the tick merges PRs
+and gh-app-review posts the reviewer-bot approvals the merge gate trusts, so
+tracked settings would let any worker run them prompt-free (operator decision
+2026-10-31).
 
 **Worktree hygiene loop body.** The mechanical body — `git worktree prune`
 and stale worker/non-worker branch cleanup — lives in
