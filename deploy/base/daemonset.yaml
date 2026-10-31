@@ -158,6 +158,14 @@ spec:
             # -- add a second --uplink-iface=... entry per additional
             # client-facing NIC this node admits traffic on.
             - --uplink-iface=eth0
+          # Ready once the first Service, EndpointSlice and Node LISTs have
+          # completed: the controller creates this file then and publishes no
+          # ingress before (deploy/README.md, "Startup readiness"). No port;
+          # the path is --ready-file's default.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/beep-ready"]
+            periodSeconds: 5
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf

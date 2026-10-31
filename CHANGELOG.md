@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The controller publishes no `status.loadBalancer.ingress` until its first
+  Service, EndpointSlice and Node LISTs have all completed (previously it
+  published `--node-ip`'s family alone from the first Service event), and the
+  DaemonSet now has an exec `readinessProbe` on `--ready-file`
+  (`/tmp/beep-ready`), created at that point. Pods report NotReady during
+  startup; custom manifests need the probe added. See deploy/README.md,
+  "Startup readiness".
 - Controller `--pod-cidr` is repeatable, at most one per family, so a
   dual-stack cluster admits non-hostNetwork pod backends of both families.
   Two CIDRs of the same family fail startup; a single flag behaves as before.

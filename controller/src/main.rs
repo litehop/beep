@@ -143,6 +143,12 @@ struct Args {
     #[arg(long, default_value = "beep-leases")]
     lease_namespace: String,
 
+    /// Created once the first Service, EndpointSlice and Node LISTs have all
+    /// completed; the DaemonSet's exec readinessProbe tests for it. Never
+    /// removed while the process runs.
+    #[arg(long, default_value = "/tmp/beep-ready")]
+    ready_file: PathBuf,
+
     /// `FWD_PENDING` max_entries (see `beep-ebpf`'s doc comment); a
     /// load-time DaemonSet config knob, not baked into the eBPF object.
     #[arg(long, default_value_t = DEFAULT_FWD_PENDING_MAX_ENTRIES)]
@@ -635,7 +641,7 @@ fn publish_ingress_for(
 ) {
     let (own_ips, desired_ips) = {
         let state = state.lock().unwrap();
-        if !state.ingress_decidable(&key) {
+        if !state.ingress_decidable() {
             return;
         }
         (
@@ -814,6 +820,41 @@ fn republish_if_own_ips_changed(
     }
 }
 
+/// Creates the readiness marker once every initial LIST has completed.
+/// Returns whether the node is ready.
+fn sync_ready_marker(state: &Mutex<WatchState>, path: &Path) -> std::io::Result<bool> {
+    if !state.lock().unwrap().ingress_decidable() {
+        return Ok(false);
+    }
+    std::fs::write(path, b"")?;
+    Ok(true)
+}
+
+/// Run after each LIST: when it completed the last outstanding one, the
+/// node becomes ready and every Service's ingress, withheld until now, is
+/// published.
+fn after_list(
+    client: &Arc<HyperApiClient>,
+    pending: &Arc<Mutex<PublishRetry>>,
+    state: &Mutex<WatchState>,
+    node: &NodeContext,
+    ready_file: &Path,
+    was_ready: bool,
+) {
+    if let Err(e) = sync_ready_marker(state, ready_file) {
+        eprintln!(
+            "controller: WARN writing readiness marker {} failed: {e:#}",
+            ready_file.display()
+        );
+    }
+    if !was_ready && state.lock().unwrap().ingress_decidable() {
+        let keys = state.lock().unwrap().service_keys();
+        for key in keys {
+            publish_ingress_for(client, pending, state, node, key);
+        }
+    }
+}
+
 /// Runs the three list-watches (Service/EndpointSlice/Node) concurrently on
 /// this task, forever -- there is no persistent proxy loop to hand control
 /// back to (`ebpf-lb-dataplane.md`'s "Userspace control plane" section). In
@@ -824,6 +865,7 @@ async fn run_controller_loop(
     state: Arc<Mutex<WatchState>>,
     maps: Arc<Mutex<PinnedMaps>>,
     node: NodeContext,
+    ready_file: PathBuf,
 ) -> anyhow::Result<()> {
     let retry = Arc::new(Mutex::new(RetryBackoff::default()));
     let pending = Arc::new(Mutex::new(PublishRetry::default()));
@@ -847,12 +889,15 @@ async fn run_controller_loop(
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
         let pending = Arc::clone(&pending);
+        let ready_file = ready_file.clone();
         move |items: Vec<Value>| {
+            let was_ready = state.lock().unwrap().ingress_decidable();
             let keys = state.lock().unwrap().replace_services(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
             for (work, key) in services_relist_work(keys, &items) {
                 run_ingress_work(&client, &pending, &state, &node, work, key);
             }
+            after_list(&client, &pending, &state, &node, &ready_file, was_ready);
             Ok(())
         }
     };
@@ -876,13 +921,16 @@ async fn run_controller_loop(
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
         let pending = Arc::clone(&pending);
+        let ready_file = ready_file.clone();
         move |items: Vec<Value>| {
+            let was_ready = state.lock().unwrap().ingress_decidable();
             state.lock().unwrap().replace_endpoint_slices(&items)?;
             apply_reconcile(&state, &maps, &retry, &node);
             let keys = state.lock().unwrap().local_policy_service_keys();
             for key in keys {
                 publish_ingress_for(&client, &pending, &state, &node, key);
             }
+            after_list(&client, &pending, &state, &node, &ready_file, was_ready);
             Ok(())
         }
     };
@@ -909,11 +957,14 @@ async fn run_controller_loop(
         let retry = Arc::clone(&retry);
         let client = Arc::clone(&client);
         let pending = Arc::clone(&pending);
+        let ready_file = ready_file.clone();
         move |items: Vec<Value>| {
+            let was_ready = state.lock().unwrap().ingress_decidable();
             let before = state.lock().unwrap().own_node_ips(node.node_ip);
             state.lock().unwrap().replace_nodes(&items, node.node_ip)?;
             apply_reconcile(&state, &maps, &retry, &node);
             republish_if_own_ips_changed(&client, &pending, &state, &node, &before);
+            after_list(&client, &pending, &state, &node, &ready_file, was_ready);
             Ok(())
         }
     };
@@ -1141,7 +1192,8 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&client),
                 Arc::clone(&state),
                 Arc::clone(&maps),
-                node
+                node,
+                args.ready_file.clone(),
             ),
             run_seed_loop(
                 Arc::clone(&client),
@@ -1207,6 +1259,52 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The readinessProbe tests for this file: if it appeared before the LISTs
+    // finished, the DaemonSet would report Ready while the node publishes and
+    // forwards nothing.
+    #[test]
+    fn ready_marker_appears_only_after_every_initial_list_completes() {
+        let path = std::env::temp_dir().join(format!("beep-ready-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let state = Mutex::new(WatchState::default());
+        state
+            .lock()
+            .unwrap()
+            .replace_nodes(
+                &[serde_json::json!({
+                    "metadata": {"name": "node-a"},
+                    "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}]},
+                })],
+                local,
+            )
+            .unwrap();
+        assert!(!sync_ready_marker(&state, &path).unwrap());
+        assert!(
+            !path.exists(),
+            "Node LIST alone must not mark the node ready"
+        );
+
+        state.lock().unwrap().replace_services(&[]).unwrap();
+        state.lock().unwrap().replace_endpoint_slices(&[]).unwrap();
+        assert!(sync_ready_marker(&state, &path).unwrap());
+        assert!(path.exists(), "all three LISTs done must create the marker");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn ready_file_defaults_to_the_path_the_daemonset_probes() {
+        let args = Args::try_parse_from([
+            "beep-controller",
+            "--uplink-iface=eth0",
+            "--pod-cidr=10.42.0.0/16",
+            "--node-ip=10.0.0.5",
+            "--node-name=n",
+        ])
+        .unwrap();
+        assert_eq!(args.ready_file, PathBuf::from("/tmp/beep-ready"));
+    }
 
     // The privileged initContainer invokes this binary as `beep-controller
     // --node-prep` alone -- no --pod-cidr/--node-ip/--kubeconfig, none of
