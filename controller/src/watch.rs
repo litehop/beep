@@ -609,13 +609,17 @@ impl WatchState {
             .collect()
     }
 
-    /// Whether `ips_to_publish(key)` is meaningful yet. An
-    /// `externalTrafficPolicy: Local` Service fails open on "no usable pod
-    /// anywhere", which before the first EndpointSlice LIST only means "not
-    /// listed yet"; publishing then would list a podless node until the LIST
-    /// lands. The LIST completion re-publishes every such Service.
-    pub fn ingress_decidable(&self, key: &ServiceKey) -> bool {
-        self.slices_listed || !self.is_local_policy(key)
+    /// Whether this node may publish `status.loadBalancer.ingress` yet: only
+    /// once the Service, EndpointSlice and Node LISTs have all completed.
+    /// Before that `desired` programs no front (`fronts_known` is false), so an
+    /// address published now would be one this node does not forward for, and
+    /// the Node-less fallback holds only `--node-ip`'s family. An
+    /// `externalTrafficPolicy: Local` Service additionally fails open on "no
+    /// usable pod anywhere", which before the EndpointSlice LIST only means
+    /// "not listed yet". The caller re-publishes every Service when this
+    /// flips to true.
+    pub fn ingress_decidable(&self) -> bool {
+        self.fully_listed()
     }
 
     /// Keys of the Services whose published ingress depends on which pods
@@ -4178,33 +4182,35 @@ mod tests {
         );
     }
 
-    // After a restart the Service LIST lands before the EndpointSlice LIST, so
-    // empty endpoints must not read as "no pod anywhere" and list a podless
-    // node.
+    // Before the first LISTs `desired` programs no front, so a published
+    // address would send clients to a node that does not forward for it; and
+    // with no EndpointSlices an eTP=Local Service would fail open and list a
+    // podless node.
     #[test]
-    fn local_ingress_is_withheld_until_the_endpoint_slice_list_completes() {
-        let key = |n: &str| ServiceKey {
-            namespace: "default".to_owned(),
-            name: n.to_owned(),
-        };
+    fn ingress_is_withheld_until_service_slice_and_node_lists_all_complete() {
+        let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
         let mut state = WatchState::default();
-        state.apply_service_event(&policy_service(
-            "local",
-            serde_json::json!({"externalTrafficPolicy": "Local"}),
-        ));
         state.apply_service_event(&policy_service("cluster", serde_json::json!({})));
         assert!(
-            !state.ingress_decidable(&key("local")),
-            "a restarted node must not fail open before it has seen any EndpointSlice"
-        );
-        assert!(
-            state.ingress_decidable(&key("cluster")),
-            "eTP=Cluster ingress does not depend on slices"
+            !state.ingress_decidable(),
+            "a cluster-policy Service must not be published before any LIST completes"
         );
         state
-            .replace_endpoint_slices(&[policy_slice("local", &[])])
+            .replace_nodes(&[node_obj("node-a", "10.0.0.5")], local)
             .unwrap();
-        assert!(state.ingress_decidable(&key("local")));
+        assert!(
+            !state.ingress_decidable(),
+            "the Node LIST alone leaves the node without programmed fronts"
+        );
+        state.replace_services(&[svc_obj("cluster")]).unwrap();
+        assert!(
+            !state.ingress_decidable(),
+            "without the EndpointSlice LIST a Local Service would fail open onto a podless node"
+        );
+        state
+            .replace_endpoint_slices(&[policy_slice("cluster", &[])])
+            .unwrap();
+        assert!(state.ingress_decidable());
     }
 
     // New flows move to the local pod once one is ready, but the remote pods

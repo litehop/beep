@@ -267,6 +267,26 @@ does not prune for its first 40 s and never prunes until it sees its own
 Lease renewing, so a missing Lease permission cannot empty every Service's
 ingress. Timings are constants (`controller/src/lease.rs`), not flags.
 
+## Startup readiness
+
+The controller pod is not Ready until its first Service, EndpointSlice and Node
+LISTs have all completed. Until then it knows only its own `--node-ip`: no peer
+underlay addresses, no Service backends, and no other family's front address.
+It therefore programs no front (the pinned maps stay as the previous process
+left them, so already-programmed flows keep forwarding), publishes no
+`status.loadBalancer.ingress`, and renews no Lease until its Node LIST
+completes (its Lease must carry the full address set). Entries it published
+before a restart are left in place. When the last LIST completes it creates
+`/tmp/beep-ready` (`--ready-file`) and publishes every Service's ingress, both
+families as each Service's `ipFamilies` allow.
+
+The DaemonSet's exec `readinessProbe` (`test -f /tmp/beep-ready`) reports that
+state; it opens no port. The file is created once and not removed: a later
+watch loss keeps the node Ready because the pinned dataplane keeps serving,
+and a restarted container starts without it. A LIST that keeps failing leaves
+the pod NotReady (it is never restarted for it); `kubectl rollout status
+daemonset/servicelb-controller` waits on it.
+
 ## Upgrading from 0.4
 
 Apply the new objects before the DaemonSet rolls:
