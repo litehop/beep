@@ -30,7 +30,11 @@ PAYLOAD_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --body-file)
-      PAYLOAD_FILE="${2:?gh-app-review.sh: --body-file requires a path}"
+      if [ $# -lt 2 ]; then
+        echo "gh-app-review.sh: --body-file requires a path" >&2
+        exit 2
+      fi
+      PAYLOAD_FILE="$2"
       shift 2
       ;;
     *)
