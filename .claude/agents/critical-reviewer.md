@@ -239,8 +239,10 @@ Then post it yourself, per deliverable type:
   The sandbox matches the posting command by its leading token, so it must
   contain no variable assignments, `$VAR` expansions, heredocs, or pipes:
   1. Build `<worktree-root>/.tmp-review-<N>.json` with ONE Bash command,
-     a quoted heredoc `cat > <path> <<'EOF'` ... `EOF` (the quoted delimiter
-     means nothing inside expands). Path is absolute under your own worktree; `.tmp-*` is gitignored; never
+     a quoted heredoc `cat > <path> <<'BEEP_REVIEW_PAYLOAD'` ...
+     `BEEP_REVIEW_PAYLOAD` (the quoted delimiter means nothing inside
+     expands; the unique delimiter cannot collide with a body line). Path is
+     absolute under your own worktree; `.tmp-*` is gitignored; never
      under `ai/findings/`. Its content is one JSON object:
      `{"body": "...", "event": "APPROVE|REQUEST_CHANGES", "comments":
      [{"path": "...", "line": 12, "side": "RIGHT", "body": "..."}]}`, with

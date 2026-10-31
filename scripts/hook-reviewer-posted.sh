@@ -72,5 +72,5 @@ POSTED=$(printf '%s' "$VIEW" | jq -r '
 [ "$(field '.stop_hook_active // false')" = "true" ] && warn "already blocked once (stop_hook_active)"
 
 HEAD_OID=$(printf '%s' "$VIEW" | jq -r '.headRefOid')
-echo "No critical-reviewer review is posted on the current head of PR #$PR. Write the payload to a file with the Write tool, then post with \`scripts/gh-app-review.sh $PR [owner/repo] --body-file <path>\`. Current head: $HEAD_OID; add \"commit_id\" to the payload only when your dispatch names a head to pin. Do not retry with another token or command. Your final message must begin with the review URL, or the exact error from the script." >&2
+echo "No critical-reviewer review is posted on the current head of PR #$PR. Build .tmp-review-$PR.json in your worktree with one quoted-heredoc Bash command (<<'BEEP_REVIEW_PAYLOAD'), then post with the bare command \`scripts/gh-app-review.sh $PR [owner/repo] --body-file <path>\`. Current head: $HEAD_OID; add \"commit_id\" to the payload only when your dispatch names a head to pin. Do not retry with another token or command. Your final message must begin with the review URL, or the exact error from the script." >&2
 exit 2
