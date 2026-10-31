@@ -28,10 +28,11 @@ documentation.
    Geneve underlay and pass on the Lima k3s rig. IPv6-only validation across
    real nodes and an IPv6-native registry pull depend on gate 3; the epic
    (`beep-7qm`) stays a v1.0 blocker.
-3. **Tests on real hardware: not started, the critical path.** Needs
-   operator-provisioned nodes: a genuinely external client IP, provider
-   uRPF/NAT, MTU, IPv6-only nodes, native-v6 pull and a documented k3s+u7s
-   deploy (`beep-903`).
+3. **Tests on real hardware: partially started, the critical path.** u7s GCP
+   IPv4 runs exist, single subnet only; no Tier-2 criterion is met yet. Still
+   needed: disjoint subnets/uRPF, external L4 client IP, WireGuard, dual-stack,
+   MTU, IPv6-only nodes, native-v6 pull (`beep-903`). Plan:
+   [real-cloud verification](../../docs/verification/real-cloud.md).
 4. **Performance and code-quality audit: started.** The `unsafe` audit is
    done; perf work is measure-first.
 5. **Red-team security audit: not started.** Begins once gate 3 is underway.
