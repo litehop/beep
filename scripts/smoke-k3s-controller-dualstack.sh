@@ -18,6 +18,13 @@
 # Service/EndpointSlice/Node reconcile + the dataplane's family-aware
 # front/tunnel-key handling -- not flannel's own dual-stack CNI plumbing.
 #
+# The final step (13) is the real pod path: a regular (non-hostNetwork)
+# Deployment on $VM_B whose pod gets a v4 AND a v6 address from k3s's dual-
+# stack cluster-cidr, behind its own PreferDualStack Service. The stock
+# controller manifest has only the v4 --pod-cidr, so the v6 pod address is
+# first shown REJECTED (negative control), then the v6 --pod-cidr is added
+# to the DaemonSet and v4+v6 round trips must reach the pod.
+#
 # TOPOLOGY: same as smoke-k3s-controller.sh -- ingress = $VM_A's own
 # address(es), backend Pod on $VM_B, client is the separate $VM_CLIENT VM.
 # The underlay Geneve tunnel itself stays v4 (both nodes' --node-ip primary
@@ -128,7 +135,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> [1/12] bringing up the DUAL-STACK k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
+echo "==> [1/13] bringing up the DUAL-STACK k3s cluster ($VM_A server, $VM_B agent) and $VM_CLIENT"
 k3s_bring_up_cluster "$VM_A" "$VM_B" "$VM_CLIENT" "iptables" "1"
 k3s_seed_lan_v6 "$VM_A" "$K3S_LAN_ULA_A" "$VM_B" "$K3S_LAN_ULA_B" "$VM_CLIENT" "$K3S_LAN_ULA_CLIENT"
 
@@ -156,7 +163,7 @@ for want in "$IP_A" "$ULA_A"; do
 done
 echo "CLUSTER-UP: PASS (dual-stack; $VM_A=$IP_A/$ULA_A ingress, $VM_B=$IP_B/$ULA_B backend, client=$VM_CLIENT $IP_CLIENT/$ULA_CLIENT)"
 
-echo "==> [2/12] creating geneve0 on both nodes (external mode -- beep sets the tunnel key itself)"
+echo "==> [2/13] creating geneve0 on both nodes (external mode -- beep sets the tunnel key itself)"
 for vm in "$VM_A" "$VM_B"; do
   limactl shell "$vm" -- sudo bash -c '
     ip link show geneve0 >/dev/null 2>&1 || ip link add geneve0 type geneve external
@@ -171,7 +178,7 @@ done
 
 SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 IMAGE="docker.io/valerauko/beep-lb:${SHA}-dualstack"
-echo "==> [4/12] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet"
+echo "==> [4/13] building the commit-under-test's image ($IMAGE) and deploying the controller DaemonSet"
 node_arch="$(limactl shell "$VM_A" -- uname -m)"
 [ "$(limactl shell "$VM_B" -- uname -m)" = "$node_arch" ] || {
   echo "FAIL: $VM_A and $VM_B report different architectures -- this rig assumes a homogeneous node pair" >&2
@@ -207,7 +214,7 @@ if ! k3s_deploy_controller_daemonset "$REPO_ROOT" "$IMAGE"; then
 fi
 echo "CONTROLLER-DEPLOY: PASS (servicelb-controller Running on both nodes, zero restarts after a 10s settle)"
 
-echo "==> [5/12] creating the backend Pod (hostNetwork, pinned to $NODE_B_K8S) + 3 Services"
+echo "==> [5/13] creating the backend Pod (hostNetwork, pinned to $NODE_B_K8S) + 3 Services"
 kube create namespace "$NAMESPACE" --dry-run=client -o yaml | kube apply -f -
 cat <<EOF | kube apply -f -
 apiVersion: apps/v1
@@ -276,7 +283,7 @@ spec:
       protocol: TCP
 EOF
 
-echo "==> [6/12] waiting for the Deployment and per-family EndpointSlices"
+echo "==> [6/13] waiting for the Deployment and per-family EndpointSlices"
 kube -n "$NAMESPACE" rollout status deployment/"$DEPLOY_NAME" --timeout=60s || {
   echo "FAIL: backend Deployment never became Ready" >&2
   kube -n "$NAMESPACE" describe pods >&2 || true
@@ -314,7 +321,7 @@ if kube -n "$NAMESPACE" get endpointslices -l kubernetes.io/service-name="$SVC_V
 fi
 echo "ENDPOINTSLICE: PASS ($SVC_DUAL v4=$dual_v4_ep v6=$dual_v6_ep, $SVC_V4 v4=$v4only_ep only, $SVC_V6 v6=$v6only_ep only)"
 
-echo "==> [7/12] confirming status.loadBalancer.ingress lists exactly the fronted families per Service"
+echo "==> [7/13] confirming status.loadBalancer.ingress lists exactly the fronted families per Service"
 assert_ingress() { # assert_ingress <svc> <want-count> <must-contain...> -- polls status.loadBalancer.ingress up to 30s
   local svc="$1" want_count="$2"; shift 2
   local ips="" ok=0 want
@@ -339,7 +346,7 @@ assert_ingress "$SVC_V4" 2 "$IP_A" "$IP_B" || { dump_evidence; exit 1; }
 assert_ingress "$SVC_V6" 2 "$ULA_A" "$ULA_B" || { dump_evidence; exit 1; }
 echo "SERVICE STATUS: PASS (each Service's status.loadBalancer.ingress matches exactly its own spec.ipFamilies)"
 
-echo "==> [8/12] confirming $VM_A's own dataplane front is programmed for each family it should serve, and NOT for families it shouldn't"
+echo "==> [8/13] confirming $VM_A's own dataplane front is programmed for each family it should serve, and NOT for families it shouldn't"
 # bpftool's --json dump has no BTF for LbFrontKey, so `key`/`value` are each
 # a flat array of "0xNN" byte strings (address order), not named
 # front_ip/front_port fields. Bytes [0..16)=front_ip, [16..18)=front_port
@@ -386,12 +393,12 @@ pod_targets_b=$(map_dump "$VM_B" POD_TARGETS | jq 'length') || { echo "FAIL: can
 [ "$pod_targets_b" -ge 1 ] || { echo "FAIL: $VM_B's POD_TARGETS has no entries -- the backend Pod was never admitted" >&2; dump_evidence; exit 1; }
 echo "MAP-PROGRAMMING: PASS ($VM_A FRONT_META has v4+v6 fronts for $SVC_DUAL, v4-only for $SVC_V4, v6-only for $SVC_V6; $VM_B POD_TARGETS=$pod_targets_b entries)"
 
-echo "==> [9/12] snapshotting geneve0 packet counters on both nodes before the round trips"
+echo "==> [9/13] snapshotting geneve0 packet counters on both nodes before the round trips"
 geneve_pkts() { limactl shell "$1" -- bash -c "ip -s -j link show geneve0 | jq '.[0].stats64.rx.packets + .[0].stats64.tx.packets'"; }
 GENEVE_A_BEFORE="$(geneve_pkts "$VM_A")"
 GENEVE_B_BEFORE="$(geneve_pkts "$VM_B")"
 
-echo "==> [10/12] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
+echo "==> [10/13] driving client ($VM_CLIENT) -> $SVC_DUAL: v4 ($IP_A:$PORT_DUAL) and v6 ([$ULA_A]:$PORT_DUAL)"
 http_url() { # http_url <addr> <port>
   echo "http://$(host_port "$1" "$2")/"
 }
@@ -417,7 +424,7 @@ echo "ROUND-TRIP-DUAL-V4: PASS (client $IP_CLIENT -> $SVC_DUAL v4 front $IP_A:$P
 round_trip -6 "$ULA_A" "$PORT_DUAL" "$ULA_CLIENT" >/dev/null || { echo "ROUND-TRIP-DUAL-V6: FAIL" >&2; dump_evidence; exit 1; }
 echo "ROUND-TRIP-DUAL-V6: PASS (client $ULA_CLIENT -> $SVC_DUAL v6 front [$ULA_A]:$PORT_DUAL -> backend on $VM_B, client IP preserved)"
 
-echo "==> [11/12] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
+echo "==> [11/13] negative checks: a v6 client must NOT reach the SingleStack-IPv4 Service (and vice versa)"
 expect_refused() { # expect_refused <curl-family-flag> <dial-addr> <port> -- passes only on curl rc 7 with the connect errno "Connection refused" (from -v; the summary line says only "Couldn't connect"): the node answered with an RST because no front exists for this family (an RST proves only that no front serves it; the FRONT_META absence check in step 8 covers "beep never programmed one"). LC_ALL=C pins curl's English errno text. Any other rc (timeout 28, no route, malformed URL 3, ...) or a successful fetch means the path is broken or leaking, not correctly refused.
   local flag="$1" addr="$2" port="$3" out rc url
   url="$(http_url "$addr" "$port")"
@@ -447,7 +454,7 @@ else
   exit 1
 fi
 
-echo "==> [12/12] confirming a conntrack/FLOW_TABLE entry exists on the ingress node for a live flow"
+echo "==> [12/13] confirming a conntrack/FLOW_TABLE entry exists on the ingress node for a live flow"
 k3s_hold_connection "$VM_CLIENT" "$IP_A" "$PORT_V4" 12 >/dev/null 2>&1 &
 HOLD_PID=$!
 sleep 4
@@ -459,6 +466,124 @@ wait "$HOLD_PID" || true
   exit 1
 }
 echo "CONNTRACK: PASS ($VM_A FLOW_TABLE=$flow_a entries)"
+
+echo "==> [13/13] real pod path: a NON-hostNetwork Deployment on $VM_B with a v4+v6 pod IP from the CNI"
+POD_DEPLOY="whoami-pod"
+SVC_POD="whoami-pod"
+PORT_POD="8083"
+V6_POD_CIDR="fd00:beef:42::/56"
+cat <<EOF | kube apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $POD_DEPLOY
+  namespace: $NAMESPACE
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: $POD_DEPLOY}
+  template:
+    metadata:
+      labels: {app: $POD_DEPLOY}
+    spec:
+      nodeName: $NODE_B_K8S
+      containers:
+        - name: whoami
+          image: docker.io/traefik/whoami:latest
+          ports:
+            - containerPort: $TARGET_PORT
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $SVC_POD
+  namespace: $NAMESPACE
+spec:
+  type: LoadBalancer
+  ipFamilyPolicy: PreferDualStack
+  selector: {app: $POD_DEPLOY}
+  ports:
+    - port: $PORT_POD
+      targetPort: $TARGET_PORT
+      protocol: TCP
+EOF
+kube -n "$NAMESPACE" rollout status deployment/"$POD_DEPLOY" --timeout=60s || {
+  echo "FAIL: pod-backed Deployment never became Ready" >&2
+  kube -n "$NAMESPACE" describe pods -l app="$POD_DEPLOY" >&2 || true
+  dump_evidence
+  exit 1
+}
+POD_NAME_BACKEND="$(kube -n "$NAMESPACE" get pod -l app="$POD_DEPLOY" -o jsonpath='{.items[0].metadata.name}')"
+POD_IPS="$(kube -n "$NAMESPACE" get pod "$POD_NAME_BACKEND" -o jsonpath='{.status.podIPs[*].ip}')"
+POD_V4=""
+POD_V6=""
+for pip in $POD_IPS; do
+  case "$pip" in
+    10.42.*) POD_V4="$pip" ;;
+    fd00:beef:42:*) POD_V6="$pip" ;;
+  esac
+done
+[ -n "$POD_V4" ] && [ -n "$POD_V6" ] || {
+  echo "FAIL: pod $POD_NAME_BACKEND podIPs='$POD_IPS' -- wanted one 10.42.0.0/16 and one $V6_POD_CIDR address (CNI is not dual-stack, or the pod is hostNetwork)" >&2
+  dump_evidence
+  exit 1
+}
+[ "$(kube -n "$NAMESPACE" get pod "$POD_NAME_BACKEND" -o jsonpath='{.spec.hostNetwork}')" != "true" ] || {
+  echo "FAIL: pod $POD_NAME_BACKEND is hostNetwork -- this leg must exercise the CNI pod path" >&2
+  exit 1
+}
+echo "POD-IPS: PASS ($POD_NAME_BACKEND on $NODE_B_K8S: v4=$POD_V4 v6=$POD_V6)"
+
+pod_round_trip() { # pod_round_trip <curl-family-flag> <dial-addr> <expect-client-addr> -- success only if the body positively identifies THIS pod (Hostname: <pod name>) and preserves the client IP
+  local body
+  body="$(round_trip "$1" "$2" "$PORT_POD" "$3" 2>/dev/null)" || return 1
+  grep -qxF "Hostname: $POD_NAME_BACKEND" <<<"$body"
+}
+controller_logs() { kube -n kube-system logs -l "$CONTROLLER_SELECTOR" --all-containers --prefix --tail=500 2>&1; }
+
+# The stock controller manifest carries only the v4 --pod-cidr, so the pod's
+# v6 address must be rejected by the admission gate: this is the control for
+# the repeatable --pod-cidr change.
+for _ in $(seq 1 30); do
+  pod_round_trip -4 "$IP_A" "$IP_CLIENT" && break
+  sleep 2
+done
+pod_round_trip -4 "$IP_A" "$IP_CLIENT" || { echo "POD-ROUND-TRIP-V4: FAIL (v4 pod $POD_V4 not reached via $IP_A:$PORT_POD)" >&2; dump_evidence; exit 1; }
+echo "POD-ROUND-TRIP-V4: PASS (client $IP_CLIENT -> v4 front $IP_A:$PORT_POD -> pod $POD_NAME_BACKEND $POD_V4, client IP preserved)"
+for _ in $(seq 1 15); do
+  controller_logs | grep -F "$POD_V6" | grep -qi "pod_cidr\|rejected" && break
+  sleep 2
+done
+controller_logs | grep -F "$POD_V6" | grep -qi "pod_cidr\|rejected" || {
+  echo "POD-V6-NEGATIVE-CONTROL: FAIL (no controller rejection log naming $POD_V6 with only the v4 --pod-cidr)" >&2
+  dump_evidence
+  exit 1
+}
+if pod_round_trip -6 "$ULA_A" "$ULA_CLIENT"; then
+  echo "POD-V6-NEGATIVE-CONTROL: FAIL (v6 round trip reached pod $POD_V6 although the controller only has the v4 --pod-cidr)" >&2
+  dump_evidence
+  exit 1
+fi
+echo "POD-V6-NEGATIVE-CONTROL: PASS (controller rejected v6 pod $POD_V6 and v6 front [$ULA_A]:$PORT_POD did not reach it with only --pod-cidr=10.42.0.0/16)"
+
+echo "    adding --pod-cidr=$V6_POD_CIDR to the controller DaemonSet"
+kube -n kube-system get daemonset servicelb-controller -o json \
+  | jq --arg cidr "--pod-cidr=$V6_POD_CIDR" '.spec.template.spec.containers[0].args += [$cidr]' \
+  | kube replace -f - >/dev/null
+kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s || {
+  echo "FAIL: controller DaemonSet did not roll out with the v6 --pod-cidr" >&2
+  dump_evidence
+  exit 1
+}
+v6_ok=0
+for _ in $(seq 1 30); do
+  if pod_round_trip -6 "$ULA_A" "$ULA_CLIENT"; then v6_ok=1; break; fi
+  sleep 2
+done
+[ "$v6_ok" -eq 1 ] || { echo "POD-ROUND-TRIP-V6: FAIL (v6 pod $POD_V6 not reached via [$ULA_A]:$PORT_POD after adding --pod-cidr=$V6_POD_CIDR)" >&2; dump_evidence; exit 1; }
+echo "POD-ROUND-TRIP-V6: PASS (client $ULA_CLIENT -> v6 front [$ULA_A]:$PORT_POD -> pod $POD_NAME_BACKEND $POD_V6, client IP preserved)"
+pod_round_trip -4 "$IP_A" "$IP_CLIENT" || { echo "POD-ROUND-TRIP-V4: FAIL (v4 regressed after the controller restart)" >&2; dump_evidence; exit 1; }
+echo "POD-ROUND-TRIP-V4-AFTER: PASS (v4 still served after the controller restart)"
 
 echo ""
 echo "GATE DUAL-STACK CONTROLLER-DRIVEN ROUND-TRIP: PASS"
