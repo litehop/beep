@@ -141,10 +141,11 @@ a redundant CI cycle per PR.
 1. Call `ListAgents`, extract the bare ids of currently running
    subagents (`agent-<id>` / `worker/agent-<id>` are also accepted; any
    non-alphanumeric entry exits 2), and run `scripts/mayor-tick.sh
-   --live-agents <comma-separated ids>` (omit the flag if none are running). This is the only reliable
-   liveness signal for an in-process worker sub-agent — a sub-agent cannot
-   call `ListAgents` on itself, and `claude agents --json` doesn't
-   enumerate in-process subagents. A worker/agent-* branch with no PR yet
+   --live-agents <comma-separated ids>` (omit the flag if none are running).
+   This is the only reliable liveness signal for an in-process worker
+   sub-agent — a sub-agent cannot call `ListAgents` on itself, and `claude
+   agents --json` doesn't enumerate in-process subagents. A worker/agent-*
+   branch with no PR yet
    whose id IS in that set reports as `no-pr-for-branch-in-flight`
    (informational only); one whose id is NOT reports as `no-pr-for-branch`
    (escalates the exit code to 30). The script drains `pr`-type
