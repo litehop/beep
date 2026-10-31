@@ -436,6 +436,16 @@ fn pick_underlay_ip(peer_ips: &[IpAddr], local_node_ip: IpAddr) -> Option<Underl
     })
 }
 
+/// Whether any address in `local` is in the same family as any in `peer`.
+/// `pick_underlay_ip` only prefers `--node-ip`'s family, so a dual-stack
+/// local node reaching a v6-only peer is a healthy fallback; only a pair with
+/// no family in common at all is unroutable.
+fn shares_family(local: &[IpAddr], peer: &[IpAddr]) -> bool {
+    local
+        .iter()
+        .any(|l| peer.iter().any(|p| l.is_ipv6() == p.is_ipv6()))
+}
+
 /// The Service's key when an ADDED/MODIFIED event shows a non-`LoadBalancer`
 /// Service still carrying `status.loadBalancer.ingress`: beep no longer
 /// forwards for it, so the entries this node published must be withdrawn.
@@ -953,6 +963,7 @@ impl WatchState {
             .copied()
             .map(tunnel_remote_v6)
             .collect();
+        let local_ips = self.own_node_ips(node.node_ip);
         for (key, svc) in &self.services {
             let slices = self.slices.get(key).unwrap_or(&no_slices);
 
@@ -1006,7 +1017,8 @@ impl WatchState {
                                     .copied()
                                     .collect();
                                 let pick = pick_underlay_ip(&peer.underlay, node.node_ip)?;
-                                if !pick.shared_family {
+                                if !pick.shared_family && !shares_family(&local_ips, &peer.underlay)
+                                {
                                     let peer_family = family_label(pick.ip);
                                     eprintln!(
                                         "controller: WARN peer node {peer_name:?} shares no \
@@ -2947,6 +2959,34 @@ mod tests {
             !pick.shared_family,
             "no family is shared here either -- this direction must be flagged as the \
              fallback too, not just the v4-local case above"
+        );
+    }
+
+    // A dual-stack local node with a v4 --node-ip tunnels to a v6-only peer
+    // over the peer's v6 (kernel-chosen v6 source), so the no-shared-family
+    // WARN must not fire: a false alarm sends an operator chasing a non-fault.
+    #[test]
+    fn dual_stack_local_and_v6_only_peer_share_a_family_so_no_warn() {
+        let local = [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5)),
+        ];
+        let peer = [IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6))];
+        assert!(
+            shares_family(&local, &peer),
+            "a dual-stack local node can reach a v6-only peer over v6; warning here is a \
+             false alarm that sends the operator chasing a non-fault"
+        );
+    }
+
+    #[test]
+    fn v4_only_local_and_v6_only_peer_share_no_family_so_warn() {
+        let local = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))];
+        let peer = [IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 6))];
+        assert!(
+            !shares_family(&local, &peer),
+            "a genuinely unroutable pair must still WARN, or the operator gets no hint why \
+             that peer's backends are unreachable"
         );
     }
 
