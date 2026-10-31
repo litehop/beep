@@ -7,18 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-31
+
+### Upgrade notes / operator action required
+
+- **Controller `--pod-cidr` is now repeatable, at most one per family.** On a
+  dual-stack cluster pass it once per family, e.g.
+  `--pod-cidr=10.42.0.0/16 --pod-cidr=fd00:42::/56`; without the v6 CIDR,
+  non-hostNetwork v6 pod backends are rejected. Two CIDRs of the same family
+  are a startup error. A single-stack cluster keeps its one flag unchanged.
+
+- **Ingress is withheld until the startup LISTs complete.** The controller
+  publishes no `status.loadBalancer.ingress` until its first Service,
+  EndpointSlice and Node LISTs have all completed (previously it published
+  `--node-ip`'s family alone from the first Service event). The stock
+  DaemonSet now has an exec `readinessProbe` that checks the `--ready-file`
+  path (`/tmp/beep-ready`), created at that point; pods report NotReady during
+  startup. Custom manifests must add the probe and pass `--ready-file`. See
+  deploy/README.md, "Startup readiness".
+
+### Added
+
+- `deploy/README.md` documents uninstalling beep, including the node-level
+  residue it leaves behind.
+
 ### Changed
 
-- The controller publishes no `status.loadBalancer.ingress` until its first
-  Service, EndpointSlice and Node LISTs have all completed (previously it
-  published `--node-ip`'s family alone from the first Service event), and the
-  DaemonSet now has an exec `readinessProbe` on `--ready-file`
-  (`/tmp/beep-ready`), created at that point. Pods report NotReady during
-  startup; custom manifests need the probe added. See deploy/README.md,
-  "Startup readiness".
-- Controller `--pod-cidr` is repeatable, at most one per family, so a
-  dual-stack cluster admits non-hostNetwork pod backends of both families.
-  Two CIDRs of the same family fail startup; a single flag behaves as before.
+- Updated to aya 0.16, with the loader and controller adapted to its API.
+- Updated politeia to v0.3.2.
+- Dependency and CI-action bumps (Renovate).
 
 ### Fixed
 

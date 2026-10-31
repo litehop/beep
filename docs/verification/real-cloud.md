@@ -9,12 +9,10 @@ scripts named below; this plan covers what they cannot prove.
 
 ## Prerequisites
 
-- **beep build under test** must contain per-family `--pod-cidr` (PR #320,
-  a81da1e) and the dual-stack non-hostNetwork pod rig (PR #324, 01d678b). Every
-  u7s release through v0.4.2-snapshot.2 pins beep v0.6.0
-  (`beep-lb@sha256:076a8474...`, via the image digest in u7s
-  `manifests/beep.yaml`), which predates both. Bump that digest to a build that
-  includes them, and record the digest used.
+- **beep v0.7.0 (or later).** Every u7s release through v0.4.2-snapshot.2 pins
+  beep v0.6.0 (`beep-lb@sha256:076a8474...`, via the image digest in u7s
+  `manifests/beep.yaml`), which predates it. Bump that digest to v0.7.0 or
+  later, and record the digest used.
 - Kernel 6.6 or newer, systemd Linux, x86-64 or AArch64 nodes (support scope).
 - GCP VPC with at least two subnets in different CIDRs (different regions are
   fine); `IPV4_IPV6` subnets for item (d).
