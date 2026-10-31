@@ -428,6 +428,24 @@ LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH
 assert "worktree-hygiene exits non-zero while a merged-but-dirty non-live worktree remains -- the mayor must notice it" \
   "$([ "$C2_MAIN_RC" -ne 0 ] && echo 1 || echo 0)"
 
+# A live worker's clean, merged worktree must survive when the mayor passes
+# its id as agent-<id> or worker/agent-<id>: the bare-id comparison would
+# otherwise miss it and reap a running worker's cwd.
+for form in agent-live worker/agent-live; do
+  LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+    bash "$SCRIPT" --live-agents "$form" >/dev/null 2>&1 || true
+  assert "--live-agents $form still protects the live worker's clean merged worktree -- a prefix mismatch must never make a running worker reapable" \
+    "$([ -d "$C2/ai/worktrees/agent-live" ] && git -C "$C2" branch --list fix-156 | grep -q fix-156 && echo 1 || echo 0)"
+done
+
+C2_BAD_RC=0
+C2_BAD_OUT=$(LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  bash "$SCRIPT" --live-agents "live,bad/id!" 2>&1) || C2_BAD_RC=$?
+assert "a malformed --live-agents entry exits 2 naming the bad id, before any destructive step" \
+  "$([ "$C2_BAD_RC" -eq 2 ] && printf '%s' "$C2_BAD_OUT" | grep -q 'bad/id!' && echo 1 || echo 0)"
+assert "...and nothing is reaped by the refused run" \
+  "$([ -d "$C2/ai/worktrees/agent-live" ] && [ -d "$C2/ai/worktrees/agent-dirty" ] && [ -d "$C2/ai/worktrees/agent-unmerged" ] && echo 1 || echo 0)"
+
 # A worktree whose only unpushed work is a merge commit (main merged into the
 # branch, e.g. a conflict resolution): `git cherry` skips merge commits and
 # calls it merged, but the commit is not on origin/main and reaping loses it.

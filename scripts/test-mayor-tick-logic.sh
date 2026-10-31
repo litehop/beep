@@ -986,11 +986,11 @@ assert "a queue entry with an old queued_at but no dispatch marker yet still sur
 #     bug this fix closes.
 # ---------------------------------------------------------------------------
 
-run_full_tick "$STUB_EMPTY_BIN" "" "live-test-agent" "live-test-agent"
+run_full_tick "$STUB_EMPTY_BIN" "" "livetestagent" "livetestagent"
 assert "a worker/agent-<id> branch with no PR, whose id IS in --live-agents, does not return exit 30 -- it's a confirmed-live dispatch, not a stalled one" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
 assert "...and it still appears in worktree_anomalies for visibility (not silently dropped), tagged in-flight" \
-  "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-live-test-agent" and .reason == "no-pr-for-branch-in-flight")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
+  "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-livetestagent" and .reason == "no-pr-for-branch-in-flight")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
 
 run_full_tick "$STUB_EMPTY_BIN" "" "stale-test-agent" ""
 assert "a worker/agent-<id> branch with no PR, whose id is NOT in --live-agents, returns exit 30 -- this is the fail-toward-surfacing default that replaces the old 45-minute grace window entirely" \
@@ -998,13 +998,25 @@ assert "a worker/agent-<id> branch with no PR, whose id is NOT in --live-agents,
 assert "...and it's tagged genuinely stale (no-pr-for-branch), not in-flight -- what worktree-hygiene.sh's destructive steps ultimately act on" \
   "$([ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-stale-test-agent" and .reason == "no-pr-for-branch")] | length' "$TICK_STATE")" -ge 1 ] && echo 1 || echo 0)"
 
-run_full_tick "$STUB_EMPTY_BIN" "" "agent-two" "agent-one,agent-two,agent-three"
+run_full_tick "$STUB_EMPTY_BIN" "" "idtwo" "idone,idtwo,idthree"
 assert "a --live-agents value with multiple comma-separated ids correctly matches the worker's id even when it isn't first or last in the list" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
 
-run_full_tick "$STUB_EMPTY_BIN" "" "agent-two" "agent-one, agent-two, agent-three"
+run_full_tick "$STUB_EMPTY_BIN" "" "idtwo" "idone, idtwo, idthree"
 assert "the SAME multi-id match still succeeds through the full main() pipeline when the mayor's --live-agents value is comma-SPACE joined -- a live worker in the middle of the list must not misreport exit 30 (stale) just because of list formatting" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
+
+run_full_tick "$STUB_EMPTY_BIN" "" "idprefixed" "agent-idprefixed"
+assert "a live worker passed as agent-<id> (as it appears in its worktree dir) is still in-flight, not exit 30 -- a prefix mismatch must never make a live worker look stale" \
+  "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
+
+run_full_tick "$STUB_EMPTY_BIN" "" "idfull" "worker/agent-idfull"
+assert "a live worker passed as worker/agent-<id> (its branch name) is still in-flight, not exit 30" \
+  "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
+
+run_full_tick "$STUB_EMPTY_BIN" "" "idbad" "idbad,not a/valid id"
+assert "a malformed --live-agents entry makes mayor-tick exit 2 before doing anything, rather than silently treating the live set as incomplete" \
+  "$([ "$TICK_RC" -eq 2 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 16. Stale-blocking-verdict reconcile -- pure-function building blocks.
