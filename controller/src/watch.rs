@@ -1332,10 +1332,11 @@ mod tests {
     fn node(ip: Ipv4Addr) -> NodeContext {
         NodeContext {
             node_ip: IpAddr::V4(ip),
-            pod_cidr: reconcile::IpCidr::V4(reconcile::Ipv4Cidr::new(
+            pod_cidr: reconcile::PodCidrs::new([reconcile::IpCidr::V4(reconcile::Ipv4Cidr::new(
                 Ipv4Addr::new(10, 244, 0, 0),
                 16,
-            )),
+            ))])
+            .unwrap(),
         }
     }
 

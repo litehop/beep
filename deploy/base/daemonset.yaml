@@ -150,7 +150,8 @@ spec:
             # admission gate (deploy/README.md's pod-cidr gotcha); the
             # controller now logs a WARN naming the rejected pod_ip(s) when
             # this happens, but confirm delivery works rather than relying
-            # on absence of that log.
+            # on absence of that log. Dual-stack: repeat the flag once per
+            # family, e.g. add --pod-cidr=fd00:42::/56.
             - --pod-cidr=10.42.0.0/16
             - --node-ip=$(NODE_IP)
             # Repeatable (docs/decisions/servicelb-multi-symmetric-uplink.md)

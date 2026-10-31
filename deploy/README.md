@@ -62,6 +62,12 @@ the first time, then confirm with "Verify your deployment" below.
    (`kubectl cluster-info dump | grep -i cluster-cidr`, or your CNI's own
    config), then confirm with "Verify your deployment" below.
 
+   On a dual-stack cluster pass `--pod-cidr` once per family, e.g.
+   `--pod-cidr=10.42.0.0/16` and `--pod-cidr=fd00:42::/56`. A pod IP is
+   checked against the CIDR of its own family only, so a family with no
+   `--pod-cidr` gets no non-hostNetwork backends. Two CIDRs of the same
+   family fail controller startup.
+
 2. **The front-IP range MUST be disjoint from the pod CIDR — LOUD if
    wrong, but hard to hit in a real cluster.** Under beep's
    node-owned-address model every node's own address doubles as a front
