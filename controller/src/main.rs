@@ -662,8 +662,24 @@ fn clear_ingress_for(
     node: &NodeContext,
     key: ServiceKey,
 ) {
-    let own_ips = state.lock().unwrap().own_node_ips(node.node_ip);
+    let Some(own_ips) = ingress_clear_ips(&state.lock().unwrap(), node.node_ip) else {
+        pending
+            .lock()
+            .unwrap()
+            .record(&key, false, true, Instant::now());
+        return;
+    };
     publish_ingress(client, pending, key, own_ips, Vec::new(), true);
+}
+
+/// The addresses a clear must withdraw, or `None` while they are not yet
+/// known: before the Node LIST completes `own_node_ips` holds only
+/// `--node-ip`'s family, so an early clear would leave this node's other-family
+/// entry behind.
+fn ingress_clear_ips(state: &WatchState, node_ip: IpAddr) -> Option<Vec<IpAddr>> {
+    state
+        .ingress_decidable()
+        .then(|| state.own_node_ips(node_ip))
 }
 
 /// What to do with one Service's published ingress.
@@ -767,6 +783,16 @@ impl PublishRetry {
         self.backoff.retry_at = None;
         self.keys.iter().map(|(k, c)| (k.clone(), *c)).collect()
     }
+
+    /// Keys with an outstanding clear, including clears deferred until the
+    /// LISTs complete.
+    fn pending_clears(&self) -> Vec<ServiceKey> {
+        self.keys
+            .iter()
+            .filter(|(_, clear)| **clear)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
 }
 
 /// Retries failed ingress publishes and clears when due. Never returns.
@@ -849,8 +875,12 @@ fn after_list(
     }
     if !was_ready && state.lock().unwrap().ingress_decidable() {
         let keys = state.lock().unwrap().service_keys();
-        for key in keys {
-            publish_ingress_for(client, pending, state, node, key);
+        for key in &keys {
+            publish_ingress_for(client, pending, state, node, key.clone());
+        }
+        let clears = pending.lock().unwrap().pending_clears();
+        for key in clears.into_iter().filter(|k| !keys.contains(k)) {
+            clear_ingress_for(client, pending, state, node, key);
         }
     }
 }
@@ -1291,6 +1321,62 @@ mod tests {
         assert!(sync_ready_marker(&state, &path).unwrap());
         assert!(path.exists(), "all three LISTs done must create the marker");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    // A Service that left type=LoadBalancer across a restart must lose BOTH of
+    // this node's ingress entries; clearing against the pre-LIST --node-ip-only
+    // set would leave the other family advertised indefinitely.
+    #[test]
+    fn clear_is_deferred_until_lists_complete_then_covers_both_families() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let v6 = IpAddr::V6("2001:db8::5".parse().unwrap());
+        let mut state = WatchState::default();
+        assert_eq!(
+            ingress_clear_ips(&state, v4),
+            None,
+            "a pre-LIST clear would anchor on --node-ip's family alone and strand the other \
+             family's entry"
+        );
+        state
+            .replace_nodes(
+                &[serde_json::json!({
+                    "metadata": {"name": "node-a"},
+                    "status": {"addresses": [
+                        {"type": "InternalIP", "address": "10.0.0.5"},
+                        {"type": "InternalIP", "address": "2001:db8::5"},
+                    ]},
+                })],
+                v4,
+            )
+            .unwrap();
+        state.replace_services(&[]).unwrap();
+        assert_eq!(
+            ingress_clear_ips(&state, v4),
+            None,
+            "still deferred until the EndpointSlice LIST completes"
+        );
+        state.replace_endpoint_slices(&[]).unwrap();
+        let mut ips = ingress_clear_ips(&state, v4).expect("all LISTs done");
+        ips.sort();
+        assert_eq!(
+            ips,
+            vec![v4, v6],
+            "both of this node's families must be withdrawn from the non-LB Service"
+        );
+    }
+
+    #[test]
+    fn deferred_clear_survives_until_the_last_list_replays_it() {
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.record(&svc("gone-lb"), false, true, t0);
+        p.record(&svc("publish-failed"), false, false, t0);
+        assert_eq!(
+            p.pending_clears(),
+            vec![svc("gone-lb")],
+            "a clear deferred before the LISTs completed must be replayed on the last LIST, \
+             or the stale ingress entry is never withdrawn"
+        );
     }
 
     #[test]

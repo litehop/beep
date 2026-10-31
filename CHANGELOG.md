@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The "shares no address family" peer WARN no longer fires when this node has
   any address in a family the peer has (e.g. a dual-stack node with a v4
   `--node-ip` and a v6-only peer, which tunnels fine over v6).
+- A Service that left `type=LoadBalancer` while the controller was down now has
+  both of this node's ingress entries withdrawn; the clear is deferred until
+  the initial LISTs complete instead of covering `--node-ip`'s family alone.
 
 ## [0.6.0] - 2026-10-19
 
