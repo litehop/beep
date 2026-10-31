@@ -38,6 +38,12 @@ underlay, dual-stack, MTU, IPv6-only.
 Record `net.ipv4.conf.{all,default,<iface>}.rp_filter` on every node before
 each item.
 
+**Beep evidence (B).** A plain-routed 200 proves nothing, so PASS for (a)-(d)
+and (g) also requires: `ip -s -j link show geneve0` rx+tx packet counts on
+both nodes grow across the request, and the ingress node's FLOW_TABLE holds
+the flow (`sudo bpftool map dump pinned /sys/fs/bpf/beep/FLOW_TABLE --json`,
+as `scripts/smoke-k3s-controller-v6only.sh` steps 9 and 12 do).
+
 **(a) Disjoint subnets (required).**
 Topology: two or more nodes in different subnets; ingress on node A, backend
 pod on node B, client elsewhere.
@@ -45,23 +51,26 @@ Run: TCP/HTTP round trip through a LoadBalancer front; `tcpdump -ni any
 'udp port 6081'` on both nodes.
 PASS: response received; Geneve leaves A and arrives at B; return packets
 reach the client with the front address as source; no provider anti-spoof
-drops (VPC flow logs).
+drops (VPC flow logs); (B).
 Evidence: pcaps, rp_filter values, flow-log excerpt, beep logs.
 
 **(b) External client, L4 client IP (required).**
 Topology: client outside the VPC targeting the front/public address, with
 `externalTrafficPolicy` `Cluster` and `Local`.
 Run: backend that echoes the TCP peer address (not XFF), e.g. a raw TCP echo.
-PASS: backend sees the client's real public IP as peer, not a node IP.
+PASS: backend sees the client's real public IP as peer, not a node IP; (B).
 Evidence: backend log, client's public IP, pcap on the backend node.
 
 **(c) Node-to-node over WireGuard (required; stands in for Tailscale).**
 Topology: nodes joined by a real `wg0` over the VPC/public path (not
 loopback), with the wg address as the k3s `--node-ip` (underlay IP).
 Run: as (a), Geneve carried inside wg0. Mirror `scripts/smoke-wg-2node.sh`
-and `scripts/smoke-wg-2node-dualstack.sh`.
-PASS: round trip works; `wg show` handshake and transfer counters grow; a pcap
-on the physical NIC shows only WireGuard UDP, no cleartext Geneve.
+and `scripts/smoke-wg-2node-dualstack.sh`. Those use a bare loader with seeded
+NODE_ALLOW; on the real fleet the controller's Node watch populates NODE_ALLOW,
+so the k3s + controller deployment, not the bare loader, is under test.
+PASS: round trip works; `wg show` handshake and transfer counters grow; Geneve
+(UDP 6081) is visible on `wg0`; a pcap on the physical NIC shows only
+WireGuard UDP, no cleartext Geneve; (B).
 Evidence: `wg show`, pcaps on NIC and wg0, round-trip output.
 
 **(d) Dual-stack with a pod backend (required).**
@@ -70,8 +79,10 @@ regular (non-hostNetwork) pod on a non-ingress node.
 Run: controller with both `--pod-cidr` values; v4 and v6 round trips from the
 external client. Mirror `scripts/smoke-k3s-controller-dualstack.sh` step 13
 (negative control with only the v4 `--pod-cidr`, then both).
-PASS: v4 and v6 requests both return 200 from the pod; the v6 pod address is
-rejected with v4-only `--pod-cidr` and accepted with both.
+PASS: for both v4 and v6 the response body is `Hostname: <pod name>` of the
+non-hostNetwork pod and the client's real IP is preserved (step 13's check);
+the v6 pod address is rejected with v4-only `--pod-cidr` and accepted with
+both; (B).
 Evidence: DaemonSet args, `kubectl get svc,endpointslices -o wide`, curl output
 for both families, controller logs.
 
@@ -89,7 +100,17 @@ On GCP if feasible: IPv6-only primary node, no NAT64/DNS64, registry pull over
 native v6. PASS: (d) round trips over the node's v6 and image pull succeeds.
 Mirror `scripts/smoke-k3s-controller-v6only.sh`.
 
-**(g) Not required.** Cross-provider latency, home NAT.
+**(g) Mixed fleet (optional, needs a v6-only node).**
+Topology: a dual-stack node (DaemonSet `--node-ip` = v4 from status.hostIP)
+and a v6-only node. The controller falls back to the peer's v6 underlay
+(`pick_underlay_ip`) and the kernel picks the outer v6 source; only hardware
+shows whether that source is one the v6-only peer's NODE_ALLOW holds (every
+node's full underlay).
+PASS: v6 round trip in both directions; `tcpdump` on the underlay shows outer
+v6 src among the dual-stack node's Node InternalIPs; (B). The dual-stack node
+logs a spurious "no shared address family" WARN (known); not a failure.
+
+**(h) Not required.** Cross-provider latency, home NAT.
 
 ## Evidence and reporting
 
