@@ -203,6 +203,54 @@ for bad in 'litehop/beep/../../x' 'litehop' 'litehop/beep?x=1' 'a/b/c' '/beep' '
     "$([ "$RUN_RC" -ne 0 ] && [ -s "$WORK/stderr" ] && [ -z "$RUN_OUT" ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
 done
 
+# ---------------------------------------------------------------------------
+# 10. --body-file: the single bare command a sandbox allow rule can match.
+# A reviewer whose post silently fails leaves the merge gate without a verdict.
+# ---------------------------------------------------------------------------
+FILE_PAYLOAD='{"body":"## critical-reviewer findings\n\nfrom file","event":"APPROVE","comments":[{"path":"a.rs","line":3,"side":"RIGHT","body":"`x`"}]}'
+printf '%s' "$FILE_PAYLOAD" > "$WORK/payload.json"
+
+run_file() {
+  rm -f "$CURL_CALLED_MARKER" "$CURL_BODY_CAPTURE"
+  RUN_OUT=$(PATH="$STUBDIR:$PATH" "$SCRATCH/gh-app-review.sh" "$@" </dev/null 2>"$WORK/stderr") \
+    && RUN_RC=0 || RUN_RC=$?
+}
+
+run_file 482 --body-file "$WORK/payload.json"
+assert "--body-file posts the file's payload byte-for-byte -- the reviewer's verdict must reach GitHub unchanged without any stdin pipe" \
+  "$([ "$RUN_RC" -eq 0 ] && [ "$(cat "$CURL_BODY_CAPTURE" 2>/dev/null)" = "$FILE_PAYLOAD" ] && echo 1 || echo 0)"
+
+run_file 11 litehop/politeia --body-file "$WORK/payload.json"
+assert "--body-file composes with the repo argument -- a cross-repo review must still retarget the POST" \
+  "$([ "$RUN_RC" -eq 0 ] && grep -qF 'repos/litehop/politeia/pulls/11/reviews' "$CURL_ARGV_CAPTURE" && echo 1 || echo 0)"
+
+run_file --body-file "$WORK/payload.json" 482
+assert "--body-file may precede the positional arguments" \
+  "$([ "$RUN_RC" -eq 0 ] && [ -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+
+run_file 482 --body-file "$WORK/does-not-exist.json"
+assert "a missing --body-file exits non-zero with a message and no request -- a silent post failure leaves the merge gate without a verdict" \
+  "$([ "$RUN_RC" -ne 0 ] && [ -s "$WORK/stderr" ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+
+printf '%s' '{"body": "unterminated' > "$WORK/bad.json"
+run_file 482 --body-file "$WORK/bad.json"
+assert "an invalid-JSON --body-file exits non-zero before any request -- GitHub would 422 it and the reviewer would not see why" \
+  "$([ "$RUN_RC" -ne 0 ] && [ -s "$WORK/stderr" ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+
+printf '%s' '[1,2]' > "$WORK/array.json"
+run_file 482 --body-file "$WORK/array.json"
+assert "a non-object --body-file payload is rejected -- the reviews endpoint needs {body,event,comments}" \
+  "$([ "$RUN_RC" -ne 0 ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+
+run_file 482 --body-file
+assert "--body-file without a path fails loudly instead of posting stdin" \
+  "$([ "$RUN_RC" -ne 0 ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+
+rm -f "$CURL_CALLED_MARKER" "$CURL_BODY_CAPTURE"
+run_wrapper 482
+assert "stdin payloads still work without --body-file -- other callers (hook fallback, mayor) keep posting" \
+  "$([ "$RUN_RC" -eq 0 ] && [ "$(cat "$CURL_BODY_CAPTURE" 2>/dev/null)" = "$PAYLOAD" ] && echo 1 || echo 0)"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
