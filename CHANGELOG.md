@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dual-stack cluster admits non-hostNetwork pod backends of both families.
   Two CIDRs of the same family fail startup; a single flag behaves as before.
 
+### Fixed
+
+- The "shares no address family" peer WARN no longer fires when this node has
+  any address in a family the peer has (e.g. a dual-stack node with a v4
+  `--node-ip` and a v6-only peer, which tunnels fine over v6).
+
 ## [0.6.0] - 2026-10-19
 
 ### Upgrade notes / operator action required
