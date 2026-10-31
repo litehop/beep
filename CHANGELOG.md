@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.0] - 2026-10-31
 
+### Added
+
+- `deploy/README.md` documents uninstalling beep, including the node-level
+  residue it leaves behind.
+
 ### Changed
+
+- Updated to aya 0.16, with the loader and controller adapted to its API.
+- Updated politeia to v0.3.2.
+- Dependency and CI-action bumps (Renovate).
 
 - **Breaking: ingress is withheld until startup LISTs complete.** The
   controller publishes no `status.loadBalancer.ingress` until its first
