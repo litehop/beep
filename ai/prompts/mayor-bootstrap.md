@@ -237,7 +237,7 @@ transcripts, env dumps), not process isolation between an operator and
 their own subagents. `Bash(scripts/mayor-tick.sh *)` and
 `Bash(scripts/gh-app-review.sh *)` stay in each operator's untracked
 `.claude/settings.local.json`, not tracked `settings.json`: the tick merges PRs
-and gh-app-review posts the reviewer-bot approvals the merge gate trusts, so
+and gh-app-review posts the reviewer-bot verdicts the merge gate trusts, so
 tracked settings would let any worker run them prompt-free (operator decision
 2026-10-31).
 
