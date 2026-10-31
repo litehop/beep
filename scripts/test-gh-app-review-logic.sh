@@ -243,8 +243,8 @@ assert "a non-object --body-file payload is rejected -- the reviews endpoint nee
   "$([ "$RUN_RC" -ne 0 ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
 
 run_file 482 --body-file
-assert "--body-file without a path fails loudly instead of posting stdin" \
-  "$([ "$RUN_RC" -ne 0 ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
+assert "--body-file without a path exits 2 like other validation errors, with a message, instead of posting stdin" \
+  "$([ "$RUN_RC" -eq 2 ] && [ -s "$WORK/stderr" ] && [ ! -e "$CURL_CALLED_MARKER" ] && echo 1 || echo 0)"
 
 rm -f "$CURL_CALLED_MARKER" "$CURL_BODY_CAPTURE"
 run_wrapper 482

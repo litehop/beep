@@ -443,6 +443,11 @@ C2_BAD_OUT=$(LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_O
   bash "$SCRIPT" --live-agents "live,bad/id!" 2>&1) || C2_BAD_RC=$?
 assert "a malformed --live-agents entry exits 2 naming the bad id, before any destructive step" \
   "$([ "$C2_BAD_RC" -eq 2 ] && printf '%s' "$C2_BAD_OUT" | grep -q 'bad/id!' && echo 1 || echo 0)"
+C2_NONE_RC=0
+C2_NONE_OUT=$(LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$C2" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
+  bash "$SCRIPT" --live-agents "__none_live__" 2>&1) || C2_NONE_RC=$?
+assert "the deprecated --live-agents __none_live__ placeholder exits 2 pointing at --no-live-workers, so an old cron line learns the replacement instead of a generic id-shape error" \
+  "$([ "$C2_NONE_RC" -eq 2 ] && printf '%s' "$C2_NONE_OUT" | grep -q 'deprecated' && printf '%s' "$C2_NONE_OUT" | grep -q -- '--no-live-workers' && echo 1 || echo 0)"
 assert "...and nothing is reaped by the refused run" \
   "$([ -d "$C2/ai/worktrees/agent-live" ] && [ -d "$C2/ai/worktrees/agent-dirty" ] && [ -d "$C2/ai/worktrees/agent-unmerged" ] && echo 1 || echo 0)"
 

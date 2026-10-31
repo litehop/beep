@@ -141,10 +141,11 @@ a redundant CI cycle per PR.
 1. Call `ListAgents`, extract the bare ids of currently running
    subagents (`agent-<id>` / `worker/agent-<id>` are also accepted; any
    non-alphanumeric entry exits 2), and run `scripts/mayor-tick.sh
-   --live-agents <comma-separated ids>` (omit the flag if none are running). This is the only reliable
-   liveness signal for an in-process worker sub-agent — a sub-agent cannot
-   call `ListAgents` on itself, and `claude agents --json` doesn't
-   enumerate in-process subagents. A worker/agent-* branch with no PR yet
+   --live-agents <comma-separated ids>` (omit the flag if none are running).
+   This is the only reliable liveness signal for an in-process worker
+   sub-agent — a sub-agent cannot call `ListAgents` on itself, and `claude
+   agents --json` doesn't enumerate in-process subagents. A worker/agent-*
+   branch with no PR yet
    whose id IS in that set reports as `no-pr-for-branch-in-flight`
    (informational only); one whose id is NOT reports as `no-pr-for-branch`
    (escalates the exit code to 30). The script drains `pr`-type
@@ -233,7 +234,12 @@ per-operator and individually revocable, so none is ever shared.
 a different OS user from reading the key, but not a worker subagent running
 as the same OS user — the threat model here is accidental exposure (logs,
 transcripts, env dumps), not process isolation between an operator and
-their own subagents.
+their own subagents. `Bash(scripts/mayor-tick.sh *)` and
+`Bash(scripts/gh-app-review.sh *)` stay in each operator's untracked
+`.claude/settings.local.json`, not tracked `settings.json`: the tick merges PRs
+and gh-app-review posts the reviewer-bot approvals the merge gate trusts, so
+tracked settings would let any worker run them prompt-free (operator decision
+2026-10-31).
 
 **Worktree hygiene loop body.** The mechanical body — `git worktree prune`
 and stale worker/non-worker branch cleanup — lives in

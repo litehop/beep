@@ -135,6 +135,10 @@ canonical_live_agents() {
     [ -n "$tok" ] || continue
     id="${tok#worker/agent-}"
     [ "$id" != "$tok" ] || id="${tok#agent-}"
+    if [ "$tok" = "__none_live__" ]; then
+      echo "$(basename "$0"): refusing to run -- --live-agents __none_live__ is deprecated; pass --no-live-workers when ListAgents shows no running workers" >&2
+      return 1
+    fi
     if ! [[ "$id" =~ ^[A-Za-z0-9]+$ ]]; then
       echo "$(basename "$0"): refusing to run -- invalid --live-agents entry '$tok' (expected a bare ListAgents agent id, optionally prefixed agent- or worker/agent-)" >&2
       return 1
