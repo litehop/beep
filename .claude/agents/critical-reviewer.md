@@ -191,8 +191,8 @@ Then post it yourself, per deliverable type:
 
 - **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`): post ONE
   Pull Request Review — not a plain issue comment — under the
-  `litehop-reviewer[bot]` App identity by piping the payload into
-  `scripts/gh-app-review.sh <N>` (never the operator's own `gh api
+  `litehop-reviewer[bot]` App identity via
+  `scripts/gh-app-review.sh <N> --body-file <path>` (never the operator's own `gh api
   ... --input -`, and never `gh pr review` directly: the wrapper mints the
   App's installation token and POSTs in one process, which is also the only
   shape the sandbox's first-token command allowlist accepts). Map the
@@ -204,7 +204,8 @@ Then post it yourself, per deliverable type:
   today (workers push under the operator identity).
 
   **Other repos:** for a PR outside `litehop/beep`, pass the repo as the
-  second argument: `scripts/gh-app-review.sh <N> litehop/<repo>`. Omitting it
+  second argument: `scripts/gh-app-review.sh <N> litehop/<repo> --body-file
+  <path>`. Omitting it
   targets `litehop/beep`, so a bare `<N>` against another repo's PR number
   reviews the wrong PR.
 
@@ -234,37 +235,25 @@ Then post it yourself, per deliverable type:
     otherwise be header+Verdict+Meta only — never post an empty `body` and
     never drop the header, since the merge-PR loop keys off it (see above).
 
-  **Build the payload with `jq`, never by hand-splicing JSON text.** Findings
-  blocks are always multi-line and routinely contain backticks and quotes
-  (citations, code spans); a literal newline inside a JSON string is invalid
-  JSON, and an unquoted heredoc delimiter lets the shell command-substitute
-  on backticks before `gh` ever sees the payload. `jq`'s `--arg`/`--argjson`
-  escape every field correctly by construction, so use them for both the
-  top-level body and every comment (matches this repo's own convention —
-  see `jq -n --arg`/`--argjson` usage in
-  `scripts/test-critical-reviewer-hook.sh`):
-  1. Capture the top-level body text into a shell variable via a
-     quote-delimited heredoc — `BODY=$(cat <<'FINDINGS_EOF'` ... `FINDINGS_EOF`
-     `)` — the quotes around the delimiter stop the shell from expanding
-     anything inside (backticks, `$vars`), so the raw markdown is captured
-     verbatim as plain text, NOT as JSON; never type the findings text
-     directly inside JSON double-quotes yourself, that is what breaks.
-  2. For each anchored finding, emit one compact comment object the same
-     way — capture its bullet text into a variable via a quote-delimited
-     heredoc, then: `jq -nc --arg path 'PATH' --argjson line LINE --arg side
-     'SIDE' --arg body "$BULLET_TEXT" '{path:$path, line:$line, side:$side,
-     body:$body}'`.
-  3. Splice the resulting one-line objects into an array literal —
-     `COMMENTS="[$obj1, $obj2, ...]"` (or `[]` if none) — the same jq-built
-     array-splicing pattern this repo already uses to compose JSON arrays
-     from `jq`-built pieces. Each piece is already safely escaped, so
-     string-splicing compact `jq -c` output is safe.
-  4. Build the final payload and pipe it straight into the posting command
-     in one pipeline — never store it in an intermediate string the shell
-     might re-interpret: `jq -n --arg body "$BODY" --arg event "$EVENT"
-     --argjson comments "$COMMENTS" '{body:$body, event:$event,
-     comments:$comments}' | scripts/gh-app-review.sh <N> [owner/repo]`. On a
-     non-zero exit, follow "No operator-token fallback" above.
+  **Write the payload with the Write tool, then post with one bare command.**
+  The sandbox matches the posting command by its leading token, so it must
+  contain no variable assignments, `$VAR` expansions, heredocs, or pipes:
+  1. Use the Write tool to create `<worktree-root>/.tmp-review-<N>.json`
+     (absolute path under your own worktree; `.tmp-*` is gitignored; never
+     under `ai/findings/`). Its content is one JSON object:
+     `{"body": "...", "event": "APPROVE|REQUEST_CHANGES", "comments":
+     [{"path": "...", "line": 12, "side": "RIGHT", "body": "..."}]}`, with
+     `"comments": []` when nothing is anchored. Escape every string as JSON:
+     newlines as `\n`, double quotes as `\"`, backslashes as `\\`; backticks
+     need no escaping. Add `"commit_id": "<head sha>"` when the dispatch
+     names a head to pin.
+  2. Post with exactly this command and nothing else on the line:
+     `scripts/gh-app-review.sh <N> [owner/repo] --body-file
+     <worktree-root>/.tmp-review-<N>.json`. The script rejects an unreadable
+     file or invalid JSON with a non-zero exit before any request is made;
+     fix the JSON and re-run. On any other non-zero exit, follow "No
+     operator-token fallback" above.
+  3. Delete the payload file afterwards with `rm`.
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
   there is no PR to comment on. Identify the originating bead ID — findings
   docs consistently name it in their own title/intro (grep the doc for the
