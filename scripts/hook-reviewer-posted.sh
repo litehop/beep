@@ -72,5 +72,5 @@ POSTED=$(printf '%s' "$VIEW" | jq -r '
 [ "$(field '.stop_hook_active // false')" = "true" ] && warn "already blocked once (stop_hook_active)"
 
 HEAD_OID=$(printf '%s' "$VIEW" | jq -r '.headRefOid')
-echo "No critical-reviewer review is posted on the current head of PR #$PR. Post via \`scripts/gh-app-review.sh $PR\` with the payload's commit_id pinned to $HEAD_OID (on non-zero exit, retry once as COMMENT via \`gh api repos/litehop/beep/pulls/$PR/reviews -X POST --input -\`). Your final message must begin with the review URL, or the exact errors from both attempts." >&2
+echo "No critical-reviewer review is posted on the current head of PR #$PR. Write the payload (commit_id pinned to $HEAD_OID) to a file with the Write tool, then post with \`scripts/gh-app-review.sh $PR [owner/repo] --body-file <path>\`. Do not retry with another token or command. Your final message must begin with the review URL, or the exact error from the script." >&2
 exit 2
