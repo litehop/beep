@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Controller `--pod-cidr` is repeatable, at most one per family, so a
+  dual-stack cluster admits non-hostNetwork pod backends of both families.
+  Two CIDRs of the same family fail startup; a single flag behaves as before.
+
 ## [0.6.0] - 2026-10-19
 
 ### Upgrade notes / operator action required

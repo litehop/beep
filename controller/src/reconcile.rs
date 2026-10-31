@@ -118,40 +118,65 @@ impl std::fmt::Display for Ipv6Cidr {
     }
 }
 
-/// `NodeContext::pod_cidr`'s dual-stack shape, mirroring the loader's own
-/// `Ipv4Cidr`/`IpCidr` split (`src/main.rs`): a Service's front and its
-/// backend Pod can each independently be v4 or v6, so `is_admitted` must
-/// compare a dual-stack `Endpoint.pod_ip` against a CIDR of either family
-/// without assuming one. `main.rs`'s CLI parser (`parse_ip_cidr`) picks
-/// `IpCidr::V4`/`V6` off the configured `--pod-cidr` network address's own
-/// family.
+/// One parsed `--pod-cidr` value; `main.rs`'s CLI parser (`parse_ip_cidr`)
+/// picks the variant off the network address's own family, and `PodCidrs`
+/// slots it into its family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpCidr {
     V4(Ipv4Cidr),
     V6(Ipv6Cidr),
 }
 
-impl IpCidr {
+/// The cluster's pod CIDRs, at most one per family, so a dual-stack cluster's
+/// non-hostNetwork pods are admitted in both families while a pod IP whose
+/// family has no configured CIDR is still rejected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PodCidrs {
+    v4: Option<Ipv4Cidr>,
+    v6: Option<Ipv6Cidr>,
+}
+
+impl PodCidrs {
+    /// Fails when two CIDRs share a family: which one a pod belongs to would
+    /// be ambiguous, and silently keeping one would drop the other's pods.
+    pub fn new(cidrs: impl IntoIterator<Item = IpCidr>) -> Result<Self, String> {
+        let mut out = PodCidrs::default();
+        for cidr in cidrs {
+            match cidr {
+                IpCidr::V4(c) => {
+                    if let Some(prev) = out.v4.replace(c) {
+                        return Err(format!(
+                            "--pod-cidr given twice for IPv4 ({prev} and {c}); at most one per family"
+                        ));
+                    }
+                }
+                IpCidr::V6(c) => {
+                    if let Some(prev) = out.v6.replace(c) {
+                        return Err(format!(
+                            "--pod-cidr given twice for IPv6 ({prev} and {c}); at most one per family"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self, ip) {
-            (IpCidr::V4(cidr), IpAddr::V4(ip)) => cidr.contains(ip),
-            (IpCidr::V6(cidr), IpAddr::V6(ip)) => cidr.contains(ip),
-            // A v6 pod_ip can never be "inside" a v4 pod_cidr (or vice
-            // versa) -- `is_admitted`'s hostNetwork disjunct is still free
-            // to admit it, same as an out-of-range same-family address.
-            _ => false,
+        match ip {
+            IpAddr::V4(ip) => self.v4.is_some_and(|c| c.contains(ip)),
+            IpAddr::V6(ip) => self.v6.is_some_and(|c| c.contains(ip)),
         }
     }
 }
 
-// So a caller (`main.rs`'s `apply_reconcile`) can name the misconfigured
-// `--pod-cidr` value in its WARN without reaching into either CIDR
-// variant's private fields.
-impl std::fmt::Display for IpCidr {
+impl std::fmt::Display for PodCidrs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IpCidr::V4(cidr) => cidr.fmt(f),
-            IpCidr::V6(cidr) => cidr.fmt(f),
+        match (self.v4, self.v6) {
+            (Some(a), Some(b)) => write!(f, "{a}, {b}"),
+            (Some(a), None) => write!(f, "{a}"),
+            (None, Some(b)) => write!(f, "{b}"),
+            (None, None) => f.write_str("(none)"),
         }
     }
 }
@@ -178,7 +203,7 @@ impl std::fmt::Display for IpCidr {
 #[derive(Clone, Copy, Debug)]
 pub struct NodeContext {
     pub node_ip: IpAddr,
-    pub pod_cidr: IpCidr,
+    pub pod_cidr: PodCidrs,
 }
 
 /// One `Service.spec.ports[]` entry: `port` is the front-facing front port,
@@ -681,8 +706,8 @@ mod tests {
     use super::*;
     use beep_common::unmap_ipv4;
 
-    fn cluster_pod_cidr() -> IpCidr {
-        IpCidr::V4(Ipv4Cidr::new(Ipv4Addr::new(10, 244, 0, 0), 16))
+    fn cluster_pod_cidr() -> PodCidrs {
+        PodCidrs::new([IpCidr::V4(Ipv4Cidr::new(Ipv4Addr::new(10, 244, 0, 0), 16))]).unwrap()
     }
 
     fn node(ip: Ipv4Addr) -> NodeContext {
@@ -692,7 +717,7 @@ mod tests {
         }
     }
 
-    fn node_v6(ip: Ipv6Addr, pod_cidr: IpCidr) -> NodeContext {
+    fn node_v6(ip: Ipv6Addr, pod_cidr: PodCidrs) -> NodeContext {
         NodeContext {
             node_ip: IpAddr::V6(ip),
             pod_cidr,
@@ -1662,7 +1687,7 @@ mod tests {
     fn reconcile_wire_encodes_v6_addresses_as_raw_octets_not_v4_mapped() {
         let node_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
         let pod_cidr = Ipv6Cidr::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0), 64);
-        let node = node_v6(node_ip, IpCidr::V6(pod_cidr));
+        let node = node_v6(node_ip, PodCidrs::new([IpCidr::V6(pod_cidr)]).unwrap());
         let front_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let pod_ip = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9);
         let svc = single_port_service_v6(front_ip, 80, 8080);
@@ -1713,8 +1738,8 @@ mod tests {
     // bare metal has no cloud LB/BGP virtual IP, so a hostNetwork pod's IP IS
     // the node IP regardless of family -- an operator running today's
     // v4-only --pod-cidr must not lose v6 hostNetwork admission because of
-    // it: `IpCidr::contains` returns false across families instead of
-    // wrongly matching, and `is_admitted`'s hostNetwork disjunct still
+    // it: `PodCidrs::contains` returns false for a family with no CIDR
+    // instead of wrongly matching, and `is_admitted`'s hostNetwork disjunct still
     // admits the pod.
     #[test]
     fn hostnetwork_v6_endpoint_is_admitted_despite_an_ipv4_only_pod_cidr() {
@@ -1771,6 +1796,108 @@ mod tests {
              is_excluded_from_pod_targets`'s doc comment) silently stops working once a \
              cluster goes dual-stack"
         );
+    }
+
+    fn v4_and_v6_pod_cidrs() -> PodCidrs {
+        PodCidrs::new([
+            IpCidr::V4(Ipv4Cidr::new(Ipv4Addr::new(10, 42, 0, 0), 16)),
+            IpCidr::V6(Ipv6Cidr::new(
+                Ipv6Addr::new(0xfd00, 0x42, 0, 0, 0, 0, 0, 0),
+                56,
+            )),
+        ])
+        .unwrap()
+    }
+
+    // On a dual-stack cluster a PreferDualStack Service's v6 (and v4)
+    // non-hostNetwork pods must both be admitted; with a single CIDR the
+    // second family's pods were rejected and that family got no backends.
+    #[test]
+    fn dual_stack_pod_cidrs_admit_non_hostnetwork_pods_of_both_families() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let node = NodeContext {
+            node_ip: IpAddr::V4(node_v4),
+            pod_cidr: v4_and_v6_pod_cidrs(),
+        };
+        let pod4 = Ipv4Addr::new(10, 42, 1, 7);
+        let pod6 = Ipv6Addr::new(0xfd00, 0x42, 0, 0, 0, 0, 0, 7);
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let node_addrs = vec![IpAddr::V4(node_v4), IpAddr::V6(node_v6_ip)];
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![
+                dual_stack_endpoint(IpAddr::V4(pod4), node_addrs.clone()),
+                dual_stack_endpoint(IpAddr::V6(pod6), node_addrs),
+            ],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node);
+
+        assert_eq!(
+            desired.pod_targets,
+            HashSet::from([wire_ip_v6(IpAddr::V4(pod4)), wire_ip_v6(IpAddr::V6(pod6))]),
+            "both the v4 and the v6 pod must be admitted when each family has its CIDR"
+        );
+        assert!(desired.rejected.is_empty());
+    }
+
+    // Anti-spoof must not weaken: configuring a v4 CIDR alone must not admit
+    // an arbitrary v6 pod_ip, and a family's CIDR must not admit the other
+    // family's addresses.
+    #[test]
+    fn v6_non_hostnetwork_pod_is_rejected_when_only_a_v4_pod_cidr_is_configured() {
+        let node_v4 = Ipv4Addr::new(10, 0, 0, 5);
+        let node_v6_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let pod6 = IpAddr::V6(Ipv6Addr::new(0xfd00, 0x42, 0, 0, 0, 0, 0, 7));
+        let svc = single_port_service(Ipv4Addr::new(10, 0, 0, 1), 80, 8080);
+        let slices = vec![EndpointSliceView {
+            endpoints: vec![dual_stack_endpoint(
+                pod6,
+                vec![IpAddr::V4(node_v4), IpAddr::V6(node_v6_ip)],
+            )],
+        }];
+
+        let desired = reconcile_service(&svc, &slices, &node(node_v4));
+
+        assert!(
+            desired.pod_targets.is_empty(),
+            "a v6 pod with no v6 pod CIDR configured must stay rejected, or an unconfigured \
+             family becomes an open admission path"
+        );
+    }
+
+    #[test]
+    fn each_family_pod_cidr_only_admits_its_own_families_addresses() {
+        let cidrs = v4_and_v6_pod_cidrs();
+        assert!(cidrs.contains(IpAddr::V4(Ipv4Addr::new(10, 42, 9, 9))));
+        assert!(cidrs.contains(IpAddr::V6(Ipv6Addr::new(0xfd00, 0x42, 0, 0xff, 0, 0, 0, 1))));
+        assert!(
+            !cidrs.contains(IpAddr::V4(Ipv4Addr::new(10, 43, 0, 1))),
+            "v4 outside the v4 CIDR must be rejected even though a v6 CIDR exists"
+        );
+        assert!(
+            !cidrs.contains(IpAddr::V6(Ipv6Addr::new(0xfd00, 0x43, 0, 0, 0, 0, 0, 1))),
+            "v6 outside the v6 CIDR must be rejected even though a v4 CIDR exists"
+        );
+    }
+
+    #[test]
+    fn two_pod_cidrs_of_the_same_family_are_rejected() {
+        let a = IpCidr::V4(Ipv4Cidr::new(Ipv4Addr::new(10, 42, 0, 0), 16));
+        let b = IpCidr::V4(Ipv4Cidr::new(Ipv4Addr::new(10, 43, 0, 0), 16));
+        let err = PodCidrs::new([a, b]).expect_err(
+            "two v4 CIDRs are ambiguous; silently keeping one would drop the other's pods",
+        );
+        assert!(err.contains("IPv4"), "error must name the family: {err}");
+        let c = IpCidr::V6(Ipv6Cidr::new(
+            Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 0),
+            56,
+        ));
+        let d = IpCidr::V6(Ipv6Cidr::new(
+            Ipv6Addr::new(0xfd00, 2, 0, 0, 0, 0, 0, 0),
+            56,
+        ));
+        assert!(PodCidrs::new([c, d]).unwrap_err().contains("IPv6"));
     }
 
     // A Service scaled to zero, or mid-rollout with no ready pods yet, must

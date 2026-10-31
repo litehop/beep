@@ -29,7 +29,7 @@ use beep_controller::{
         confirmed_pruned_ingress, lease_name, list_leases, may_prune, renew_lease, withdraw_lease,
         LeaseTracker, PruneSuspects, LEASE_RENEW, PRUNE_JITTER_MAX,
     },
-    reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext},
+    reconcile::{DesiredEntries, IpCidr, Ipv4Cidr, Ipv6Cidr, NodeContext, PodCidrs},
     seed::{converge_seed, load_or_create_seed, read_config_parity, write_config_parity},
     status::{ensure_node_ingress, update_ingress, ServiceGone},
     watch::{
@@ -96,9 +96,10 @@ struct Args {
 
     /// Cluster pod CIDR (e.g. `10.244.0.0/16` or `fd00:10:244::/56`) --
     /// scopes `POD_TARGETS` membership to endpoints whose pod_ip actually
-    /// falls inside it (`reconcile::NodeContext`'s doc comment).
+    /// falls inside it (`reconcile::NodeContext`'s doc comment). Repeat once
+    /// per family on a dual-stack cluster; two of the same family is an error.
     #[arg(long = "pod-cidr", value_parser = parse_ip_cidr, required_unless_present = "node_prep")]
-    pod_cidr: Option<IpCidr>,
+    pod_cidr: Vec<IpCidr>,
 
     /// This node's own address: the LB front IP every `type=LoadBalancer`
     /// Service resolves to on this node (the node-owned-address model,
@@ -1121,9 +1122,7 @@ async fn main() -> anyhow::Result<()> {
         node_ip: args
             .node_ip
             .expect("clap requires --node-ip unless --node-prep, which already returned above"),
-        pod_cidr: args
-            .pod_cidr
-            .expect("clap requires --pod-cidr unless --node-prep, which already returned above"),
+        pod_cidr: PodCidrs::new(args.pod_cidr).map_err(anyhow::Error::msg)?,
     };
     let state = Arc::new(Mutex::new(WatchState::default()));
     let maps = Arc::new(Mutex::new(
@@ -1470,10 +1469,62 @@ mod tests {
         );
         assert_eq!(
             args.pod_cidr,
-            Some(IpCidr::V6(Ipv6Cidr::new(
+            vec![IpCidr::V6(Ipv6Cidr::new(
                 Ipv6Addr::new(0xfd00, 0x10, 0x244, 0, 0, 0, 0, 0),
                 56
-            )))
+            ))]
+        );
+    }
+
+    fn pod_cidr_args(cidrs: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = [
+            "beep-controller",
+            "--uplink-iface",
+            "eth0",
+            "--node-ip",
+            "10.0.0.5",
+            "--kubeconfig",
+            "/tmp/kubeconfig",
+            "--node-name",
+            "node-a",
+        ]
+        .map(String::from)
+        .into();
+        for c in cidrs {
+            v.push("--pod-cidr".into());
+            v.push((*c).into());
+        }
+        v
+    }
+
+    // A dual-stack cluster has one pod CIDR per family; the flag must repeat
+    // or the second family's pods can never be admitted.
+    #[test]
+    fn pod_cidr_flag_repeats_once_per_family_for_dual_stack() {
+        let args = Args::try_parse_from(pod_cidr_args(&["10.42.0.0/16", "fd00:42::/56"]))
+            .expect("--pod-cidr must be repeatable for dual-stack clusters");
+        let cidrs = PodCidrs::new(args.pod_cidr).expect("one CIDR per family is valid");
+        assert!(cidrs.contains(IpAddr::V4(Ipv4Addr::new(10, 42, 3, 4))));
+        assert!(cidrs.contains(IpAddr::V6(Ipv6Addr::new(0xfd00, 0x42, 0, 0, 0, 0, 0, 9))));
+    }
+
+    #[test]
+    fn single_pod_cidr_flag_still_configures_one_family() {
+        let args = Args::try_parse_from(pod_cidr_args(&["10.42.0.0/16"])).unwrap();
+        let cidrs = PodCidrs::new(args.pod_cidr).unwrap();
+        assert!(cidrs.contains(IpAddr::V4(Ipv4Addr::new(10, 42, 3, 4))));
+        assert!(
+            !cidrs.contains(IpAddr::V6(Ipv6Addr::new(0xfd00, 0x42, 0, 0, 0, 0, 0, 9))),
+            "an unconfigured family must stay closed"
+        );
+    }
+
+    #[test]
+    fn duplicate_family_pod_cidr_flags_are_rejected() {
+        let args = Args::try_parse_from(pod_cidr_args(&["10.42.0.0/16", "10.43.0.0/16"])).unwrap();
+        assert!(
+            PodCidrs::new(args.pod_cidr).is_err(),
+            "two v4 --pod-cidr values must fail startup rather than silently drop one"
         );
     }
 
