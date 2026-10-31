@@ -58,6 +58,7 @@ transcript "Review PR https://github.com/litehop/beep/pull/77 (bead beep-x)"
 GH_JSON="$NO_REVIEW"; run_hook critical-reviewer false
 assert "blocks via exit 2 (the only code that keeps a subagent from stopping) when no review is posted" "$(blocks && echo 1 || echo 0)"
 assert "block reason on stderr names the posting script, --body-file and head so the reviewer knows the fix" "$(printf '%s' "$ERR" | grep -q 'scripts/gh-app-review.sh 77.*--body-file.*bbbb' && echo 1 || echo 0)"
+assert "block reason does not tell the reviewer to use the Write tool, which it is disallowed from using" "$(printf '%s' "$ERR" | grep -q 'Write tool' && echo 0 || echo 1)"
 assert "block reason teaches no operator-token fallback (gh api / stdin) that contradicts the reviewer's no-fallback rule" "$(printf '%s' "$ERR" | grep -qE 'gh api|--input' && echo 0 || echo 1)"
 assert "queried the PR number from the dispatch prompt" "$(grep -q 'pr view 77' "$GH_LOG" && echo 1 || echo 0)"
 

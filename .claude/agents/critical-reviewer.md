@@ -235,12 +235,15 @@ Then post it yourself, per deliverable type:
     otherwise be header+Verdict+Meta only — never post an empty `body` and
     never drop the header, since the merge-PR loop keys off it (see above).
 
-  **Write the payload with the Write tool, then post with one bare command.**
+  **Build the payload with one Bash command, then post with one bare command.**
   The sandbox matches the posting command by its leading token, so it must
   contain no variable assignments, `$VAR` expansions, heredocs, or pipes:
-  1. Use the Write tool to create `<worktree-root>/.tmp-review-<N>.json`
-     (absolute path under your own worktree; `.tmp-*` is gitignored; never
-     under `ai/findings/`). Its content is one JSON object:
+  1. Build `<worktree-root>/.tmp-review-<N>.json` with ONE Bash command,
+     a quoted heredoc `cat > <path> <<'BEEP_REVIEW_PAYLOAD'` ...
+     `BEEP_REVIEW_PAYLOAD` (the quoted delimiter means nothing inside
+     expands; the unique delimiter cannot collide with a body line). Path is
+     absolute under your own worktree; `.tmp-*` is gitignored; never
+     under `ai/findings/`. Its content is one JSON object:
      `{"body": "...", "event": "APPROVE|REQUEST_CHANGES", "comments":
      [{"path": "...", "line": 12, "side": "RIGHT", "body": "..."}]}`, with
      `"comments": []` when nothing is anchored. Escape every string as JSON:
