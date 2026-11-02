@@ -2990,6 +2990,53 @@ mod tests {
         );
     }
 
+    // The WARN is fed `own_node_ips`, which includes front addresses. A front
+    // family absent from the underlay would hide a genuinely unroutable peer;
+    // `parse_node_addrs` makes that impossible (per-family fallback), and this
+    // pins it.
+    #[test]
+    fn external_ip_fronts_never_add_a_family_the_underlay_lacks() {
+        let state_for = |addrs: &[Value]| {
+            let mut state = WatchState::default();
+            state.apply_node_event(&serde_json::json!({
+                "type": "ADDED",
+                "object": {
+                    "metadata": {"name": "node-a"},
+                    "status": {"addresses": addrs},
+                },
+            }));
+            state
+        };
+        let local = ip("10.0.0.5");
+        let v6_only_peer = [ip("2001:db8::6")];
+
+        let v4_underlay_v4_front = state_for(&[
+            serde_json::json!({"type": "InternalIP", "address": "10.0.0.5"}),
+            serde_json::json!({"type": "ExternalIP", "address": "203.0.113.5"}),
+        ]);
+        assert!(
+            !shares_family(&v4_underlay_v4_front.own_node_ips(local), &v6_only_peer),
+            "a v4-only node (with a v4 ExternalIP front) cannot reach a v6-only peer; the \
+             WARN must fire or the operator gets no hint why its backends are unreachable"
+        );
+
+        let v4_underlay_v6_front = state_for(&[
+            serde_json::json!({"type": "InternalIP", "address": "10.0.0.5"}),
+            serde_json::json!({"type": "ExternalIP", "address": "2001:db8::5"}),
+        ]);
+        let own = v4_underlay_v6_front.own_node_ips(local);
+        let underlay = &v4_underlay_v6_front
+            .own_node_addrs(local)
+            .expect("own node resolved")
+            .underlay;
+        assert_eq!(
+            own.iter().any(|a| a.is_ipv6()),
+            underlay.iter().any(|a| a.is_ipv6()),
+            "a front family missing from the underlay would suppress the no-shared-family \
+             WARN for a peer this node cannot route to"
+        );
+    }
+
     // Operator decision (HONOUR spec.ipFamilies): a SingleStack [IPv4]
     // Service must not become reachable on a node's v6 address just
     // because that node happens to have one.

@@ -663,10 +663,7 @@ fn clear_ingress_for(
     key: ServiceKey,
 ) {
     let Some(own_ips) = ingress_clear_ips(&state.lock().unwrap(), node.node_ip) else {
-        pending
-            .lock()
-            .unwrap()
-            .record(&key, false, true, Instant::now());
+        pending.lock().unwrap().defer_clear(&key);
         return;
     };
     publish_ingress(client, pending, key, own_ips, Vec::new(), true);
@@ -749,14 +746,25 @@ fn run_ingress_work(
     }
 }
 
+/// Why a Service is tracked for retry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// A publish (`clear == false`) or clear (`clear == true`) that failed;
+    /// the retry loop re-issues it on the shared `RetryBackoff`.
+    Failed { clear: bool },
+    /// A clear postponed until the Node LIST completes. Nothing failed, so it
+    /// neither arms nor escalates the backoff; `after_list` replays it.
+    DeferredClear,
+}
+
 /// Services whose ingress publish or clear failed, retried with `RetryBackoff`
 /// delays until it succeeds: without it a node that just lost its last
 /// `externalTrafficPolicy: Local` pod, or a Service that left `LoadBalancer`,
-/// stays advertised until the next event. The value is whether the failed
-/// operation was a clear.
+/// stays advertised until the next event. Clears deferred until the LISTs
+/// complete are held separately and never count as failures.
 #[derive(Default)]
 struct PublishRetry {
-    keys: HashMap<ServiceKey, bool>,
+    keys: HashMap<ServiceKey, Pending>,
     backoff: RetryBackoff,
 }
 
@@ -764,24 +772,43 @@ impl PublishRetry {
     fn record(&mut self, key: &ServiceKey, ok: bool, clear: bool, now: Instant) {
         if ok {
             self.keys.remove(key);
-            if self.keys.is_empty() {
-                self.backoff = RetryBackoff::default();
-            }
+            self.reset_if_no_failures();
         } else {
-            self.keys.insert(key.clone(), clear);
+            self.keys.insert(key.clone(), Pending::Failed { clear });
             self.backoff.record(false, now);
         }
     }
 
-    /// The keys to retry now, each with whether it was a clear. Disarms the
-    /// deadline so the next poll does not retry while these are in flight; a
-    /// failure re-arms it.
+    fn defer_clear(&mut self, key: &ServiceKey) {
+        self.keys.insert(key.clone(), Pending::DeferredClear);
+        self.reset_if_no_failures();
+    }
+
+    fn reset_if_no_failures(&mut self) {
+        if !self
+            .keys
+            .values()
+            .any(|p| matches!(p, Pending::Failed { .. }))
+        {
+            self.backoff = RetryBackoff::default();
+        }
+    }
+
+    /// The failed keys to retry now, each with whether it was a clear. Disarms
+    /// the deadline so the next poll does not retry while these are in flight;
+    /// a failure re-arms it.
     fn take_due(&mut self, now: Instant) -> Vec<(ServiceKey, bool)> {
         if !self.backoff.due(now) {
             return Vec::new();
         }
         self.backoff.retry_at = None;
-        self.keys.iter().map(|(k, c)| (k.clone(), *c)).collect()
+        self.keys
+            .iter()
+            .filter_map(|(k, p)| match p {
+                Pending::Failed { clear } => Some((k.clone(), *clear)),
+                Pending::DeferredClear => None,
+            })
+            .collect()
     }
 
     /// Keys with an outstanding clear, including clears deferred until the
@@ -789,7 +816,7 @@ impl PublishRetry {
     fn pending_clears(&self) -> Vec<ServiceKey> {
         self.keys
             .iter()
-            .filter(|(_, clear)| **clear)
+            .filter(|(_, p)| matches!(p, Pending::Failed { clear: true } | Pending::DeferredClear))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -1369,7 +1396,7 @@ mod tests {
     fn deferred_clear_survives_until_the_last_list_replays_it() {
         let t0 = Instant::now();
         let mut p = PublishRetry::default();
-        p.record(&svc("gone-lb"), false, true, t0);
+        p.defer_clear(&svc("gone-lb"));
         p.record(&svc("publish-failed"), false, false, t0);
         assert_eq!(
             p.pending_clears(),
@@ -1377,6 +1404,35 @@ mod tests {
             "a clear deferred before the LISTs completed must be replayed on the last LIST, \
              or the stale ingress entry is never withdrawn"
         );
+    }
+
+    #[test]
+    fn pre_list_deferrals_do_not_escalate_another_services_failure_backoff() {
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.record(&svc("a"), false, false, t0);
+        for _ in 0..10 {
+            p.defer_clear(&svc("b"));
+        }
+        assert_eq!(
+            p.take_due(t0 + RETRY_INITIAL),
+            vec![(svc("a"), false)],
+            "one real failure must retry after RETRY_INITIAL; deferrals escalating the shared \
+             backoff would delay a node's stale-ingress fix for no failure"
+        );
+    }
+
+    #[test]
+    fn deferrals_alone_never_arm_the_retry_loop() {
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.defer_clear(&svc("b"));
+        assert!(
+            p.take_due(t0 + RETRY_MAX).is_empty(),
+            "a deferred clear is replayed by the last LIST, not by a retry that would only \
+             re-defer it"
+        );
+        assert_eq!(p.pending_clears(), vec![svc("b")]);
     }
 
     #[test]
