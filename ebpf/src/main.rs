@@ -1,5 +1,8 @@
 #![no_std]
 #![no_main]
+// The `#[classifier]` entry wrapper takes the kernel's raw ctx pointer and is
+// not `unsafe`; the macro generates it, so the lint cannot be fixed at source.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 //! Phase 2 (Geneve encap/decap on the symmetric-return path) plus Phase 3
 //! (conntrack full-tuple keying + backend source-port remap on conflict) of
@@ -59,6 +62,7 @@ use aya_ebpf::{
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
+    EbpfContext,
 };
 use beep_common::{
     address_rewrite_checksums, backend_port_resolution, decap_forward_pod_admission,
@@ -377,37 +381,52 @@ fn flow_table_get_forward(key: FlowKey) -> Option<ForwardFlowValue> {
     // reader sees a whole old or new value, never a torn one. Invariant:
     // FLOW_TABLE must never get an in-place writer (`get_ptr_mut`,
     // BPF_F_LOCK); that would make this copy racy.
-    FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).forward })
+    FLOW_TABLE.get_ptr(&key).map(|p| unsafe { (*p).forward })
 }
 
 #[inline(always)]
 fn flow_table_get_reverse(key: FlowKey) -> Option<RevFlowValue> {
     // SAFETY: as `flow_table_get_forward`.
-    FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).reverse })
+    FLOW_TABLE.get_ptr(&key).map(|p| unsafe { (*p).reverse })
 }
 
 #[inline(always)]
 fn flow_table_get_port_memo(key: FlowKey) -> Option<PortMemoValue> {
     // SAFETY: as `flow_table_get_forward`.
-    FLOW_TABLE.get_ptr(key).map(|p| unsafe { (*p).port_memo })
+    FLOW_TABLE.get_ptr(&key).map(|p| unsafe { (*p).port_memo })
 }
 
 #[inline(always)]
 fn front_meta_get(front: LbFrontKey) -> Option<FrontMeta> {
     // SAFETY: as `flow_table_get_forward`.
-    FRONT_META.get_ptr(front).map(|p| unsafe { *p })
+    FRONT_META.get_ptr(&front).map(|p| unsafe { *p })
 }
 
 #[inline(always)]
 fn front_endpoints_get(key: FrontEndpointKey) -> Option<FrontEndpoint> {
     // SAFETY: as `flow_table_get_forward`.
-    FRONT_ENDPOINTS.get_ptr(key).map(|p| unsafe { *p })
+    FRONT_ENDPOINTS.get_ptr(&key).map(|p| unsafe { *p })
 }
 
 #[inline(always)]
 fn fwd_pending_get(key: TcpFlowKey) -> Option<ForwardFlowValue> {
     // SAFETY: as `flow_table_get_forward`.
-    FWD_PENDING.get_ptr(key).map(|p| unsafe { *p })
+    FWD_PENDING.get_ptr(&key).map(|p| unsafe { *p })
+}
+
+#[inline(always)]
+fn is_node_allowed(addr: [u8; 16]) -> bool {
+    NODE_ALLOW.get_ptr(&addr).is_some()
+}
+
+#[inline(always)]
+fn is_pod_target(addr: [u8; 16]) -> bool {
+    POD_TARGETS.get_ptr(&addr).is_some()
+}
+
+#[inline(always)]
+fn flow_table_insert(key: FlowKey, value: FlowValue) -> Result<(), i32> {
+    FLOW_TABLE.insert(&key, &value, 0)
 }
 
 /// The controller's current idle-GC parities (`Config::udp_parity`/
@@ -440,10 +459,9 @@ fn touch_forward_row(
     match flow_step(Some(value.flags), proto, tcp_flags, side, gc_parity()) {
         FlowStep::Keep | FlowStep::Skip => {}
         FlowStep::Write(flags) => {
-            let _ = FLOW_TABLE.insert(
+            let _ = flow_table_insert(
                 key,
                 FlowValue::from_forward(ForwardFlowValue { flags, ..value }),
-                0,
             );
         }
     }
@@ -463,7 +481,7 @@ fn tcp_flags_direct(ctx: &TcContext, proto: u8, l4_off: usize) -> Option<u8> {
 #[inline(always)]
 fn uplink_config_get(ifindex: u32) -> Option<UplinkConfig> {
     // SAFETY: as `flow_table_get_forward`.
-    UPLINK_CONFIG.get_ptr(ifindex).map(|p| unsafe { *p })
+    UPLINK_CONFIG.get_ptr(&ifindex).map(|p| unsafe { *p })
 }
 
 #[inline(always)]
@@ -528,7 +546,7 @@ fn ingress_backend(
                 if let FwdPendingPin::Insert(candidate) =
                     fwd_pending_affinity_pin(pending, admitted)
                 {
-                    if FWD_PENDING.insert(flow_key, candidate, 0).is_err() {
+                    if FWD_PENDING.insert(&flow_key, &candidate, 0).is_err() {
                         return Err(TC_ACT_OK);
                     }
                 }
@@ -547,9 +565,9 @@ fn ingress_backend(
 /// skb.
 #[inline(always)]
 fn skb_ctx(ctx: &TcContext) -> &__sk_buff {
-    // SAFETY: `ctx.skb.skb` is the program's live, non-null `__sk_buff`
+    // SAFETY: `ctx.as_ptr()` is the program's live, non-null `__sk_buff`
     // context for the whole invocation.
-    unsafe { &*ctx.skb.skb }
+    unsafe { &*ctx.as_ptr().cast() }
 }
 
 /// Host-specific runtime config the loader fills in after attach (an
@@ -697,14 +715,20 @@ fn zeroed_tunnel_key() -> bpf_tunnel_key {
 fn get_tunnel_key(ctx: &TcContext) -> Option<(bpf_tunnel_key, bool)> {
     let mut tkey = zeroed_tunnel_key();
     let size = core::mem::size_of::<bpf_tunnel_key>() as u32;
-    // SAFETY: `ctx.skb.skb` is the live skb; `tkey` is a stack local of
+    // SAFETY: `ctx.as_ptr()` is the live skb; `tkey` is a stack local of
     // exactly `size` bytes.
-    if unsafe { bpf_skb_get_tunnel_key(ctx.skb.skb, &mut tkey, size, 0) } == 0 {
+    if unsafe { bpf_skb_get_tunnel_key(ctx.as_ptr().cast(), &mut tkey, size, 0) } == 0 {
         return Some((tkey, false));
     }
     // SAFETY: as above.
-    if unsafe { bpf_skb_get_tunnel_key(ctx.skb.skb, &mut tkey, size, BPF_F_TUNINFO_IPV6 as u64) }
-        == 0
+    if unsafe {
+        bpf_skb_get_tunnel_key(
+            ctx.as_ptr().cast(),
+            &mut tkey,
+            size,
+            BPF_F_TUNINFO_IPV6 as u64,
+        )
+    } == 0
     {
         return Some((tkey, true));
     }
@@ -768,11 +792,11 @@ fn redirect_to_geneve<const N: usize>(
     let tkey_flags = set_tunnel_remote(&mut tkey, remote);
     tkey.tunnel_id = vni;
     tkey.tunnel_ttl = 64;
-    // SAFETY: `ctx.skb.skb` is the live skb of this program invocation;
+    // SAFETY: `ctx.as_ptr()` is the live skb of this program invocation;
     // `tkey` is a stack local of exactly the `size_of` passed.
     if unsafe {
         bpf_skb_set_tunnel_key(
-            ctx.skb.skb,
+            ctx.as_ptr().cast(),
             &mut tkey,
             core::mem::size_of::<bpf_tunnel_key>() as u32,
             tkey_flags,
@@ -782,18 +806,23 @@ fn redirect_to_geneve<const N: usize>(
         return Some(TC_ACT_SHOT);
     }
 
-    // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
+    // SAFETY: `ctx.as_ptr()` is the live skb; `opt` is a stack array of
     // exactly `opt.len()` bytes.
-    if unsafe { bpf_skb_set_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) }
-        != 0
+    if unsafe {
+        bpf_skb_set_tunnel_opt(
+            ctx.as_ptr().cast(),
+            opt.as_mut_ptr().cast(),
+            opt.len() as u32,
+        )
+    } != 0
     {
         return Some(TC_ACT_SHOT);
     }
 
     if l3_ethertype != NO_L3_ETHERTYPE {
         let ethertype = l3_ethertype;
-        // SAFETY: `ctx.skb.skb` is the live skb; no argument is a pointer.
-        if unsafe { bpf_skb_change_head(ctx.skb.skb, ETH_HLEN as u32, 0) } != 0 {
+        // SAFETY: `ctx.as_ptr()` is the live skb; no argument is a pointer.
+        if unsafe { bpf_skb_change_head(ctx.as_ptr().cast(), ETH_HLEN as u32, 0) } != 0 {
             return Some(TC_ACT_SHOT);
         }
         // `ethertype` is a stack local, not a const reference: referencing
@@ -1124,9 +1153,7 @@ fn commit_reverse_row(
         _ => mine_flags,
     };
     if stored != Some(rev_value) {
-        FLOW_TABLE
-            .insert(rev_key, FlowValue::from_reverse(rev_value), 0)
-            .ok()?;
+        flow_table_insert(rev_key, FlowValue::from_reverse(rev_value)).ok()?;
     }
     Some(())
 }
@@ -1154,7 +1181,7 @@ fn try_geneve_decap_forward(
     // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
     // than the pre-existing POD_TARGETS check below alone required; accepted
     // as the cost of not reintroducing a restart-wipe risk on this map.
-    let is_known_peer = NODE_ALLOW.get_ptr(tunnel_remote(tkey, used_ipv6)).is_some();
+    let is_known_peer = is_node_allowed(tunnel_remote(tkey, used_ipv6));
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1165,10 +1192,15 @@ fn try_geneve_decap_forward(
     // once here, before the inner packet's own family is even known, so
     // `_v4`/`_v6` below don't each need their own copy of this block.
     let mut opt = [0u8; POD_ID_OPT_LEN];
-    // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
+    // SAFETY: `ctx.as_ptr()` is the live skb; `opt` is a stack array of
     // exactly `opt.len()` bytes.
-    let opt_len =
-        unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) };
+    let opt_len = unsafe {
+        bpf_skb_get_tunnel_opt(
+            ctx.as_ptr().cast(),
+            opt.as_mut_ptr().cast(),
+            opt.len() as u32,
+        )
+    };
     // The helper returns the option's actual length: anything but the exact
     // forward-option length (e.g. a pre-widening 20-byte option, zero-padded
     // into `opt`) would yield a bogus target port.
@@ -1184,7 +1216,7 @@ fn try_geneve_decap_forward(
     // cross-node convergence drift -- is still one of its own pods. Same
     // pod-IP-only POD_TARGETS membership `try_uplink_egress_return` gates
     // its own direction on (`egress_return_admission`'s doc comment).
-    let is_local_pod = POD_TARGETS.get_ptr(pod_ip_v6).is_some();
+    let is_local_pod = is_pod_target(pod_ip_v6);
     if let DecapForwardPodAdmission::Drop = decap_forward_pod_admission(is_local_pod) {
         return Some(TC_ACT_SHOT);
     }
@@ -1318,15 +1350,13 @@ fn try_geneve_decap_forward_v4(
                     // NoRemap: that outcome is already stable across any
                     // table churn (it never depends on other occupants), so
                     // it needs no memo.
-                    FLOW_TABLE
-                        .insert(
-                            port_memo_key,
-                            FlowValue::from_port_memo(PortMemoValue {
-                                backend_src_port: synthetic_port,
-                            }),
-                            0,
-                        )
-                        .ok()?;
+                    flow_table_insert(
+                        port_memo_key,
+                        FlowValue::from_port_memo(PortMemoValue {
+                            backend_src_port: synthetic_port,
+                        }),
+                    )
+                    .ok()?;
                     // The probe's last iteration already patched
                     // `candidate_key` to exactly this winning port -- reuse
                     // it instead of re-encoding.
@@ -1474,15 +1504,13 @@ fn try_geneve_decap_forward_v6(
             ) {
                 BackendPortDecision::NoRemap => (natural_rev_key, client_port),
                 BackendPortDecision::Remap(synthetic_port) => {
-                    FLOW_TABLE
-                        .insert(
-                            port_memo_key,
-                            FlowValue::from_port_memo(PortMemoValue {
-                                backend_src_port: synthetic_port,
-                            }),
-                            0,
-                        )
-                        .ok()?;
+                    flow_table_insert(
+                        port_memo_key,
+                        FlowValue::from_port_memo(PortMemoValue {
+                            backend_src_port: synthetic_port,
+                        }),
+                    )
+                    .ok()?;
                     (candidate_key, synthetic_port)
                 }
                 BackendPortDecision::Exhausted => return Some(TC_ACT_SHOT),
@@ -1548,7 +1576,7 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
     // Same peer-node attestation as `try_geneve_decap_forward` above -- this
     // branch used to take `tkey` unused, relying entirely on the FLOW_TABLE
     // reverse-key match with no outer-source check of its own.
-    let is_known_peer = NODE_ALLOW.get_ptr(tunnel_remote(tkey, used_ipv6)).is_some();
+    let is_known_peer = is_node_allowed(tunnel_remote(tkey, used_ipv6));
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1557,9 +1585,15 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
     // widening), same as forward-decap's pod-id option -- read it once here
     // before the inner packet's own family is known.
     let mut opt = [0u8; 24];
-    // SAFETY: `ctx.skb.skb` is the live skb; `opt` is a stack array of
+    // SAFETY: `ctx.as_ptr()` is the live skb; `opt` is a stack array of
     // exactly `opt.len()` bytes.
-    if unsafe { bpf_skb_get_tunnel_opt(ctx.skb.skb, opt.as_mut_ptr().cast(), opt.len() as u32) } < 0
+    if unsafe {
+        bpf_skb_get_tunnel_opt(
+            ctx.as_ptr().cast(),
+            opt.as_mut_ptr().cast(),
+            opt.len() as u32,
+        )
+    } < 0
     {
         return Some(TC_ACT_SHOT);
     }
@@ -1670,12 +1704,10 @@ fn try_geneve_decap_return_v4(
                         if let FlowStep::Write(flags) = step {
                             value.flags = flags;
                         }
-                        FLOW_TABLE
-                            .insert(fwd_key, FlowValue::from_forward(value), 0)
-                            .ok()?;
+                        flow_table_insert(fwd_key, FlowValue::from_forward(value)).ok()?;
                     }
                 }
-                let _ = FWD_PENDING.remove(key);
+                let _ = FWD_PENDING.remove(&key);
                 Some(value)
             }
             ReturnAuthorization::Drop => return None,
@@ -1726,7 +1758,7 @@ fn try_geneve_decap_return_v4(
     // reply and dropping it.
     ctx.set_mark(REDIRECTED_RETURN_MARK);
     // `ingress_ifindex` here is the FLOW_TABLE-stored value resolved above,
-    // NOT `ctx.skb.skb->ingress_ifindex` read fresh at this call site: this
+    // NOT `ctx.as_ptr()->ingress_ifindex` read fresh at this call site: this
     // hook runs on `geneve0`'s ingress (the packet just arrived there via
     // its own tunnel decap), so a fresh read would resolve to `geneve0`
     // itself, not the client's uplink. See `redirect_client_bound`'s doc
@@ -1776,12 +1808,10 @@ fn try_geneve_decap_return_v6(
                         if let FlowStep::Write(flags) = step {
                             value.flags = flags;
                         }
-                        FLOW_TABLE
-                            .insert(fwd_key, FlowValue::from_forward(value), 0)
-                            .ok()?;
+                        flow_table_insert(fwd_key, FlowValue::from_forward(value)).ok()?;
                     }
                 }
-                let _ = FWD_PENDING.remove(key);
+                let _ = FWD_PENDING.remove(&key);
                 Some(value)
             }
             ReturnAuthorization::Drop => return None,
@@ -1826,11 +1856,7 @@ fn touch_return_row(key: FlowKey, rev: RevFlowValue, proto: u8, tcp_flags: u8) {
     ) {
         FlowStep::Keep | FlowStep::Skip => {}
         FlowStep::Write(flags) => {
-            let _ = FLOW_TABLE.insert(
-                key,
-                FlowValue::from_reverse(RevFlowValue { flags, ..rev }),
-                0,
-            );
+            let _ = flow_table_insert(key, FlowValue::from_reverse(RevFlowValue { flags, ..rev }));
         }
     }
 }
@@ -1935,7 +1961,7 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
     // table, far cheaper to probe than this hook's own conntrack table, and
     // most packets crossing this hook (ALL uplink egress, not just
     // beep's) take this branch.
-    let is_backend_pod = POD_TARGETS.get_ptr(ipv4_mapped_v6(pod_ip)).is_some();
+    let is_backend_pod = is_pod_target(ipv4_mapped_v6(pod_ip));
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);
     }
@@ -2022,7 +2048,7 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let pod_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
 
-    let is_backend_pod = POD_TARGETS.get_ptr(pod_ip_v6).is_some();
+    let is_backend_pod = is_pod_target(pod_ip_v6);
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);
     }
