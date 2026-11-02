@@ -269,15 +269,6 @@ jobs:
       - name: Build beep-ebpf + beep + beep-controller
         run: cargo build --release -p beep -p beep-controller
 
-      - name: Upload the loader for kernel-smoke
-        continue-on-error: true
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: beep-loader
-          path: target/release/beep
-          retention-days: 1
-          if-no-files-found: error
-
       # Guards build.rs's post-link DWARF strip from a
       # silent future revert -- a fresh checkout's target/ has exactly one
       # build.rs invocation, so exactly one OUT_DIR/beep-ebpf to find.
@@ -344,15 +335,49 @@ jobs:
       - name: Run beep-controller against k3s and gate its userspace RSS
         run: sudo bash scripts/memory-smoke-controller.sh run
 
+  # Same build as memory-smoke's, published on its own so kernel-smoke starts
+  # as soon as a loader exists instead of after memory-smoke's gates.
+  build-loader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+        with:
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: bpf-linker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build beep-ebpf + beep + beep-controller
+        run: cargo build --release -p beep -p beep-controller
+
+      - name: Upload the loader for kernel-smoke
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: beep-loader
+          path: target/release/beep
+          retention-days: 1
+          if-no-files-found: error
+
   # ADVISORY (not a required check): runs the same smoke fixture as
   # memory-smoke, but inside a QEMU/KVM guest booting a pinned stock kernel
   # (scripts/kernel-smoke.sh), so the 6.6 floor and the next LTS are actually
   # exercised -- the verifier and TCX can accept on the runner's kernel and
-  # still reject on 6.6. Reuses memory-smoke's loader build. The runner's
+  # still reject on 6.6. Uses build-loader's binary. The runner's
   # /dev/kvm is only reachable after the chmod below.
   kernel-smoke:
     name: kernel-smoke (${{ matrix.kernel }})
-    needs: memory-smoke
+    needs: build-loader
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
