@@ -7,9 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-02
+
 ### Security
 
 - New [kernel security page](docs/kernel-security.md) lists kernel CVEs in code paths beep depends on. First entry: CVE-2026-45932 (TCX detach skips the capability check), fixed in 6.6.160, 6.12.114 and 7.0. Patching the host kernel is your responsibility.
+- The CI kernel-smoke pins now carry that fix (6.6.161, 6.12.115).
+
+### Changed
+
+- Updated to aya-ebpf 0.3.0, with no behaviour change.
+
+### Fixed
+
+- The controller no longer delays retrying a failed `status.loadBalancer.ingress`
+  publish while ingress clears wait on the startup LISTs: a Service with a real
+  publish failure retries on its own schedule.
+
+### Docs
+
+- The 0.7.0 upgrade note is corrected: custom manifests need only the exec
+  `readinessProbe`; `--ready-file` defaults to `/tmp/beep-ready` and is passed
+  only for a non-default path.
 
 ## [0.7.0] - 2026-10-31
 
@@ -27,8 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--node-ip`'s family alone from the first Service event). The stock
   DaemonSet now has an exec `readinessProbe` that checks the `--ready-file`
   path (`/tmp/beep-ready`), created at that point; pods report NotReady during
-  startup. Custom manifests must add the probe and pass `--ready-file`. See
-  deploy/README.md, "Startup readiness".
+  startup. Custom manifests must add the probe; pass `--ready-file` only for a
+  non-default path. See deploy/README.md, "Startup readiness".
 
 ### Added
 
