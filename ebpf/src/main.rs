@@ -414,6 +414,21 @@ fn fwd_pending_get(key: TcpFlowKey) -> Option<ForwardFlowValue> {
     FWD_PENDING.get_ptr(&key).map(|p| unsafe { *p })
 }
 
+#[inline(always)]
+fn is_node_allowed(addr: [u8; 16]) -> bool {
+    NODE_ALLOW.get_ptr(&addr).is_some()
+}
+
+#[inline(always)]
+fn is_pod_target(addr: [u8; 16]) -> bool {
+    POD_TARGETS.get_ptr(&addr).is_some()
+}
+
+#[inline(always)]
+fn flow_table_insert(key: FlowKey, value: FlowValue) -> Result<(), i32> {
+    FLOW_TABLE.insert(&key, &value, 0)
+}
+
 /// The controller's current idle-GC parities (`Config::udp_parity`/
 /// `tcp_parity`); both false if `CONFIG` cannot be read.
 #[inline(always)]
@@ -444,10 +459,9 @@ fn touch_forward_row(
     match flow_step(Some(value.flags), proto, tcp_flags, side, gc_parity()) {
         FlowStep::Keep | FlowStep::Skip => {}
         FlowStep::Write(flags) => {
-            let _ = FLOW_TABLE.insert(
-                &key,
-                &FlowValue::from_forward(ForwardFlowValue { flags, ..value }),
-                0,
+            let _ = flow_table_insert(
+                key,
+                FlowValue::from_forward(ForwardFlowValue { flags, ..value }),
             );
         }
     }
@@ -1139,9 +1153,7 @@ fn commit_reverse_row(
         _ => mine_flags,
     };
     if stored != Some(rev_value) {
-        FLOW_TABLE
-            .insert(&rev_key, &FlowValue::from_reverse(rev_value), 0)
-            .ok()?;
+        flow_table_insert(rev_key, FlowValue::from_reverse(rev_value)).ok()?;
     }
     Some(())
 }
@@ -1169,9 +1181,7 @@ fn try_geneve_decap_forward(
     // node_allow`'s doc comment) -- a strictly cold-start-only, wider window
     // than the pre-existing POD_TARGETS check below alone required; accepted
     // as the cost of not reintroducing a restart-wipe risk on this map.
-    let is_known_peer = NODE_ALLOW
-        .get_ptr(&tunnel_remote(tkey, used_ipv6))
-        .is_some();
+    let is_known_peer = is_node_allowed(tunnel_remote(tkey, used_ipv6));
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1206,7 +1216,7 @@ fn try_geneve_decap_forward(
     // cross-node convergence drift -- is still one of its own pods. Same
     // pod-IP-only POD_TARGETS membership `try_uplink_egress_return` gates
     // its own direction on (`egress_return_admission`'s doc comment).
-    let is_local_pod = POD_TARGETS.get_ptr(&pod_ip_v6).is_some();
+    let is_local_pod = is_pod_target(pod_ip_v6);
     if let DecapForwardPodAdmission::Drop = decap_forward_pod_admission(is_local_pod) {
         return Some(TC_ACT_SHOT);
     }
@@ -1340,15 +1350,13 @@ fn try_geneve_decap_forward_v4(
                     // NoRemap: that outcome is already stable across any
                     // table churn (it never depends on other occupants), so
                     // it needs no memo.
-                    FLOW_TABLE
-                        .insert(
-                            &port_memo_key,
-                            &FlowValue::from_port_memo(PortMemoValue {
-                                backend_src_port: synthetic_port,
-                            }),
-                            0,
-                        )
-                        .ok()?;
+                    flow_table_insert(
+                        port_memo_key,
+                        FlowValue::from_port_memo(PortMemoValue {
+                            backend_src_port: synthetic_port,
+                        }),
+                    )
+                    .ok()?;
                     // The probe's last iteration already patched
                     // `candidate_key` to exactly this winning port -- reuse
                     // it instead of re-encoding.
@@ -1496,15 +1504,13 @@ fn try_geneve_decap_forward_v6(
             ) {
                 BackendPortDecision::NoRemap => (natural_rev_key, client_port),
                 BackendPortDecision::Remap(synthetic_port) => {
-                    FLOW_TABLE
-                        .insert(
-                            &port_memo_key,
-                            &FlowValue::from_port_memo(PortMemoValue {
-                                backend_src_port: synthetic_port,
-                            }),
-                            0,
-                        )
-                        .ok()?;
+                    flow_table_insert(
+                        port_memo_key,
+                        FlowValue::from_port_memo(PortMemoValue {
+                            backend_src_port: synthetic_port,
+                        }),
+                    )
+                    .ok()?;
                     (candidate_key, synthetic_port)
                 }
                 BackendPortDecision::Exhausted => return Some(TC_ACT_SHOT),
@@ -1570,9 +1576,7 @@ fn try_geneve_decap_return(ctx: &TcContext, tkey: &bpf_tunnel_key, used_ipv6: bo
     // Same peer-node attestation as `try_geneve_decap_forward` above -- this
     // branch used to take `tkey` unused, relying entirely on the FLOW_TABLE
     // reverse-key match with no outer-source check of its own.
-    let is_known_peer = NODE_ALLOW
-        .get_ptr(&tunnel_remote(tkey, used_ipv6))
-        .is_some();
+    let is_known_peer = is_node_allowed(tunnel_remote(tkey, used_ipv6));
     if let PeerNodeAdmission::Drop = peer_node_admission(is_known_peer) {
         return Some(TC_ACT_SHOT);
     }
@@ -1700,9 +1704,7 @@ fn try_geneve_decap_return_v4(
                         if let FlowStep::Write(flags) = step {
                             value.flags = flags;
                         }
-                        FLOW_TABLE
-                            .insert(&fwd_key, &FlowValue::from_forward(value), 0)
-                            .ok()?;
+                        flow_table_insert(fwd_key, FlowValue::from_forward(value)).ok()?;
                     }
                 }
                 let _ = FWD_PENDING.remove(&key);
@@ -1806,9 +1808,7 @@ fn try_geneve_decap_return_v6(
                         if let FlowStep::Write(flags) = step {
                             value.flags = flags;
                         }
-                        FLOW_TABLE
-                            .insert(&fwd_key, &FlowValue::from_forward(value), 0)
-                            .ok()?;
+                        flow_table_insert(fwd_key, FlowValue::from_forward(value)).ok()?;
                     }
                 }
                 let _ = FWD_PENDING.remove(&key);
@@ -1856,11 +1856,7 @@ fn touch_return_row(key: FlowKey, rev: RevFlowValue, proto: u8, tcp_flags: u8) {
     ) {
         FlowStep::Keep | FlowStep::Skip => {}
         FlowStep::Write(flags) => {
-            let _ = FLOW_TABLE.insert(
-                &key,
-                &FlowValue::from_reverse(RevFlowValue { flags, ..rev }),
-                0,
-            );
+            let _ = flow_table_insert(key, FlowValue::from_reverse(RevFlowValue { flags, ..rev }));
         }
     }
 }
@@ -1965,7 +1961,7 @@ fn try_uplink_egress_return_headers_v4<const L2_HLEN: usize>(ctx: &TcContext) ->
     // table, far cheaper to probe than this hook's own conntrack table, and
     // most packets crossing this hook (ALL uplink egress, not just
     // beep's) take this branch.
-    let is_backend_pod = POD_TARGETS.get_ptr(&ipv4_mapped_v6(pod_ip)).is_some();
+    let is_backend_pod = is_pod_target(ipv4_mapped_v6(pod_ip));
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);
     }
@@ -2052,7 +2048,7 @@ fn try_uplink_egress_return_headers_v6<const L2_HLEN: usize>(ctx: &TcContext) ->
 
     let pod_ip_v6: [u8; 16] = load_direct(ctx, ip6_src)?;
 
-    let is_backend_pod = POD_TARGETS.get_ptr(&pod_ip_v6).is_some();
+    let is_backend_pod = is_pod_target(pod_ip_v6);
     if let EgressReturnAdmission::NotBackendTraffic = egress_return_admission(is_backend_pod) {
         return Some(TC_ACT_OK);
     }
