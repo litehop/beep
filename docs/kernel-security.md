@@ -18,13 +18,13 @@ CI `kernel-smoke` boots pinned Ubuntu mainline builds in QEMU. The pins are exac
 
 | Matrix entry | Resolves to |
 | --- | --- |
-| `6.6` | 6.6.158 |
-| `6.12` | 6.12.112 |
+| `6.6` | 6.6.161 |
+| `6.12` | 6.12.115 |
 | `latest` | 7.2.6 |
 
 The Lima rigs also run `beep-smoke` on Debian 13 (Linux 6.12.x) and `beep-node-a`, `beep-node-b` and `client` on Ubuntu 24.04 (Linux 6.8).
 
-Run the newest point release of the 6.6 or 6.12 branch, or 7.0 or newer. That is at or above every fix in the table below. The CI pins for 6.6 and 6.12 currently sit below the CVE-2026-45932 fix.
+Run the newest point release of the 6.6 or 6.12 branch, or 7.0 or newer. That is at or above every fix in the table below. Every tested kernel carries the CVE-2026-45932 fix.
 
 ## CVEs
 
