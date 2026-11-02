@@ -1411,14 +1411,55 @@ mod tests {
         let t0 = Instant::now();
         let mut p = PublishRetry::default();
         p.record(&svc("a"), false, false, t0);
+        let t1 = t0 + RETRY_INITIAL;
+        assert_eq!(p.take_due(t1), vec![(svc("a"), false)]);
         for _ in 0..10 {
             p.defer_clear(&svc("b"));
         }
+        p.record(&svc("a"), false, false, t1);
+        let own_delay = RETRY_INITIAL * 2;
+        assert!(
+            p.take_due(t1 + own_delay - Duration::from_millis(1))
+                .is_empty(),
+            "a's second failure must not retry before its own backoff elapses"
+        );
+        assert_eq!(
+            p.take_due(t1 + own_delay),
+            vec![(svc("a"), false)],
+            "a's retry delay must be what its own two failures earn; deferrals escalating the \
+             shared backoff would delay a node's stale-ingress fix for no failure"
+        );
+    }
+
+    #[test]
+    fn a_failure_after_a_deferral_belongs_to_the_retry_loop() {
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.defer_clear(&svc("a"));
+        p.record(&svc("a"), false, true, t0);
         assert_eq!(
             p.take_due(t0 + RETRY_INITIAL),
-            vec![(svc("a"), false)],
-            "one real failure must retry after RETRY_INITIAL; deferrals escalating the shared \
-             backoff would delay a node's stale-ingress fix for no failure"
+            vec![(svc("a"), true)],
+            "a clear that really failed after being deferred must be retried, or the stale \
+             ingress stays advertised"
+        );
+        assert_eq!(p.pending_clears(), vec![svc("a")]);
+    }
+
+    #[test]
+    fn a_deferral_after_a_failure_is_replayed_once_by_the_list_not_the_retry_loop() {
+        let t0 = Instant::now();
+        let mut p = PublishRetry::default();
+        p.record(&svc("a"), false, true, t0);
+        p.defer_clear(&svc("a"));
+        assert!(
+            p.take_due(t0 + RETRY_MAX).is_empty(),
+            "a deferred clear must not also be re-issued by the retry loop, or it runs twice"
+        );
+        assert_eq!(
+            p.pending_clears(),
+            vec![svc("a")],
+            "after_list must replay the deferred clear exactly once"
         );
     }
 
