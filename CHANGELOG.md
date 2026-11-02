@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- New [kernel security page](docs/kernel-security.md) lists kernel CVEs in code paths beep depends on. First entry: CVE-2026-45932 (TCX detach skips the capability check), fixed in 6.6.160, 6.12.114 and 7.0. Patching the host kernel is your responsibility.
+
 ## [0.7.0] - 2026-10-31
 
 ### Upgrade notes / operator action required
