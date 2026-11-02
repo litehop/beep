@@ -20,12 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The controller no longer delays retrying a failed `status.loadBalancer.ingress`
-  publish while ingress clears wait on the startup LISTs: a Service with a real
-  publish failure retries on its own schedule.
-
-### Docs
-
+- Deferred ingress clears before the startup LISTs no longer escalate the
+  shared publish-retry backoff, so they no longer delay retries of genuinely
+  failed `status.loadBalancer.ingress` publishes.
 - The 0.7.0 upgrade note is corrected: custom manifests need only the exec
   `readinessProbe`; `--ready-file` defaults to `/tmp/beep-ready` and is passed
   only for a non-default path.
@@ -47,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DaemonSet now has an exec `readinessProbe` that checks the `--ready-file`
   path (`/tmp/beep-ready`), created at that point; pods report NotReady during
   startup. Custom manifests must add the probe; pass `--ready-file` only for a
-  non-default path. See deploy/README.md, "Startup readiness".
+  non-default path, and then point the probe at that path too. See deploy/README.md, "Startup readiness".
 
 ### Added
 
