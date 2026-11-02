@@ -781,7 +781,6 @@ impl PublishRetry {
 
     fn defer_clear(&mut self, key: &ServiceKey) {
         self.keys.insert(key.clone(), Pending::DeferredClear);
-        self.backoff.failures += 1;
         self.reset_if_no_failures();
     }
 
