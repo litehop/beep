@@ -22,7 +22,7 @@ To run beep on a real Kubernetes cluster as a DaemonSet, rather than standalone 
 Until 1.0, beep supports:
 
 - systemd-based Linux distros (for example Debian, Ubuntu, the Fedora/RHEL family, Flatcar)
-- Linux kernel 6.6 or newer
+- Linux kernel 6.6 or newer (see [kernel security](docs/kernel-security.md) for patch requirements and tested kernels)
 - little-endian x86-64 and AArch64 only
 - the latest two Kubernetes minor versions (currently 1.36 and 1.37)
 
