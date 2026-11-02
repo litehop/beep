@@ -1150,6 +1150,7 @@ pub fn flow_hash(seed: u64, client_ip: [u8; 16], client_port: u16, front: &LbFro
 /// `flow_hash` for a new flow of the front described by `meta`: the client
 /// port is left out when the front has `FRONT_FLAG_CLIENT_IP_AFFINITY`, so
 /// sticky-session clients keep their backend across new connections.
+#[inline(always)]
 pub fn front_flow_hash(
     seed: u64,
     client_ip: [u8; 16],
