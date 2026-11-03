@@ -20,7 +20,7 @@ stub id 'echo 0'
 stub setsid 'exec "$@"'
 stub timeout 'shift; exec "$@"'
 stub uname 'echo 6.8.0-stub'
-stub sysctl 'echo "$1 = 1"'
+stub sysctl 'for k in "$@"; do echo "$k = 1"; done'
 stub bpftool 'echo "[]"'
 stub ip '
 echo "ip $*" >>"$STUB_LOG"
@@ -88,11 +88,18 @@ mkdir -p "$WORK/pin"
 touch "$WORK/pin/FLOW_TABLE"
 export BEEP_PIN_DIR="$WORK/pin"
 
-# An empty route list ([]) made `jq -er '.[0].dev // empty'` succeed with no
-# output in the original form; the snapshot then ran sysctl for an empty iface
-# name and recorded junk as rp_filter evidence.
-export STUB_DEFAULT4='[]' STUB_DEFAULT6='[]' STUB_WG_IFACES=""
-run_case "no default route (empty route list) dies instead of recording an empty-iface rp_filter" 1 "no default-route interface" -- before "$WORK/d1"
+# Without `// empty`, jq -e on an empty v4 route list ([]) still exits 1 but
+# prints "null" on stdout; the v6 fallback then appends the real dev, so the
+# iface becomes "null\neth0" and rp_filter evidence is recorded for a garbage key.
+export STUB_DEFAULT4='[]' STUB_DEFAULT6='[{"dev":"eth0"}]' STUB_WG_IFACES=""
+run_case "v6-only default route is snapshotted" 0 "" -- before "$WORK/d1a"
+expect_true "rp_filter evidence is for the real v6 default iface, not a garbled multi-line key" \
+  grep -qxF 'net.ipv4.conf.eth0.rp_filter = 1' "$WORK/d1a/before/rp_filter.txt"
+expect_true "no 'null' leaked into rp_filter evidence" test "$(grep -c null "$WORK/d1a/before/rp_filter.txt" || true)" = 0
+
+# No route at all must die cleanly, not record evidence for an empty iface.
+export STUB_DEFAULT4='[]' STUB_DEFAULT6='[]'
+run_case "no default route at all dies instead of recording rp_filter evidence" 1 "no default-route interface" -- before "$WORK/d1"
 reset_env
 
 # Default route through wg0 made NIC == wg iface: two tcpdumps wrote one
@@ -144,9 +151,13 @@ reset_env
 # Second capture failing must not leave the first tcpdump running forever.
 export STUB_TCPDUMP_FAIL_IFACE=wg0
 run_case "failed wg capture reports the tcpdump error" 1 "tcpdump exited at start" -- pcap-start "$WORK/d7"
-sleep 1
-orphans=0
-while read -r p; do kill -0 "$p" 2>/dev/null && orphans=1; done <"$WORK/d7/tcpdump.pid"
+orphans=1
+for _ in $(seq 30); do
+  orphans=0
+  while read -r p; do kill -0 "$p" 2>/dev/null && orphans=1; done <"$WORK/d7/tcpdump.pid"
+  [ "$orphans" = 0 ] && break
+  sleep 0.1
+done
 expect_true "a start failure kills the already-started tcpdumps (no orphans)" test "$orphans" = 0
 reset_env
 
