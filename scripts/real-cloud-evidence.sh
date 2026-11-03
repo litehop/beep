@@ -7,8 +7,9 @@
 #                                            geneve.pcap (-i any, udp port 6081) and,
 #                                            when WireGuard is present, <wg>.pcap
 #                                            (udp port 6081 on the wg iface) and
-#                                            <nic>.pcap (ALL udp on the underlay NIC,
-#                                            to show only WireGuard crosses it)
+#                                            <nic>-underlay.pcap (ALL udp on the NIC
+#                                            routing to the wg peer endpoint, to show
+#                                            only WireGuard crosses it)
 #   ... drive the request ...
 #   real-cloud-evidence.sh pcap-stop <dir>
 #   real-cloud-evidence.sh after <dir>       snapshot into <dir>/after/, write
@@ -18,11 +19,14 @@
 #                                            as carrying the flow; others legitimately
 #                                            exit 1)
 #
-# Layout per <dir> (one per checklist item and node): before/ and after/ each hold
-# geneve0.json (ip -s -j link show), flow_table.json (bpftool dump), rp_filter.txt,
-# kernel.txt, and with WireGuard wg-<iface>.txt (wg show, no keys) plus
-# wg-<iface>-handshakes.txt and wg-<iface>-transfer.txt; plus geneve0-delta.json
-# and the pcaps above.
+# Output interface per <dir> (one per checklist item and node), safe to rely on:
+#   before/, after/        each: geneve0.json (ip -s -j link show), flow_table.json
+#                          (bpftool dump), rp_filter.txt, kernel.txt, and with
+#                          WireGuard wg-<iface>.txt (wg show, no keys),
+#                          wg-<iface>-handshakes.txt, wg-<iface>-transfer.txt
+#   geneve0-delta.json     written by `after`
+#   geneve.pcap, <wg>.pcap, <nic>-underlay.pcap   written by pcap-start/stop
+# Not an interface: tcpdump-*.log, tcpdump.pid, pcaps.txt.
 #
 # Env: BEEP_PIN_DIR (default /sys/fs/bpf/beep), BEEP_EVIDENCE_PCAP_SECS (pcap
 # time bound, default 300), BEEP_EVIDENCE_WG_IFACE (wg iface; default: first of
@@ -45,6 +49,16 @@ wg_iface() {
   if [ -n "${BEEP_EVIDENCE_WG_IFACE:-}" ]; then echo "$BEEP_EVIDENCE_WG_IFACE"; return; fi
   command -v wg >/dev/null 2>&1 || return 0
   wg show interfaces | awk '{print $1}'
+}
+
+underlay_iface() { # underlay_iface <wg>: dev routing to the first wg peer endpoint
+  local ep addr
+  ep="$(wg show "$1" endpoints | awk '$2 != "(none)" {print $2; exit}')"
+  [ -n "$ep" ] || die "wireguard iface $1 has no peer endpoint; cannot pick the underlay NIC"
+  addr="${ep%:*}"
+  addr="${addr#[}"
+  addr="${addr%]}"
+  ip -j route get "$addr" | jq -er '.[0].dev // empty' || die "no route to wireguard endpoint $addr"
 }
 
 [ "$(id -u)" -eq 0 ] || die "must run as root"
@@ -95,27 +109,39 @@ case "$cmd" in
       done <"$dir/tcpdump.pid"
       rm -f "$dir/tcpdump.pid"
     fi
+    started_ok=0
+    kill_started() {
+      [ "$started_ok" -eq 1 ] || [ ! -f "$dir/tcpdump.pid" ] ||
+        while read -r p; do kill "$p" 2>/dev/null || true; done <"$dir/tcpdump.pid"
+    }
+    trap kill_started EXIT
     capture() { # capture <iface> <pcap> <filter>
       setsid timeout "$PCAP_SECS" tcpdump -nn -U -i "$1" -w "$dir/$2" "$3" \
         >"$dir/tcpdump-$2.log" 2>&1 </dev/null &
       echo $! >>"$dir/tcpdump.pid"
       echo "$2" >>"$dir/pcaps.txt"
     }
+    wg="$(wg_iface)"
+    nic=""
+    if [ -n "$wg" ]; then
+      nic="$(underlay_iface "$wg")"
+      [ "$nic" != "$wg" ] || die "underlay NIC resolved to the wireguard iface $wg; cannot capture the encrypted side separately"
+    fi
     : >"$dir/pcaps.txt"
     capture any geneve.pcap 'udp port 6081'
-    wg="$(wg_iface)"
     if [ -n "$wg" ]; then
-      nic="$(default_iface)" || die "no default-route interface (v4 or v6)"
       capture "$wg" "$wg.pcap" 'udp port 6081'
-      capture "$nic" "$nic.pcap" 'udp'
+      capture "$nic" "$nic-underlay.pcap" 'udp'
     fi
     sleep 1
     while read -r p; do
       kill -0 "$p" 2>/dev/null || die "tcpdump exited at start: $(cat "$dir"/tcpdump-*.log)"
     done <"$dir/tcpdump.pid"
+    started_ok=1
     ;;
   pcap-stop)
     [ -f "$dir/tcpdump.pid" ] || die "$dir/tcpdump.pid missing; pcap-start was not run"
+    [ -f "$dir/pcaps.txt" ] || die "$dir/pcaps.txt missing; $dir was not written by pcap-start"
     while read -r pid; do kill -INT "$pid" 2>/dev/null || true; done <"$dir/tcpdump.pid"
     for _ in 1 2 3 4 5; do
       alive=0
