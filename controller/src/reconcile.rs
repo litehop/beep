@@ -2407,6 +2407,20 @@ mod tests {
     }
 
     #[test]
+    fn remote_draining_pod_keeps_only_its_own_node_published_under_only_local() {
+        let draining = [terminating_ep_on(OTHER, 5, true)];
+        let refs: Vec<&Endpoint> = draining.iter().collect();
+        assert!(
+            !publishes_ingress(EndpointPolicy::OnlyLocal, &refs, IpAddr::V4(THIS), true),
+            "a draining pod is not a fallback target, so a node without it would drop clients"
+        );
+        assert!(
+            publishes_ingress(EndpointPolicy::OnlyLocal, &refs, IpAddr::V4(OTHER), true),
+            "the node still serving the draining pod stays listed, so the Service keeps an ingress"
+        );
+    }
+
+    #[test]
     fn only_local_fails_open_while_no_node_has_a_usable_pod() {
         let this = IpAddr::V4(THIS);
         let none: [&Endpoint; 0] = [];

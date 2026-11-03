@@ -182,9 +182,10 @@ static FRONT_ENDPOINTS: HashMap<FrontEndpointKey, FrontEndpoint> =
 /// but its endpoint was missing (or the count was zero). Traffic for that
 /// front has no usable endpoint, so the packet is silently dropped
 /// (`TC_ACT_SHOT`). Counted on the ingress path only. A non-zero value means
-/// the front has no endpoint (e.g. `externalTrafficPolicy: Local` without a
-/// local pod), or the controller's generation-swap protocol was violated or an
-/// endpoint write failed.
+/// the front has no endpoint (no pod is ready anywhere; the controller falls
+/// back cluster-wide for `externalTrafficPolicy: Local` without a local pod),
+/// or the controller's generation-swap protocol was violated or an endpoint
+/// write failed.
 #[map]
 static FRONT_MISSES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 

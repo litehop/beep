@@ -90,8 +90,8 @@ atomically. Ingress, per packet, in this order:
    live flow.
 3. **Count 0**: silent drop (no RST/ICMP; nothing for a scanner to learn),
    counted in `FRONT_MISSES`. Applies to every owned front with no usable
-   endpoint, including `externalTrafficPolicy: Local` on a node without a
-   local pod, matching kube-proxy.
+   endpoint. `externalTrafficPolicy: Local` on a node without a local pod
+   is not count 0: it forwards cluster-wide (below), unlike kube-proxy.
 4. **Hash**: `slot = flow_hash(seed, client_ip, client_port, front) × N >>
    32`, where N is `local_count` if non-zero (local pods occupy slots
    `0..local_count`), else `count`. Deterministic, unweighted.
@@ -103,7 +103,7 @@ What the controller emits, from `spec.externalTrafficPolicy` and
 |---|---|---|---|
 | default (eTP=Cluster) | all ready, non-terminating, sorted by pod IP | 0: uniform | every node with a ready beep |
 | `trafficDistribution: PreferSameNode` (`PreferClose`/`PreferSameZone` map to it: no zone model) | same, local pods first | local pod count: local preferred while any exist, else uniform | every node with a ready beep |
-| eTP=Local (wins over `trafficDistribution`) | local ready pods only; if none, local serving-terminating pods; else none | = `count` | only nodes with a usable local pod |
+| eTP=Local (wins over `trafficDistribution`) | local ready pods; else local serving-terminating pods; else all ready, non-terminating pods cluster-wide (client IP preserved); none only if no pod is ready anywhere | = `count` when local, 0 on the cluster-wide fallback | only nodes with a usable local pod; every node while no usable pod exists anywhere (fail-open) |
 
 Uniform slot order depends on pod IP alone, so one flow hashes to the
 same pod from any ingress node. Terminating pods get no new flows;
