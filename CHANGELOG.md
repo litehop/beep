@@ -117,8 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node with no usable local pod forwards to the ready, non-terminating
   endpoints cluster-wide (client IP preserved) instead of dropping. The front
   is count 0 (drop) only when no pod is ready anywhere; a remote
-  serving-but-terminating pod keeps the Service published but is not a
-  fallback target.
+  serving-but-terminating pod keeps only its own node published and is not a
+  fallback target for other nodes.
 - Dependency and CI-action bumps (Renovate).
 
 ### Fixed

@@ -103,7 +103,7 @@ What the controller emits, from `spec.externalTrafficPolicy` and
 |---|---|---|---|
 | default (eTP=Cluster) | all ready, non-terminating, sorted by pod IP | 0: uniform | every node with a ready beep |
 | `trafficDistribution: PreferSameNode` (`PreferClose`/`PreferSameZone` map to it: no zone model) | same, local pods first | local pod count: local preferred while any exist, else uniform | every node with a ready beep |
-| eTP=Local (wins over `trafficDistribution`) | local ready pods; else local serving-terminating pods; else all ready, non-terminating pods cluster-wide (client IP preserved); none only if no pod is ready anywhere | = `count` when local, 0 on the cluster-wide fallback | only nodes with a usable local pod |
+| eTP=Local (wins over `trafficDistribution`) | local ready pods; else local serving-terminating pods; else all ready, non-terminating pods cluster-wide (client IP preserved); none only if no pod is ready anywhere | = `count` when local, 0 on the cluster-wide fallback | only nodes with a usable local pod; every node while no usable pod exists anywhere (fail-open) |
 
 Uniform slot order depends on pod IP alone, so one flow hashes to the
 same pod from any ingress node. Terminating pods get no new flows;
