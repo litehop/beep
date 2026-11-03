@@ -41,6 +41,7 @@ and (g) also requires: `ip -s -j link show geneve0` rx+tx packet counts on
 both nodes grow across the request, and the ingress node's FLOW_TABLE holds
 the flow (`sudo bpftool map dump pinned /sys/fs/bpf/beep/FLOW_TABLE --json`,
 as `scripts/smoke-k3s-controller-v6only.sh` steps 9 and 12 do).
+`scripts/real-cloud-evidence.sh` collects it per node (see its header).
 
 **(a) Disjoint subnets (required).**
 Topology: two or more nodes in different subnets; ingress on node A, backend
