@@ -45,7 +45,7 @@ jobs:
       # once a cargo-zigbuild release filters it.
       - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
         with:
-          toolchain: nightly-2026-11-03
+          toolchain: nightly-2026-11-16
           components: rust-src, llvm-tools
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
