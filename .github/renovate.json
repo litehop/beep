@@ -19,7 +19,8 @@
       "schedule": [
         "before 6am on monday"
       ],
-      "automerge": true
+      "automerge": true,
+      "platformAutomerge": true
     },
     {
       "matchManagers": [
