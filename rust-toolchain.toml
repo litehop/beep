@@ -6,4 +6,5 @@
 # delivery and scripts; Renovate bumps the date and the full CI gate verifies it.
 [toolchain]
 channel = "nightly-2026-11-17"
+# rust-analyzer is only for local editors/LSP tooling; CI downloads it unused.
 components = ["rust-src", "clippy", "rustfmt", "rust-analyzer", "llvm-tools"]
