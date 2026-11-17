@@ -6,4 +6,8 @@
 # delivery and scripts; Renovate bumps the date and the full CI gate verifies it.
 [toolchain]
 channel = "nightly-2026-11-17"
+# rust-analyzer is only for local editors/LSP tooling; CI downloads it unused.
 components = ["rust-src", "clippy", "rustfmt", "rust-analyzer", "llvm-tools"]
+# Cross-build targets for the smoke scripts (aarch64 Lima guests) and delivery
+# (both). bpfel-unknown-none is tier 3, built via -Z build-std, so not listed.
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]

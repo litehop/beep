@@ -46,8 +46,7 @@
 # Host prerequisites (same as README.md's "Building",
 # plus cargo-zigbuild for the macOS-host -> Linux-VM cross build this
 # harness needs since this crate cannot compile natively on macOS):
-#   rustup toolchain install nightly --component rust-src
-#   rustup target add aarch64-unknown-linux-gnu --toolchain nightly
+#   rustup show   # installs the toolchain + targets from rust-toolchain.toml
 #   cargo install bpf-linker cargo-zigbuild
 # VM prerequisite: bpftool (already present on beep-smoke from prior
 # beep work; otherwise `apt-get install linux-tools-$(uname -r)`).
@@ -71,10 +70,7 @@ VERIFIER_CHECK_SCRIPT="$SCRIPT_DIR/verifier-accept-check.sh"
 for tool in cargo-zigbuild limactl; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
-rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
-  echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
-  exit 1
-}
+"$SCRIPT_DIR/require-toolchain.sh"
 
 echo "==> [1/4] bringing up $VM"
 if ! limactl list --format '{{.Name}}\t{{.Status}}' 2>/dev/null | grep -qE "^${VM}[[:space:]]+Running"; then

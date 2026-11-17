@@ -53,10 +53,7 @@ UPLINK_IFACE="eth0"
 for tool in cargo-zigbuild limactl; do
   command -v "$tool" >/dev/null || { echo "FAIL: $tool not found on PATH" >&2; exit 1; }
 done
-rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
-  echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
-  exit 1
-}
+"$SCRIPT_DIR/require-toolchain.sh"
 
 remote() {
   local vm="$1"; shift

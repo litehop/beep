@@ -30,10 +30,10 @@ Non-systemd distros and immutable OSes (Talos, Bottlerocket) are unsupported for
 
 ## Building
 
-You need a `nightly` toolchain with the `rust-src` component, and `bpf-linker` on your `PATH`. Install `bpf-linker` with `cargo install bpf-linker`, or grab a prebuilt release from https://github.com/aya-rs/bpf-linker/releases.
+The nightly toolchain (with `rust-src`) is pinned in `rust-toolchain.toml`; `rustup show` installs it. You also need `bpf-linker` on your `PATH`. Install `bpf-linker` with `cargo install bpf-linker`, or grab a prebuilt release from https://github.com/aya-rs/bpf-linker/releases.
 
 ```console
-$ rustup toolchain install nightly --component rust-src
+$ rustup show
 $ cargo install bpf-linker
 $ cargo build --release   # from this directory; builds beep-ebpf too
 ```
