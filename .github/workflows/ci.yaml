@@ -46,13 +46,18 @@ jobs:
   
   test-gate:
     if: ${{ always() }}
-    needs: test-matrix
+    needs: [test-matrix, controller-cross-aarch64]
     runs-on: ubuntu-latest
     steps:
       - name: Check matrix status
         if: ${{ needs.test-matrix.result != 'success' }}
         run: |
           echo "One or more component tests failed."
+          exit 1
+      - name: Check controller cross-build status
+        if: ${{ needs.controller-cross-aarch64.result != 'success' }}
+        run: |
+          echo "controller-cross-aarch64 did not succeed."
           exit 1
 
   lint-matrix:
