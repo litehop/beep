@@ -325,6 +325,11 @@ k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root
   # no-op, not a caught error.
   CONTROLLER_SELECTOR=$(kube -n kube-system get daemonset servicelb-controller \
     -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+  k3s_assert_controller_settled || controller_deploy_failed=1
+  return "$controller_deploy_failed"
+}
+
+k3s_assert_controller_settled() { # k3s_assert_controller_settled -- after a rollout, sleeps 10s then requires zero container restarts on every pod matching $CONTROLLER_SELECTOR (set by k3s_deploy_controller_daemonset); returns 1 otherwise
   # `rollout status` alone is not sufficient evidence: a container with no
   # readiness/liveness probe (this one has neither) reports Ready as soon as
   # it *starts*, even if it exits non-zero moments later -- `rollout status`
@@ -332,13 +337,14 @@ k3s_deploy_controller_daemonset() { # k3s_deploy_controller_daemonset <repo-root
   # enters CrashLoopBackOff (confirmed: this exact false-positive happened
   # while diagnosing the AppArmor/bpffs blocker). Settle, then require zero
   # restarts.
+  local restarts c rc=0
   sleep 10
   restarts=$(kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" \
     -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "")
   for c in $restarts; do
-    [ "$c" = "0" ] || controller_deploy_failed=1
+    [ "$c" = "0" ] || rc=1
   done
-  return "$controller_deploy_failed"
+  return "$rc"
 }
 
 k3s_teardown_controller() { # k3s_teardown_controller <repo-root> -- deletes the controller DaemonSet/RBAC/ConfigMap via the caller's kube(); `-f -` (stdin), not a host path -- kube() runs kubectl on a remote VM with no access to this process's own $REPO_ROOT

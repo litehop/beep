@@ -550,12 +550,13 @@ for _ in $(seq 1 30); do
 done
 pod_round_trip -4 "$IP_A" "$IP_CLIENT" || { echo "POD-ROUND-TRIP-V4: FAIL (v4 pod $POD_V4 not reached via $IP_A:$PORT_POD)" >&2; dump_evidence; exit 1; }
 echo "POD-ROUND-TRIP-V4: PASS (client $IP_CLIENT -> v4 front $IP_A:$PORT_POD -> pod $POD_NAME_BACKEND $POD_V4, client IP preserved)"
+v6_rejected() { controller_logs | grep -F "rejected from POD_TARGETS" | grep -qF "$POD_V6"; }
 for _ in $(seq 1 15); do
-  controller_logs | grep -F "$POD_V6" | grep -qi "pod_cidr\|rejected" && break
+  v6_rejected && break
   sleep 2
 done
-controller_logs | grep -F "$POD_V6" | grep -qi "pod_cidr\|rejected" || {
-  echo "POD-V6-NEGATIVE-CONTROL: FAIL (no controller rejection log naming $POD_V6 with only the v4 --pod-cidr)" >&2
+v6_rejected || {
+  echo "POD-V6-NEGATIVE-CONTROL: FAIL (no controller 'rejected from POD_TARGETS' WARN naming $POD_V6 with only the v4 --pod-cidr)" >&2
   dump_evidence
   exit 1
 }
@@ -575,6 +576,13 @@ kube -n kube-system rollout status daemonset/servicelb-controller --timeout=90s 
   dump_evidence
   exit 1
 }
+k3s_assert_controller_settled || {
+  echo "CONTROLLER-REDEPLOY: FAIL (controller container restarted after the v6 --pod-cidr patch)" >&2
+  kube -n kube-system get pods -l "$CONTROLLER_SELECTOR" -o wide >&2 || true
+  dump_evidence
+  exit 1
+}
+echo "CONTROLLER-REDEPLOY: PASS (servicelb-controller rolled out with the dual --pod-cidr, zero restarts after a 10s settle)"
 v6_ok=0
 for _ in $(seq 1 30); do
   if pod_round_trip -6 "$ULA_A" "$ULA_CLIENT"; then v6_ok=1; break; fi
