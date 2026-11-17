@@ -114,8 +114,8 @@ rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
 # needs rust-src regardless of the host target -- a nightly toolchain
 # without it passes the check above but fails later with an obscure
 # zigbuild/build.rs error.
-rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src (installed)' || {
-  echo "FAIL: rust-src component not installed for nightly (rustup component add rust-src --toolchain nightly)" >&2
+(cd "$REPO_ROOT" && rustup component list) 2>/dev/null | grep -q '^rust-src (installed)' || {
+  echo "FAIL: rust-src component not installed for nightly (run rustup toolchain install in the repo)" >&2
   exit 1
 }
 

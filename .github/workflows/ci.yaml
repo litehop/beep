@@ -26,13 +26,8 @@ jobs:
           # - beep-ebpf
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy;
-          # explicit here because this action's `components:` input pins
-          # the toolchain via RUSTUP_TOOLCHAIN, bypassing rust-toolchain.toml's
-          # own `components` list.
-          components: clippy, rustfmt, rust-src, llvm-tools
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -75,13 +70,8 @@ jobs:
           - beep-ebpf
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy;
-          # explicit here because this action's `components:` input pins
-          # the toolchain via RUSTUP_TOOLCHAIN, bypassing rust-toolchain.toml's
-          # own `components` list.
-          components: clippy, rustfmt, rust-src, llvm-tools
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -135,9 +125,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          components: clippy, rustfmt, rust-src
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -198,15 +187,12 @@ jobs:
       # beep-controller's build.rs cross-builds beep-ebpf via aya-build,
       # which needs nightly + rust-src regardless of the host build's own
       # target; aarch64-unknown-linux-gnu is beep-controller's own target.
-      # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      # Pinned: nightly >= 2026-11-05 passes -mfix-cortex-a53-843419 to the
-      # linker driver, which cargo-zigbuild 0.24.1 / zig 0.15.2 reject. Unpin
-      # once a cargo-zigbuild release filters it.
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          toolchain: nightly-2026-11-03
-          components: rust-src, llvm-tools
-          targets: aarch64-unknown-linux-gnu
+      # rust-toolchain.toml carries rust-src + llvm-tools (build.rs's
+      # post-link DWARF strip needs llvm-objcopy).
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add aarch64-unknown-linux-gnu
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -226,7 +212,7 @@ jobs:
           version: 0.15.2
 
       - name: Cross-compile beep-controller for aarch64-gnu
-        run: cargo +nightly-2026-11-03 zigbuild -p beep-controller --target aarch64-unknown-linux-gnu.2.36
+        run: scripts/cargo-zigbuild.sh -p beep-controller --target aarch64-unknown-linux-gnu.2.36
 
   # Loads the real programs and drives one client->front->backend round trip
   # natively on ubuntu-latest (no Lima/cross-build), then asserts the discovered
@@ -244,9 +230,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          components: rust-src, llvm-tools
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -353,9 +338,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          components: rust-src, llvm-tools
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -449,9 +433,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          components: rust-src, llvm-tools
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}

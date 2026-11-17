@@ -39,15 +39,12 @@ jobs:
       # beep-controller's build.rs cross-builds beep-ebpf via aya-build,
       # which needs nightly + rust-src regardless of the host build's own
       # target. The gnu targets are for beep-controller itself.
-      # llvm-tools: build.rs's post-link DWARF strip needs llvm-objcopy.
-      # Pinned: nightly >= 2026-11-05 passes -mfix-cortex-a53-843419 to the
-      # linker driver, which cargo-zigbuild 0.24.1 / zig 0.15.2 reject. Unpin
-      # once a cargo-zigbuild release filters it.
-      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
-        with:
-          toolchain: nightly-2026-11-03
-          components: rust-src, llvm-tools
-          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+      # rust-toolchain.toml carries rust-src + llvm-tools (build.rs's
+      # post-link DWARF strip needs llvm-objcopy).
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
       # Namespaced by job id automatically, so this doesn't collide with
       # ci.yaml's caches; keyed on Cargo.lock (Swatinem/rust-cache's
@@ -74,8 +71,8 @@ jobs:
       - name: Cross-build beep-controller (gnu, both arches)
         run: |
           set -euo pipefail
-          cargo +nightly-2026-11-03 zigbuild --release -p beep-controller --target x86_64-unknown-linux-gnu.2.36
-          cargo +nightly-2026-11-03 zigbuild --release -p beep-controller --target aarch64-unknown-linux-gnu.2.36
+          scripts/cargo-zigbuild.sh --release -p beep-controller --target x86_64-unknown-linux-gnu.2.36
+          scripts/cargo-zigbuild.sh --release -p beep-controller --target aarch64-unknown-linux-gnu.2.36
           mkdir -p dist/linux/amd64 dist/linux/arm64
           cp target/x86_64-unknown-linux-gnu/release/beep-controller dist/linux/amd64/beep-controller
           cp target/aarch64-unknown-linux-gnu/release/beep-controller dist/linux/arm64/beep-controller

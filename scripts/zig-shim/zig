@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# PATH shim for cargo-zigbuild: execs the real zig minus
+# -mfix-cortex-a53-843419. rustc nightly passes that flag on aarch64 links;
+# zig's clang rejects it and cargo-zigbuild (<= 0.24.1) does not filter it.
+# Delete once a cargo-zigbuild release filters the flag itself.
+set -euo pipefail
+
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+real=""
+while IFS= read -r cand; do
+  if [[ "$(cd "$(dirname "$cand")" && pwd)" != "$self_dir" ]]; then
+    real="$cand"
+    break
+  fi
+done < <(type -ap zig)
+if [[ -z "$real" ]]; then
+  echo "zig-shim: no real zig on PATH" >&2
+  exit 127
+fi
+
+args=()
+for a in "$@"; do
+  [[ "$a" == "-mfix-cortex-a53-843419" ]] || args+=("$a")
+done
+exec "$real" ${args[@]+"${args[@]}"}
