@@ -20,11 +20,21 @@ fn main() -> aya_build::Result<()> {
     // rust-toolchain.toml pins a dated channel; reuse the toolchain rustup
     // resolved for this build instead.
     println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
-    let rustup_toolchain = env::var("RUSTUP_TOOLCHAIN").ok();
-    let toolchain = match rustup_toolchain.as_deref() {
-        Some(name) => aya_build::Toolchain::Custom(name),
-        None => aya_build::Toolchain::default(),
+    // Without it aya-build would fall back to a floating `nightly` and could
+    // build the eBPF object with a different toolchain than the loader.
+    let Ok(rustup_toolchain) = env::var("RUSTUP_TOOLCHAIN") else {
+        let pinned = std::fs::read_to_string("rust-toolchain.toml")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    l.strip_prefix("channel = ")
+                        .map(|c| c.trim_matches('"').to_owned())
+                })
+            })
+            .unwrap_or_else(|| "the channel in rust-toolchain.toml".to_owned());
+        bail!("RUSTUP_TOOLCHAIN is not set; build through rustup/cargo so it resolves {pinned}");
     };
+    let toolchain = aya_build::Toolchain::Custom(&rustup_toolchain);
     aya_build::build_ebpf(
         [aya_build::Package {
             name: "beep-ebpf",
