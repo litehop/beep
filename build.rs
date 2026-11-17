@@ -16,13 +16,22 @@ fn main() -> aya_build::Result<()> {
     // aya-build only watches `ebpf/`; the object also embeds `beep-common`.
     println!("cargo:rerun-if-changed=common");
     println!("cargo:rerun-if-changed=Cargo.lock");
+    // aya-build defaults to the floating `nightly`, which is not installed when
+    // rust-toolchain.toml pins a dated channel; reuse the toolchain rustup
+    // resolved for this build instead.
+    println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
+    let rustup_toolchain = env::var("RUSTUP_TOOLCHAIN").ok();
+    let toolchain = match rustup_toolchain.as_deref() {
+        Some(name) => aya_build::Toolchain::Custom(name),
+        None => aya_build::Toolchain::default(),
+    };
     aya_build::build_ebpf(
         [aya_build::Package {
             name: "beep-ebpf",
             root_dir: "ebpf",
             ..Default::default()
         }],
-        aya_build::Toolchain::default(),
+        toolchain,
     )?;
     strip_dwarf_keep_btf(&ebpf_object_path()?)
 }

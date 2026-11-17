@@ -265,7 +265,7 @@ k3s_build_load_image() { # k3s_build_load_image <repo-root> <vm-a> <vm-b> -- cro
   targets="$(k3s_arch_targets "$node_arch")" || { echo "FAIL: unsupported node architecture '$node_arch' (want aarch64 or x86_64)" >&2; return 1; }
   rust_target="${targets% *}"
   goarch="${targets#* }"
-  ( cd "$repo_root" && cargo +nightly zigbuild --release -p beep-controller --target "$rust_target" ) || return 1
+  ( cd "$repo_root" && "$repo_root/scripts/cargo-zigbuild.sh" --release -p beep-controller --target "$rust_target" ) || return 1
   mkdir -p "$repo_root/dist/linux/$goarch"
   cp "$repo_root/target/${rust_target%%.*}/release/beep-controller" "$repo_root/dist/linux/$goarch/beep-controller" || return 1
   docker buildx build --platform "linux/$goarch" -t "$IMAGE" --load "$repo_root" >/dev/null || return 1

@@ -155,7 +155,7 @@ IFACE_A_ACTUAL="$(limactl shell "$VM_A" -- bash -c "ip -4 -o addr show | awk '\$
 echo "UPLINK-IFACE-NAME: PASS ($VM_A's user-v2 NIC is $UPLINK_IFACE_A)"
 
 echo "==> [3/8] cross-building beep-ebpf + beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
-( cd "$BEEP_DIR" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
+( cd "$BEEP_DIR" && "$REPO_ROOT/scripts/cargo-zigbuild.sh" --release --target aarch64-unknown-linux-gnu )
 BIN="$BEEP_DIR/target/aarch64-unknown-linux-gnu/release/beep"
 [ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
 
