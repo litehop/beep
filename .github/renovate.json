@@ -31,6 +31,23 @@
         "aya-obj"
       ],
       "allowedVersions": "<0.7"
+    },
+    {
+      "description": "Hold the aarch64 zigbuild nightly: later nightlies pass -mfix-cortex-a53-843419, which zig 0.15.2 rejects. Remove this rule, and bump the pin by hand, once a cargo-zigbuild release filters that flag.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "uses-with"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yaml",
+        ".github/workflows/delivery.yaml"
+      ],
+      "enabled": false
     }
   ]
 }
