@@ -410,6 +410,10 @@ Rationale: `docs/decisions/geneve-underlay-trust-model.md`.
 
 ## MTU requirement
 
+**Risk: if the pod MTU is too large, large transfers can stall silently.**
+Configure the pod MTU in your CNI as described below; do not rely on the
+underlay or on path MTU discovery to compensate.
+
 **Pod MTU MUST be at most the underlay MTU minus the Geneve overhead.** beep
 does not set an MTU on `geneve0` and does not clamp TCP MSS, so the pod MTU,
 which your CNI owns, is the only size limit on tunnelled packets.
@@ -425,24 +429,21 @@ cluster whose underlay can carry v6 between nodes needs the 94 B budget.
 | 1460 (GCP)   | 1386                     | 1366                     |
 | 9000 (jumbo) | 8926                     | 8906                     |
 
-**Risk if the pod MTU is larger.** Full-size pod packets then exceed the
-underlay MTU once encapsulated. beep sets no DF bit on the outer packet and
-no ICMP Packet Too Big ever reaches the pod, so path MTU discovery cannot
-shrink the pod's segments. The only thing that lets such packets through is
-the underlay delivering outer IP fragments. Wherever fragments are dropped or
-policed (cloud firewalls and security groups, some load balancers, NAT
-devices, hardware filters), large transfers stall or fail silently while small
-requests keep working, which is easy to misread as an application bug. It
-also affects UDP (including QUIC), where an MSS clamp would not help. An
+**What happens if the pod MTU is larger.** Full-size pod packets then exceed
+the underlay MTU once encapsulated. beep sets no DF bit on the outer packet and
+does not ensure a Packet Too Big reaches the pod, so don't rely on path MTU
+discovery to fix an oversized pod MTU. The only thing that lets such packets
+through is the underlay delivering outer IP fragments. Wherever fragments are
+dropped or policed (cloud firewalls and security groups, some load balancers,
+NAT devices, hardware filters), large transfers stall or fail silently while
+small requests keep working, which is easy to misread as an application bug.
+It also affects UDP (including QUIC), where an MSS clamp would not help. An
 oversized pod MTU can appear to work on a lenient underlay; verify your
 underlay rather than relying on it.
 
-Setting the pod MTU is the CNI's job. Use your CNI's own MTU option and
-reapply it to existing pods (they pick it up on recreation):
-
-- Flannel, Calico, Cilium and others each have an MTU setting in their own
-  config (for example Cilium's `mtu` Helm value, Calico's `Installation`
-  MTU field). Check your CNI's documentation for the exact key.
+Setting the pod MTU is the CNI's job. Set your CNI's MTU option. An MTU change
+usually applies only to pods created afterwards; check your CNI's
+documentation and restart pods as needed.
 
 A CNI that sizes pods as `underlay - its own overhead` (for example flannel
 VXLAN, 1460 - 50 = 1410) is too large by 24 B on a v4 underlay and 44 B on a

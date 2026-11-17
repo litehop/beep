@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Documentation
+### Changed
 
 - `deploy/README.md` "MTU requirement": pod MTU must be at most the underlay
   MTU minus 74 B (v4 underlay) or 94 B (v6 underlay). An oversized pod MTU
-  relies on the underlay passing outer IP fragments (beep sets no DF and no
-  Packet Too Big reaches the pod), so large transfers can stall silently
-  where fragments are dropped.
+  relies on the underlay passing outer IP fragments (beep sets no DF and does
+  not ensure a Packet Too Big reaches the pod), so large transfers can stall
+  silently where fragments are dropped.
 
 ## [0.7.1] - 2026-11-02
 
