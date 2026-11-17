@@ -46,7 +46,7 @@ jobs:
   
   test-gate:
     if: ${{ always() }}
-    needs: [test-matrix, controller-cross-aarch64]
+    needs: [test-matrix, controller-cross-aarch64, kernel-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Check matrix status
@@ -58,6 +58,11 @@ jobs:
         if: ${{ needs.controller-cross-aarch64.result != 'success' }}
         run: |
           echo "controller-cross-aarch64 did not succeed."
+          exit 1
+      - name: Check kernel-smoke status
+        if: ${{ needs.kernel-smoke.result != 'success' }}
+        run: |
+          echo "kernel-smoke did not succeed on every kernel (6.6 verifier floor, 6.12, latest)."
           exit 1
 
   lint-matrix:
@@ -378,7 +383,8 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # ADVISORY (not a required check): runs the same smoke fixture as
+  # Gated via test-gate's needs: (a leg that fails, is cancelled, or is
+  # skipped fails the gate). Runs the same smoke fixture as
   # memory-smoke, but inside a QEMU/KVM guest booting a pinned stock kernel
   # (scripts/kernel-smoke.sh), so the 6.6 floor and the next LTS are actually
   # exercised -- the verifier and TCX can accept on the runner's kernel and
