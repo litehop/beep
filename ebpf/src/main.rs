@@ -2,6 +2,8 @@
 #![no_main]
 // The `#[classifier]` entry wrapper takes the kernel's raw ctx pointer and is
 // not `unsafe`; the macro generates it, so the lint cannot be fixed at source.
+// An `#[allow]` on the individual `#[classifier]` fns does not reach the
+// generated wrapper (clippy still errors), hence crate-level.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 //! Phase 2 (Geneve encap/decap on the symmetric-return path) plus Phase 3
@@ -1759,7 +1761,7 @@ fn try_geneve_decap_return_v4(
     // reply and dropping it.
     ctx.set_mark(REDIRECTED_RETURN_MARK);
     // `ingress_ifindex` here is the FLOW_TABLE-stored value resolved above,
-    // NOT `ctx.as_ptr()->ingress_ifindex` read fresh at this call site: this
+    // NOT `skb->ingress_ifindex` read fresh at this call site: this
     // hook runs on `geneve0`'s ingress (the packet just arrived there via
     // its own tunnel decap), so a fresh read would resolve to `geneve0`
     // itself, not the client's uplink. See `redirect_client_bound`'s doc

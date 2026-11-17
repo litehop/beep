@@ -220,6 +220,20 @@ expect_eq "a DaemonSet left OnDelete by an aborted leg is deleted before the sto
   "kube -n kube-system delete daemonset servicelb-controller --ignore-not-found --timeout=120s" \
   "$(head -n1 "$WORK/deploy.calls")"
 
+settled_rc() { # settled_rc <restart counts as kubectl jsonpath prints them> -- rc of k3s_assert_controller_settled against a stubbed kube
+  local counts="$1" rc=0
+  (
+    CONTROLLER_SELECTOR=app=servicelb-controller
+    kube() { echo "$counts"; }
+    sleep() { :; }
+    k3s_assert_controller_settled
+  ) 2>/dev/null || rc=$?
+  echo "$rc"
+}
+expect_eq "zero restarts on every controller pod settles, or a healthy rollout is reported failed" 0 "$(settled_rc '0 0 0')"
+expect_eq "a restarted controller container fails the gate even though rollout status said Ready, or a crash-looping controller false-PASSes" 1 "$(settled_rc '0 3 0')"
+expect_eq "a single pod with one restart fails the gate" 1 "$(settled_rc '1')"
+
 expect_eq "arm64 Lima nodes get an aarch64 build and an arm64 image, or the controller binary crashes with exec format error" \
   "aarch64-unknown-linux-gnu.2.36 arm64" "$(k3s_arch_targets aarch64)"
 expect_eq "amd64 Lima nodes get an x86_64 build and an amd64 image, or the controller binary crashes with exec format error" \
