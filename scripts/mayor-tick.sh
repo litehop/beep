@@ -914,11 +914,19 @@ main() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --live-agents)
-        LIVE_AGENTS="${2:-}"
+        [ "$#" -ge 2 ] || { echo "$(basename "$0"): --live-agents requires a value" >&2; exit 2; }
+        LIVE_AGENTS="$2"
         shift 2
         ;;
-      *)
+      --live-agents=*)
+        LIVE_AGENTS="${1#--live-agents=}"
         shift
+        ;;
+      *)
+        # A silently ignored flag leaves LIVE_AGENTS empty, which reports a
+        # live worker as stale (exit 30).
+        echo "$(basename "$0"): unknown argument '$1'" >&2
+        exit 2
         ;;
     esac
   done
