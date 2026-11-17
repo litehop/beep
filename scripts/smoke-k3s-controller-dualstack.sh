@@ -89,8 +89,8 @@ rustup toolchain list 2>/dev/null | grep -q '^nightly' || {
   echo "FAIL: nightly toolchain not installed (rustup toolchain install nightly --component rust-src)" >&2
   exit 1
 }
-rustup component list --toolchain nightly 2>/dev/null | grep -q '^rust-src (installed)' || {
-  echo "FAIL: rust-src component not installed for nightly (rustup component add rust-src --toolchain nightly)" >&2
+(cd "$REPO_ROOT" && rustup component list) 2>/dev/null | grep -q '^rust-src (installed)' || {
+  echo "FAIL: rust-src component not installed for nightly (run rustup toolchain install in the repo)" >&2
   exit 1
 }
 
@@ -190,7 +190,7 @@ case "$node_arch" in
   *) echo "FAIL: unsupported node architecture '$node_arch' (want aarch64 or x86_64)" >&2; exit 1 ;;
 esac
 
-( cd "$REPO_ROOT" && cargo +nightly zigbuild --release -p beep-controller --target "$rust_target" )
+( cd "$REPO_ROOT" && "$REPO_ROOT/scripts/cargo-zigbuild.sh" --release -p beep-controller --target "$rust_target" )
 mkdir -p "$REPO_ROOT/dist/linux/$goarch"
 cp "$REPO_ROOT/target/${rust_target%%.*}/release/beep-controller" "$REPO_ROOT/dist/linux/$goarch/beep-controller"
 
