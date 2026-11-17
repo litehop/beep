@@ -12,6 +12,16 @@
       "versioning": "regex:^v?(?<major>\\d+)(\\.(?<minor>\\d+)\\.(?<patch>\\d+))?$"
     },
     {
+      "description": "rust-toolchain.toml is the single toolchain source; weekly bump, merged by the queue only if the full CI gate passes.",
+      "matchManagers": [
+        "rust-toolchain"
+      ],
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": true
+    },
+    {
       "matchManagers": [
         "cargo"
       ],

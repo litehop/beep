@@ -2,7 +2,8 @@
 # bpfel-unknown-none via `-Z build-std=core`, which needs nightly + rust-src.
 # aya-build (invoked from build.rs) shells out to this toolchain, so pinning it
 # here makes local + CI builds reproducible instead of depending on whatever
-# nightly happens to be installed.
+# nightly happens to be installed. This is the single toolchain source for CI,
+# delivery and scripts; Renovate bumps the date and the full CI gate verifies it.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-11-17"
 components = ["rust-src", "clippy", "rustfmt", "rust-analyzer", "llvm-tools"]

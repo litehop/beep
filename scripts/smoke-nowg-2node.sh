@@ -107,7 +107,7 @@ for vm in "$VM_A" "$VM_B" "$VM_CLIENT"; do
 done
 
 echo "==> [2/8] cross-building beep (nightly + bpf-linker + zigbuild -> aarch64-unknown-linux-gnu)"
-( cd "$REPO_ROOT" && cargo +nightly zigbuild --release --target aarch64-unknown-linux-gnu )
+( cd "$REPO_ROOT" && "$REPO_ROOT/scripts/cargo-zigbuild.sh" --release --target aarch64-unknown-linux-gnu )
 BIN="$REPO_ROOT/target/aarch64-unknown-linux-gnu/release/beep"
 [ -x "$BIN" ] || { echo "FAIL: build did not produce $BIN" >&2; exit 1; }
 
