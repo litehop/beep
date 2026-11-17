@@ -1014,6 +1014,28 @@ run_full_tick "$STUB_EMPTY_BIN" "" "idfull" "worker/agent-idfull"
 assert "a live worker passed as worker/agent-<id> (its branch name) is still in-flight, not exit 30" \
   "$([ "$TICK_RC" -ne 30 ] && echo 1 || echo 0)"
 
+run_full_tick "$STUB_EMPTY_BIN" "" "a0513deb30de413b1" "a0513deb30de413b1"
+assert "a bare ListAgents id (the documented --live-agents format) classifies its worker branch no-pr-for-branch-in-flight and does not count toward exit 30" \
+  "$([ "$TICK_RC" -ne 30 ] && [ "$(jq -r '[.worktree_anomalies[] | select(.branch == "worker/agent-a0513deb30de413b1" and .reason == "no-pr-for-branch-in-flight")] | length' "$TICK_STATE")" -eq 1 ] && echo 1 || echo 0)"
+
+# The `--live-agents=<ids>` spelling used to fall through the parser's
+# ignore-unknown arm, leaving the live set empty and the live worker stale.
+build_scratch_repo "eqform"
+TICK_RC=0
+TICK_STATE="$SCRATCH_REPO/../state.json"
+PATH="$STUB_EMPTY_BIN:$PATH" MAYOR_TICK_QUEUE_DIR="$SCRATCH_REPO/.claude/review-queue" \
+  MAYOR_TICK_STATE_FILE="$TICK_STATE" MAYOR_TICK_DASHBOARD_FILE="$SCRATCH_REPO/no-such-dashboard.md" \
+  MAYOR_TICK_DRY_RUN=1 bash "$SCRATCH_REPO/scripts/mayor-tick.sh" --live-agents=eqform >/dev/null 2>&1 || TICK_RC=$?
+assert "--live-agents=<id> is honored, so a live worker is not reported stale (exit 30)" \
+  "$([ "$TICK_RC" -ne 30 ] && [ "$TICK_RC" -ne 2 ] && echo 1 || echo 0)"
+
+TICK_RC=0
+PATH="$STUB_EMPTY_BIN:$PATH" MAYOR_TICK_QUEUE_DIR="$SCRATCH_REPO/.claude/review-queue" \
+  MAYOR_TICK_STATE_FILE="$TICK_STATE" MAYOR_TICK_DASHBOARD_FILE="$SCRATCH_REPO/no-such-dashboard.md" \
+  MAYOR_TICK_DRY_RUN=1 bash "$SCRATCH_REPO/scripts/mayor-tick.sh" --live-agent eqform >/dev/null 2>&1 || TICK_RC=$?
+assert "an unknown/misspelled flag exits 2 instead of being silently dropped (which would empty the live set and misreport a live worker as stale)" \
+  "$([ "$TICK_RC" -eq 2 ] && echo 1 || echo 0)"
+
 run_full_tick "$STUB_EMPTY_BIN" "" "idbad" "idbad,not a/valid id"
 assert "a malformed --live-agents entry makes mayor-tick exit 2 before doing anything, rather than silently treating the live set as incomplete" \
   "$([ "$TICK_RC" -eq 2 ] && echo 1 || echo 0)"
